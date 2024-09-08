@@ -63,7 +63,7 @@ CartesianGrid::CartesianGrid(MeshBlockPack *pmy_pack, Real center[3],
   // Call functions to prepare CartesianGrid object for interpolation
   // SetInterpolationCoordinates();
   SetInterpolationIndices();
-  // SetInterpolationWeights();
+  SetInterpolationWeights();
 
   return;
 }
@@ -80,6 +80,8 @@ void CartesianGrid::SetInterpolationIndices() {
         Real x1 = min_x1 + nx * d_x1;
         Real x2 = min_x2 + ny * d_x2;
         Real x3 = min_x3 + nz * d_x3;
+
+        std::cout << x1 << "\t" << x2 << "\t" << x3 << std::endl;
 
         // indices default to -1 if point does not reside in this MeshBlockPack
         iindcs.h_view(nx,ny,nz,0) = -1;
@@ -187,3 +189,61 @@ void CartesianGrid::SetInterpolationWeights() {
 
   return;
 }
+
+//----------------------------------------------------------------------------------------
+//! \fn void CartesianGrid::InterpolateToGrid
+//! \brief interpolate Cartesian data to cart_grid for output
+
+void CartesianGrid::InterpolateToGrid(int nvars, DvceArray5D<Real> &val) {
+  // reinitialize interpolation indices and weights if AMR
+  if (pmy_pack->pmesh->adaptive) {
+    SetInterpolationIndices();
+    SetInterpolationWeights();
+  }
+
+  // capturing variables for kernel
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int &is = indcs.is; int &js = indcs.js; int &ks = indcs.ks;
+  int &ng = indcs.ng;
+  int n_x1 = nx1 - 1;
+  int n_x2 = nx2 - 1;
+  int n_x3 = nx3 - 1;
+
+  int nvar1 = nvars - 1;
+
+  // reallocate container
+  Kokkos::realloc(interp_vals,n_x1,n_x2,n_x3,nvars);
+
+  auto &iindcs = interp_indcs;
+  auto &iwghts = interp_wghts;
+  auto &ivals = interp_vals;
+  par_for("int2cart",DevExeSpace(),0,n_x1,0,n_x2,0,n_x3,0,nvar1,
+  KOKKOS_LAMBDA(int nx, int ny, int nz, int v) {
+    int ii0 = iindcs.d_view(nx,ny,nz,0);
+    int ii1 = iindcs.d_view(nx,ny,nz,1);
+    int ii2 = iindcs.d_view(nx,ny,nz,2);
+    int ii3 = iindcs.d_view(nx,ny,nz,3);
+
+    if (ii0==-1) {  // angle not on this rank
+      ivals.d_view(nx,ny,nz,v) = 0.0;
+    } else {
+      Real int_value = 0.0;
+      for (int i=0; i<2*ng; i++) {
+        for (int j=0; j<2*ng; j++) {
+          for (int k=0; k<2*ng; k++) {
+            Real iwght = iwghts.d_view(nx,ny,nz,i,0)*iwghts.d_view(nx,ny,nz,j,1)*iwghts.d_view(nx,ny,nz,k,2);
+            int_value += iwght*val(ii0,v,ii3-(ng-k-ks)+1,ii2-(ng-j-js)+1,ii1-(ng-i-is)+1);
+          }
+        }
+      }
+      ivals.d_view(nx,ny,nz,v) = int_value;
+    }
+  });
+
+  // sync dual arrays
+  interp_vals.template modify<DevExeSpace>();
+  interp_vals.template sync<HostMemSpace>();
+
+  return;
+}
+

@@ -31,12 +31,11 @@ class CartesianGrid {
     Real d_x1, d_x2, d_x3;                     // resolution
     int nx1, nx2, nx3;                      // number of points
 
-
     // For simplicity, unravell all points into a 1d array
     DualArray4D<Real> interp_vals;   // container for data interpolated to sphere
     void InterpolateToGrid(int nvars, DvceArray5D<Real> &val);  // interpolate to sphere
 
- private:
+ // private:
     MeshBlockPack* pmy_pack;  // ptr to MeshBlockPack containing this Hydro
     DualArray4D<int> interp_indcs;   // indices of MeshBlock and zones therein for interp
     DualArray5D<Real> interp_wghts;  // weights for interpolation
