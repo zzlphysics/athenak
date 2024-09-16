@@ -207,6 +207,7 @@ void MeshBlockPack::AddPhysics(ParameterInput *pin) {
   if ((pin->DoesBlockExist("z4c") || pin->DoesBlockExist("adm")) &&
       (pin->DoesBlockExist("mhd")) ) {
     pdyngr = dyngr::BuildDynGRMHD(this, pin);
+    ptmunu = new Tmunu(this, pin);
   }
 
   if (pz4c != nullptr || padm != nullptr) {
