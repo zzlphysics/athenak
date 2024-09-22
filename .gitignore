@@ -16,3 +16,7 @@ build/
 # editor temp files
 *~
 *.swp
+
+# other
+output/
+*.png
