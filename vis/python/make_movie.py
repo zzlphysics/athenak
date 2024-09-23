@@ -1808,8 +1808,7 @@ if __name__ == '__main__':
     elif args.output_file != "show" and os.path.isdir(args.data_file):
         input_dir = args.data_file
         output_dir = args.output_file
-        if not os.path.exists(args.output_file):
-            os.makedirs(args.output_file)
+        
         files = [f for f in os.listdir(input_dir) if f.endswith('.bin')]
 
         try:
@@ -1824,11 +1823,16 @@ if __name__ == '__main__':
             use_mpi = False
 
         if use_mpi:
-            print("Using MPI")
+            if MPI.COMM_WORLD.Get_rank() == 0:
+                print("Using MPI")
             comm = MPI.COMM_WORLD
             size = comm.Get_size()  # Total number of MPI processes
             rank = comm.Get_rank()  # Rank of the current MPI process
             local_files = [files[i] for i in range(rank, len(files), size)]
+            if MPI.COMM_WORLD.Get_rank() == 0:
+                if not os.path.exists(args.output_file):
+                    os.makedirs(args.output_file)
+            comm.Barrier()
 
             # Each rank processes its local files
             if len(local_files) > 0:
@@ -1843,7 +1847,8 @@ if __name__ == '__main__':
 
             # Ensure all processes are synchronized before proceeding
             comm.Barrier()
-            print("MPI Finish")
+            if MPI.COMM_WORLD.Get_rank() == 0:
+                print("MPI Finish")
         else:
             for file in os.listdir(args.data_file):
                 if file.endswith('.bin'):
