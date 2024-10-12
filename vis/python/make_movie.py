@@ -189,7 +189,11 @@ def main(**kwargs):
         if line != 'Athena binary output version=1.1\n':
             raise RuntimeError('Unrecognized data file format.')
         next(f)
-        next(f)
+        # next(f)
+        line = f.readline().decode('ascii')
+        if line[:7] != '  time=':
+            raise RuntimeError('Could not read location size.')
+        frame_time = float(line[7:])
         next(f)
         line = f.readline().decode('ascii')
         if line[:19] != '  size of location=':
@@ -1289,6 +1293,7 @@ def main(**kwargs):
         plt.xlabel('$x$', labelpad=x1_labelpad)
         plt.ylabel('$y$', labelpad=x2_labelpad)
 
+    plt.title(f"time = {int(frame_time)}")
     # Adjust layout
     plt.tight_layout()
 
@@ -1815,6 +1820,7 @@ if __name__ == '__main__':
             import mpi4py
             from mpi4py import MPI
             from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
+            import time
             if MPI.COMM_WORLD.Get_rank() == 0:
                 print("MPI Available")
             # Use MPI unless we're alone
@@ -1837,6 +1843,7 @@ if __name__ == '__main__':
             # Each rank processes its local files
             if len(local_files) > 0:
                 print(f"Rank {rank} is processing {len(local_files)} files.", flush=True)
+                time.sleep(1 * rank)
                 for fname in local_files:
                     print("Imaging :", fname)
                     args.data_file = os.path.join(input_dir, fname)
@@ -1850,6 +1857,8 @@ if __name__ == '__main__':
             if MPI.COMM_WORLD.Get_rank() == 0:
                 print("MPI Finish")
         else:
+            if not os.path.exists(args.output_file):
+                    os.makedirs(args.output_file)
             for file in os.listdir(args.data_file):
                 if file.endswith('.bin'):
                     print("Imaging :", file)
