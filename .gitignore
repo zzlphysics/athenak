@@ -20,3 +20,7 @@ build/
 # other
 output/
 *.png
+*.err
+*.out
+*.sbatch
+*.pyc
