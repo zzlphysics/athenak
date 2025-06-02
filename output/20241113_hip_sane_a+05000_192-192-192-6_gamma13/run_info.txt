@@ -1,0 +1,94 @@
+ 1040       hip  ath-hip zhangzel  R 9-02:07:49      1 node3
+ 2xMI50
+ tend = 16667
+
+ <mesh>
+nghost = 4        # Number of ghost cells
+nx1    = 144       # number of cells in x1-direction
+x1min  = -1024.0  # minimum x1
+x1max  = 1024.0   # maximum x1
+ix1_bc = user     # inner boundary
+ox1_bc = user     # outer boundary
+
+nx2    = 144       # number of cells in x2-direction
+x2min  = -1024.0  # minimum x2
+x2max  = 1024.0   # maximum x2
+ix2_bc = user     # inner boundary
+ox2_bc = user     # outer boundary
+
+nx3    = 144       # number of cells in x3-direction
+x3min  = -1024.0  # minimum x3
+x3max  = 1024.0   # maximum x3
+ix3_bc = user     # inner boundary
+ox3_bc = user     # outer boundary
+
+<meshblock>
+nx1  = 36          # Number of cells in each MeshBlock, X1-dir
+nx2  = 36          # Number of cells in each MeshBlock, X2-dir
+nx3  = 36          # Number of cells in each MeshBlock, X3-dir
+
+<mesh_refinement>
+refinement = static    # type of refinement
+
+<refinement1>
+level = 1
+x1min = -512.0
+x1max = 512.0
+x2min = -512.0
+x2max = 512.0
+x3min = -512.0
+x3max = 512.0
+
+<refinement2>
+level = 2
+x1min = -256.0
+x1max = 256.0
+x2min = -256.0
+x2max = 256.0
+x3min = -256.0
+x3max = 256.0
+
+<refinement3>
+level = 3
+x1min = -128.0
+x1max = 128.0
+x2min = -128.0
+x2max = 128.0
+x3min = -128.0
+x3max = 128.0
+
+<refinement4>
+level = 4
+x1min = -64.0
+x1max = 64.0
+x2min = -64.0
+x2max = 64.0
+x3min = -64.0
+x3max = 64.0
+
+<refinement5>
+level = 5
+x1min = -32.0
+x1max = 32.0
+x2min = -32.0
+x2max = 32.0
+x3min = -32.0
+x3max = 32.0
+
+<refinement6>
+level = 6
+x1min = -16.0
+x1max = 16.0
+x2min = -16.0
+x2max = 16.0
+x3min = -16.0
+x3max = 16.0
+
+<refinement7>
+level = 7
+x1min = -8.0
+x1max = 8.0
+x2min = -8.0
+x2max = 8.0
+x3min = -8.0
+x3max = 8.0

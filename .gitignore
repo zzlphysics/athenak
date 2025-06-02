@@ -6,7 +6,7 @@ build*/
 *.vtk
 *.bin
 *.athdf*
-*.hst
+# *.hst
 *.rst
 
 # Mac OS metadata
@@ -18,9 +18,8 @@ build*/
 *.swp
 
 # other
-output/
 *.png
 *.err
 *.out
-*.sbatch
 *.pyc
+*.mp4
