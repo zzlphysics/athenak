@@ -1102,6 +1102,8 @@ def main(**kwargs):
     else:
         quantity_masked = quantity
 
+    print("min = ", np.nanmin(np.where(quantity_masked > -np.inf, quantity_masked, np.nan)), "  max = ", np.nanmax(np.where(quantity_masked < np.inf, quantity_masked, np.nan)))
+
     # Calculate color scaling
     if kwargs['vmin'] is None:
         if kwargs['norm'] == 'linear':
