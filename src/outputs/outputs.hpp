@@ -16,7 +16,7 @@
 #include "athena.hpp"
 #include "io_wrapper.hpp"
 
-#define NHISTORY_VARIABLES 12
+#define NHISTORY_VARIABLES 20
 #if NHISTORY_VARIABLES > NREDUCTION_VARIABLES
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
@@ -413,6 +413,23 @@ class CartesianGridOutput : public BaseTypeOutput {
   MetaData md;
 };
 
+// Forward declaration
+class SphericalSurface;
+
+//----------------------------------------------------------------------------------------
+//! \class SphericalGridOutput
+//  \brief derived BaseTypeOutput class for output on a Cartesian grid
+class SphericalSurfaceOutput : public BaseTypeOutput {
+ public:
+  SphericalSurfaceOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
+  ~SphericalSurfaceOutput();
+  //! Interpolate the data on the Cartesian grid and handle MPI communication
+  void LoadOutputData(Mesh *pm) override;
+  //! Write the data to file
+  void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+ private:
+  SphericalSurface *psurf;
+};
 //----------------------------------------------------------------------------------------
 //! \class EventLogOutput
 //  \brief derived BaseTypeOutput class for event counter data
