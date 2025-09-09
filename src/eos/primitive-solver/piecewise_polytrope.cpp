@@ -47,13 +47,14 @@ bool Primitive::PiecewisePolytrope::ReadParametersFromInput(std::string block,
   // Initialize the EOS
   // Convert double arrays to Real arrays for single precision compatibility
 #if SINGLE_PRECISION_ENABLED
-  std::vector<Real> densities_real(np);
-  std::vector<Real> gammas_real(np);
+  // Use stack-allocated arrays for GPU compatibility (np is typically small)
+  Real densities_real[np];
+  Real gammas_real[np];
   for (int i = 0; i < np; ++i) {
     densities_real[i] = static_cast<Real>(densities[i]);
     gammas_real[i] = static_cast<Real>(gammas[i]);
   }
-  InitializeFromData(densities_real.data(), gammas_real.data(), P0, Real(1.0), np);
+  InitializeFromData(densities_real, gammas_real, P0, Real(1.0), np);
 #else
   InitializeFromData(densities, gammas, P0, 1.0, np);
 #endif

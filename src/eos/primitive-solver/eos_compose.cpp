@@ -57,72 +57,85 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
 
     { // read nb
       double * table_nb_double = table["nb"];
-      Real * table_nb = reinterpret_cast<Real*>(table_nb_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_nb_real(m_nn);
-      for (size_t i = 0; i < m_nn; ++i) {
-        table_nb_real[i] = static_cast<Real>(table_nb_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        host_log_nb(in) = log(static_cast<Real>(table_nb_double[in]));
       }
-      table_nb = table_nb_real.data();
-#endif
+      m_id_log_nb = Real(1.0)/(host_log_nb(1) - host_log_nb(0));
+      min_n = static_cast<Real>(table_nb_double[0]);
+      max_n = static_cast<Real>(table_nb_double[m_nn-1]);
+#else
+      // For double precision, use direct access
+      Real * table_nb = reinterpret_cast<Real*>(table_nb_double);
       for (size_t in=0; in<m_nn; ++in) {
         host_log_nb(in) = log(table_nb[in]);
       }
       m_id_log_nb = 1.0/(host_log_nb(1) - host_log_nb(0));
       min_n = table_nb[0];
       max_n = table_nb[m_nn-1];
+#endif
     }
 
     { // read yq
       double * table_yq_double = table["yq"];
-      Real * table_yq = reinterpret_cast<Real*>(table_yq_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_yq_real(m_ny);
-      for (size_t i = 0; i < m_ny; ++i) {
-        table_yq_real[i] = static_cast<Real>(table_yq_double[i]);
+      // For single precision, convert directly during access
+      for (size_t iy=0; iy<m_ny; ++iy) {
+        host_yq(iy) = static_cast<Real>(table_yq_double[iy]);
       }
-      table_yq = table_yq_real.data();
-#endif
+      m_id_yq = Real(1.0)/(host_yq(1) - host_yq(0));
+      min_Y[0] = static_cast<Real>(table_yq_double[0]);
+      max_Y[0] = static_cast<Real>(table_yq_double[m_ny-1]);
+#else
+      // For double precision, use direct access
+      Real * table_yq = reinterpret_cast<Real*>(table_yq_double);
       for (size_t iy=0; iy<m_ny; ++iy) {
         host_yq(iy) = table_yq[iy];
       }
       m_id_yq = 1.0/(host_yq(1) - host_yq(0));
       min_Y[0] = table_yq[0];
       max_Y[0] = table_yq[m_ny-1];
+#endif
     }
 
     { // read T
       double * table_t_double = table["t"];
-      Real * table_t = reinterpret_cast<Real*>(table_t_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_t_real(m_nt);
-      for (size_t i = 0; i < m_nt; ++i) {
-        table_t_real[i] = static_cast<Real>(table_t_double[i]);
+      // For single precision, convert directly during access
+      for (size_t it=0; it<m_nt; ++it) {
+        host_log_t(it) = log(static_cast<Real>(table_t_double[it]));
       }
-      table_t = table_t_real.data();
-#endif
+      m_id_log_t = Real(1.0)/(host_log_t(1) - host_log_t(0));
+      min_T = static_cast<Real>(table_t_double[1]);      // These are different
+      max_T = static_cast<Real>(table_t_double[m_nt-2]); // on purpose
+#else
+      // For double precision, use direct access
+      Real * table_t = reinterpret_cast<Real*>(table_t_double);
       for (size_t it=0; it<m_nt; ++it) {
         host_log_t(it) = log(table_t[it]);
       }
       m_id_log_t = 1.0/(host_log_t(1) - host_log_t(0));
       min_T = table_t[1];      // These are different
       max_T = table_t[m_nt-2]; // on purpose
+#endif
     }
 
     { // Read Q1 -> log(P)
       double * table_Q1_double = table["Q1"];
-      Real * table_Q1 = reinterpret_cast<Real*>(table_Q1_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q1_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q1_real[i] = static_cast<Real>(table_Q1_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECLOGP,in,iy,it) = log(static_cast<Real>(table_Q1_double[iflat])) + host_log_nb(in);
+          }
+        }
       }
-      table_Q1 = table_Q1_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_Q1 = reinterpret_cast<Real*>(table_Q1_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -131,19 +144,24 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     { // Read Q2 -> S
       double * table_Q2_double = table["Q2"];
-      Real * table_Q2 = reinterpret_cast<Real*>(table_Q2_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q2_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q2_real[i] = static_cast<Real>(table_Q2_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECENT,in,iy,it) = static_cast<Real>(table_Q2_double[iflat]);
+          }
+        }
       }
-      table_Q2 = table_Q2_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_Q2 = reinterpret_cast<Real*>(table_Q2_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -152,19 +170,24 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     { // Read Q3-> mu_b
       double * table_Q3_double = table["Q3"];
-      Real * table_Q3 = reinterpret_cast<Real*>(table_Q3_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q3_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q3_real[i] = static_cast<Real>(table_Q3_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECMUB,in,iy,it) = (static_cast<Real>(table_Q3_double[iflat])+Real(1))*mb;
+          }
+        }
       }
-      table_Q3 = table_Q3_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_Q3 = reinterpret_cast<Real*>(table_Q3_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -173,40 +196,50 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     { // Read Q4-> mu_q
       double * table_Q4_double = table["Q4"];
-      Real * table_Q4 = reinterpret_cast<Real*>(table_Q4_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q4_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q4_real[i] = static_cast<Real>(table_Q4_double[i]);
-      }
-      table_Q4 = table_Q4_real.data();
-#endif
+      // For single precision, convert directly during access
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
             size_t iflat = it + m_nt*(iy + m_ny*in);
-            host_table(ECMUB,in,iy,it) = table_Q4[iflat]*mb;
+            host_table(ECMUQ,in,iy,it) = static_cast<Real>(table_Q4_double[iflat])*mb;
           }
         }
       }
+#else
+      // For double precision, use direct access
+      Real * table_Q4 = reinterpret_cast<Real*>(table_Q4_double);
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECMUQ,in,iy,it) = table_Q4[iflat]*mb;
+          }
+        }
+      }
+#endif
     }
 
     { // Read Q5-> mu_le
       double * table_Q5_double = table["Q5"];
-      Real * table_Q5 = reinterpret_cast<Real*>(table_Q5_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q5_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q5_real[i] = static_cast<Real>(table_Q5_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECMUL,in,iy,it) = static_cast<Real>(table_Q5_double[iflat])*mb;
+          }
+        }
       }
-      table_Q5 = table_Q5_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_Q5 = reinterpret_cast<Real*>(table_Q5_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -215,19 +248,24 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     { // Read Q7-> log(e)
       double * table_Q7_double = table["Q7"];
-      Real * table_Q7 = reinterpret_cast<Real*>(table_Q7_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_Q7_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_Q7_real[i] = static_cast<Real>(table_Q7_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECLOGE,in,iy,it) = log(mb*(static_cast<Real>(table_Q7_double[iflat]) + Real(1))) + host_log_nb(in);
+          }
+        }
       }
-      table_Q7 = table_Q7_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_Q7 = reinterpret_cast<Real*>(table_Q7_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -236,19 +274,24 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     { // Read cs2-> cs
       double * table_cs2_double = table["cs2"];
-      Real * table_cs2 = reinterpret_cast<Real*>(table_cs2_double);
 #if SINGLE_PRECISION_ENABLED
-      // For single precision, we need to convert from double to float
-      std::vector<Real> table_cs2_real(m_nn*m_ny*m_nt);
-      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
-        table_cs2_real[i] = static_cast<Real>(table_cs2_double[i]);
+      // For single precision, convert directly during access
+      for (size_t in=0; in<m_nn; ++in) {
+        for (size_t iy=0; iy<m_ny; ++iy) {
+          for (size_t it=0; it<m_nt; ++it) {
+            size_t iflat = it + m_nt*(iy + m_ny*in);
+            host_table(ECCS,in,iy,it) = sqrt(static_cast<Real>(table_cs2_double[iflat]));
+          }
+        }
       }
-      table_cs2 = table_cs2_real.data();
-#endif
+#else
+      // For double precision, use direct access
+      Real * table_cs2 = reinterpret_cast<Real*>(table_cs2_double);
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -257,6 +300,7 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
           }
         }
       }
+#endif
     }
 
     // Copy from host to device

@@ -38,32 +38,37 @@ using Real = double;
 // Precision-aware mathematical functions
 
 #if SINGLE_PRECISION_ENABLED
-// Single precision math functions
-#include <cmath>
+// Single precision math functions - let Kokkos handle platform optimization
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real pow_real(T base, T exp) {
-  return powf(static_cast<float>(base), static_cast<float>(exp));
+  using Kokkos::pow;
+  return pow(Real(base), Real(exp));
 }
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real sqrt_real(T x) {
-  return sqrtf(static_cast<float>(x));
+  using Kokkos::sqrt;
+  return sqrt(Real(x));
 }
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real log_real(T x) {
-  return logf(static_cast<float>(x));
+  using Kokkos::log;
+  return log(Real(x));
 }
 #else
 // Double precision math functions
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real pow_real(T base, T exp) {
+  using Kokkos::pow;
   return pow(static_cast<double>(base), static_cast<double>(exp));
 }
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real sqrt_real(T x) {
+  using Kokkos::sqrt;
   return sqrt(static_cast<double>(x));
 }
 template<typename T>
 KOKKOS_INLINE_FUNCTION Real log_real(T x) {
+  using Kokkos::log;
   return log(static_cast<double>(x));
 }
 #endif
@@ -76,10 +81,18 @@ KOKKOS_INLINE_FUNCTION Real log_real(T x) {
 #define NUM_BITS_LID 14
 
 #define SQR(x) ( (x)*(x) )
-#define SIGN(x) ( ((x) < 0.0) ? -1.0 : 1.0 )
+#define SIGN(x) ( ((x) < Real(0.0)) ? Real(-1.0) : Real(1.0) )
+
+// Precision-aware constants
+#if SINGLE_PRECISION_ENABLED
+#define ONE_3RD  0.3333333f
+#define TWO_3RDS 0.6666667f
+#define FOUR_3RDS 1.3333333f
+#else
 #define ONE_3RD  0.3333333333333333
 #define TWO_3RDS 0.6666666666666667
 #define FOUR_3RDS 1.333333333333333
+#endif
 
 // data types only used in physics modules (defined here to avoid recursive dependencies)
 
