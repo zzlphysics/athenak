@@ -35,6 +35,40 @@ using Real = double;
 #endif // SINGLE_PRECISION_ENABLED
 
 //----------------------------------------------------------------------------------------
+// Precision-aware mathematical functions
+
+#if SINGLE_PRECISION_ENABLED
+// Single precision math functions
+#include <cmath>
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real pow_real(T base, T exp) {
+  return powf(static_cast<float>(base), static_cast<float>(exp));
+}
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real sqrt_real(T x) {
+  return sqrtf(static_cast<float>(x));
+}
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real log_real(T x) {
+  return logf(static_cast<float>(x));
+}
+#else
+// Double precision math functions
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real pow_real(T base, T exp) {
+  return pow(static_cast<double>(base), static_cast<double>(exp));
+}
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real sqrt_real(T x) {
+  return sqrt(static_cast<double>(x));
+}
+template<typename T>
+KOKKOS_INLINE_FUNCTION Real log_real(T x) {
+  return log(static_cast<double>(x));
+}
+#endif
+
+//----------------------------------------------------------------------------------------
 // general purpose macros (never modified)
 
 // number of bits needed to store MeshBlock local ID in each rank in an integer.  Thus

@@ -14,6 +14,7 @@
 #include <iostream>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "eos_compose.hpp"
 #include "utils/tr_table.hpp"
@@ -55,7 +56,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     HostArray4D<Real>::HostMirror host_table =  create_mirror_view(m_table);
 
     { // read nb
-      Real * table_nb = table["nb"];
+      double * table_nb_double = table["nb"];
+      Real * table_nb = reinterpret_cast<Real*>(table_nb_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_nb_real(m_nn);
+      for (size_t i = 0; i < m_nn; ++i) {
+        table_nb_real[i] = static_cast<Real>(table_nb_double[i]);
+      }
+      table_nb = table_nb_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         host_log_nb(in) = log(table_nb[in]);
       }
@@ -65,7 +75,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // read yq
-      Real * table_yq = table["yq"];
+      double * table_yq_double = table["yq"];
+      Real * table_yq = reinterpret_cast<Real*>(table_yq_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_yq_real(m_ny);
+      for (size_t i = 0; i < m_ny; ++i) {
+        table_yq_real[i] = static_cast<Real>(table_yq_double[i]);
+      }
+      table_yq = table_yq_real.data();
+#endif
       for (size_t iy=0; iy<m_ny; ++iy) {
         host_yq(iy) = table_yq[iy];
       }
@@ -75,7 +94,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // read T
-      Real * table_t = table["t"];
+      double * table_t_double = table["t"];
+      Real * table_t = reinterpret_cast<Real*>(table_t_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_t_real(m_nt);
+      for (size_t i = 0; i < m_nt; ++i) {
+        table_t_real[i] = static_cast<Real>(table_t_double[i]);
+      }
+      table_t = table_t_real.data();
+#endif
       for (size_t it=0; it<m_nt; ++it) {
         host_log_t(it) = log(table_t[it]);
       }
@@ -85,7 +113,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q1 -> log(P)
-      Real * table_Q1 = table["Q1"];
+      double * table_Q1_double = table["Q1"];
+      Real * table_Q1 = reinterpret_cast<Real*>(table_Q1_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q1_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q1_real[i] = static_cast<Real>(table_Q1_double[i]);
+      }
+      table_Q1 = table_Q1_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -97,7 +134,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q2 -> S
-      Real * table_Q2 = table["Q2"];
+      double * table_Q2_double = table["Q2"];
+      Real * table_Q2 = reinterpret_cast<Real*>(table_Q2_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q2_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q2_real[i] = static_cast<Real>(table_Q2_double[i]);
+      }
+      table_Q2 = table_Q2_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -109,7 +155,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q3-> mu_b
-      Real * table_Q3 = table["Q3"];
+      double * table_Q3_double = table["Q3"];
+      Real * table_Q3 = reinterpret_cast<Real*>(table_Q3_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q3_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q3_real[i] = static_cast<Real>(table_Q3_double[i]);
+      }
+      table_Q3 = table_Q3_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -121,7 +176,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q4-> mu_q
-      Real * table_Q4 = table["Q4"];
+      double * table_Q4_double = table["Q4"];
+      Real * table_Q4 = reinterpret_cast<Real*>(table_Q4_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q4_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q4_real[i] = static_cast<Real>(table_Q4_double[i]);
+      }
+      table_Q4 = table_Q4_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -133,7 +197,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q5-> mu_le
-      Real * table_Q5 = table["Q5"];
+      double * table_Q5_double = table["Q5"];
+      Real * table_Q5 = reinterpret_cast<Real*>(table_Q5_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q5_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q5_real[i] = static_cast<Real>(table_Q5_double[i]);
+      }
+      table_Q5 = table_Q5_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -145,7 +218,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read Q7-> log(e)
-      Real * table_Q7 = table["Q7"];
+      double * table_Q7_double = table["Q7"];
+      Real * table_Q7 = reinterpret_cast<Real*>(table_Q7_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_Q7_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_Q7_real[i] = static_cast<Real>(table_Q7_double[i]);
+      }
+      table_Q7 = table_Q7_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {
@@ -157,7 +239,16 @@ void EOSCompOSE::ReadTableFromFile(std::string fname) {
     }
 
     { // Read cs2-> cs
-      Real * table_cs2 = table["cs2"];
+      double * table_cs2_double = table["cs2"];
+      Real * table_cs2 = reinterpret_cast<Real*>(table_cs2_double);
+#if SINGLE_PRECISION_ENABLED
+      // For single precision, we need to convert from double to float
+      std::vector<Real> table_cs2_real(m_nn*m_ny*m_nt);
+      for (size_t i = 0; i < m_nn*m_ny*m_nt; ++i) {
+        table_cs2_real[i] = static_cast<Real>(table_cs2_double[i]);
+      }
+      table_cs2 = table_cs2_real.data();
+#endif
       for (size_t in=0; in<m_nn; ++in) {
         for (size_t iy=0; iy<m_ny; ++iy) {
           for (size_t it=0; it<m_nt; ++it) {

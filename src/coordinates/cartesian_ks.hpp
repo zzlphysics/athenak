@@ -137,7 +137,7 @@ void ComputeADMDecomposition(Real x, Real y, Real z, bool minkowski, Real a,
   *betax = 2.*H/(1. + 2.*H)*l_u[0];
   *betay = 2.*H/(1. + 2.*H)*l_u[1];
   *betaz = 2.*H/(1. + 2.*H)*l_u[2];
-  Real const beta_d[3] = {2.*H*l_u[0], 2.*H*l_u[1], 2.*H*l_u[2]};
+  Real const beta_d[3] = {Real(2.)*H*l_u[0], Real(2.)*H*l_u[1], Real(2.)*H*l_u[2]};
 
   *gxx = 2.*H*l_d[0]*l_d[0] + 1.;
   *gxy = 2.*H*l_d[0]*l_d[1];
@@ -149,7 +149,7 @@ void ComputeADMDecomposition(Real x, Real y, Real z, bool minkowski, Real a,
   //
   // conformal factor
   Real const det = adm::SpatialDet(*gxx, *gxy, *gxz, *gyy, *gyz, *gzz);
-  *psi4 = pow(det, 1./3.);
+  *psi4 = pow_real(det, Real(1.)/Real(3.));
 
   //
   // inverse metric
@@ -165,29 +165,29 @@ void ComputeADMDecomposition(Real x, Real y, Real z, bool minkowski, Real a,
 
   //
   // derivatives of the three metric (expressions taken from below)
-  Real const qa = 2.0*SQR(r) - SQR(rad) + SQR(a);
+  Real const qa = Real(2.0)*SQR(r) - SQR(rad) + SQR(a);
   Real const qb = SQR(r) + SQR(a);
-  Real const qc = 3.0*SQR(a * z) - SQR(r)*SQR(r);
+  Real const qc = Real(3.0)*SQR(a * z) - SQR(r)*SQR(r);
   Real const dH_d[3] = {
-    SQR(H)*x/(pow(r,3)) * ( ( qc ) )/ qa,
-    SQR(H)*y/(pow(r,3)) * ( ( qc ) )/ qa,
-    SQR(H)*z/(pow(r,5)) * ( ( qc * qb ) / qa - 2.0*SQR(a*r))
+    SQR(H)*x/(pow_real(r,Real(3))) * ( ( qc ) )/ qa,
+    SQR(H)*y/(pow_real(r,Real(3))) * ( ( qc ) )/ qa,
+    SQR(H)*z/(pow_real(r,Real(5))) * ( ( qc * qb ) / qa - Real(2.0)*SQR(a*r))
   };
 
   // \partial_i l_k
   Real const dl_dd[3][3] = {
     // \partial_x l_k
-    {x*r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + r/( qb ),
-    x*r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) - a/( qb ),
+    {x*r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + r/( qb ),
+    x*r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) - a/( qb ),
     - x*z/(r*qa)},
     // \partial_y l_k
-    {y*r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + a/( qb ),
-    y*r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) + r/( qb ),
+    {y*r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + a/( qb ),
+    y*r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) + r/( qb ),
     - y*z/(r*qa)},
     // \partial_z l_k
-    {z/r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( (qb) * qa ),
-    z/r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( (qb) * qa ),
-    - SQR(z)/(SQR(r)*r) * ( qb )/( qa ) + 1.0/r},
+    {z/r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( (qb) * qa ),
+    z/r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( (qb) * qa ),
+    - SQR(z)/(SQR(r)*r) * ( qb )/( qa ) + Real(1.0)/r},
   };
 
   Real dg_ddd[3][3][3] = {0.0};
@@ -216,17 +216,17 @@ void ComputeADMDecomposition(Real x, Real y, Real z, bool minkowski, Real a,
   // Derivatives of the shift vector
   Real const dbeta_dd[3][3] = {
     // \partial_x \beta_i
-    {2.*dH_d[0]*l_d[0] + 2.*H*dl_dd[0][0],
-    2.*dH_d[0]*l_d[1] + 2.*H*dl_dd[0][1],
-    2.*dH_d[0]*l_d[2] + 2.*H*dl_dd[0][2]},
+    {Real(2.)*dH_d[0]*l_d[0] + Real(2.)*H*dl_dd[0][0],
+    Real(2.)*dH_d[0]*l_d[1] + Real(2.)*H*dl_dd[0][1],
+    Real(2.)*dH_d[0]*l_d[2] + Real(2.)*H*dl_dd[0][2]},
     // \partial_y \beta_i
-    {2.*dH_d[1]*l_d[0] + 2.*H*dl_dd[1][0],
-    2.*dH_d[1]*l_d[1] + 2.*H*dl_dd[1][1],
-    2.*dH_d[1]*l_d[2] + 2.*H*dl_dd[1][2]},
+    {Real(2.)*dH_d[1]*l_d[0] + Real(2.)*H*dl_dd[1][0],
+    Real(2.)*dH_d[1]*l_d[1] + Real(2.)*H*dl_dd[1][1],
+    Real(2.)*dH_d[1]*l_d[2] + Real(2.)*H*dl_dd[1][2]},
     // \partial_z \beta_i
-    {2.*dH_d[2]*l_d[0] + 2.*H*dl_dd[2][0],
-    2.*dH_d[2]*l_d[1] + 2.*H*dl_dd[2][1],
-    2.*dH_d[2]*l_d[2] + 2.*H*dl_dd[2][2]},
+    {Real(2.)*dH_d[2]*l_d[0] + Real(2.)*H*dl_dd[2][0],
+    Real(2.)*dH_d[2]*l_d[1] + Real(2.)*H*dl_dd[2][1],
+    Real(2.)*dH_d[2]*l_d[2] + Real(2.)*H*dl_dd[2][2]},
   };
   /*Real dbeta_dd[3][3];
   for (int a = 0; a < 3; a++) {
@@ -292,20 +292,20 @@ void ComputeMetricDerivatives(Real x, Real y, Real z, bool minkowski, Real a,
   llower[2] = (r*y - a * x)/( SQR(r) + SQR(a) );
   llower[3] = z/r;
 
-  Real qa = 2.0*SQR(r) - SQR(rad) + SQR(a);
+  Real qa = Real(2.0)*SQR(r) - SQR(rad) + SQR(a);
   Real qb = SQR(r) + SQR(a);
-  Real qc = 3.0*SQR(a * z)-SQR(r)*SQR(r);
-  Real f = 2.0 * SQR(r)*r / (SQR(SQR(r)) + SQR(a)*SQR(z));
+  Real qc = Real(3.0)*SQR(a * z)-SQR(r)*SQR(r);
+  Real f = Real(2.0) * SQR(r)*r / (SQR(SQR(r)) + SQR(a)*SQR(z));
 
-  Real df_dx1 = SQR(f)*x/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
-  Real df_dx2 = SQR(f)*y/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
-  Real df_dx3 = SQR(f)*z/(2.0*pow(r,5)) * ( ( qc * qb ) / qa - 2.0*SQR(a*r));
-  Real dl1_dx1 = x*r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + r/( qb );
-  Real dl1_dx2 = y*r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + a/( qb );
-  Real dl1_dx3 = z/r * ( SQR(a)*x - 2.0*a*r*y - SQR(r)*x )/( (qb) * qa );
-  Real dl2_dx1 = x*r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) - a/( qb );
-  Real dl2_dx2 = y*r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) + r/( qb );
-  Real dl2_dx3 = z/r * ( SQR(a)*y + 2.0*a*r*x - SQR(r)*y )/( (qb) * qa );
+  Real df_dx1 = SQR(f)*x/(Real(2.0)*pow_real(r,Real(3))) * ( ( qc ) )/ qa;
+  Real df_dx2 = SQR(f)*y/(Real(2.0)*pow_real(r,Real(3))) * ( ( qc ) )/ qa;
+  Real df_dx3 = SQR(f)*z/(Real(2.0)*pow_real(r,Real(5))) * ( ( qc * qb ) / qa - Real(2.0)*SQR(a*r));
+  Real dl1_dx1 = x*r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + r/( qb );
+  Real dl1_dx2 = y*r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( SQR(qb) * qa ) + a/( qb );
+  Real dl1_dx3 = z/r * ( SQR(a)*x - Real(2.0)*a*r*y - SQR(r)*x )/( (qb) * qa );
+  Real dl2_dx1 = x*r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) - a/( qb );
+  Real dl2_dx2 = y*r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( SQR(qb) * qa ) + r/( qb );
+  Real dl2_dx3 = z/r * ( SQR(a)*y + Real(2.0)*a*r*x - SQR(r)*y )/( (qb) * qa );
   Real dl3_dx1 = - x*z/(r*qa);
   Real dl3_dx2 = - y*z/(r*qa);
   Real dl3_dx3 = - SQR(z)/(SQR(r)*r) * ( qb )/( qa ) + 1.0/r;

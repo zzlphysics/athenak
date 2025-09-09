@@ -45,7 +45,18 @@ bool Primitive::PiecewisePolytrope::ReadParametersFromInput(std::string block,
   Real P0 = densities[1]*pow(densities[1]/poly_rmd, gammas[0] - 1.0);
 
   // Initialize the EOS
+  // Convert double arrays to Real arrays for single precision compatibility
+#if SINGLE_PRECISION_ENABLED
+  std::vector<Real> densities_real(np);
+  std::vector<Real> gammas_real(np);
+  for (int i = 0; i < np; ++i) {
+    densities_real[i] = static_cast<Real>(densities[i]);
+    gammas_real[i] = static_cast<Real>(gammas[i]);
+  }
+  InitializeFromData(densities_real.data(), gammas_real.data(), P0, Real(1.0), np);
+#else
   InitializeFromData(densities, gammas, P0, 1.0, np);
+#endif
 
   // Set the gamma thermal (the default is 5/3)
   if (pin->DoesParameterExist(block, "gamma_thermal")) {

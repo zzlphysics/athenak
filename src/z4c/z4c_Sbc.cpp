@@ -44,7 +44,7 @@ static void Z4cSommerfeld(const Z4c::Z4c_vars& z4c, const Z4c::Z4c_vars& rhs,
   // Psuedoradial vector
   AthenaPointTensor<Real, TensorSymm::NONE, 3, 1> s_u;
 
-  Real idx[] = {1./size.d_view(m).dx1, 1./size.d_view(m).dx2, 1./size.d_view(m).dx3};
+  Real idx[] = {Real(1.)/size.d_view(m).dx1, Real(1.)/size.d_view(m).dx2, Real(1.)/size.d_view(m).dx3};
 
   // -------------------------------------------------------------------------------------
   // First derivatives
