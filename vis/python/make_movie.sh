@@ -2,11 +2,31 @@
 
 SIZE=50
 DRICTION="z"
-INPUT_FILE_PATH="/home/zzl/Project/athenak/output/mad/bin"
-OUTPUT_FILE_PATH="/home/zzl/Project/athenak/output/mad"
-OUTPUT_FILE_NAME="frames_log_dens_"$DRICTION"_"$SIZE
 
-mpirun -n 8 python /home/zzl/Project/athenak/vis/python/make_movie.py -d $DRICTION -n log --r_max=$SIZE --vmin=1e-5 --vmax=1.5 --horizon_mask $INPUT_FILE_PATH dens $OUTPUT_FILE_PATH/$OUTPUT_FILE_NAME
+# VALUE="dens"
+# VMIN=1e-5
+# VMAX=15
+# CMAP="viridis"
+
+# VALUE="derived:beta_inv_rel"
+# VMIN=1e-3
+# VMAX=1e3
+# CMAP="jet"
+# CMAP="viridis"
+
+VALUE="derived:sigma_rel"
+VMIN=1e-8
+VMAX=1e6
+# CMAP="jet"
+CMAP="viridis"
+
+
+FILE_PATH="/home/zzl/kx-4t/athenak/output/20240929_cuda_mad_a09375_128-128-128-8"
+INPUT_FILE_PATH="$FILE_PATH/bin"
+OUTPUT_FILE_PATH="$FILE_PATH"
+OUTPUT_FILE_NAME="frames_log_"$VALUE"_"$DRICTION"_"$SIZE
+
+mpirun -n 6 python ./make_movie.py -d $DRICTION -n log -c $CMAP --r_max=$SIZE --vmin=$VMIN --vmax=$VMAX --horizon_mask --notex $INPUT_FILE_PATH $VALUE $OUTPUT_FILE_PATH/$OUTPUT_FILE_NAME
 
 # 设置帧率
 FPS=30
