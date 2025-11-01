@@ -48,7 +48,7 @@ template<class TOVEOS>
 void SetupTOV(ParameterInput *pin, Mesh* pmy_mesh_) {
   Real v_pert = pin->GetOrAddReal("problem", "v_pert", 0.0);
   Real p_pert = pin->GetOrAddReal("problem", "p_pert", 0.0);
-  bool isotropic = pin->GetOrAddReal("problem", "isotropic", false);
+  bool isotropic = pin->GetOrAddBoolean("problem", "isotropic", false);
 
   bool minkowski = pin->GetOrAddBoolean("problem", "minkowski", false);
 
@@ -65,6 +65,7 @@ void SetupTOV(ParameterInput *pin, Mesh* pmy_mesh_) {
   //auto& u0_ = pmbp->pmhd->u0;
   auto& w0_ = pmbp->pmhd->w0;
   int& nvars_ = pmbp->pmhd->nmhd;
+  int& nscal_ = pmbp->pmhd->nscalars;
 
   // Capture variables for kernel
   auto &indcs = pmy_mesh_->mb_indcs;
@@ -144,7 +145,8 @@ void SetupTOV(ParameterInput *pin, Mesh* pmy_mesh_) {
     w0_(m,IVY,k,j,i) = vr*x2v/r;
     w0_(m,IVZ,k,j,i) = vr*x3v/r;
     auto &nvars = nvars_;
-    if (use_ye && pmbp->pmhd->nscalars>=1) {
+    auto &nscal = nscal_;
+    if (use_ye && nscal >= 1) {
       w0_(m,nvars,k,j,i) = ye;
     }
 
@@ -196,7 +198,7 @@ void SetupTOV(ParameterInput *pin, Mesh* pmy_mesh_) {
   // If use_pcut_rel = true, we take pcut to be a percentage of pmax rather than
   // an absolute cutoff
   if (pin->GetOrAddBoolean("problem", "use_pcut_rel", false)) {
-    Real pmax = eos_.template GetPFromRho<tov::LocationTag::Device>(tov_.rhoc);
+    Real pmax = eos_.template GetPFromRho<tov::LocationTag::Host>(tov_.rhoc);
     pcut = pcut * pmax;
   }
 
