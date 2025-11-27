@@ -16,6 +16,7 @@ build*/
 # editor temp files
 *~
 *.swp
+Lorene
 
 # other
 output/
