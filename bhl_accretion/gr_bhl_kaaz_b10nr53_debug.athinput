@@ -125,8 +125,10 @@ mach_inf  = 2.45
 beta_inf  = 10.0
 theta_b   = 0.0
 user_hist = true
-r_hist    = 3.0
+r_hist    = 3.0   # mdot/edot/jdot/F_mom extraction surface
 hist_nangle = 5
+grav_drag = true
+drag_exclude_radius = 3.0  # F_grav excludes r < 3, matching the surface diagnostic
 
 <output1>
 file_type  = hst

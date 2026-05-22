@@ -126,13 +126,23 @@ History output:
 <basename>.user.hst
 ```
 
-The BHL pgen writes:
+The BHL pgen writes the following history columns for each configured `r_hist`:
 
 ```text
-mdot_<r_hist>
-mdotHL_<r_hist>
-phi_<r_hist>      # MHD only
+mdot_<r_hist>       # mass inflow rate at r_hist
+mdotHL_<r_hist>     # mdot / mdot_HL
+edot_<r_hist>       # T^r_t surface integral
+jdot_<r_hist>       # T^r_phi surface integral
+phi_<r_hist>        # unsigned magnetic flux, MHD only
+varphi_<r_hist>     # phi / sqrt(mdot), MHD only, G=M=c=1
+fm_[xyz]_<r_hist>   # F_mom: momentum out-flux through the r_hist sphere
+fg_[xyz]_<r_hist>   # F_grav: modified-Newtonian gravitational drag volume integral
+fd_[xyz]_<r_hist>   # F_drag = -F_mom + F_grav
 ```
+
+By default `fg_*` / `F_grav` excludes `r < r_hist`. This can be overridden with
+`problem/drag_exclude_radius`; set `problem/grav_drag = false` to skip the volume
+integral if history output becomes too expensive during debugging.
 
 Binary dumps:
 
@@ -148,6 +158,10 @@ NBNR53:  variable = hydro_w
 ```
 
 ## Visualization
+
+The plotting script requires `numpy` and `matplotlib` in the active Python environment.
+If they are missing from `grmhd`, add/install `py-numpy` and `py-matplotlib` in that
+Spack environment before using `plot_bhl.py`.
 
 Quick-look latest dump and history:
 
@@ -180,19 +194,25 @@ bhl_plots/
 
 The script creates:
 
-- `history_bhl.png`: `mdot/mdot_HL` and, for MHD, `phi`.
+- `history_bhl.png`: `mdot/mdot_HL`, `varphi`/`phi`, `edot`/`jdot`, and `fd_*` / `F_drag` when present.
 - `*.xz.*.png`: x-z slices.
 - `*.xy.*.png`: x-y slices.
 
 The slice plotting is delegated to `vis/python/plot_slice.py`, so any variable or
 `derived:*` quantity supported there can be passed through `--variables`.
 
-## Current Caveats
+## Remaining Caveats
 
 - The upstream boundary is fixed wind on `inner_x1`; the other outer faces are outflow.
 - The current implementation initializes a uniform magnetic field in Cartesian
 coordinates. For Kaaz+2023 aligned-field runs, use `theta_b = 0` for `B || +z`.
-- `phi` is the unsigned magnetic flux through `r_hist`, not yet normalized by
-`sqrt(mdot)` into the dimensionless `varphi` convention used in MAD papers.
-- Drag-force diagnostics are not implemented yet.
+- `varphi` uses `phi/sqrt(mdot)` in code units. If the instantaneous surface mass
+flux is non-accreting (`mdot <= 0`), the pgen writes `varphi = 0` for that sample.
+- `fg_*` / `F_grav` follows the modified Newtonian volume integral used in 2409.12359. For
+the current Schwarzschild runs this is unambiguous; for spinning cases the exclusion
+surface uses Kerr-Schild radius while the force kernel remains Cartesian `x^i/r^3`.
+- AthenaK's default `NHISTORY_VARIABLES=20` means the expanded diagnostics are intended
+for one history radius at a time unless the history array size is increased.
+- The current inputs are still debug-oriented. A paper-level comparison requires longer
+runtime, convergence checks, and averaging over the quasi-steady window.
 

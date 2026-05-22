@@ -52,16 +52,28 @@ def find_dumps(run_dir: Path, basename: str | None) -> list[Path]:
 
 
 def require_numpy():
-    import numpy as np  # pylint: disable=import-outside-toplevel
+    try:
+        import numpy as np  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+        raise SystemExit(
+            "numpy is required for history plotting. Install it in the active Python "
+            "environment, e.g. add py-numpy to the grmhd Spack environment."
+        ) from exc
 
     return np
 
 
 def require_pyplot():
-    import matplotlib  # pylint: disable=import-outside-toplevel
+    try:
+        import matplotlib  # pylint: disable=import-outside-toplevel
 
-    matplotlib.use("agg")
-    import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
+        matplotlib.use("agg")
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+        raise SystemExit(
+            "matplotlib is required for plotting. Install it in the active Python "
+            "environment, e.g. add py-matplotlib to the grmhd Spack environment."
+        ) from exc
 
     return plt
 
@@ -82,6 +94,10 @@ def first_existing_key(data: dict, prefixes: Iterable[str]) -> str | None:
     return None
 
 
+def keys_with_prefix(data: dict, prefixes: Iterable[str]) -> list[str]:
+    return [key for key in data if any(key.startswith(prefix) for prefix in prefixes)]
+
+
 def plot_history(
     hst_file: Path,
     output_dir: Path,
@@ -99,13 +115,23 @@ def plot_history(
 
     mdot_key = first_existing_key(data, ("mdotHL_",))
     mdot_raw_key = first_existing_key(data, ("mdot_",))
+    varphi_key = first_existing_key(data, ("varphi_",))
     phi_key = first_existing_key(data, ("phi_",))
+    edot_key = first_existing_key(data, ("edot_",))
+    jdot_key = first_existing_key(data, ("jdot_",))
+    drag_keys = keys_with_prefix(data, ("fd_x_", "fd_y_", "fd_z_"))
 
-    fig, axes = plt.subplots(2 if phi_key else 1, 1, figsize=(8.0, 5.0), sharex=True)
+    panel_count = 1
+    panel_count += 1 if (varphi_key or phi_key) else 0
+    panel_count += 1 if (edot_key or jdot_key) else 0
+    panel_count += 1 if drag_keys else 0
+    fig, axes = plt.subplots(panel_count, 1, figsize=(8.0, 2.2 + 1.6*panel_count),
+                             sharex=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
+    axis_iter = iter(axes)
 
-    ax = axes[0]
+    ax = next(axis_iter)
     if mdot_key:
         y = data[mdot_key]
         ax.plot(x, y, color="0.65", linewidth=0.8, label=mdot_key)
@@ -121,13 +147,38 @@ def plot_history(
     ax.grid(alpha=0.25)
     ax.legend(loc="best", fontsize=8)
 
-    if phi_key:
-        ax = axes[1]
-        y = data[phi_key]
-        ax.plot(x, y, color="0.65", linewidth=0.8, label=phi_key)
+    if varphi_key or phi_key:
+        ax = next(axis_iter)
+        key = varphi_key or phi_key
+        y = data[key]
+        ax.plot(x, y, color="0.65", linewidth=0.8, label=key)
         ax.plot(x, moving_average(y, smooth), color="tab:orange", linewidth=1.5,
-                label=f"{phi_key}, smoothed")
-        ax.set_ylabel(r"$\Phi_{BH}$")
+                label=f"{key}, smoothed")
+        ax.set_ylabel(r"$\varphi$" if varphi_key else r"$\Phi$")
+        ax.grid(alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+
+    if edot_key or jdot_key:
+        ax = next(axis_iter)
+        if edot_key:
+            ax.plot(x, moving_average(data[edot_key], smooth), color="tab:green",
+                    linewidth=1.3, label=edot_key)
+        if jdot_key:
+            ax.plot(x, moving_average(data[jdot_key], smooth), color="tab:red",
+                    linewidth=1.3, label=jdot_key)
+        ax.set_ylabel("flux")
+        ax.grid(alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+
+    if drag_keys:
+        ax = next(axis_iter)
+        colors = {"x": "tab:blue", "y": "tab:orange", "z": "tab:green"}
+        for key in drag_keys:
+            component = key.split("_")[1]
+            ax.plot(x, moving_average(data[key], smooth), linewidth=1.2,
+                    color=colors.get(component), label=key)
+        ax.axhline(0.0, color="0.2", linewidth=0.7, alpha=0.5)
+        ax.set_ylabel(r"$F^i_{drag}$")
         ax.grid(alpha=0.25)
         ax.legend(loc="best", fontsize=8)
 

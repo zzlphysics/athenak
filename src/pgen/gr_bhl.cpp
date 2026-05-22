@@ -46,6 +46,8 @@ struct bhl_pgen {
   Real b3_inf;
   Real r_acc;
   Real mdot_hl;
+  Real drag_exclude_radius;
+  bool grav_drag;
 };
 
 bhl_pgen bhl;
@@ -71,6 +73,13 @@ void SetWindPrimitives(const bhl_pgen pgen, const bool is_mhd,
 
 void BHLWindInnerX1(Mesh *pm);
 void BHLFluxes(HistoryData *pdata, Mesh *pm);
+
+KOKKOS_INLINE_FUNCTION
+Real KerrSchildRadius(const Real x, const Real y, const Real z, const Real spin) {
+  const Real rad2 = SQR(x) + SQR(y) + SQR(z);
+  const Real a2 = SQR(spin);
+  return std::sqrt(0.5*(rad2 - a2 + std::sqrt(SQR(rad2 - a2) + 4.0*a2*SQR(z))));
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn void ProblemGenerator::UserProblem()
@@ -165,6 +174,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     auto &grids = spherical_grids;
     Real r_hist = pin->GetOrAddReal("problem", "r_hist", 3.0);
     int nangle = pin->GetOrAddInteger("problem", "hist_nangle", 5);
+    bhl.grav_drag = pin->GetOrAddBoolean("problem", "grav_drag", true);
+    bhl.drag_exclude_radius = pin->GetOrAddReal("problem", "drag_exclude_radius", -1.0);
     grids.push_back(std::make_unique<SphericalGrid>(pmbp, nangle, r_hist));
     user_hist_func = BHLFluxes;
   }
@@ -290,13 +301,17 @@ void BHLWindInnerX1(Mesh *pm) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void BHLFluxes()
-//! \brief Mass accretion and magnetic flux through one spherical KS surface.
+//! \brief Surface accretion fluxes and BHL drag diagnostics.
 
 void BHLFluxes(HistoryData *pdata, Mesh *pm) {
   MeshBlockPack *pmbp = pm->pmb_pack;
   bool flat = pmbp->pcoord->coord_data.is_minkowski;
   Real spin = pmbp->pcoord->coord_data.bh_spin;
   bool is_mhd = (pmbp->pmhd != nullptr);
+
+  Real gamma = is_mhd ? pmbp->pmhd->peos->eos_data.gamma
+                      : pmbp->phydro->peos->eos_data.gamma;
+  Real to_ien = (pmbp->pdyngr != nullptr) ? 1.0/(gamma - 1.0) : 1.0;
 
   int nvars = is_mhd ? pmbp->pmhd->nmhd + pmbp->pmhd->nscalars
                      : pmbp->phydro->nhydro + pmbp->phydro->nscalars;
@@ -305,22 +320,46 @@ void BHLFluxes(HistoryData *pdata, Mesh *pm) {
   if (is_mhd) bcc0 = pmbp->pmhd->bcc0;
 
   auto &grids = pm->pgen->spherical_grids;
-  int nflux = is_mhd ? 3 : 2;
+  const int phi_offset = 4;
+  const int drag_offset = is_mhd ? 6 : 4;
+  const int nflux = drag_offset + 9;
   pdata->nhist = grids.size()*nflux;
+  if (pdata->nhist > NHISTORY_VARIABLES) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "BHL user history requested " << pdata->nhist
+              << " columns, larger than NHISTORY_VARIABLES=" << NHISTORY_VARIABLES
+              << ". Reduce the number of history radii or increase NHISTORY_VARIABLES."
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
   for (int g=0; g<static_cast<int>(grids.size()); ++g) {
     std::stringstream stream;
     stream << std::fixed << std::setprecision(1) << grids[g]->radius;
     std::string rad = stream.str();
     pdata->label[nflux*g+0] = "mdot_" + rad;
     pdata->label[nflux*g+1] = "mdotHL_" + rad;
-    if (is_mhd) pdata->label[nflux*g+2] = "phi_" + rad;
+    pdata->label[nflux*g+2] = "edot_" + rad;
+    pdata->label[nflux*g+3] = "jdot_" + rad;
+    if (is_mhd) {
+      pdata->label[nflux*g+phi_offset+0] = "phi_" + rad;
+      pdata->label[nflux*g+phi_offset+1] = "varphi_" + rad;
+    }
+    pdata->label[nflux*g+drag_offset+0] = "fm_x_" + rad;
+    pdata->label[nflux*g+drag_offset+1] = "fm_y_" + rad;
+    pdata->label[nflux*g+drag_offset+2] = "fm_z_" + rad;
+    pdata->label[nflux*g+drag_offset+3] = "fg_x_" + rad;
+    pdata->label[nflux*g+drag_offset+4] = "fg_y_" + rad;
+    pdata->label[nflux*g+drag_offset+5] = "fg_z_" + rad;
+    pdata->label[nflux*g+drag_offset+6] = "fd_x_" + rad;
+    pdata->label[nflux*g+drag_offset+7] = "fd_y_" + rad;
+    pdata->label[nflux*g+drag_offset+8] = "fd_z_" + rad;
   }
 
   DualArray2D<Real> interpolated_bcc;
   for (int g=0; g<static_cast<int>(grids.size()); ++g) {
-    pdata->hdata[nflux*g+0] = 0.0;
-    pdata->hdata[nflux*g+1] = 0.0;
-    if (is_mhd) pdata->hdata[nflux*g+2] = 0.0;
+    for (int n=0; n<nflux; ++n) {
+      pdata->hdata[nflux*g+n] = 0.0;
+    }
 
     if (is_mhd) {
       grids[g]->InterpolateToSphere(3, bcc0);
@@ -334,6 +373,7 @@ void BHLFluxes(HistoryData *pdata, Mesh *pm) {
     for (int n=0; n<grids[g]->nangles; ++n) {
       Real r = grids[g]->radius;
       Real theta = grids[g]->polar_pos.h_view(n,0);
+      Real phi = grids[g]->polar_pos.h_view(n,1);
       Real x1 = grids[g]->interp_coord.h_view(n,0);
       Real x2 = grids[g]->interp_coord.h_view(n,1);
       Real x3 = grids[g]->interp_coord.h_view(n,2);
@@ -341,9 +381,16 @@ void BHLFluxes(HistoryData *pdata, Mesh *pm) {
       ComputeMetricAndInverse(x1, x2, x3, flat, spin, glower, gupper);
 
       Real rho = grids[g]->interp_vals.h_view(n,IDN);
+      Real eint = grids[g]->interp_vals.h_view(n,IEN)*to_ien;
       Real vx = grids[g]->interp_vals.h_view(n,IVX);
       Real vy = grids[g]->interp_vals.h_view(n,IVY);
       Real vz = grids[g]->interp_vals.h_view(n,IVZ);
+      Real bx = 0.0, by = 0.0, bz = 0.0;
+      if (is_mhd) {
+        bx = interpolated_bcc.h_view(n,IBX);
+        by = interpolated_bcc.h_view(n,IBY);
+        bz = interpolated_bcc.h_view(n,IBZ);
+      }
 
       Real q = glower[1][1]*vx*vx + 2.0*glower[1][2]*vx*vy +
                2.0*glower[1][3]*vx*vz + glower[2][2]*vy*vy +
@@ -355,9 +402,17 @@ void BHLFluxes(HistoryData *pdata, Mesh *pm) {
       Real u2 = vy - alpha*lor*gupper[0][2];
       Real u3 = vz - alpha*lor*gupper[0][3];
 
+      Real u_0 = glower[0][0]*u0 + glower[0][1]*u1 + glower[0][2]*u2 + glower[0][3]*u3;
+      Real u_1 = glower[1][0]*u0 + glower[1][1]*u1 + glower[1][2]*u2 + glower[1][3]*u3;
+      Real u_2 = glower[2][0]*u0 + glower[2][1]*u1 + glower[2][2]*u2 + glower[2][3]*u3;
+      Real u_3 = glower[3][0]*u0 + glower[3][1]*u1 + glower[3][2]*u2 + glower[3][3]*u3;
+
       Real a2 = SQR(spin);
       Real rad2 = SQR(x1) + SQR(x2) + SQR(x3);
       Real r2 = SQR(r);
+      Real sth = std::sin(theta);
+      Real sph = std::sin(phi);
+      Real cph = std::cos(phi);
       Real drdx = r*x1/(2.0*r2 - rad2 + a2);
       Real drdy = r*x2/(2.0*r2 - rad2 + a2);
       Real drdz = (r*x3 + a2*x3/r)/(2.0*r2 - rad2 + a2);
@@ -365,25 +420,98 @@ void BHLFluxes(HistoryData *pdata, Mesh *pm) {
       Real sqrtmdet = r2 + SQR(spin*std::cos(theta));
       Real domega = grids[g]->solid_angles.h_view(n);
 
+      Real b0 = u_1*bx + u_2*by + u_3*bz;
+      Real b1 = (u0 != 0.0) ? (bx + b0*u1)/u0 : 0.0;
+      Real b2 = (u0 != 0.0) ? (by + b0*u2)/u0 : 0.0;
+      Real b3 = (u0 != 0.0) ? (bz + b0*u3)/u0 : 0.0;
+      Real b_0 = glower[0][0]*b0 + glower[0][1]*b1 + glower[0][2]*b2 + glower[0][3]*b3;
+      Real b_1 = glower[1][0]*b0 + glower[1][1]*b1 + glower[1][2]*b2 + glower[1][3]*b3;
+      Real b_2 = glower[2][0]*b0 + glower[2][1]*b1 + glower[2][2]*b2 + glower[2][3]*b3;
+      Real b_3 = glower[3][0]*b0 + glower[3][1]*b1 + glower[3][2]*b2 + glower[3][3]*b3;
+      Real b_sq = b0*b_0 + b1*b_1 + b2*b_2 + b3*b_3;
+      Real br = drdx*b1 + drdy*b2 + drdz*b3;
+      Real u_ph = (-r*sph - spin*cph)*sth*u_1 + (r*cph - spin*sph)*sth*u_2;
+      Real b_ph = (-r*sph - spin*cph)*sth*b_1 + (r*cph - spin*sph)*sth*b_2;
+      Real wtot = rho + gamma*eint + b_sq;
+
       pdata->hdata[nflux*g+0] += -rho*ur*sqrtmdet*domega;
+      pdata->hdata[nflux*g+2] += (wtot*ur*u_0 - br*b_0)*sqrtmdet*domega;
+      pdata->hdata[nflux*g+3] += (wtot*ur*u_ph - br*b_ph)*sqrtmdet*domega;
+      pdata->hdata[nflux*g+drag_offset+0] += (wtot*ur*u_1 - br*b_1)*sqrtmdet*domega;
+      pdata->hdata[nflux*g+drag_offset+1] += (wtot*ur*u_2 - br*b_2)*sqrtmdet*domega;
+      pdata->hdata[nflux*g+drag_offset+2] += (wtot*ur*u_3 - br*b_3)*sqrtmdet*domega;
 
       if (is_mhd) {
-        Real bx = interpolated_bcc.h_view(n,IBX);
-        Real by = interpolated_bcc.h_view(n,IBY);
-        Real bz = interpolated_bcc.h_view(n,IBZ);
-        Real u_1 = glower[1][0]*u0 + glower[1][1]*u1 + glower[1][2]*u2 + glower[1][3]*u3;
-        Real u_2 = glower[2][0]*u0 + glower[2][1]*u1 + glower[2][2]*u2 + glower[2][3]*u3;
-        Real u_3 = glower[3][0]*u0 + glower[3][1]*u1 + glower[3][2]*u2 + glower[3][3]*u3;
-        Real b0 = u_1*bx + u_2*by + u_3*bz;
-        Real b1 = (bx + b0*u1)/u0;
-        Real b2 = (by + b0*u2)/u0;
-        Real b3 = (bz + b0*u3)/u0;
-        Real br = drdx*b1 + drdy*b2 + drdz*b3;
-        pdata->hdata[nflux*g+2] += 0.5*std::abs(br*u0 - b0*ur)*sqrtmdet*domega;
+        pdata->hdata[nflux*g+phi_offset] +=
+            0.5*std::abs(br*u0 - b0*ur)*sqrtmdet*domega;
       }
     }
 
     pdata->hdata[nflux*g+1] = pdata->hdata[nflux*g+0]/bhl.mdot_hl;
+    if (is_mhd) {
+      Real mdot = pdata->hdata[nflux*g+0];
+      pdata->hdata[nflux*g+phi_offset+1] =
+          (mdot > 0.0) ? pdata->hdata[nflux*g+phi_offset]/std::sqrt(mdot) : 0.0;
+    }
+
+    if (bhl.grav_drag) {
+      auto &indcs = pmbp->pmesh->mb_indcs;
+      auto &size = pmbp->pmb->mb_size;
+      int is = indcs.is, js = indcs.js, ks = indcs.ks;
+      int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+      int nmkji = pmbp->nmb_thispack*nx3*nx2*nx1;
+      int nkji = nx3*nx2*nx1;
+      int nji = nx2*nx1;
+      Real r_exclude = (bhl.drag_exclude_radius > 0.0) ? bhl.drag_exclude_radius
+                                                       : grids[g]->radius;
+      array_sum::GlobalSum grav_sum;
+      Kokkos::parallel_reduce("bhl_grav_drag", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+      KOKKOS_LAMBDA(const int &idx, array_sum::GlobalSum &mb_sum) {
+        int m = idx/nkji;
+        int k = (idx - m*nkji)/nji;
+        int j = (idx - m*nkji - k*nji)/nx1;
+        int i = (idx - m*nkji - k*nji - j*nx1) + is;
+        k += ks;
+        j += js;
+
+        Real x1min = size.d_view(m).x1min;
+        Real x1max = size.d_view(m).x1max;
+        Real x2min = size.d_view(m).x2min;
+        Real x2max = size.d_view(m).x2max;
+        Real x3min = size.d_view(m).x3min;
+        Real x3max = size.d_view(m).x3max;
+        Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+        Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+        Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+        Real r_ks = KerrSchildRadius(x1v, x2v, x3v, spin);
+        Real r2 = SQR(x1v) + SQR(x2v) + SQR(x3v);
+
+        array_sum::GlobalSum hvars;
+        if (r_ks >= r_exclude && r2 > 0.0) {
+          Real vol = size.d_view(m).dx1*size.d_view(m).dx2*size.d_view(m).dx3;
+          Real fac = w0(m,IDN,k,j,i)*vol/(r2*std::sqrt(r2));
+          hvars.the_array[0] = fac*x1v;
+          hvars.the_array[1] = fac*x2v;
+          hvars.the_array[2] = fac*x3v;
+        }
+        for (int n=3; n<NREDUCTION_VARIABLES; ++n) {
+          hvars.the_array[n] = 0.0;
+        }
+        mb_sum += hvars;
+      }, Kokkos::Sum<array_sum::GlobalSum>(grav_sum));
+      Kokkos::fence();
+
+      pdata->hdata[nflux*g+drag_offset+3] = grav_sum.the_array[0];
+      pdata->hdata[nflux*g+drag_offset+4] = grav_sum.the_array[1];
+      pdata->hdata[nflux*g+drag_offset+5] = grav_sum.the_array[2];
+    }
+
+    pdata->hdata[nflux*g+drag_offset+6] =
+        -pdata->hdata[nflux*g+drag_offset+0] + pdata->hdata[nflux*g+drag_offset+3];
+    pdata->hdata[nflux*g+drag_offset+7] =
+        -pdata->hdata[nflux*g+drag_offset+1] + pdata->hdata[nflux*g+drag_offset+4];
+    pdata->hdata[nflux*g+drag_offset+8] =
+        -pdata->hdata[nflux*g+drag_offset+2] + pdata->hdata[nflux*g+drag_offset+5];
   }
 
   for (int n=pdata->nhist; n<NHISTORY_VARIABLES; ++n) {
