@@ -1,0 +1,143 @@
+# AthenaK input for Kaaz+2023 BHL accretion, model B10NR53 (debug)
+# Compile with: cmake -D PROBLEM=gr_bhl ...
+
+<comment>
+problem   = GRMHD Bondi-Hoyle-Lyttleton accretion
+reference = Kaaz et al. 2023, ApJ 950 31
+
+<job>
+basename  = bhl_b10nr53
+
+<mesh>
+nghost = 4
+nx1    = 192
+x1min  = -1024.0
+x1max  =  1024.0
+ix1_bc = user
+ox1_bc = outflow
+
+nx2    = 192
+x2min  = -1024.0
+x2max  =  1024.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 192
+x3min  = -1024.0
+x3max  =  1024.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1  = 48
+nx2  = 48
+nx3  = 48
+
+<mesh_refinement>
+refinement = static
+
+<refined_region1>
+level = 1
+x1min = -512.0
+x1max =  512.0
+x2min = -512.0
+x2max =  512.0
+x3min = -512.0
+x3max =  512.0
+
+<refined_region2>
+level = 2
+x1min = -256.0
+x1max =  256.0
+x2min = -256.0
+x2max =  256.0
+x3min = -256.0
+x3max =  256.0
+
+<refined_region3>
+level = 3
+x1min = -128.0
+x1max =  128.0
+x2min = -128.0
+x2max =  128.0
+x3min = -128.0
+x3max =  128.0
+
+<refined_region4>
+level = 4
+x1min = -64.0
+x1max =  64.0
+x2min = -64.0
+x2max =  64.0
+x3min = -64.0
+x3max =  64.0
+
+<refined_region5>
+level = 5
+x1min = -32.0
+x1max =  32.0
+x2min = -32.0
+x2max =  32.0
+x3min = -32.0
+x3max =  32.0
+
+<refined_region6>
+level = 6
+x1min = -16.0
+x1max =  16.0
+x2min = -16.0
+x2max =  16.0
+x3min = -16.0
+x3max =  16.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 2000.0
+ndiag      = 1
+
+<coord>
+general_rel = true
+a           = 0.0
+excise      = true
+dexcise     = 1.0e-14
+pexcise     = 0.3333333333333333e-14
+
+<mhd>
+eos         = ideal
+reconstruct = wenoz
+rsolver     = hlle
+dfloor      = 1.0e-14
+pfloor      = 0.3333333333333333e-14
+gamma       = 1.6666666666666667
+fofc        = true
+gamma_max   = 20.0
+sigma_max   = 50.0
+
+<problem>
+rho_inf   = 1.0
+v1_inf    = 0.1   # sets r_acc = 2/v_inf^2 = 200
+v2_inf    = 0.0
+v3_inf    = 0.0
+mach_inf  = 2.45
+beta_inf  = 10.0
+theta_b   = 0.0
+user_hist = true
+r_hist    = 3.0
+hist_nangle = 5
+
+<output1>
+file_type  = hst
+dt         = 1.0
+user_hist_only = true
+
+<output2>
+file_type  = bin
+variable   = mhd_w_bcc
+dt         = 100.0
+
+<output3>
+file_type  = rst
+dt         = 500.0
