@@ -104,6 +104,8 @@ Optional inputs include:
   -l: location of slice of 3D data if not 0
   --average_slice: linearly interpolate between the two cells bracketing the
     slice plane instead of using the nearest cell center
+  --composite_image: resample visible AMR blocks to one image before plotting,
+    avoiding block-by-block rendering seams
   --r_max: half-width of plot in both coordinates, centered at the origin
   --x1_min, --x1_max, --x2_min, --x2_max: horizontal and vertical limits of plot
   -c: colormap recognized by Matplotlib
@@ -1184,14 +1186,51 @@ def main(**kwargs):
     else:
         label = variable_name
 
+    # Determine plot limits before drawing, so optional compositing only rasterizes
+    # the visible region rather than the full domain.
+    if kwargs['dimension'] == 'x':
+        plot_x1_min = float(input_data['mesh']['x2min'])
+        plot_x1_max = float(input_data['mesh']['x2max'])
+        plot_x2_min = float(input_data['mesh']['x3min'])
+        plot_x2_max = float(input_data['mesh']['x3max'])
+    if kwargs['dimension'] == 'y':
+        plot_x1_min = float(input_data['mesh']['x1min'])
+        plot_x1_max = float(input_data['mesh']['x1max'])
+        plot_x2_min = float(input_data['mesh']['x3min'])
+        plot_x2_max = float(input_data['mesh']['x3max'])
+    if kwargs['dimension'] == 'z':
+        plot_x1_min = float(input_data['mesh']['x1min'])
+        plot_x1_max = float(input_data['mesh']['x1max'])
+        plot_x2_min = float(input_data['mesh']['x2min'])
+        plot_x2_max = float(input_data['mesh']['x2max'])
+    if kwargs['x1_min'] is not None:
+        plot_x1_min = kwargs['x1_min']
+    if kwargs['x1_max'] is not None:
+        plot_x1_max = kwargs['x1_max']
+    if kwargs['x2_min'] is not None:
+        plot_x2_min = kwargs['x2_min']
+    if kwargs['x2_max'] is not None:
+        plot_x2_max = kwargs['x2_max']
+    if kwargs['r_max'] is not None:
+        plot_x1_min = -kwargs['r_max']
+        plot_x1_max = kwargs['r_max']
+        plot_x2_min = -kwargs['r_max']
+        plot_x2_max = kwargs['r_max']
+
     # Prepare figure
     plt.figure()
 
     # Plot data
-    for block_num in range(num_blocks_used):
-        plt.imshow(quantity[block_num], cmap=kwargs['cmap'], norm=norm, vmin=vmin,
-                   vmax=vmax, interpolation='none', origin='lower',
-                   extent=extents[block_num])
+    if kwargs['composite_image']:
+        image, image_extent = composite_blocks(quantity, extents, plot_x1_min, plot_x1_max,
+                                               plot_x2_min, plot_x2_max)
+        plt.imshow(image, cmap=kwargs['cmap'], norm=norm, vmin=vmin, vmax=vmax,
+                   interpolation='none', origin='lower', extent=image_extent)
+    else:
+        for block_num in range(num_blocks_used):
+            plt.imshow(quantity[block_num], cmap=kwargs['cmap'], norm=norm, vmin=vmin,
+                       vmax=vmax, interpolation='none', origin='lower',
+                       extent=extents[block_num])
 
     # Make colorbar
     plt.colorbar(label=label)
@@ -1343,6 +1382,56 @@ def main(**kwargs):
         plt.savefig(kwargs['output_file'], dpi=kwargs['dpi'])
     else:
         plt.show()
+
+
+# Function for composing visible AMR blocks into one raster image
+def composite_blocks(quantity, extents, x1_min, x1_max, x2_min, x2_max):
+    visible = []
+    dx_min = None
+    dy_min = None
+    for block_num, extent in enumerate(extents):
+        x0, x1, y0, y1 = extent
+        if x1 <= x1_min or x0 >= x1_max or y1 <= x2_min or y0 >= x2_max:
+            continue
+        n2, n1 = quantity[block_num].shape
+        dx = (x1 - x0)/n1
+        dy = (y1 - y0)/n2
+        dx_min = dx if dx_min is None else min(dx_min, dx)
+        dy_min = dy if dy_min is None else min(dy_min, dy)
+        visible.append((block_num, extent, dx, dy))
+    if not visible:
+        return np.full((1, 1), np.nan), (x1_min, x1_max, x2_min, x2_max)
+
+    nx = max(1, int(np.ceil((x1_max - x1_min)/dx_min)))
+    ny = max(1, int(np.ceil((x2_max - x2_min)/dy_min)))
+    image = np.full((ny, nx), np.nan)
+    image_extent = (x1_min, x1_min + nx*dx_min, x2_min, x2_min + ny*dy_min)
+
+    for block_num, extent, dx, dy in visible:
+        x0, x1, y0, y1 = extent
+        q = quantity[block_num]
+        scale_x = max(1, int(round(dx/dx_min)))
+        scale_y = max(1, int(round(dy/dy_min)))
+        q = np.repeat(np.repeat(q, scale_y, axis=0), scale_x, axis=1)
+
+        i0 = int(round((x0 - x1_min)/dx_min))
+        j0 = int(round((y0 - x2_min)/dy_min))
+        i1 = i0 + q.shape[1]
+        j1 = j0 + q.shape[0]
+
+        ci0 = max(0, i0)
+        cj0 = max(0, j0)
+        ci1 = min(nx, i1)
+        cj1 = min(ny, j1)
+        if ci0 >= ci1 or cj0 >= cj1:
+            continue
+        qi0 = ci0 - i0
+        qj0 = cj0 - j0
+        qi1 = qi0 + (ci1 - ci0)
+        qj1 = qj0 + (cj1 - cj0)
+        image[cj0:cj1, ci0:ci1] = q[qj0:qj1, qi0:qi1]
+
+    return image, image_extent
 
 
 # Function that defines dependencies for derived quantities
@@ -1811,6 +1900,9 @@ if __name__ == '__main__':
     parser.add_argument('--average_slice', action='store_true',
                         help='linearly interpolate between the two cells bracketing the '
                              'slice plane instead of using the nearest cell center')
+    parser.add_argument('--composite_image', action='store_true',
+                        help='resample visible AMR blocks to one image before plotting, '
+                             'avoiding block-by-block rendering seams')
     parser.add_argument('--r_max', type=float,
                         help='half-width of plot in both coordinates, centered at the '
                              'origin')

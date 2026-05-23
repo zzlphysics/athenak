@@ -162,9 +162,10 @@ NBNR53:  variable = hydro_w
 The plotting script requires `numpy` and `matplotlib` in the active Python environment.
 If they are missing from `grmhd`, add/install `py-numpy` and `py-matplotlib` in that
 Spack environment before using `plot_bhl.py`. Slice plots use normal-direction
-interpolation by default, so a nominal `y=0` or `z=0` plane averages the two cell
-centers bracketing the plane instead of taking only one side of a mesh boundary. Add
-`--no-slice-average` to recover the original nearest-cell behavior.
+interpolation and AMR block compositing by default, so a nominal `y=0` or `z=0`
+plane averages the two cell centers bracketing the plane and is drawn as one raster
+image instead of separate block images. Add `--no-slice-average` or
+`--no-composite-image` to recover the older behavior for comparison.
 
 Quick-look latest dump and history:
 

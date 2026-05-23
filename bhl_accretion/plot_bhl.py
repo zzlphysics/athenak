@@ -199,6 +199,7 @@ def run_slice_plot(
     cmap: str,
     dpi: int,
     average_slice: bool,
+    composite_image: bool,
     extra: list[str],
 ) -> None:
     cmd = [
@@ -225,6 +226,8 @@ def run_slice_plot(
         cmd += ["-n", norm]
     if average_slice:
         cmd += ["--average_slice"]
+    if composite_image:
+        cmd += ["--composite_image"]
     cmd += extra
     subprocess.run(cmd, check=True)
 
@@ -238,6 +241,7 @@ def make_slice_gallery(
     stride: int,
     dpi: int,
     average_slice: bool,
+    composite_image: bool,
 ) -> None:
     if latest_only and dumps:
         dumps = [dumps[-1]]
@@ -264,6 +268,7 @@ def make_slice_gallery(
                         cmap=cmap,
                         dpi=dpi,
                         average_slice=average_slice,
+                        composite_image=composite_image,
                         extra=[],
                     )
                 except subprocess.CalledProcessError as exc:
@@ -295,6 +300,8 @@ def main() -> None:
     parser.add_argument("--dpi", type=int, default=180, help="image DPI")
     parser.add_argument("--no-slice-average", action="store_true",
                         help="disable normal-direction interpolation for slice plots")
+    parser.add_argument("--no-composite-image", action="store_true",
+                        help="disable AMR block compositing before plotting")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
@@ -314,7 +321,8 @@ def main() -> None:
     if dumps:
         variables = [item.strip() for item in args.variables.split(",") if item.strip()]
         make_slice_gallery(dumps, output_dir, variables, args.r_max, args.latest_only,
-                           args.stride, args.dpi, not args.no_slice_average)
+                           args.stride, args.dpi, not args.no_slice_average,
+                           not args.no_composite_image)
         print(f"wrote slice plots to {output_dir}")
     else:
         print("warning: no binary dumps found", file=sys.stderr)
