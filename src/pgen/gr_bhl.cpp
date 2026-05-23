@@ -23,6 +23,8 @@
 #include "coordinates/cell_locations.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "eos/eos.hpp"
+#include "eos/ideal_c2p_hyd.hpp"
+#include "eos/ideal_c2p_mhd.hpp"
 #include "geodesic-grid/spherical_grid.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -67,6 +69,47 @@ void SetWindPrimitives(const bhl_pgen pgen, const bool is_mhd,
     bcc(m,IBY,k,j,i) = pgen.b2_inf;
     bcc(m,IBZ,k,j,i) = pgen.b3_inf;
   }
+}
+
+KOKKOS_INLINE_FUNCTION
+void SetWindConserved(const bhl_pgen pgen, const bool is_mhd, const Real gamma,
+                      const bool flat, const Real spin, const RegionSize &mb_size,
+                      const RegionIndcs &indcs, DvceArray5D<Real> u0,
+                      const int m, const int k, const int j, const int i) {
+  Real x = CellCenterX(i - indcs.is, indcs.nx1, mb_size.x1min, mb_size.x1max);
+  Real y = CellCenterX(j - indcs.js, indcs.nx2, mb_size.x2min, mb_size.x2max);
+  Real z = CellCenterX(k - indcs.ks, indcs.nx3, mb_size.x3min, mb_size.x3max);
+
+  Real glower[4][4], gupper[4][4];
+  ComputeMetricAndInverse(x, y, z, flat, spin, glower, gupper);
+
+  HydCons1D u;
+  if (is_mhd) {
+    MHDPrim1D w;
+    w.d = pgen.rho_inf;
+    w.vx = pgen.u1_inf;
+    w.vy = pgen.u2_inf;
+    w.vz = pgen.u3_inf;
+    w.e = pgen.eint_inf;
+    w.bx = pgen.b1_inf;
+    w.by = pgen.b2_inf;
+    w.bz = pgen.b3_inf;
+    SingleP2C_IdealGRMHD(glower, gupper, w, gamma, u);
+  } else {
+    HydPrim1D w;
+    w.d = pgen.rho_inf;
+    w.vx = pgen.u1_inf;
+    w.vy = pgen.u2_inf;
+    w.vz = pgen.u3_inf;
+    w.e = pgen.eint_inf;
+    SingleP2C_IdealGRHyd(glower, gupper, w, gamma, u);
+  }
+
+  u0(m,IDN,k,j,i) = u.d;
+  u0(m,IM1,k,j,i) = u.mx;
+  u0(m,IM2,k,j,i) = u.my;
+  u0(m,IM3,k,j,i) = u.mz;
+  u0(m,IEN,k,j,i) = u.e;
 }
 
 } // namespace
@@ -243,6 +286,7 @@ void BHLWindInnerX1(Mesh *pm) {
   int ks = indcs.ks, ke = indcs.ke;
   int nmb = pm->pmb_pack->nmb_thispack;
   auto &mb_bcs = pm->pmb_pack->pmb->mb_bcs;
+  auto &size = pm->pmb_pack->pmb->mb_size;
   const bool is_mhd = (pm->pmb_pack->pmhd != nullptr);
 
   DvceArray5D<Real> w0, u0, bcc;
@@ -255,16 +299,26 @@ void BHLWindInnerX1(Mesh *pm) {
     u0 = pm->pmb_pack->phydro->u0;
   }
   auto bhl_ = bhl;
-  Real gm1 = is_mhd ? pm->pmb_pack->pmhd->peos->eos_data.gamma - 1.0
-                    : pm->pmb_pack->phydro->peos->eos_data.gamma - 1.0;
+  auto indcs_ = indcs;
+  bool flat = pm->pmb_pack->pcoord->coord_data.is_minkowski;
+  Real spin = pm->pmb_pack->pcoord->coord_data.bh_spin;
+  Real gamma = is_mhd ? pm->pmb_pack->pmhd->peos->eos_data.gamma
+                      : pm->pmb_pack->phydro->peos->eos_data.gamma;
+  Real gm1 = gamma - 1.0;
 
   par_for("bhl_wind_x1", DevExeSpace(), 0,nmb-1,0,n3-1,0,n2-1,0,ng-1,
   KOKKOS_LAMBDA(int m, int k, int j, int n) {
     if (mb_bcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::user) {
-      SetWindPrimitives(bhl_, is_mhd, gm1, w0, bcc, m, k, j, is-ng+n);
+      int i = is-ng+n;
+      SetWindPrimitives(bhl_, is_mhd, gm1, w0, bcc, m, k, j, i);
+      SetWindConserved(bhl_, is_mhd, gamma, flat, spin, size.d_view(m), indcs_,
+                       u0, m, k, j, i);
     }
     if (mb_bcs.d_view(m,BoundaryFace::outer_x1) == BoundaryFlag::user) {
-      SetWindPrimitives(bhl_, is_mhd, gm1, w0, bcc, m, k, j, ie+1+n);
+      int i = ie+1+n;
+      SetWindPrimitives(bhl_, is_mhd, gm1, w0, bcc, m, k, j, i);
+      SetWindConserved(bhl_, is_mhd, gamma, flat, spin, size.d_view(m), indcs_,
+                       u0, m, k, j, i);
     }
   });
 
@@ -285,17 +339,6 @@ void BHLWindInnerX1(Mesh *pm) {
         b0.x3f(m,k,j,i) = bhl_.b3_inf;
       }
     });
-  }
-
-  if (pm->pmb_pack->padm != nullptr) {
-    pm->pmb_pack->pdyngr->PrimToConInit(is-ng, is-1, 0, n2-1, 0, n3-1);
-    pm->pmb_pack->pdyngr->PrimToConInit(ie+1, ie+ng, 0, n2-1, 0, n3-1);
-  } else if (is_mhd) {
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0, bcc, u0, is-ng, is-1, 0, n2-1, 0, n3-1);
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0, bcc, u0, ie+1, ie+ng, 0, n2-1, 0, n3-1);
-  } else {
-    pm->pmb_pack->phydro->peos->PrimToCons(w0, u0, is-ng, is-1, 0, n2-1, 0, n3-1);
-    pm->pmb_pack->phydro->peos->PrimToCons(w0, u0, ie+1, ie+ng, 0, n2-1, 0, n3-1);
   }
 }
 
