@@ -102,6 +102,8 @@ alpha_{a,s,t} (cm^-1). All others are in code units.
 Optional inputs include:
   -d: direction orthogonal to slice of 3D data
   -l: location of slice of 3D data if not 0
+  --average_slice: linearly interpolate between the two cells bracketing the
+    slice plane instead of using the nearest cell center
   --r_max: half-width of plot in both coordinates, centered at the origin
   --x1_min, --x1_max, --x2_min, --x2_max: horizontal and vertical limits of plot
   -c: colormap recognized by Matplotlib
@@ -420,8 +422,7 @@ def main(**kwargs):
 
         # Prepare lists to hold results
         max_level_calculated = -1
-        block_loc_for_level = []
-        block_ind_for_level = []
+        block_samples_for_level = []
         num_blocks_used = 0
         extents = []
         quantities = {}
@@ -499,25 +500,43 @@ def main(**kwargs):
             if block_level > max_level_calculated:
                 for level in range(max_level_calculated + 1, block_level + 1):
                     if kwargs['location'] <= slice_location_min:
-                        block_loc_for_level.append(0)
-                        block_ind_for_level.append(0)
+                        block_samples_for_level.append([(0, 0, 1.0)])
                     elif kwargs['location'] >= slice_location_max:
-                        block_loc_for_level.append(slice_root_blocks - 1)
-                        block_ind_for_level.append(slice_block_n - 1)
+                        block_samples_for_level.append(
+                            [(slice_root_blocks - 1, slice_block_n - 1, 1.0)])
                     else:
                         slice_mesh_n = slice_block_n * slice_root_blocks * 2 ** level
-                        mesh_ind = int(slice_normalized_coord * slice_mesh_n)
-                        block_loc_for_level.append(mesh_ind // slice_block_n)
-                        block_ind_for_level.append(mesh_ind - slice_block_n
-                                                   * block_loc_for_level[-1])
+                        slice_coord = slice_normalized_coord * slice_mesh_n
+                        if kwargs['average_slice']:
+                            mesh_ind_l = int(np.floor(slice_coord - 0.5))
+                            mesh_ind_r = mesh_ind_l + 1
+                            mesh_ind_l = max(0, min(slice_mesh_n - 1, mesh_ind_l))
+                            mesh_ind_r = max(0, min(slice_mesh_n - 1, mesh_ind_r))
+                            if mesh_ind_l == mesh_ind_r:
+                                sample_inds = [(mesh_ind_l, 1.0)]
+                            else:
+                                weight_r = slice_coord - (mesh_ind_l + 0.5)
+                                weight_r = max(0.0, min(1.0, weight_r))
+                                sample_inds = [(mesh_ind_l, 1.0 - weight_r),
+                                               (mesh_ind_r, weight_r)]
+                        else:
+                            mesh_ind = int(slice_coord)
+                            mesh_ind = max(0, min(slice_mesh_n - 1, mesh_ind))
+                            sample_inds = [(mesh_ind, 1.0)]
+                        block_samples_for_level.append(
+                            [(mesh_ind // slice_block_n,
+                              mesh_ind % slice_block_n,
+                              weight) for mesh_ind, weight in sample_inds])
                 max_level_calculated = block_level
-            if kwargs['dimension'] == 'x' and block_i != block_loc_for_level[block_level]:
-                f.seek(6 * location_size + num_variables_base * variable_data_size, 1)
-                continue
-            if kwargs['dimension'] == 'y' and block_j != block_loc_for_level[block_level]:
-                f.seek(6 * location_size + num_variables_base * variable_data_size, 1)
-                continue
-            if kwargs['dimension'] == 'z' and block_k != block_loc_for_level[block_level]:
+
+            block_samples = block_samples_for_level[block_level]
+            block_sample_matches = []
+            for loc, ind, weight in block_samples:
+                if ((kwargs['dimension'] == 'x' and block_i == loc)
+                        or (kwargs['dimension'] == 'y' and block_j == loc)
+                        or (kwargs['dimension'] == 'z' and block_k == loc)):
+                    block_sample_matches.append((ind, weight))
+            if not block_sample_matches:
                 f.seek(6 * location_size + num_variables_base * variable_data_size, 1)
                 continue
             num_blocks_used += 1
@@ -539,30 +558,58 @@ def main(**kwargs):
             if len(variable_inds_sorted) > 0:
                 for ind, name in zip(variable_inds_sorted, variable_names_sorted):
                     if ind == -1:
+                        weight_sum = sum(weight for _, weight in block_sample_matches)
                         if kwargs['dimension'] == 'x':
-                            quantities[name].append(np.full((block_nz, block_ny),
-                                                            block_level))
+                            quantities[name].append(
+                                weight_sum*np.full((block_nz, block_ny), block_level))
                         if kwargs['dimension'] == 'y':
-                            quantities[name].append(np.full((block_nz, block_nx),
-                                                            block_level))
+                            quantities[name].append(
+                                weight_sum*np.full((block_nz, block_nx), block_level))
                         if kwargs['dimension'] == 'z':
-                            quantities[name].append(np.full((block_ny, block_nx),
-                                                            block_level))
+                            quantities[name].append(
+                                weight_sum*np.full((block_ny, block_nx), block_level))
                     else:
                         f.seek(cell_data_start + ind * variable_data_size, 0)
                         cell_data = (np.array(struct.unpack(block_cell_format,
                                                             f.read(variable_data_size)))
                                      .reshape(block_nz, block_ny, block_nx))
-                        block_ind = block_ind_for_level[block_level]
-                        if kwargs['dimension'] == 'x':
-                            quantities[name].append(cell_data[:, :, block_ind])
-                        if kwargs['dimension'] == 'y':
-                            quantities[name].append(cell_data[:, block_ind, :])
-                        if kwargs['dimension'] == 'z':
-                            quantities[name].append(cell_data[block_ind, :, :])
+                        block_quantity = None
+                        for block_ind, weight in block_sample_matches:
+                            if kwargs['dimension'] == 'x':
+                                sample = cell_data[:, :, block_ind]
+                            if kwargs['dimension'] == 'y':
+                                sample = cell_data[:, block_ind, :]
+                            if kwargs['dimension'] == 'z':
+                                sample = cell_data[block_ind, :, :]
+                            if block_quantity is None:
+                                block_quantity = weight*sample
+                            else:
+                                block_quantity += weight*sample
+                        quantities[name].append(block_quantity)
                 f.seek((num_variables_base - ind - 1) * variable_data_size, 1)
             else:
                 f.seek(num_variables_base * variable_data_size, 1)
+
+    # Combine the two bracketing normal slices before derived quantities are calculated.
+    # This keeps nonlinear derived variables consistent with interpolation of primitives.
+    if kwargs['average_slice']:
+        merged_extents = []
+        merged_indices = {}
+        merged_quantities = {name: [] for name in variable_names_sorted}
+        for n, extent in enumerate(extents):
+            key = tuple(extent)
+            if key not in merged_indices:
+                merged_indices[key] = len(merged_extents)
+                merged_extents.append(extent)
+                for name in variable_names_sorted:
+                    merged_quantities[name].append(quantities[name][n].copy())
+            else:
+                ind = merged_indices[key]
+                for name in variable_names_sorted:
+                    merged_quantities[name][ind] += quantities[name][n]
+        extents = merged_extents
+        quantities = merged_quantities
+        num_blocks_used = len(extents)
 
     # Prepare to calculate derived quantity
     for name in variable_names_sorted:
@@ -1761,6 +1808,9 @@ if __name__ == '__main__':
     parser.add_argument('-l', '--location', type=float, default=0.0,
                         help='coordinate value along which slice is to be taken '
                              '(default: 0)')
+    parser.add_argument('--average_slice', action='store_true',
+                        help='linearly interpolate between the two cells bracketing the '
+                             'slice plane instead of using the nearest cell center')
     parser.add_argument('--r_max', type=float,
                         help='half-width of plot in both coordinates, centered at the '
                              'origin')

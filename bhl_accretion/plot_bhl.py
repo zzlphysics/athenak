@@ -198,6 +198,7 @@ def run_slice_plot(
     norm: str | None,
     cmap: str,
     dpi: int,
+    average_slice: bool,
     extra: list[str],
 ) -> None:
     cmd = [
@@ -222,6 +223,8 @@ def run_slice_plot(
     ]
     if norm:
         cmd += ["-n", norm]
+    if average_slice:
+        cmd += ["--average_slice"]
     cmd += extra
     subprocess.run(cmd, check=True)
 
@@ -234,6 +237,7 @@ def make_slice_gallery(
     latest_only: bool,
     stride: int,
     dpi: int,
+    average_slice: bool,
 ) -> None:
     if latest_only and dumps:
         dumps = [dumps[-1]]
@@ -259,6 +263,7 @@ def make_slice_gallery(
                         norm=norm,
                         cmap=cmap,
                         dpi=dpi,
+                        average_slice=average_slice,
                         extra=[],
                     )
                 except subprocess.CalledProcessError as exc:
@@ -288,6 +293,8 @@ def main() -> None:
     parser.add_argument("--stride", type=int, default=1,
                         help="plot every Nth dump when not using --latest-only")
     parser.add_argument("--dpi", type=int, default=180, help="image DPI")
+    parser.add_argument("--no-slice-average", action="store_true",
+                        help="disable normal-direction interpolation for slice plots")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
@@ -307,7 +314,7 @@ def main() -> None:
     if dumps:
         variables = [item.strip() for item in args.variables.split(",") if item.strip()]
         make_slice_gallery(dumps, output_dir, variables, args.r_max, args.latest_only,
-                           args.stride, args.dpi)
+                           args.stride, args.dpi, not args.no_slice_average)
         print(f"wrote slice plots to {output_dir}")
     else:
         print("warning: no binary dumps found", file=sys.stderr)
