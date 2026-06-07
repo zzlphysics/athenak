@@ -56,6 +56,7 @@ TaskStatus Radiation::RadFluidCoupling(Driver *pdriver, int stage) {
   auto &coord = pmy_pack->pcoord->coord_data;
   bool &flat = coord.is_minkowski;
   Real &spin = coord.bh_spin;
+  Real &kz_eta = coord.kz_eta;
   bool &excise = pmy_pack->pcoord->coord_data.bh_excise;
   auto &rad_mask_ = pmy_pack->pcoord->excision_floor;
   Real &n_0_floor_ = n_0_floor;
@@ -137,7 +138,7 @@ TaskStatus Radiation::RadFluidCoupling(Driver *pdriver, int stage) {
 
     // compute metric and inverse
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper,kz_eta);
     Real alpha = sqrt(-1.0/gupper[0][0]);
 
     // fluid state

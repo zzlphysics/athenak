@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "coordinates/adm.hpp"
@@ -60,6 +61,20 @@ static Real CalculateCovariantUT(struct torus_pgen pgen, Real r, Real sin_theta,
 
 KOKKOS_INLINE_FUNCTION
 static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r);
+
+KOKKOS_INLINE_FUNCTION
+static Real KZRadialFunction(struct torus_pgen pgen, Real r);
+
+KOKKOS_INLINE_FUNCTION
+static void KZBLMetricTerms(struct torus_pgen pgen, Real r, Real sin_theta,
+                            Real *delta, Real *sigma, Real *aa, Real *g_00,
+                            Real *g_03, Real *g_33, Real *g00, Real *g03);
+
+KOKKOS_INLINE_FUNCTION
+static Real LogHFMValue(struct torus_pgen pgen, Real r, Real sin_theta, Real l);
+
+KOKKOS_INLINE_FUNCTION
+static Real LogHFMMidplaneDerivative(struct torus_pgen pgen, Real r, Real l);
 
 KOKKOS_INLINE_FUNCTION
 static Real LogHAux(struct torus_pgen pgen, Real r, Real sin_theta);
@@ -102,11 +117,13 @@ Real A3(struct torus_pgen pgen, Real x1, Real x2, Real x3);
 // Useful container for physical parameters of torus
 struct torus_pgen {
   Real spin;                                  // black hole spin
+  Real kz_eta;                                // Konoplya-Zhidenko deviation
+  Real rhorizon;                              // outer horizon radius
   Real dexcise, pexcise;                      // excision parameters
   Real gamma_adi;                             // EOS parameters
   Real arad;                                  // radiation constant
   bool prograde;                              // flag indicating disk is prograde (FM)
-  Real r_edge, r_peak, l, rho_max;            // fixed torus parameters
+  Real r_edge, r_peak, rho_max;               // fixed torus parameters
   Real l_peak;                                // fixed torus parameters
   Real c_param;                               // calculated chakrabarti parameter
   Real n_param;                               // fixed or calculated chakrabarti parameter
@@ -164,13 +181,15 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
   // Extract BH parameters
   torus.spin = coord.bh_spin;
+  torus.kz_eta = coord.kz_eta;
+  torus.rhorizon = coord.rhorizon;
   const Real r_excise = coord.rexcise;
   const bool is_radiation_enabled = (pmbp->prad != nullptr);
 
   // Spherical Grid for user-defined history
   auto &grids = spherical_grids;
   const Real rflux =
-    (is_radiation_enabled) ? ceil(r_excise + 1.0) : 1.0 + sqrt(1.0 - SQR(torus.spin));
+    (is_radiation_enabled) ? ceil(r_excise + 1.0) : torus.rhorizon;
   grids.push_back(std::make_unique<SphericalGrid>(pmbp, 5, rflux));
   // NOTE(@pdmullen): Enroll additional radii for flux analysis by
   // pushing back the grids vector with additional SphericalGrid instances
@@ -242,6 +261,19 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   torus.dexcise = coord.dexcise;
   torus.pexcise = coord.pexcise;
 
+  if (fabs(torus.kz_eta) > 1.0e-14 && torus.chakrabarti_torus) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "KZ torus initialization currently supports fm_torus only; "
+              << "Chakrabarti constants still use Kerr-specific expressions." << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (torus.r_edge <= torus.rhorizon || torus.r_peak <= torus.rhorizon) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Torus radii must lie outside the KZ horizon: rhorizon=" << torus.rhorizon
+              << ", r_edge=" << torus.r_edge << ", r_peak=" << torus.r_peak << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
   // Compute angular momentum and prepare constants describing primitives
   if (torus.fm_torus) {
     torus.l_peak = CalculateLFromRPeak(torus, torus.r_peak);
@@ -258,6 +290,29 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   torus.log_h_peak = LogHAux(torus, torus.r_peak, 1.0) - torus.log_h_edge;
   torus.ptot_over_rho_peak = gm1/torus.gamma_adi * (exp(torus.log_h_peak)-1.0);
   torus.rho_peak = pow(torus.ptot_over_rho_peak, 1.0/gm1) / torus.rho_max;
+
+  if (global_variable::my_rank == 0) {
+    Real delta_h = SQR(torus.rhorizon) + SQR(torus.spin) -
+                   KZRadialFunction(torus, torus.rhorizon);
+    Real dlogh_peak = torus.fm_torus ?
+      LogHFMMidplaneDerivative(torus, torus.r_peak, torus.l_peak) : 0.0;
+    std::cout << std::setprecision(16)
+              << "KZ torus diagnostics:" << std::endl
+              << "  a               = " << torus.spin << std::endl
+              << "  kz_eta          = " << torus.kz_eta << std::endl
+              << "  rhorizon        = " << torus.rhorizon << std::endl
+              << "  Delta(rhorizon) = " << delta_h << std::endl
+              << "  rexcise         = " << coord.rexcise << std::endl
+              << "  flux_excise_r   = " << coord.flux_excise_r << std::endl
+              << "  r_edge          = " << torus.r_edge << std::endl
+              << "  r_peak          = " << torus.r_peak << std::endl
+              << "  l_peak          = " << torus.l_peak << std::endl
+              << "  dlogh_dr_peak   = " << dlogh_peak << std::endl
+              << "  log_h_edge_abs  = " << torus.log_h_edge << std::endl
+              << "  log_h_peak      = " << torus.log_h_peak << std::endl
+              << "  ptot/rho_peak   = " << torus.ptot_over_rho_peak << std::endl
+              << "  rho_peak_norm   = " << torus.rho_peak << std::endl;
+  }
 
   // find "outer edge" of torus (first place log_h > 0)
   Real ra = torus.r_peak;
@@ -323,7 +378,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     // Extract metric and inverse
     Real glower[4][4], gupper[4][4];
     ComputeMetricAndInverse(x1v, x2v, x3v, coord.is_minkowski, coord.bh_spin,
-                            glower, gupper);
+                            glower, gupper, coord.kz_eta);
 
     // Calculate Boyer-Lindquist coordinates of cell
     Real r, theta, phi;
@@ -410,7 +465,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
       Real glower[4][4], gupper[4][4];
       ComputeMetricAndInverse(x1v, x2v, x3v, coord.is_minkowski, coord.bh_spin,
-                              glower, gupper);
+                              glower, gupper, coord.kz_eta);
       uu1 = u1 - gupper[0][1]/gupper[0][0] * u0;
       uu2 = u2 - gupper[0][2]/gupper[0][0] * u0;
       uu3 = u3 - gupper[0][3]/gupper[0][0] * u0;
@@ -704,7 +759,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
       Real glower[4][4], gupper[4][4];
       ComputeMetricAndInverse(x1v, x2v, x3v, coord.is_minkowski, coord.bh_spin,
-                              glower, gupper);
+                              glower, gupper, coord.kz_eta);
 
       // Calculate Boyer-Lindquist coordinates of cell
       Real r, theta, phi;
@@ -836,6 +891,71 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 namespace {
 
 //----------------------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------------------
+// KZ radial function F(r). eta=0 returns the Kerr value 2r.
+
+KOKKOS_INLINE_FUNCTION
+static Real KZRadialFunction(struct torus_pgen pgen, Real r) {
+  return 2.0*r + pgen.kz_eta/r;
+}
+
+//----------------------------------------------------------------------------------------
+// BL-like metric terms for the strict CKS KZ family.
+
+KOKKOS_INLINE_FUNCTION
+static void KZBLMetricTerms(struct torus_pgen pgen, Real r, Real sin_theta,
+                            Real *delta, Real *sigma, Real *aa, Real *g_00,
+                            Real *g_03, Real *g_33, Real *g00, Real *g03) {
+  Real sin_sq_theta = SQR(sin_theta);
+  Real cos_sq_theta = 1.0 - sin_sq_theta;
+  Real a2 = SQR(pgen.spin);
+  Real r2 = SQR(r);
+  Real f = KZRadialFunction(pgen, r);
+  Real sig = r2 + a2*cos_sq_theta;
+  Real del = r2 + a2 - f;
+  Real aterm = SQR(r2 + a2) - del*a2*sin_sq_theta;
+
+  if (delta != nullptr) *delta = del;
+  if (sigma != nullptr) *sigma = sig;
+  if (aa != nullptr) *aa = aterm;
+  if (g_00 != nullptr) *g_00 = -1.0 + f/sig;
+  if (g_03 != nullptr) *g_03 = -pgen.spin*f/sig*sin_sq_theta;
+  if (g_33 != nullptr) *g_33 = (r2 + a2 + a2*f/sig*sin_sq_theta)*sin_sq_theta;
+  if (g00 != nullptr) *g00 = -aterm/(del*sig);
+  if (g03 != nullptr) *g03 = -pgen.spin*f/(del*sig);
+}
+
+//----------------------------------------------------------------------------------------
+// Fishbone-Moncrief potential before subtracting the edge value.
+
+KOKKOS_INLINE_FUNCTION
+static Real LogHFMValue(struct torus_pgen pgen, Real r, Real sin_theta, Real l) {
+  Real sin_sq_theta = SQR(sin_theta);
+  Real delta, sigma, aa;
+  KZBLMetricTerms(pgen, r, sin_theta, &delta, &sigma, &aa, nullptr, nullptr, nullptr,
+                  nullptr, nullptr);
+  Real exp_2nu = sigma * delta / aa;
+  Real exp_2psi = aa / sigma * sin_sq_theta;
+  Real exp_neg2chi = exp_2nu / exp_2psi;
+  Real omega = pgen.spin*KZRadialFunction(pgen, r)/aa;
+  Real var_a = sqrt(1.0 + 4.0*SQR(l)*exp_neg2chi);
+  Real var_b = 0.5 * log((1.0+var_a) / (sigma*delta/aa));
+  Real var_c = -0.5 * var_a;
+  Real var_d = -l * omega;
+  return var_b + var_c + var_d;
+}
+
+
+KOKKOS_INLINE_FUNCTION
+static Real LogHFMMidplaneDerivative(struct torus_pgen pgen, Real r, Real l) {
+  Real dr = fmax(1.0e-5*r, 1.0e-5);
+  if (r - dr <= pgen.rhorizon) dr = 0.5*(r - pgen.rhorizon);
+  Real hp = LogHFMValue(pgen, r + dr, 1.0, l);
+  Real hm = LogHFMValue(pgen, r - dr, 1.0, l);
+  return (hp - hm)/(2.0*dr);
+}
+
 // Function for calculating angular momentum variable l in Fishbone-Moncrief torus
 // Inputs:
 //   r: desired radius of pressure maximum
@@ -851,13 +971,53 @@ namespace {
 
 KOKKOS_INLINE_FUNCTION
 static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r) {
-  Real sgn = (pgen.prograde) ? 1.0 : -1.0;
-  Real num = sgn*(SQR(r*r) + SQR(pgen.spin*r) - 2.0*SQR(pgen.spin)*r)
-           - pgen.spin*(r*r - pgen.spin*pgen.spin)*sqrt(r);
-  Real denom = SQR(r) - 3.0*r + sgn*2.0*pgen.spin*sqrt(r);
-  return 1.0/r * sqrt(1.0/r) * num/denom;
-}
+  if (fabs(pgen.kz_eta) <= 1.0e-14) {
+    Real sgn = (pgen.prograde) ? 1.0 : -1.0;
+    Real num = sgn*(SQR(r*r) + SQR(pgen.spin*r) - 2.0*SQR(pgen.spin)*r)
+             - pgen.spin*(r*r - pgen.spin*pgen.spin)*sqrt(r);
+    Real denom = SQR(r) - 3.0*r + sgn*2.0*pgen.spin*sqrt(r);
+    return 1.0/r * sqrt(1.0/r) * num/denom;
+  }
 
+  Real sign_l = (pgen.prograde) ? 1.0 : -1.0;
+  Real best_l = 0.0;
+  Real best_abs = 1.0e300;
+  Real lo = 0.0, hi = 0.0, flo = 0.0;
+  bool bracketed = false;
+  Real prev_l = sign_l*1.0e-4;
+  Real prev_f = LogHFMMidplaneDerivative(pgen, r, prev_l);
+  for (int n = 1; n <= 240; ++n) {
+    Real frac = static_cast<Real>(n)/240.0;
+    Real l = sign_l*exp(log(1.0e-4) + frac*(log(100.0) - log(1.0e-4)));
+    Real f = LogHFMMidplaneDerivative(pgen, r, l);
+    if (isfinite(f) && fabs(f) < best_abs) {
+      best_abs = fabs(f);
+      best_l = l;
+    }
+    if (isfinite(prev_f) && isfinite(f) && prev_f*f <= 0.0) {
+      lo = prev_l;
+      hi = l;
+      flo = prev_f;
+      bracketed = true;
+      break;
+    }
+    prev_l = l;
+    prev_f = f;
+  }
+  if (!bracketed) return best_l;
+
+  for (int iter = 0; iter < 80; ++iter) {
+    Real mid = 0.5*(lo + hi);
+    Real fmid = LogHFMMidplaneDerivative(pgen, r, mid);
+    if (flo*fmid <= 0.0) {
+      hi = mid;
+    } else {
+      lo = mid;
+      flo = fmid;
+    }
+  }
+  return 0.5*(lo + hi);
+}
 
 //----------------------------------------------------------------------------------------
 // Function to calculate enthalpy in Fishbone-Moncrief torus or Chakrabarti torus
@@ -877,20 +1037,7 @@ static Real LogHAux(struct torus_pgen pgen, Real r, Real sin_theta) {
   Real tol_trunc=1e-15;
   Real logh;
   if (pgen.fm_torus) {
-    Real sin_sq_theta = SQR(sin_theta);
-    Real cos_sq_theta = 1.0 - sin_sq_theta;
-    Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);            // \Delta
-    Real sigma = SQR(r) + SQR(pgen.spin)*cos_sq_theta;       // \Sigma
-    Real aa = SQR(SQR(r)+SQR(pgen.spin)) - delta*SQR(pgen.spin)*sin_sq_theta;  // A
-    Real exp_2nu = sigma * delta / aa;                       // \exp(2\nu) (FM 3.5)
-    Real exp_2psi = aa / sigma * sin_sq_theta;               // \exp(2\psi) (FM 3.5)
-    Real exp_neg2chi = exp_2nu / exp_2psi;                   // \exp(-2\chi) (cf. FM 2.15)
-    Real omega = 2.0*pgen.spin*r/aa;                         // \omega (FM 3.5)
-    Real var_a = sqrt(1.0 + 4.0*SQR(pgen.l_peak)*exp_neg2chi);
-    Real var_b = 0.5 * log((1.0+var_a) / (sigma*delta/aa));
-    Real var_c = -0.5 * var_a;
-    Real var_d = -pgen.l_peak * omega;
-    logh = var_b + var_c + var_d;                            // (FM 3.4)
+    logh = LogHFMValue(pgen, r, sin_theta, pgen.l_peak);  // (FM 3.4)
   } else { // Chakrabarti
     Real l = CalculateL(pgen, r, sin_theta);
     Real u_t = CalculateCovariantUT(pgen, r, sin_theta, l);
@@ -1002,11 +1149,9 @@ static void CalculateCN(struct torus_pgen pgen, Real *cparam, Real *nparam) {
 KOKKOS_INLINE_FUNCTION
 static Real CalculateL(struct torus_pgen pgen, Real r, Real sin_theta) {
   // Compute BL metric components
-  Real sigma = SQR(r) + SQR(pgen.spin)*(1.0-SQR(sin_theta));
-  Real g_00 = -1.0 + 2.0*r/sigma;
-  Real g_03 = -2.0*pgen.spin*r/sigma*SQR(sin_theta);
-  Real g_33 = (SQR(r) + SQR(pgen.spin) +
-               2.0*SQR(pgen.spin)*r/sigma*SQR(sin_theta))*SQR(sin_theta);
+  Real g_00, g_03, g_33;
+  KZBLMetricTerms(pgen, r, sin_theta, nullptr, nullptr, nullptr, &g_00, &g_03,
+                  &g_33, nullptr, nullptr);
 
   // Perform bisection
   Real l_min = 1.0;
@@ -1045,11 +1190,9 @@ static Real CalculateL(struct torus_pgen pgen, Real r, Real sin_theta) {
 KOKKOS_INLINE_FUNCTION
 static Real CalculateCovariantUT(struct torus_pgen pgen, Real r, Real sin_theta, Real l) {
   // Compute BL metric components
-  Real sigma = SQR(r) + SQR(pgen.spin)*(1.0-SQR(sin_theta));
-  Real g_00 = -1.0 + 2.0*r/sigma;
-  Real g_03 = -2.0*pgen.spin*r/sigma*SQR(sin_theta);
-  Real g_33 = (SQR(r) + SQR(pgen.spin) +
-               2.0*SQR(pgen.spin)*r/sigma*SQR(sin_theta))*SQR(sin_theta);
+  Real g_00, g_03, g_33;
+  KZBLMetricTerms(pgen, r, sin_theta, nullptr, nullptr, nullptr, &g_00, &g_03,
+                  &g_33, nullptr, nullptr);
 
   // Compute time component of covariant BL 4-velocity
   Real u_t = -sqrt(fmax((SQR(g_03) - g_00*g_33)/(g_33 + 2.0*l*g_03 + SQR(l)*g_00), 0.0));
@@ -1072,8 +1215,8 @@ static void GetBoyerLindquistCoordinates(struct torus_pgen pgen,
                       + 4.0*SQR(pgen.spin)*SQR(x3)) ) / sqrt(2.0)), 1.0);
   *pr = r;
   *ptheta = (fabs(x3/r) < 1.0) ? acos(x3/r) : acos(copysign(1.0, x3));
-  *pphi = atan2(r*x2-pgen.spin*x1, pgen.spin*x2+r*x1) -
-          pgen.spin*r/(SQR(r)-2.0*r+SQR(pgen.spin));
+  Real delta = SQR(r) + SQR(pgen.spin) - KZRadialFunction(pgen, r);
+  *pphi = atan2(r*x2-pgen.spin*x1, pgen.spin*x2+r*x1) - pgen.spin*r/delta;
   return;
 }
 
@@ -1164,16 +1307,9 @@ static void CalculateVelocityInTorus(struct torus_pgen pgen,
                                     Real r, Real sin_theta, Real *pu0, Real *pu3) {
   // Compute BL metric components
   Real sin_sq_theta = SQR(sin_theta);
-  Real cos_sq_theta = 1.0 - sin_sq_theta;
-  Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);              // \Delta
-  Real sigma = SQR(r) + SQR(pgen.spin)*cos_sq_theta;         // \Sigma
-  Real aa = SQR(SQR(r)+SQR(pgen.spin)) - delta*SQR(pgen.spin)*sin_sq_theta;  // A
-  Real g_00 = -(1.0 - 2.0*r/sigma); // g_tt
-  Real g_03 = -2.0*pgen.spin*r/sigma * sin_sq_theta; // g_tp
-  Real g_33 = (sigma + (1.0 + 2.0*r/sigma) *
-              SQR(pgen.spin) * sin_sq_theta) * sin_sq_theta; // g_pp
-  Real g00 = -aa/(delta*sigma); // g^tt
-  Real g03 = -2.0*pgen.spin*r/(delta*sigma); // g^tp
+  Real delta, sigma, aa, g_00, g_03, g_33, g00, g03;
+  KZBLMetricTerms(pgen, r, sin_theta, &delta, &sigma, &aa, &g_00, &g_03, &g_33,
+                  &g00, &g03);
 
   Real u0 = 0.0, u3 = 0.0;
   // Compute non-zero components of 4-velocity
@@ -1186,7 +1322,7 @@ static void CalculateVelocityInTorus(struct torus_pgen pgen,
     Real u_phi_proj = sqrt(0.5 * u_phi_proj_b);        // (FM 3.3)
     u_phi_proj *= (pgen.prograde) ? 1.0 : -1.0;
     Real u3_a = (1.0+SQR(u_phi_proj)) / (aa*sigma*delta);
-    Real u3_b = 2.0*pgen.spin*r * sqrt(u3_a);
+    Real u3_b = pgen.spin*KZRadialFunction(pgen, r) * sqrt(u3_a);
     Real u3_c = sqrt(sigma/aa) / sin_theta;
     u3 = u3_b + u3_c * u_phi_proj;
     Real u0_a = (SQR(g_03) - g_00*g_33) * SQR(u3);
@@ -1222,8 +1358,8 @@ static void TransformVector(struct torus_pgen pgen,
   Real rad = sqrt( SQR(x1) + SQR(x2) + SQR(x3) );
   Real r = fmax((sqrt( SQR(rad) - SQR(pgen.spin) + sqrt(SQR(SQR(rad)-SQR(pgen.spin))
                       + 4.0*SQR(pgen.spin)*SQR(x3)) ) / sqrt(2.0)), 1.0);
-  Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);
-  *pa0 = a0_bl + 2.0*r/delta * a1_bl;
+  Real delta = SQR(r) + SQR(pgen.spin) - KZRadialFunction(pgen, r);
+  *pa0 = a0_bl + KZRadialFunction(pgen, r)/delta * a1_bl;
   *pa1 = a1_bl * ( (r*x1+pgen.spin*x2)/(SQR(r) + SQR(pgen.spin)) - x2*pgen.spin/delta) +
          a2_bl * x1*x3/r * sqrt((SQR(r) + SQR(pgen.spin))/(SQR(x1) + SQR(x2))) -
          a3_bl * x2;
@@ -1724,6 +1860,7 @@ void TorusFluxes(HistoryData *pdata, Mesh *pm) {
   // extract BH parameters
   bool &flat = pmbp->pcoord->coord_data.is_minkowski;
   Real &spin = pmbp->pcoord->coord_data.bh_spin;
+  Real &kz_eta = pmbp->pcoord->coord_data.kz_eta;
 
   // set nvars, adiabatic index, primitive array w0, and field array bcc0 if is_mhd
   int nvars; Real gamma; bool is_mhd = false;
@@ -1804,7 +1941,7 @@ void TorusFluxes(HistoryData *pdata, Mesh *pm) {
       Real x2 = grids[g]->interp_coord.h_view(n,1);
       Real x3 = grids[g]->interp_coord.h_view(n,2);
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1,x2,x3,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1,x2,x3,flat,spin,glower,gupper,kz_eta);
 
       // extract interpolated primitives
       Real &int_dn = grids[g]->interp_vals.h_view(n,IDN);

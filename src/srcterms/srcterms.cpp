@@ -234,6 +234,7 @@ void SourceTerms::BeamSource(DvceArray5D<Real> &i0, const Real bdt) {
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
 
   Real &p1 = pos1, &p2 = pos2, &p3 = pos3;
   Real &d1 = dir1, &d2 = dir2, &d3 = dir3;
@@ -259,9 +260,9 @@ void SourceTerms::BeamSource(DvceArray5D<Real> &i0, const Real bdt) {
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper,kz_eta);
     Real dgx[4][4], dgy[4][4], dgz[4][4];
-    ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz);
+    ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz,kz_eta);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
     ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
 

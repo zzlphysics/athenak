@@ -38,6 +38,7 @@ void HLLE_GR(TeamMember_t const &member, const EOS_Data &eos,
   const Real gamma_prime = eos.gamma/(gm1);
   auto &flat = coord.is_minkowski;
   auto &spin = coord.bh_spin;
+  auto &kz_eta = coord.kz_eta;
 
   int is = indcs.is;
   int js = indcs.js;
@@ -88,7 +89,7 @@ void HLLE_GR(TeamMember_t const &member, const EOS_Data &eos,
       x3v = LeftEdgeX  (k-ks, indcs.nx3, x3min, x3max);
     }
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     // Calculate 4-velocity in left state (contravariant compt)
     Real q = glower[ivx][ivx] * SQR(wl_ivx) + glower[ivy][ivy] * SQR(wl_ivy) +

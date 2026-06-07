@@ -32,6 +32,7 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
 
   //---- 1-D problem:
   //  copy face-centered E-fields to edges and return.
@@ -101,7 +102,7 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         Real x3v = CellCenterX(0, indcs.nx3, x3min, x3max);
 
         Real glower[4][4], gupper[4][4];
-        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
         const Real &ux = w0_(m,IVX,ks,j,i);
         const Real &uy = w0_(m,IVY,ks,j,i);
@@ -258,7 +259,7 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
         Real glower[4][4], gupper[4][4];
-        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
         const Real &ux = w0_(m,IVX,k,j,i);
         const Real &uy = w0_(m,IVY,k,j,i);

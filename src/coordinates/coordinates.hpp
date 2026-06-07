@@ -34,6 +34,8 @@ struct CoordData {
   // following data is only used in GR calculations to compute metric
   bool is_minkowski;               // flag to specify Minkowski (flat) space
   Real bh_spin;                    // needed for GR metric
+  Real kz_eta;                     // Konoplya-Zhidenko deviation parameter
+  Real rhorizon;                   // outer horizon radius for the selected metric
   bool bh_excise;                  // flag to specify excision
   Real rexcise;                    // excision radius (SKS)
   Real dexcise;                    // rest-mass density inside excised region

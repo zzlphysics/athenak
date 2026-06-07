@@ -5,6 +5,7 @@
 //========================================================================================
 //! \file coordinates.cpp
 //! \brief
+#include <algorithm>
 #include <iostream> // cout
 #include <string>
 
@@ -16,6 +17,72 @@
 #include "cell_locations.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
+
+namespace {
+Real KZHorizonFunction(const Real r, const Real a, const Real eta) {
+  return r*r*r - 2.0*r*r + a*a*r - eta;
+}
+
+Real KZBisectHorizonRoot(Real lo, Real hi, const Real a, const Real eta) {
+  Real flo = KZHorizonFunction(lo, a, eta);
+  for (int iter = 0; iter < 120; ++iter) {
+    Real mid = 0.5*(lo + hi);
+    Real fmid = KZHorizonFunction(mid, a, eta);
+    if (flo*fmid <= 0.0) {
+      hi = mid;
+    } else {
+      lo = mid;
+      flo = fmid;
+    }
+  }
+  return 0.5*(lo + hi);
+}
+
+Real KZHorizonRadius(const Real a, const Real eta) {
+  const Real tol = 1.0e-12;
+  Real rmax = fmax(16.0, 4.0 + fabs(eta) + a*a);
+  while (KZHorizonFunction(rmax, a, eta) <= 0.0 && rmax < 1.0e10) {
+    rmax *= 2.0;
+  }
+  if (KZHorizonFunction(rmax, a, eta) <= 0.0) return -1.0;
+
+  Real points[4];
+  int npts = 0;
+  points[npts++] = 0.0;
+  Real discr = 16.0 - 12.0*a*a;
+  if (discr >= 0.0) {
+    Real root_discr = sqrt(discr);
+    Real c1 = (4.0 - root_discr)/6.0;
+    Real c2 = (4.0 + root_discr)/6.0;
+    if (c1 > 0.0 && c1 < rmax) points[npts++] = c1;
+    if (c2 > 0.0 && c2 < rmax) points[npts++] = c2;
+  }
+  points[npts++] = rmax;
+  std::sort(points, points + npts);
+
+  Real best_root = -1.0;
+  for (int n = 0; n < npts; ++n) {
+    Real r = points[n];
+    if (r > 0.0 && fabs(KZHorizonFunction(r, a, eta)) <= tol*fmax(1.0, r*r*r)) {
+      best_root = fmax(best_root, r);
+    }
+  }
+  for (int n = 0; n < npts - 1; ++n) {
+    Real lo = points[n];
+    Real hi = points[n+1];
+    if (hi <= 0.0 || hi - lo <= 0.0) continue;
+    Real flo = KZHorizonFunction(lo, a, eta);
+    Real fhi = KZHorizonFunction(hi, a, eta);
+    if (fabs(flo) <= tol*fmax(1.0, lo*lo*lo) || fabs(fhi) <= tol*fmax(1.0, hi*hi*hi)) {
+      continue;
+    }
+    if (flo*fhi < 0.0) {
+      best_root = fmax(best_root, KZBisectHorizonRoot(lo, hi, a, eta));
+    }
+  }
+  return best_root;
+}
+} // namespace
 
 //----------------------------------------------------------------------------------------
 // constructor, initializes coordinates data
@@ -45,9 +112,19 @@ Coordinates::Coordinates(ParameterInput *pin, MeshBlockPack *ppack) :
     coord_data.is_minkowski = pin->GetOrAddBoolean("coord","minkowski",false);
     if (!(coord_data.is_minkowski)) {
       coord_data.bh_spin = pin->GetReal("coord","a");
+      coord_data.kz_eta = pin->GetOrAddReal("coord","kz_eta",0.0);
+      coord_data.rhorizon = KZHorizonRadius(coord_data.bh_spin, coord_data.kz_eta);
+      if (coord_data.rhorizon <= 0.0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+                  << "No positive KZ outer horizon found for a=" << coord_data.bh_spin
+                  << ", kz_eta=" << coord_data.kz_eta << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       coord_data.bh_excise = pin->GetOrAddBoolean("coord","excise",true);
     } else {
       coord_data.bh_spin = 0.0;
+      coord_data.kz_eta = 0.0;
+      coord_data.rhorizon = 0.0;
       coord_data.bh_excise = false;
     }
 
@@ -56,11 +133,11 @@ Coordinates::Coordinates(ParameterInput *pin, MeshBlockPack *ppack) :
       // be reset to.  Primitive velocities will be set to zero.
       coord_data.dexcise = pin->GetReal("coord","dexcise");
       coord_data.pexcise = pin->GetReal("coord","pexcise");
+      Real default_excise_r = fmin(1.0, 0.8*coord_data.rhorizon);
       coord_data.flux_excise_r = (pin->DoesBlockExist("radiation")) ?
-        1.0+sqrt(1.0-SQR(coord_data.bh_spin)) :
-        pin->GetOrAddReal("coord","flux_excise_r",1.0);
-      coord_data.rexcise =
-        (pin->DoesBlockExist("radiation")) ? 1.0+sqrt(1.0-SQR(coord_data.bh_spin)) : 1.0;
+        coord_data.rhorizon : pin->GetOrAddReal("coord","flux_excise_r",default_excise_r);
+      coord_data.rexcise = (pin->DoesBlockExist("radiation")) ? coord_data.rhorizon :
+        pin->GetOrAddReal("coord","rexcise",default_excise_r);
 
       coord_data.excision_scheme = ExcisionScheme::fixed;
       if (is_dynamical_relativistic) {
@@ -107,6 +184,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim, const EOS_Data &e
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = coord_data.is_minkowski;
   auto &spin = coord_data.bh_spin;
+  auto &kz_eta = coord_data.kz_eta;
 
   Real gamma_prime = eos.gamma / (eos.gamma - 1.0);
 
@@ -127,7 +205,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim, const EOS_Data &e
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     // Extract primitives
     const Real &rho  = prim(m,IDN,k,j,i);
@@ -164,7 +242,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim, const EOS_Data &e
 
     // compute derivatives of metric.
     Real dg_dx1[4][4], dg_dx2[4][4], dg_dx3[4][4];
-    ComputeMetricDerivatives(x1v, x2v, x3v, flat, spin, dg_dx1, dg_dx2, dg_dx3);
+    ComputeMetricDerivatives(x1v, x2v, x3v, flat, spin, dg_dx1, dg_dx2, dg_dx3, kz_eta);
 
     // Calculate source terms, exploiting symmetries
     Real s_1 = 0.0, s_2 = 0.0, s_3 = 0.0;
@@ -230,6 +308,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim,
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = coord_data.is_minkowski;
   auto &spin = coord_data.bh_spin;
+  auto &kz_eta = coord_data.kz_eta;
 
   Real gamma_prime = eos.gamma / (eos.gamma - 1.0);
 
@@ -250,7 +329,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim,
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     // Extract primitives
     const Real &rho  = prim(m,IDN,k,j,i);
@@ -308,7 +387,7 @@ void Coordinates::CoordSrcTerms(const DvceArray5D<Real> &prim,
 
     // compute derivatives of metric.
     Real dg_dx1[4][4], dg_dx2[4][4], dg_dx3[4][4];
-    ComputeMetricDerivatives(x1v, x2v, x3v, flat, spin, dg_dx1, dg_dx2, dg_dx3);
+    ComputeMetricDerivatives(x1v, x2v, x3v, flat, spin, dg_dx1, dg_dx2, dg_dx3, kz_eta);
 
     // Calculate source terms
     Real s_1 = 0.0, s_2 = 0.0, s_3 = 0.0;

@@ -61,6 +61,7 @@ ADM::~ADM() {}
 //----------------------------------------------------------------------------------------
 void ADM::SetADMVariablesToKerrSchild(MeshBlockPack *pmbp) {
   Real a = pmbp->pcoord->coord_data.bh_spin;
+  Real kz_eta = pmbp->pcoord->coord_data.kz_eta;
   bool minkowski = pmbp->pcoord->coord_data.is_minkowski;
   auto &adm = pmbp->padm->adm;
   auto &size = pmbp->pmb->mb_size;
@@ -92,7 +93,8 @@ void ADM::SetADMVariablesToKerrSchild(MeshBlockPack *pmbp) {
       &adm.g_dd(m,0,0,k,j,i), &adm.g_dd(m,0,1,k,j,i), &adm.g_dd(m,0,2,k,j,i),
       &adm.g_dd(m,1,1,k,j,i), &adm.g_dd(m,1,2,k,j,i), &adm.g_dd(m,2,2,k,j,i),
       &adm.vK_dd(m,0,0,k,j,i), &adm.vK_dd(m,0,1,k,j,i), &adm.vK_dd(m,0,2,k,j,i),
-      &adm.vK_dd(m,1,1,k,j,i), &adm.vK_dd(m,1,2,k,j,i), &adm.vK_dd(m,2,2,k,j,i));
+      &adm.vK_dd(m,1,1,k,j,i), &adm.vK_dd(m,1,2,k,j,i), &adm.vK_dd(m,2,2,k,j,i),
+      kz_eta);
   });
 }
 

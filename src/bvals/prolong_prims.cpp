@@ -47,6 +47,7 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
   auto &eos = pmy_pack->phydro->peos->eos_data;
@@ -116,7 +117,7 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
           Real x3v = CellCenterX(k-indcs.cks, indcs.cnx3, x3min, x3max);
 
           Real glower[4][4], gupper[4][4];
-          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
           HydCons1D u_sr;
           Real s2;
@@ -202,6 +203,7 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
   Real &gamma = pmy_pack->phydro->peos->eos_data.gamma;
@@ -267,7 +269,7 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
           Real x3v = CellCenterX(k-indcs.ks, indcs.nx3, x3min, x3max);
 
           Real glower[4][4], gupper[4][4];
-          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
           SingleP2C_IdealGRHyd(glower, gupper, w, gamma, u);
         } else if (is_sr) {
           SingleP2C_IdealSRHyd(w, gamma, u);
@@ -315,6 +317,7 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
   auto &eos = pmy_pack->pmhd->peos->eos_data;
@@ -388,7 +391,7 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
           Real x3v = CellCenterX(k-indcs.cks, indcs.cnx3, x3min, x3max);
 
           Real glower[4][4], gupper[4][4];
-          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
           MHDCons1D u_sr;
           Real s2,b2,rpar;
@@ -477,6 +480,7 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
   Real &gamma = pmy_pack->pmhd->peos->eos_data.gamma;
@@ -546,7 +550,7 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
           Real x3v = CellCenterX(k-indcs.ks, indcs.nx3, x3min, x3max);
 
           Real glower[4][4], gupper[4][4];
-          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+          ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
           SingleP2C_IdealGRMHD(glower, gupper, w, gamma, u);
         } else if (is_sr) {
           SingleP2C_IdealSRMHD(w, gamma, u);

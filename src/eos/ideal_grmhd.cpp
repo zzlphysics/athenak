@@ -53,6 +53,7 @@ void IdealGRMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &
 
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   auto &use_excise = pmy_pack->pcoord->coord_data.bh_excise;
   auto &excision_floor_ = pmy_pack->pcoord->excision_floor;
   auto &excision_flux_ = pmy_pack->pcoord->excision_flux;
@@ -109,7 +110,7 @@ void IdealGRMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     HydPrim1D w;
     bool dfloor_used=false, efloor_used=false;
@@ -243,6 +244,7 @@ void IdealGRMHD::PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Rea
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
@@ -264,7 +266,7 @@ void IdealGRMHD::PrimToCons(const DvceArray5D<Real> &prim, const DvceArray5D<Rea
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     // Load single state of primitive variables
     MHDPrim1D w;

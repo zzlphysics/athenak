@@ -53,6 +53,7 @@ void IdealGRHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
 
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   auto &use_excise = pmy_pack->pcoord->coord_data.bh_excise;
   auto &excision_floor_ = pmy_pack->pcoord->excision_floor;
   auto &excision_flux_ = pmy_pack->pcoord->excision_flux;
@@ -96,7 +97,7 @@ void IdealGRHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     HydPrim1D w;
     bool dfloor_used=false, efloor_used=false;
@@ -213,6 +214,7 @@ void IdealGRHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
+  auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
@@ -234,7 +236,7 @@ void IdealGRHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+    ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper, kz_eta);
 
     // Load single state of primitive variables
     HydPrim1D w;

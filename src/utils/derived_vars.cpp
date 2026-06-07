@@ -52,6 +52,7 @@ void ComputeDerivedVariable(std::string name, int index, MeshBlockPack* pmbp,
     auto &coord = pmbp->pcoord->coord_data;
     bool &flat = coord.is_minkowski;
     Real &spin = coord.bh_spin;
+    Real &kz_eta = coord.kz_eta;
 
     // Radiation
     int nang1 = pmbp->prad->prgeo->nangles - 1;
@@ -77,7 +78,7 @@ void ComputeDerivedVariable(std::string name, int index, MeshBlockPack* pmbp,
 
       // Extract components of metric
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper,kz_eta);
 
       // coordinate component n^0
       Real n0 = tet_c_(m,0,0,k,j,i);

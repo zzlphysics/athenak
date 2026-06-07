@@ -226,7 +226,7 @@ void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
 
   // Extract components of metric
   Real glower[4][4], gupper[4][4];
-  ComputeMetricAndInverse(x1v,x2v,x3v,coord.is_minkowski, coord.bh_spin, glower, gupper);
+  ComputeMetricAndInverse(x1v,x2v,x3v,coord.is_minkowski, coord.bh_spin, glower, gupper, coord.kz_eta);
 
   // Calculate 4-velocity in left state (contravariant compt)
   Real q = glower[ivx][ivx] * SQR(wl_ivx) + glower[ivy][ivy] * SQR(wl_ivy) +

@@ -130,6 +130,7 @@ ndiag      = 1           # cycles between diagostic output
 <coord>
 general_rel = true       # general relativity
 a           = 0.9375     # black hole spin a (0 <= a/M < 1)
+kz_eta      = 0.0        # Konoplya-Zhidenko deviation parameter; 0 recovers Kerr
 excise      = true       # excise r_ks <= 1.0
 dexcise     = 1.0e-8     # density inside excision
 pexcise     = 0.333e-10  # pressure inside excision
@@ -162,7 +163,7 @@ mu = 0.5              # mean molecular weight
 <problem>
 fm_torus   = true  # Fishbone & Moncrief
 r_edge     = 20.0  # radius of inner edge of disk
-r_peak     = 41.0  # radius of pressure maximum; use l instead if negative
+r_peak     = 41.0  # radius of pressure maximum
 tilt_angle = 0.0   # angle (deg) to incl disk spin axis relative to BH spin in dir of x
 potential_beta_min = 100.0  # ratio of gas to magnetic pressure at maxima (diff locations)
 potential_cutoff   = 0.2    # amount to subtract from density when calculating potential
@@ -172,7 +173,6 @@ rho_pow   = -1.5      # ... * r^rho_pow
 pgas_min  = 0.333e-7  # background on p_gas given by pgas_min ...
 pgas_pow  = -2.5      # ... * r^pgas_pow
 rho_max   = 1.0       # if > 0, rescale rho to have this peak; rescale pres by same factor
-l         = 0.0       # const. ang. mom. per unit mass u^t u_phi; only used if r_peak < 0
 pert_amp  = 2.0e-2    # perturbation amplitude
 user_hist = true      # enroll user-defined history function
 

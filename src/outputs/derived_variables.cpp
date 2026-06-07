@@ -361,6 +361,7 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
     auto &coord = pm->pmb_pack->pcoord->coord_data;
     bool &flat = coord.is_minkowski;
     auto &spin = coord.bh_spin;
+    auto &kz_eta = coord.kz_eta;
 
     const Real dt_last = pm->dt_last_completed;
     const bool have_prior = (pm->pmb_pack->pmhd->wbcc_saved && dt_last > 0.);
@@ -410,16 +411,16 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       Real glower_jm1[4][4], gupper_jm1[4][4];
       Real glower_kp1[4][4], gupper_kp1[4][4];
       Real glower_km1[4][4], gupper_km1[4][4];
-      ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower_c, gupper_c);
-      ComputeMetricAndInverse(x1v_ip1, x2v, x3v, flat, spin, glower_ip1, gupper_ip1);
-      ComputeMetricAndInverse(x1v_im1, x2v, x3v, flat, spin, glower_im1, gupper_im1);
+      ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower_c, gupper_c, kz_eta);
+      ComputeMetricAndInverse(x1v_ip1, x2v, x3v, flat, spin, glower_ip1, gupper_ip1, kz_eta);
+      ComputeMetricAndInverse(x1v_im1, x2v, x3v, flat, spin, glower_im1, gupper_im1, kz_eta);
       if (multi_d) {
-        ComputeMetricAndInverse(x1v, x2v_jp1, x3v, flat, spin, glower_jp1, gupper_jp1);
-        ComputeMetricAndInverse(x1v, x2v_jm1, x3v, flat, spin, glower_jm1, gupper_jm1);
+        ComputeMetricAndInverse(x1v, x2v_jp1, x3v, flat, spin, glower_jp1, gupper_jp1, kz_eta);
+        ComputeMetricAndInverse(x1v, x2v_jm1, x3v, flat, spin, glower_jm1, gupper_jm1, kz_eta);
       }
       if (three_d) {
-        ComputeMetricAndInverse(x1v, x2v, x3v_kp1, flat, spin, glower_kp1, gupper_kp1);
-        ComputeMetricAndInverse(x1v, x2v, x3v_km1, flat, spin, glower_km1, gupper_km1);
+        ComputeMetricAndInverse(x1v, x2v, x3v_kp1, flat, spin, glower_kp1, gupper_kp1, kz_eta);
+        ComputeMetricAndInverse(x1v, x2v, x3v_km1, flat, spin, glower_km1, gupper_km1, kz_eta);
       }
 
       // Center (new/old) for temporal term
@@ -1076,6 +1077,7 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
     auto &coord = pm->pmb_pack->pcoord->coord_data;
     bool &flat = coord.is_minkowski;
     Real &spin = coord.bh_spin;
+    Real &kz_eta = coord.kz_eta;
 
     // Radiation
     int nang1 = pm->pmb_pack->prad->prgeo->nangles - 1;
@@ -1110,7 +1112,7 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
 
       // Extract components of metric
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper,kz_eta);
 
       // coordinate component n^0
       Real n0 = tet_c_(m,0,0,k,j,i);
