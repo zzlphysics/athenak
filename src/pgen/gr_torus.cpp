@@ -296,6 +296,17 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                    KZRadialFunction(torus, torus.rhorizon);
     Real dlogh_peak = torus.fm_torus ?
       LogHFMMidplaneDerivative(torus, torus.r_peak, torus.l_peak) : 0.0;
+    Real u0_peak = 0.0, u3_peak = 0.0;
+    CalculateVelocityInTorus(torus, torus.r_peak, 1.0, &u0_peak, &u3_peak);
+    Real delta_peak, sigma_peak, aa_peak, g_00_peak, g_03_peak, g_33_peak;
+    KZBLMetricTerms(torus, torus.r_peak, 1.0, &delta_peak, &sigma_peak, &aa_peak,
+                    &g_00_peak, &g_03_peak, &g_33_peak, nullptr, nullptr);
+    Real u_phi_peak = g_03_peak*u0_peak + g_33_peak*u3_peak;
+    Real l_check_peak = u_phi_peak*u0_peak;
+    Real norm_res_peak = g_00_peak*SQR(u0_peak) + 2.0*g_03_peak*u0_peak*u3_peak +
+                         g_33_peak*SQR(u3_peak) + 1.0;
+    Real omega_peak = u3_peak/u0_peak;
+    Real u_lnr_phi_peak = u_phi_peak/sqrt(g_33_peak);
     std::cout << std::setprecision(16)
               << "KZ torus diagnostics:" << std::endl
               << "  a               = " << torus.spin << std::endl
@@ -307,6 +318,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << "  r_edge          = " << torus.r_edge << std::endl
               << "  r_peak          = " << torus.r_peak << std::endl
               << "  l_peak          = " << torus.l_peak << std::endl
+              << "  u^t_peak        = " << u0_peak << std::endl
+              << "  u^phi_peak      = " << u3_peak << std::endl
+              << "  Omega_peak      = " << omega_peak << std::endl
+              << "  u_lnr_phi_peak  = " << u_lnr_phi_peak << std::endl
+              << "  u_phi*u^t-l     = " << (l_check_peak - torus.l_peak) << std::endl
+              << "  norm_res_peak   = " << norm_res_peak << std::endl
               << "  dlogh_dr_peak   = " << dlogh_peak << std::endl
               << "  log_h_edge_abs  = " << torus.log_h_edge << std::endl
               << "  log_h_peak      = " << torus.log_h_peak << std::endl
@@ -460,7 +477,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
       // Transform to preferred coordinates
       Real u0, u1, u2, u3;
-      TransformVector(trs, u0_bl, 0.0, u2_bl, u3_bl,
+      TransformVector(trs, u0_bl, u1_bl, u2_bl, u3_bl,
                       x1v, x2v, x3v, &u0, &u1, &u2, &u3);
 
       Real glower[4][4], gupper[4][4];
@@ -1299,8 +1316,7 @@ static void CalculateVelocityInTiltedTorus(struct torus_pgen pgen,
 //   pu0: u^t set (Boyer-Lindquist coordinates)
 //   pu3: u^\phi set (Boyer-Lindquist coordinates)
 // Notes:
-//   The formula for u^3 as a function of u_{(\phi)} is tedious to derive, but this
-//       matches the formula used in Harm (init.c).
+//   The FM branch follows the LNRF projection formula for u^t and u^phi directly.
 
 KOKKOS_INLINE_FUNCTION
 static void CalculateVelocityInTorus(struct torus_pgen pgen,
@@ -1321,13 +1337,11 @@ static void CalculateVelocityInTorus(struct torus_pgen pgen,
     Real u_phi_proj_b = -1.0 + sqrt(u_phi_proj_a);
     Real u_phi_proj = sqrt(0.5 * u_phi_proj_b);        // (FM 3.3)
     u_phi_proj *= (pgen.prograde) ? 1.0 : -1.0;
-    Real u3_a = (1.0+SQR(u_phi_proj)) / (aa*sigma*delta);
-    Real u3_b = pgen.spin*KZRadialFunction(pgen, r) * sqrt(u3_a);
-    Real u3_c = sqrt(sigma/aa) / sin_theta;
-    u3 = u3_b + u3_c * u_phi_proj;
-    Real u0_a = (SQR(g_03) - g_00*g_33) * SQR(u3);
-    Real u0_b = sqrt(u0_a - g_00);
-    u0 = -1.0/g_00 * (g_03*u3 + u0_b);
+    Real exp_nu = sqrt(exp_2nu);
+    Real exp_psi = sqrt(exp_2psi);
+    Real omega = -g_03/g_33;
+    u0 = sqrt(1.0 + SQR(u_phi_proj)) / exp_nu;         // (Eq.14d)
+    u3 = u_phi_proj / exp_psi + omega*u0;              // (Eq.15)
   } else { // Chakrabarti torus
     Real l = CalculateL(pgen, r, sin_theta);
     Real u_0 = CalculateCovariantUT(pgen, r, sin_theta, l); // u_t
