@@ -33,6 +33,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
   auto &kz_eta = pmy_pack->pcoord->coord_data.kz_eta;
+  auto &use_excise = pmy_pack->pcoord->coord_data.bh_excise;
+  auto &excision_floor = pmy_pack->pcoord->excision_floor;
 
   //---- 1-D problem:
   //  copy face-centered E-fields to edges and return.
@@ -88,6 +90,10 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
       // compute cell-centered EMF in GR MHD
       par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
+        if (use_excise && excision_floor(m,ks,j,i)) {
+          e3cc_(m,ks,j,i) = 0.0;
+          return;
+        }
         // Extract components of metric
         Real &x1min = size.d_view(m).x1min;
         Real &x1max = size.d_view(m).x1max;
@@ -131,6 +137,9 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         //Real b3 = (bz + b0 * u3) / u0;
 
         e3cc_(m,ks,j,i) = b1 * u2 - b2 * u1;
+        if (!(Kokkos::isfinite(e3cc_(m,ks,j,i)))) {
+          e3cc_(m,ks,j,i) = 0.0;
+        }
       });
 
     // compute cell-centered EMF in SR MHD
@@ -245,6 +254,12 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
       // compute cell-centered EMFs in GR MHD
       par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        if (use_excise && excision_floor(m,k,j,i)) {
+          e1cc_(m,k,j,i) = 0.0;
+          e2cc_(m,k,j,i) = 0.0;
+          e3cc_(m,k,j,i) = 0.0;
+          return;
+        }
         // Extract components of metric
         Real &x1min = size.d_view(m).x1min;
         Real &x1max = size.d_view(m).x1max;
@@ -290,6 +305,9 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         e1cc_(m,k,j,i) = b2 * u3 - b3 * u2;
         e2cc_(m,k,j,i) = b3 * u1 - b1 * u3;
         e3cc_(m,k,j,i) = b1 * u2 - b2 * u1;
+        if (!(Kokkos::isfinite(e1cc_(m,k,j,i)))) { e1cc_(m,k,j,i) = 0.0; }
+        if (!(Kokkos::isfinite(e2cc_(m,k,j,i)))) { e2cc_(m,k,j,i) = 0.0; }
+        if (!(Kokkos::isfinite(e3cc_(m,k,j,i)))) { e3cc_(m,k,j,i) = 0.0; }
       });
 
     // compute cell-centered EMFs in SR MHD

@@ -40,7 +40,7 @@ void ComputeMetricAndInverse(Real x, Real y, Real z, bool minkowski, Real a,
   if (r < eps) {
     r = 0.5*(eps + r*r/eps);
   }
-  //r = fmax(r, 1.0);  // floor r_ks to 0.5*(r_inner + r_outer)
+  r = fmax(r, 1.0);  // regularize metric evaluations inside the excised region
 
   // Set covariant components
   // null vector l
@@ -121,7 +121,7 @@ void ComputeADMDecomposition(Real x, Real y, Real z, bool minkowski, Real a,
   if (r < eps) {
     r = 0.5*(eps + r*r/eps);
   }
-  //r = fmax(r, 1.0);
+  r = fmax(r, 1.0);
 
   // l covector (spatial components only)
   Real l_d[3];
@@ -293,7 +293,7 @@ void ComputeMetricDerivatives(Real x, Real y, Real z, bool minkowski, Real a,
   if (r < eps) {
     r = 0.5*(eps + r*r/eps);
   }
-  //r = fmax(r, 1.0);  // floor r_ks to 0.5*(r_inner + r_outer)
+  r = fmax(r, 1.0);  // regularize metric evaluations inside the excised region
 
   Real llower[4];
   llower[0] = 1.0;

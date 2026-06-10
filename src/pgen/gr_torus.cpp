@@ -119,6 +119,7 @@ struct torus_pgen {
   Real spin;                                  // black hole spin
   Real kz_eta;                                // Konoplya-Zhidenko deviation
   Real rhorizon;                              // outer horizon radius
+  Real rexcise;                               // excision radius
   Real dexcise, pexcise;                      // excision parameters
   Real gamma_adi;                             // EOS parameters
   Real arad;                                  // radiation constant
@@ -183,6 +184,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   torus.spin = coord.bh_spin;
   torus.kz_eta = coord.kz_eta;
   torus.rhorizon = coord.rhorizon;
+  torus.rexcise = coord.rexcise;
   const Real r_excise = coord.rexcise;
   const bool is_radiation_enabled = (pmbp->prad != nullptr);
 
@@ -437,7 +439,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                                       x3v + copysign(0.5*dx3,x3v), &r_excise,
                                       &theta_excise, &phi_excise);
     Real rho_bg, pgas_bg;
-    if (r_excise > 1.0) {
+    if (r_excise > trs.rexcise) {
       rho_bg = trs.rho_min * pow(r, trs.rho_pow);
       pgas_bg = trs.pgas_min * pow(r, trs.pgas_pow);
     } else {

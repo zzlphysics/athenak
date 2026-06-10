@@ -133,7 +133,7 @@ Coordinates::Coordinates(ParameterInput *pin, MeshBlockPack *ppack) :
       // be reset to.  Primitive velocities will be set to zero.
       coord_data.dexcise = pin->GetReal("coord","dexcise");
       coord_data.pexcise = pin->GetReal("coord","pexcise");
-      Real default_excise_r = fmin(1.0, 0.8*coord_data.rhorizon);
+      Real default_excise_r = 0.8*coord_data.rhorizon;
       coord_data.flux_excise_r = (pin->DoesBlockExist("radiation")) ?
         coord_data.rhorizon : pin->GetOrAddReal("coord","flux_excise_r",default_excise_r);
       coord_data.rexcise = (pin->DoesBlockExist("radiation")) ? coord_data.rhorizon :

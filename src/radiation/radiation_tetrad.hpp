@@ -16,7 +16,8 @@
 KOKKOS_INLINE_FUNCTION
 void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
                    Real g[][4], Real gi[][4], Real dgx[][4], Real dgy[][4], Real dgz[][4],
-                   Real e[][4], Real ecov[][4], Real omega[][4][4]) {
+                   Real e[][4], Real ecov[][4], Real omega[][4][4],
+                   Real kz_eta = 0.0) {
   // if (fabs(z) < (SMALL_NUMBER)) z = (SMALL_NUMBER);  // see cartesian_ks.hpp comments
   Real rad = sqrt(SQR(x) + SQR(y) + SQR(z));
   Real r = sqrt((SQR(rad)-SQR(a)+sqrt(SQR(SQR(rad)-SQR(a))+4.0*SQR(a)*SQR(z)))/2.0);
@@ -25,7 +26,9 @@ void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
   Real ll1 = (r*x + (a)*y)/( SQR(r) + SQR(a) );
   Real ll2 = (r*y - (a)*x)/( SQR(r) + SQR(a) );
   Real ll3 = z/r;
-  Real f = 2.0 * SQR(r)*r / (SQR(SQR(r)) + SQR(a)*SQR(z));
+  Real const denom = SQR(SQR(r)) + SQR(a)*SQR(z);
+  Real const f_num = 2.0*SQR(r)*r + kz_eta*r;
+  Real f = f_num/denom;
   if (minkowski) {f=0.0;}
 
   // Set Cartesian tetrad
@@ -56,10 +59,11 @@ void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
   Real de[4][4][4] = {0.0};
   Real qa = 2.0*SQR(r) - SQR(rad) + SQR(a);
   Real qb = SQR(r) + SQR(a);
-  Real qc = 3.0*SQR(a * z)-SQR(r)*SQR(r);
-  Real df_dx1 = SQR(f)*x/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
-  Real df_dx2 = SQR(f)*y/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
-  Real df_dx3 = SQR(f)*z/(2.0*pow(r,5)) * ( ( qc * qb ) / qa - 2.0*SQR(a*r));
+  Real const df_dr = ((6.0*SQR(r) + kz_eta)*denom - f_num*4.0*SQR(r)*r)/SQR(denom);
+  Real const df_dz_explicit = -f_num*2.0*SQR(a)*z/SQR(denom);
+  Real df_dx1 = df_dr*x*r/qa;
+  Real df_dx2 = df_dr*y*r/qa;
+  Real df_dx3 = df_dr*z*qb/(r*qa) + df_dz_explicit;
   if (minkowski) {
     f = 0.0;
     df_dx1 = 0.0;
