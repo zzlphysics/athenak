@@ -63,6 +63,9 @@ KOKKOS_INLINE_FUNCTION
 static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r);
 
 KOKKOS_INLINE_FUNCTION
+static Real FindRPeakFromL(struct torus_pgen pgen, Real l);
+
+KOKKOS_INLINE_FUNCTION
 static Real KZRadialFunction(struct torus_pgen pgen, Real r);
 
 KOKKOS_INLINE_FUNCTION
@@ -269,17 +272,43 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << "Chakrabarti constants still use Kerr-specific expressions." << std::endl;
     exit(EXIT_FAILURE);
   }
-  if (torus.r_edge <= torus.rhorizon || torus.r_peak <= torus.rhorizon) {
+  if (torus.r_edge <= torus.rhorizon ||
+      (torus.r_peak > 0.0 && torus.r_peak <= torus.rhorizon)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Torus radii must lie outside the KZ horizon: rhorizon=" << torus.rhorizon
               << ", r_edge=" << torus.r_edge << ", r_peak=" << torus.r_peak << std::endl;
     exit(EXIT_FAILURE);
   }
 
-  // Compute angular momentum and prepare constants describing primitives
+  // Compute angular momentum and prepare constants describing primitives.  For FM tori,
+  // r_peak < 0 switches to a user-specified constant angular momentum problem/l.
   if (torus.fm_torus) {
-    torus.l_peak = CalculateLFromRPeak(torus, torus.r_peak);
+    if (torus.r_peak < 0.0) {
+      if (!pin->DoesParameterExist("problem", "l")) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "FM torus with problem/r_peak < 0 requires problem/l"
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      torus.l_peak = pin->GetReal("problem", "l");
+      if (torus.l_peak == 0.0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "problem/l must be non-zero when problem/r_peak < 0"
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      torus.prograde = (torus.l_peak > 0.0);
+      torus.r_peak = FindRPeakFromL(torus, torus.l_peak);
+    } else {
+      torus.l_peak = CalculateLFromRPeak(torus, torus.r_peak);
+    }
   } else if (torus.chakrabarti_torus) {
+    if (torus.r_peak < 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "problem/r_peak < 0 with problem/l is only supported "
+                << "for fm_torus" << std::endl;
+      exit(EXIT_FAILURE);
+    }
     CalculateCN(torus, &torus.c_param, &torus.n_param);
     torus.l_peak = CalculateL(torus, torus.r_peak, 1.0);
   } else {
@@ -287,9 +316,24 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << "Unrecognized torus type in input file" << std::endl;
     exit(EXIT_FAILURE);
   }
+  if (torus.r_peak <= torus.r_edge || torus.r_peak <= torus.rhorizon) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "No valid pressure maximum outside the torus inner edge for l="
+              << torus.l_peak << ": rhorizon=" << torus.rhorizon
+              << ", r_edge=" << torus.r_edge << ", r_peak=" << torus.r_peak << std::endl;
+    exit(EXIT_FAILURE);
+  }
   // Common to both tori:
   torus.log_h_edge = LogHAux(torus, torus.r_edge, 1.0);
   torus.log_h_peak = LogHAux(torus, torus.r_peak, 1.0) - torus.log_h_edge;
+  if (!(isfinite(torus.log_h_peak)) || torus.log_h_peak <= 0.0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "FM torus potential has no positive enthalpy maximum outside r_edge: "
+              << "l=" << torus.l_peak << ", r_edge=" << torus.r_edge
+              << ", r_peak=" << torus.r_peak << ", log_h_peak=" << torus.log_h_peak
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
   torus.ptot_over_rho_peak = gm1/torus.gamma_adi * (exp(torus.log_h_peak)-1.0);
   torus.rho_peak = pow(torus.ptot_over_rho_peak, 1.0/gm1) / torus.rho_max;
 
@@ -356,7 +400,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     }
   }
   torus.r_outer_edge = ra;
-  std::cout << "Found torus outer edge: " << torus.r_outer_edge << std::endl;
+  if (global_variable::my_rank == 0) {
+    std::cout << "Found torus outer edge: " << torus.r_outer_edge << std::endl;
+  }
 
   // initialize primitive variables for new run ---------------------------------------
 
@@ -364,12 +410,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   auto &size = pmbp->pmb->mb_size;
   Kokkos::Random_XorShift64_Pool<> rand_pool64(pmbp->gids);
   Real ptotmax = std::numeric_limits<float>::min();
+  Real torus_mass = 0.0;
   const int nmkji = (pmbp->nmb_thispack)*indcs.nx3*indcs.nx2*indcs.nx1;
   const int nkji = indcs.nx3*indcs.nx2*indcs.nx1;
   const int nji  = indcs.nx2*indcs.nx1;
 
   Kokkos::parallel_reduce("pgen_torus1", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
-  KOKKOS_LAMBDA(const int &idx, Real &max_ptot) {
+  KOKKOS_LAMBDA(const int &idx, Real &max_ptot, Real &mass) {
     // compute m,k,j,i indices of thread and call function
     int m = (idx)/nkji;
     int k = (idx - m*nkji)/nji;
@@ -540,7 +587,24 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     }
     if (is_radiation_enabled) ptot += urad/3.0;
     max_ptot = fmax(ptot, max_ptot);
-  }, Kokkos::Max<Real>(ptotmax));
+
+    if (in_torus) {
+      Real q = glower[1][1]*uu1*uu1 + 2.0*glower[1][2]*uu1*uu2
+             + 2.0*glower[1][3]*uu1*uu3 + glower[2][2]*uu2*uu2
+             + 2.0*glower[2][3]*uu2*uu3 + glower[3][3]*uu3*uu3;
+      Real alpha = sqrt(-1.0/gupper[0][0]);
+      Real u0 = sqrt(1.0 + q)/alpha;
+      mass += rho*u0*dx1*dx2*dx3;
+    }
+  }, Kokkos::Max<Real>(ptotmax), Kokkos::Sum<Real>(torus_mass));
+
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &torus_mass, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#endif
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(16)
+              << "  initial_torus_mass = " << torus_mass << std::endl;
+  }
 
   // initialize ADM variables -----------------------------------------
 
@@ -1036,6 +1100,78 @@ static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r) {
     }
   }
   return 0.5*(lo + hi);
+}
+
+KOKKOS_INLINE_FUNCTION
+static Real FindRPeakFromL(struct torus_pgen pgen, Real l) {
+  Real rlo = fmax(pgen.r_edge*(1.0 + 1.0e-10), pgen.rhorizon*(1.0 + 1.0e-8));
+  Real rhi = fmax(100.0*rlo, 1.0e3);
+
+  Real best_r = rlo;
+  Real best_h = -1.0e300;
+  Real left = rlo;
+  Real right = rhi;
+  bool bracketed = false;
+
+  for (int expand = 0; expand < 16 && !bracketed; ++expand) {
+    const int nscan = 512;
+    best_r = rlo;
+    best_h = LogHFMValue(pgen, rlo, 1.0, l);
+    int best_n = 0;
+
+    for (int n = 1; n <= nscan; ++n) {
+      Real frac = static_cast<Real>(n)/static_cast<Real>(nscan);
+      Real r = exp(log(rlo) + frac*(log(rhi) - log(rlo)));
+      Real h = LogHFMValue(pgen, r, 1.0, l);
+      if (isfinite(h) && h > best_h) {
+        best_h = h;
+        best_r = r;
+        best_n = n;
+      }
+    }
+
+    if (best_n > 0 && best_n < nscan) {
+      Real f_left = static_cast<Real>(best_n - 1)/static_cast<Real>(nscan);
+      Real f_right = static_cast<Real>(best_n + 1)/static_cast<Real>(nscan);
+      left = exp(log(rlo) + f_left*(log(rhi) - log(rlo)));
+      right = exp(log(rlo) + f_right*(log(rhi) - log(rlo)));
+      bracketed = true;
+    } else if (best_n == nscan) {
+      rlo = rhi;
+      rhi *= 10.0;
+    } else {
+      break;
+    }
+  }
+
+  if (!bracketed) {
+    return best_r;
+  }
+
+  const Real gr = 0.5*(sqrt(5.0) - 1.0);
+  Real a = left;
+  Real b = right;
+  Real c = b - gr*(b - a);
+  Real d = a + gr*(b - a);
+  Real fc = LogHFMValue(pgen, c, 1.0, l);
+  Real fd = LogHFMValue(pgen, d, 1.0, l);
+  for (int iter = 0; iter < 120; ++iter) {
+    if (fabs(b - a) <= 1.0e-10*fmax(1.0, 0.5*(a + b))) break;
+    if (fc < fd) {
+      a = c;
+      c = d;
+      fc = fd;
+      d = a + gr*(b - a);
+      fd = LogHFMValue(pgen, d, 1.0, l);
+    } else {
+      b = d;
+      d = c;
+      fd = fc;
+      c = b - gr*(b - a);
+      fc = LogHFMValue(pgen, c, 1.0, l);
+    }
+  }
+  return 0.5*(a + b);
 }
 
 //----------------------------------------------------------------------------------------

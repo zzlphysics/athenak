@@ -264,7 +264,7 @@ void SourceTerms::BeamSource(DvceArray5D<Real> &i0, const Real bdt) {
     Real dgx[4][4], dgy[4][4], dgz[4][4];
     ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz,kz_eta);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
-    ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+    ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega,kz_eta);
 
     // Calculate proper distance to beam origin and minimum angle between directions
     Real dx1 = x1v - p1;
