@@ -196,11 +196,14 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, const DvceFaceFld4D<Real> &b,
                            DvceArray5D<Real> &cons);
 
- private:
-  int flux_reg_nvar_ = 0;
+  // This shared implementation must remain public: NVCC rejects extended host/device
+  // lambdas whose enclosing member function has private or protected access.
   TaskStatus PackAndSendCCImpl(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
                                const DvceArray5D<Real> &old_a, Real theta,
                                bool temporal_interp);
+
+ private:
+  int flux_reg_nvar_ = 0;
 };
 
 //----------------------------------------------------------------------------------------
