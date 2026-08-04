@@ -87,7 +87,14 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   auto &is_dynamical_relativistic_ = pmy_pack->pcoord->is_dynamical_relativistic;
   adm::ADM::ADM_vars adm_vars;
   if (is_dynamical_relativistic_) adm_vars = pmy_pack->padm->adm;
-  const int nmkji = (pmy_pack->nmb_thispack)*nx3*nx2*nx1;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  const int active_offset = pmy_pack->active_offset;
+  const int nmb_active = pmy_pack->nmb_active;
+  if (nmb_active <= 0) {
+    dtnew = std::numeric_limits<float>::max();
+    return TaskStatus::complete;
+  }
+  const int nmkji = nmb_active*nx3*nx2*nx1;
   const int nkji = nx3*nx2*nx1;
   const int nji  = nx2*nx1;
 
@@ -96,10 +103,11 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
     Kokkos::parallel_reduce("MHDNudt1",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
     KOKKOS_LAMBDA(const int &idx, Real &min_dt1, Real &min_dt2, Real &min_dt3) {
       // compute m,k,j,i indices of thread and call function
-      int m = (idx)/nkji;
-      int k = (idx - m*nkji)/nji;
-      int j = (idx - m*nkji - k*nji)/nx1;
-      int i = (idx - m*nkji - k*nji - j*nx1) + is;
+      const int a = idx/nkji;
+      const int m = active_lids(active_offset + a);
+      int k = (idx - a*nkji)/nji;
+      int j = (idx - a*nkji - k*nji)/nx1;
+      int i = (idx - a*nkji - k*nji - j*nx1) + is;
       k += ks;
       j += js;
 
@@ -114,10 +122,11 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
     Kokkos::parallel_reduce("MHDNudt2",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
     KOKKOS_LAMBDA(const int &idx, Real &min_dt1, Real &min_dt2, Real &min_dt3) {
       // compute m,k,j,i indices of thread and call function
-      int m = (idx)/nkji;
-      int k = (idx - m*nkji)/nji;
-      int j = (idx - m*nkji - k*nji)/nx1;
-      int i = (idx - m*nkji - k*nji - j*nx1) + is;
+      const int a = idx/nkji;
+      const int m = active_lids(active_offset + a);
+      int k = (idx - a*nkji)/nji;
+      int j = (idx - a*nkji - k*nji)/nx1;
+      int i = (idx - a*nkji - k*nji - j*nx1) + is;
       k += ks;
       j += js;
       Real max_dv1 = 0.0, max_dv2 = 0.0, max_dv3 = 0.0;

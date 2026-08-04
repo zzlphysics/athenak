@@ -343,6 +343,104 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   });
 }
 
+//------------------------------
+// Loops over a compact list of MeshBlock local IDs using Kokkos 1D Ranges.
+//
+// The first logical index passed to function() is the MeshBlock local ID stored in
+// active_lids, rather than the compact-list index.  Keeping this mapping in one helper
+// lets level-subcycled kernels avoid launching work for inactive refinement levels while
+// preserving the rank-wide Z-order/GID layout used by boundary communication.
+template <typename IndexView, typename Function>
+inline void par_for_active(const std::string &name, DevExeSpace exec_space,
+                           const IndexView &active_lids, const int &active_offset,
+                           const int &nactive, const int &il, const int &iu,
+                           const Function &function) {
+  if (nactive <= 0) return;
+  const int ni = iu - il + 1;
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nactive*ni),
+  KOKKOS_LAMBDA(const int &idx) {
+    const int a = idx/ni;
+    const int m = active_lids(active_offset + a);
+    const int i = (idx - a*ni) + il;
+    function(m, i);
+  });
+}
+
+template <typename IndexView, typename Function>
+inline void par_for_active(const std::string &name, DevExeSpace exec_space,
+                           const IndexView &active_lids, const int &active_offset,
+                           const int &nactive, const int &jl, const int &ju,
+                           const int &il, const int &iu, const Function &function) {
+  if (nactive <= 0) return;
+  const int nj = ju - jl + 1;
+  const int ni = iu - il + 1;
+  const int nji = nj*ni;
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nactive*nji),
+  KOKKOS_LAMBDA(const int &idx) {
+    const int a = idx/nji;
+    const int m = active_lids(active_offset + a);
+    int j = (idx - a*nji)/ni;
+    const int i = (idx - a*nji - j*ni) + il;
+    j += jl;
+    function(m, j, i);
+  });
+}
+
+template <typename IndexView, typename Function>
+inline void par_for_active(const std::string &name, DevExeSpace exec_space,
+                           const IndexView &active_lids, const int &active_offset,
+                           const int &nactive, const int &kl, const int &ku,
+                           const int &jl, const int &ju, const int &il, const int &iu,
+                           const Function &function) {
+  if (nactive <= 0) return;
+  const int nk = ku - kl + 1;
+  const int nj = ju - jl + 1;
+  const int ni = iu - il + 1;
+  const int nkji = nk*nj*ni;
+  const int nji = nj*ni;
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nactive*nkji),
+  KOKKOS_LAMBDA(const int &idx) {
+    const int a = idx/nkji;
+    const int m = active_lids(active_offset + a);
+    int k = (idx - a*nkji)/nji;
+    int j = (idx - a*nkji - k*nji)/ni;
+    const int i = (idx - a*nkji - k*nji - j*ni) + il;
+    k += kl;
+    j += jl;
+    function(m, k, j, i);
+  });
+}
+
+template <typename IndexView, typename Function>
+inline void par_for_active(const std::string &name, DevExeSpace exec_space,
+                           const IndexView &active_lids, const int &active_offset,
+                           const int &nactive,
+                           const int &nl, const int &nu, const int &kl, const int &ku,
+                           const int &jl, const int &ju, const int &il, const int &iu,
+                           const Function &function) {
+  if (nactive <= 0) return;
+  const int nn = nu - nl + 1;
+  const int nk = ku - kl + 1;
+  const int nj = ju - jl + 1;
+  const int ni = iu - il + 1;
+  const int nnkji = nn * nk * nj * ni;
+  const int nkji  = nk * nj * ni;
+  const int nji   = nj * ni;
+  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nactive*nnkji),
+  KOKKOS_LAMBDA(const int &idx) {
+    const int a = idx/nnkji;
+    const int m = active_lids(active_offset + a);
+    int n = (idx - a*nnkji)/nkji;
+    int k = (idx - a*nnkji - n*nkji)/nji;
+    int j = (idx - a*nnkji - n*nkji - k*nji)/ni;
+    int i = (idx - a*nnkji - n*nkji - k*nji - j*ni) + il;
+    n += nl;
+    k += kl;
+    j += jl;
+    function(m, n, k, j, i);
+  });
+}
+
 //------------------------------------------
 // 1D outer parallel loop using Kokkos Teams
 template <typename Function>
@@ -355,6 +453,75 @@ inline void par_for_outer(const std::string &name, DevExeSpace exec_space,
   KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int k = tmember.league_rank() + kl;
     function(tmember, k);
+  });
+}
+
+//------------------------------------------
+// Team loops over a compact list of MeshBlock local IDs.
+template <typename IndexView, typename Function>
+inline void par_for_outer_active(const std::string &name, DevExeSpace exec_space,
+                                 size_t scr_size, const int scr_level,
+                                 const IndexView &active_lids, const int &active_offset,
+                                 const int &nactive, const int &kl, const int &ku,
+                                 const Function &function) {
+  if (nactive <= 0) return;
+  const int nk = ku - kl + 1;
+  Kokkos::TeamPolicy<> policy(exec_space, nactive*nk, Kokkos::AUTO);
+  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nk;
+    const int m = active_lids(active_offset + a);
+    const int k = (tmember.league_rank() - a*nk) + kl;
+    function(tmember, m, k);
+  });
+}
+
+template <typename IndexView, typename Function>
+inline void par_for_outer_active(const std::string &name, DevExeSpace exec_space,
+                                 size_t scr_size, const int scr_level,
+                                 const IndexView &active_lids, const int &active_offset,
+                                 const int &nactive, const int &kl, const int &ku,
+                                 const int &jl, const int &ju, const Function &function) {
+  if (nactive <= 0) return;
+  const int nk = ku - kl + 1;
+  const int nj = ju - jl + 1;
+  const int nkj = nk*nj;
+  Kokkos::TeamPolicy<> policy(exec_space, nactive*nkj, Kokkos::AUTO);
+  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nkj;
+    const int m = active_lids(active_offset + a);
+    int k = (tmember.league_rank() - a*nkj)/nj;
+    const int j = (tmember.league_rank() - a*nkj - k*nj) + jl;
+    k += kl;
+    function(tmember, m, k, j);
+  });
+}
+
+template <typename IndexView, typename Function>
+inline void par_for_outer_active(const std::string &name, DevExeSpace exec_space,
+                                 size_t scr_size, const int scr_level,
+                                 const IndexView &active_lids, const int &active_offset,
+                                 const int &nactive,
+                                 const int &nl, const int &nu, const int &kl, const int &ku,
+                                 const int &jl, const int &ju, const Function &function) {
+  if (nactive <= 0) return;
+  const int nn = nu - nl + 1;
+  const int nk = ku - kl + 1;
+  const int nj = ju - jl + 1;
+  const int nkj = nk*nj;
+  const int nnkj = nn*nk*nj;
+  Kokkos::TeamPolicy<> policy(exec_space, nactive*nnkj, Kokkos::AUTO);
+  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nnkj;
+    const int m = active_lids(active_offset + a);
+    int n = (tmember.league_rank() - a*nnkj)/nkj;
+    int k = (tmember.league_rank() - a*nnkj - n*nkj)/nj;
+    int j = (tmember.league_rank() - a*nnkj - n*nkj - k*nj) + jl;
+    n += nl;
+    k += kl;
+    function(tmember, m, n, k, j);
   });
 }
 

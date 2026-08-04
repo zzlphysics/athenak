@@ -91,8 +91,25 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
 
 TaskStatus MHD::SaveMHDState(Driver *pdrive, int stage) {
   if (wbcc_saved) {
-    Kokkos::deep_copy(DevExeSpace(), wsaved, w0);
-    Kokkos::deep_copy(DevExeSpace(), bccsaved, bcc0);
+    auto active_lids = pmy_pack->active_lids.d_view;
+    int active_offset = pmy_pack->active_offset;
+    int nmb_active = pmy_pack->nmb_active;
+    auto wsaved_ = wsaved;
+    auto w0_ = w0;
+    par_for_active("save_mhd_w", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0, w0.extent_int(1)-1, 0, w0.extent_int(2)-1, 0, w0.extent_int(3)-1,
+    0, w0.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      wsaved_(m,n,k,j,i) = w0_(m,n,k,j,i);
+    });
+    auto bccsaved_ = bccsaved;
+    auto bcc0_ = bcc0;
+    par_for_active("save_mhd_bcc", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0, bcc0.extent_int(1)-1, 0, bcc0.extent_int(2)-1, 0, bcc0.extent_int(3)-1,
+    0, bcc0.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      bccsaved_(m,n,k,j,i) = bcc0_(m,n,k,j,i);
+    });
   }
   return TaskStatus::complete;
 }
@@ -162,10 +179,31 @@ TaskStatus MHD::InitRecv(Driver *pdrive, int stage) {
 
 TaskStatus MHD::CopyCons(Driver *pdrive, int stage) {
   if (stage == 1) {
-    Kokkos::deep_copy(DevExeSpace(), u1, u0);
-    Kokkos::deep_copy(DevExeSpace(), b1.x1f, b0.x1f);
-    Kokkos::deep_copy(DevExeSpace(), b1.x2f, b0.x2f);
-    Kokkos::deep_copy(DevExeSpace(), b1.x3f, b0.x3f);
+    auto active_lids = pmy_pack->active_lids.d_view;
+    int active_offset = pmy_pack->active_offset;
+    int nmb_active = pmy_pack->nmb_active;
+    auto u0_ = u0;
+    auto u1_ = u1;
+    par_for_active("copy_mhd_u", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0, u0.extent_int(1)-1, 0, u0.extent_int(2)-1, 0, u0.extent_int(3)-1,
+    0, u0.extent_int(4)-1,
+    KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {
+      u1_(m,n,k,j,i) = u0_(m,n,k,j,i);
+    });
+
+    auto copy_face = [&](const std::string &name, DvceArray4D<Real> &dst,
+                         DvceArray4D<Real> &src) {
+      auto dst_ = dst;
+      auto src_ = src;
+      par_for_active(name, DevExeSpace(), active_lids, active_offset, nmb_active,
+      0, src.extent_int(1)-1, 0, src.extent_int(2)-1, 0, src.extent_int(3)-1,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        dst_(m,k,j,i) = src_(m,k,j,i);
+      });
+    };
+    copy_face("copy_mhd_b1", b1.x1f, b0.x1f);
+    copy_face("copy_mhd_b2", b1.x2f, b0.x2f);
+    copy_face("copy_mhd_b3", b1.x3f, b0.x3f);
   }
   return TaskStatus::complete;
 }

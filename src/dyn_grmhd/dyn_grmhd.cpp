@@ -286,7 +286,9 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::PrimToConInit(int is, int ie, int js, i
 template<class EOSPolicy, class ErrorPolicy>
 void DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConvertInternalEnergyToPressure(int is, int ie,
     int js, int je, int ks, int ke) {
-  int nmb = pmy_pack->nmb_thispack;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
   auto &prim = pmy_pack->pmhd->w0;
   auto &eos_ = eos.ps.GetEOS();
   int &nmhd  = pmy_pack->pmhd->nmhd;
@@ -294,7 +296,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConvertInternalEnergyToPressure(int is,
 
   const Real mb = eos_.GetBaryonMass();
 
-  par_for("coord_src", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+  par_for_active("convert_e_to_p", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     Real n = prim(m, IDN, k, j, i) / mb;
     Real egas = mb*n + prim(m, IEN, k, j, i);
@@ -440,7 +443,9 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
   int &js = indcs.js; int &je = indcs.je;
   int &ks = indcs.ks; int &ke = indcs.ke;
 
-  int nmb = pmy_pack->nmb_thispack;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
 
   auto &adm = pmy_pack->padm->adm;
   auto &tmunu = pmy_pack->ptmunu->tmunu;
@@ -451,7 +456,8 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
   auto &cons = pmy_pack->pmhd->u0;
   auto &bcc = pmy_pack->pmhd->bcc0;
 
-  par_for("dyngr_tmunu_loop",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
+  par_for_active("dyngr_tmunu_loop",DevExeSpace(),active_lids,active_offset,nmb_active,
+  ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Calculate the determinant/volume form
     Real detg = adm::SpatialDet(adm.g_dd(m,0,0,k,j,i),adm.g_dd(m,0,1,k,j,i),
@@ -537,7 +543,9 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS(const DvceArray5D<Real
   int &js = indcs.js; int &je = indcs.je;
   int &ks = indcs.ks; int &ke = indcs.ke;
 
-  int nmb = pmy_pack->nmb_thispack;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
 
   auto &adm = pmy_pack->padm->adm;
   auto &eos_ = eos.ps.GetEOS();
@@ -563,7 +571,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS(const DvceArray5D<Real
     ndim = 3;
   }
 
-  par_for("coord_src", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+  par_for_active("coord_src", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Extract the metric and coordinate quantities.
     Real g3d[NSPMETRIC] = {adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),

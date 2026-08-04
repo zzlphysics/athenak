@@ -227,12 +227,15 @@ class PrimitiveSolverHydro {
 
     int &nhyd = pmy_pack->pmhd->nmhd;
     int &nscal = pmy_pack->pmhd->nscalars;
-    int &nmb = pmy_pack->nmb_thispack;
+    auto active_lids = pmy_pack->active_lids.d_view;
+    int active_offset = pmy_pack->active_offset;
+    int nmb_active = pmy_pack->nmb_active;
 
     Real mb = eos_.GetBaryonMass();
 
 
-    par_for("pshyd_prim2cons", DevExeSpace(), 0, (nmb-1), kl, ku, jl, ju, il, iu,
+    par_for_active("pshyd_prim2cons", DevExeSpace(), active_lids, active_offset,
+    nmb_active, kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       // Extract metric at a single point
       Real g3d[NSPMETRIC];
@@ -312,7 +315,10 @@ class PrimitiveSolverHydro {
                   const int kl, const int ku, bool floors_only=false) {
     int &nhyd = pmy_pack->pmhd->nmhd;
     int &nscal = pmy_pack->pmhd->nscalars;
-    int &nmb = pmy_pack->nmb_thispack;
+    auto active_lids = pmy_pack->active_lids.d_view;
+    const int active_offset = pmy_pack->active_offset;
+    const int nmb_active = pmy_pack->nmb_active;
+    if (nmb_active <= 0) return;
     auto &fofc_ = pmy_pack->pmhd->fofc;
 
     // Some problem-specific parameters
@@ -335,7 +341,7 @@ class PrimitiveSolverHydro {
     const int ni = (iu - il + 1);
     const int nji = (ju - jl + 1)*ni;
     const int nkji = (ku - kl + 1)*nji;
-    const int nmkji = nmb*nkji;
+    const int nmkji = nmb_active*nkji;
 
     const int rank = global_variable::my_rank;
     const int nerrs_ = nerrs;
@@ -357,10 +363,11 @@ class PrimitiveSolverHydro {
     int count_errs=0;
     Kokkos::parallel_reduce("pshyd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
     KOKKOS_LAMBDA(const int &idx, int &sumerrs) {
-      int m = (idx)/nkji;
-      int k = (idx - m*nkji)/nji;
-      int j = (idx - m*nkji - k*nji)/ni;
-      int i = (idx - m*nkji - k*nji - j*ni) + il;
+      const int a = idx/nkji;
+      const int m = active_lids(active_offset + a);
+      int k = (idx - a*nkji)/nji;
+      int j = (idx - a*nkji - k*nji)/ni;
+      int i = (idx - a*nkji - k*nji - j*ni) + il;
       j += jl;
       k += kl;
 

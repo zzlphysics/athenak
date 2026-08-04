@@ -28,7 +28,9 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
-  int nmb1 = pmy_pack->nmb_thispack - 1;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
   auto &size = pmy_pack->pmb->mb_size;
   auto &flat = pmy_pack->pcoord->coord_data.is_minkowski;
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
@@ -44,7 +46,7 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     auto e3 = efld.x3e;
     auto e2x1_ = e2x1;
     auto e3x1_ = e3x1;
-    par_for("emf1", DevExeSpace(), 0, nmb1, is, ie+1,
+    par_for_active("emf1", DevExeSpace(), active_lids, active_offset, nmb_active, is, ie+1,
     KOKKOS_LAMBDA(int m, int i) {
       e2(m,ks  ,js  ,i) = e2x1_(m,ks,js,i);
       e2(m,ke+1,js  ,i) = e2x1_(m,ks,js,i);
@@ -65,7 +67,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     // compute cell-centered EMF in dynamical GRMHD
     if (pmy_pack->padm != nullptr) {
       auto &adm = pmy_pack->padm->adm;
-      par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_2d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
         // Calculate the spatial components of the three-velocity
         const Real &ux = w0_(m,IVX,ks,j,i);
@@ -85,7 +88,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
       });
     } else if (pmy_pack->pcoord->is_general_relativistic) {
       // compute cell-centered EMF in GR MHD
-      par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_2d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
         // Extract components of metric
         Real &x1min = size.d_view(m).x1min;
@@ -134,7 +138,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
 
     // compute cell-centered EMF in SR MHD
     } else if (pmy_pack->pcoord->is_special_relativistic) {
-      par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_2d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
         const Real &u1 = w0_(m,IVX,ks,j,i);
         const Real &u2 = w0_(m,IVY,ks,j,i);
@@ -145,7 +150,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
 
     // compute cell-centered EMF in Newtonian MHD
     } else {
-      par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_2d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
         e3cc_(m,ks,j,i) = w0_(m,IVY,ks,j,i)*bcc_(m,IBX,ks,j,i) -
                           w0_(m,IVX,ks,j,i)*bcc_(m,IBY,ks,j,i);
@@ -167,7 +173,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     //  Note e1[is:ie,  js:je+1,ks:ke+1]
     //       e2[is:ie+1,js:je,  ks:ke+1]
     //       e3[is:ie+1,js:je+1,ks:ke  ]
-    par_for("emf2", DevExeSpace(), 0, nmb1, js, je+1, is, ie+1,
+    par_for_active("emf2", DevExeSpace(), active_lids, active_offset, nmb_active,
+    js, je+1, is, ie+1,
     KOKKOS_LAMBDA(const int m, const int j, const int i) {
       e2(m,ks  ,j,i) = e2x1_(m,ks,j,i);
       e2(m,ke+1,j,i) = e2x1_(m,ks,j,i);
@@ -217,7 +224,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     // compute cell-centered EMFs in dynamical GRMHD
     if (pmy_pack->padm != nullptr) {
       auto &adm = pmy_pack->padm->adm;
-      par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_3d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      ks-1, ke+1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         // Calculate something that resembles the spatial components of the four-velocity
         // normalized by W.
@@ -242,7 +250,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
       });
     } else if (pmy_pack->pcoord->is_general_relativistic) {
       // compute cell-centered EMFs in GR MHD
-      par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_3d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      ks-1, ke+1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         // Extract components of metric
         Real &x1min = size.d_view(m).x1min;
@@ -293,7 +302,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
 
     // compute cell-centered EMFs in SR MHD
     } else if (pmy_pack->pcoord->is_special_relativistic) {
-      par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_3d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      ks-1, ke+1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         const Real &u1 = w0_(m,IVX,k,j,i);
         const Real &u2 = w0_(m,IVY,k,j,i);
@@ -306,7 +316,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
 
     // compute cell-centered EMFs in Newtonian MHD
     } else {
-      par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
+      par_for_active("e_cc_3d", DevExeSpace(), active_lids, active_offset, nmb_active,
+      ks-1, ke+1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         e1cc_(m,k,j,i) = w0_(m,IVZ,k,j,i)*bcc_(m,IBY,k,j,i) -
                          w0_(m,IVY,k,j,i)*bcc_(m,IBZ,k,j,i);
@@ -335,7 +346,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     //  Note e1[is:ie,  js:je+1,ks:ke+1]
     //       e2[is:ie+1,js:je,  ks:ke+1]
     //       e3[is:ie+1,js:je+1,ks:ke  ]
-    par_for("emf3", DevExeSpace(), 0, nmb1, ks, ke+1, js, je+1, is, ie+1,
+    par_for_active("emf3", DevExeSpace(), active_lids, active_offset, nmb_active,
+    ks, ke+1, js, je+1, is, ie+1,
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
       // integrate E1 to corner using SG07
       Real e1_l3, e1_r3, e1_l2, e1_r2;

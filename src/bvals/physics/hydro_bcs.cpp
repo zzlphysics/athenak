@@ -31,14 +31,17 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
   int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
   int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
   int nvar = u0.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  int nmb = ppack->nmb_thispack;
+  auto active_lids = ppack->active_lids.d_view;
+  const int active_offset = ppack->active_offset;
+  const int nmb_active = ppack->nmb_active;
 
   // only apply BCs if not (periodic) or (shear_periodic)
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic &&
       pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) {
     int &is = indcs.is;
     int &ie = indcs.ie;
-    par_for("hydrobc_x1", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n2-1),
+    par_for_active("hydrobc_x1", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0,(nvar-1),0,(n3-1),0,(n2-1),
     KOKKOS_LAMBDA(int m, int n, int k, int j) {
       // apply physical boundaries to inner_x1
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x1)) {
@@ -126,7 +129,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
   if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
     int &js = indcs.js;
     int &je = indcs.je;
-    par_for("hydrobc_x2", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n1-1),
+    par_for_active("hydrobc_x2", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0,(nvar-1),0,(n3-1),0,(n1-1),
     KOKKOS_LAMBDA(int m, int n, int k, int i) {
       // apply physical boundaries to inner_x2
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x2)) {
@@ -213,7 +217,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
   if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
   int &ks = indcs.ks;
   int &ke = indcs.ke;
-  par_for("hydrobc_x3", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n2-1),0,(n1-1),
+  par_for_active("hydrobc_x3", DevExeSpace(), active_lids, active_offset, nmb_active,
+  0,(nvar-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int n, int j, int i) {
     // apply physical boundaries to inner_x3
     switch (mb_bcs.d_view(m,BoundaryFace::inner_x3)) {

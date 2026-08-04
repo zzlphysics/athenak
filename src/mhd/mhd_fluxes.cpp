@@ -46,7 +46,9 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
 
   int &nmhd_ = nmhd;
   int nvars = nmhd + nscalars;
-  int nmb1 = pmy_pack->nmb_thispack - 1;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
   const auto recon_method_ = recon_method;
   bool extrema = false;
   if (recon_method == ReconstructionMethod::ppmx) {
@@ -82,7 +84,8 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
   int il = is, iu = ie+1;
   if (use_fofc) { il = is-1, iu = ie+2; }
 
-  par_for_outer("mhd_flux1",DevExeSpace(), scr_size, scr_level, 0, nmb1, kl, ku, jl, ju,
+  par_for_outer_active("mhd_flux1",DevExeSpace(), scr_size, scr_level,
+  active_lids,active_offset,nmb_active,kl,ku,jl,ju,
   KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k, const int j) {
     ScrArray2D<Real> wl(member.team_scratch(scr_level), nvars, ncells1);
     ScrArray2D<Real> wr(member.team_scratch(scr_level), nvars, ncells1);
@@ -179,7 +182,8 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     jl = js-1, ju = je+1;
     if (use_fofc) { jl = js-2, ju = je+2; }
 
-    par_for_outer("mhd_flux2",DevExeSpace(),scr_size,scr_level,0,nmb1, kl, ku,
+    par_for_outer_active("mhd_flux2",DevExeSpace(),scr_size,scr_level,
+    active_lids,active_offset,nmb_active,kl,ku,
     KOKKOS_LAMBDA(TeamMember_t member, const int m, const int k) {
       ScrArray2D<Real> scr1(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr2(member.team_scratch(scr_level), nvars, ncells1);
@@ -299,7 +303,8 @@ void MHD::CalculateFluxes(Driver *pdriver, int stage) {
     kl = ks-1, ku = ke+1;
     if (use_fofc) { kl = ks-2, ku = ke+2; }
 
-    par_for_outer("mhd_flux3",DevExeSpace(), scr_size, scr_level, 0, nmb1, js-1, je+1,
+    par_for_outer_active("mhd_flux3",DevExeSpace(), scr_size, scr_level,
+    active_lids,active_offset,nmb_active,js-1,je+1,
     KOKKOS_LAMBDA(TeamMember_t member, const int m, const int j) {
       ScrArray2D<Real> scr1(member.team_scratch(scr_level), nvars, ncells1);
       ScrArray2D<Real> scr2(member.team_scratch(scr_level), nvars, ncells1);

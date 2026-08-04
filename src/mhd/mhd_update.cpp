@@ -33,7 +33,9 @@ TaskStatus MHD::RKUpdate(Driver *pdriver, int stage) {
   Real &gam0 = pdriver->gam0[stage-1];
   Real &gam1 = pdriver->gam1[stage-1];
   Real beta_dt = (pdriver->beta[stage-1])*(pmy_pack->pmesh->dt);
-  int nmb1 = pmy_pack->nmb_thispack - 1;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
   int nv1 = nmhd + nscalars - 1;
   auto u0_ = u0;
   auto u1_ = u1;
@@ -48,7 +50,8 @@ TaskStatus MHD::RKUpdate(Driver *pdriver, int stage) {
   int scr_level = 0;
   size_t scr_size = ScrArray1D<Real>::shmem_size(ncells1);
 
-  par_for_outer("mhd_update",DevExeSpace(),scr_size,scr_level,0,nmb1,0,nv1,ks,ke,js,je,
+  par_for_outer_active("mhd_update",DevExeSpace(),scr_size,scr_level,
+  active_lids,active_offset,nmb_active,0,nv1,ks,ke,js,je,
   KOKKOS_LAMBDA(TeamMember_t member, const int m, const int n, const int k, const int j) {
     ScrArray1D<Real> divf(member.team_scratch(scr_level), ncells1);
 

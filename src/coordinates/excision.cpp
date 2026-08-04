@@ -174,14 +174,17 @@ void Coordinates::UpdateExcisionMasks() {
     int n1 = indcs.nx1 + 2*ng;
     int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
     int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
-    int nmb1 = pmy_pack->nmb_thispack - 1;
+    auto active_lids = pmy_pack->active_lids.d_view;
+    int active_offset = pmy_pack->active_offset;
+    int nmb_active = pmy_pack->nmb_active;
     auto &adm = pmy_pack->padm->adm;
     auto &floor = excision_floor;
     auto &flux = excision_flux;
 
     Real &excise_lapse = coord_data.excise_lapse;
 
-    par_for("set_excision", DevExeSpace(), 0, nmb1, 0, (n3-1), 0, (n2-1), 0, (n1-1),
+    par_for_active("set_excision", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0, (n3-1), 0, (n2-1), 0, (n1-1),
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
       bool excise = (adm.alpha(m,k,j,i) < excise_lapse);
       floor(m,k,j,i) = excise;

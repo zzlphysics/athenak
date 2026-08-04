@@ -39,7 +39,12 @@ MeshBlockPack::MeshBlockPack(Mesh *pm, int igids, int igide) :
   pmesh(pm),
   gids(igids),
   gide(igide),
-  nmb_thispack(igide - igids + 1) {
+  nmb_thispack(igide - igids + 1),
+  active_lids("active_lids", 1),
+  active_level(-1),
+  active_offset(0),
+  nmb_active(0),
+  all_blocks_active(true) {
   // create map for task lists
   tl_map.insert(std::make_pair("before_timeintegrator",std::make_shared<TaskList>()));
   tl_map.insert(std::make_pair("after_timeintegrator",std::make_shared<TaskList>()));
@@ -81,6 +86,82 @@ MeshBlockPack::~MeshBlockPack() {
 
 void MeshBlockPack::AddMeshBlocks(ParameterInput *pin) {
   pmb = new MeshBlock(this, gids, nmb_thispack);
+  RebuildActiveBlockLists();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn MeshBlockPack::RebuildActiveBlockLists()
+//! \brief Build compact maps from level-local active indices to the existing local IDs.
+//!
+//! The maps never reorder MeshBlock storage or alter GIDs.  AddMeshBlocks() calls this
+//! routine after both initial construction and AMR reconstruction, so the metadata tracks
+//! the current set of local MeshBlocks.
+
+void MeshBlockPack::RebuildActiveBlockLists() {
+  int highest_level = 0;
+  for (int m=0; m<nmb_thispack; ++m) {
+    int level = pmb->mb_lev.h_view(m);
+    if (level > highest_level) {highest_level = level;}
+  }
+
+  level_offsets.assign(highest_level + 1, 0);
+  level_counts.assign(highest_level + 1, 0);
+  for (int m=0; m<nmb_thispack; ++m) {
+    ++level_counts[pmb->mb_lev.h_view(m)];
+  }
+
+  // Reserve one identity-map segment followed by one segment grouped by level.
+  int next_offset = nmb_thispack;
+  for (int level=0; level<=highest_level; ++level) {
+    level_offsets[level] = next_offset;
+    next_offset += level_counts[level];
+  }
+  int list_size = (next_offset > 0) ? next_offset : 1;
+  Kokkos::realloc(active_lids, list_size);
+
+  for (int m=0; m<nmb_thispack; ++m) {
+    active_lids.h_view(m) = m;
+  }
+  std::vector<int> next_lid = level_offsets;
+  for (int m=0; m<nmb_thispack; ++m) {
+    int level = pmb->mb_lev.h_view(m);
+    active_lids.h_view(next_lid[level]++) = m;
+  }
+  active_lids.template modify<HostMemSpace>();
+  active_lids.template sync<DevExeSpace>();
+
+  SetAllBlocksActive();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn MeshBlockPack::SetActiveLevel()
+//! \brief Select all local MeshBlocks at one logical level.
+//!
+//! A level may have no MeshBlocks on this rank.  In that case nmb_active is zero, which
+//! lets every MPI rank participate in the same global level schedule without special
+//! casing its local mesh layout.
+
+void MeshBlockPack::SetActiveLevel(int level) {
+  active_level = level;
+  all_blocks_active = false;
+  if (level >= 0 && level < static_cast<int>(level_counts.size())) {
+    active_offset = level_offsets[level];
+    nmb_active = level_counts[level];
+  } else {
+    active_offset = 0;
+    nmb_active = 0;
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn MeshBlockPack::SetAllBlocksActive()
+//! \brief Restore the default identity selection over every local MeshBlock.
+
+void MeshBlockPack::SetAllBlocksActive() {
+  active_level = -1;
+  active_offset = 0;
+  nmb_active = nmb_thispack;
+  all_blocks_active = true;
 }
 
 //----------------------------------------------------------------------------------------

@@ -25,7 +25,9 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
   int ks = indcs.ks, ke = indcs.ke;
-  int nmb1 = pmy_pack->nmb_thispack - 1;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
 
   // capture class variables for the kernels
   Real &gam0 = pdriver->gam0[stage-1];
@@ -42,7 +44,8 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
   if (multi_d) {
     auto bx1f = b0.x1f;
     auto bx1f_old = b1.x1f;
-    par_for("CT-b1", DevExeSpace(), 0, nmb1, ks, ke, js, je, is, ie+1,
+    par_for_active("CT-b1", DevExeSpace(), active_lids, active_offset, nmb_active,
+    ks, ke, js, je, is, ie+1,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       bx1f(m,k,j,i) = gam0*bx1f(m,k,j,i) + gam1*bx1f_old(m,k,j,i);
       bx1f(m,k,j,i) -= beta_dt*(e3(m,k,j+1,i) - e3(m,k,j,i))/mbsize.d_view(m).dx2;
@@ -55,7 +58,8 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
   //---- update B2 (curl terms in 1D and 3D problems)
   auto bx2f = b0.x2f;
   auto bx2f_old = b1.x2f;
-  par_for("CT-b2", DevExeSpace(), 0, nmb1, ks, ke, js, je+1, is, ie,
+  par_for_active("CT-b2", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke, js, je+1, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     bx2f(m,k,j,i) = gam0*bx2f(m,k,j,i) + gam1*bx2f_old(m,k,j,i);
     bx2f(m,k,j,i) += beta_dt*(e3(m,k,j,i+1) - e3(m,k,j,i))/mbsize.d_view(m).dx1;
@@ -67,7 +71,8 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
   //---- update B3 (curl terms in 1D and 2D/3D problems)
   auto bx3f = b0.x3f;
   auto bx3f_old = b1.x3f;
-  par_for("CT-b3", DevExeSpace(), 0, nmb1, ks, ke+1, js, je, is, ie,
+  par_for_active("CT-b3", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke+1, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     bx3f(m,k,j,i) = gam0*bx3f(m,k,j,i) + gam1*bx3f_old(m,k,j,i);
     bx3f(m,k,j,i) -= beta_dt*(e2(m,k,j,i+1) - e2(m,k,j,i))/mbsize.d_view(m).dx1;

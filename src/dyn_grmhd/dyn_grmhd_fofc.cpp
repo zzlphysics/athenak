@@ -43,7 +43,9 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;
 
-  int nmb = pmy_pack->nmb_thispack;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  int active_offset = pmy_pack->active_offset;
+  int nmb_active = pmy_pack->nmb_active;
   auto flx1 = pmy_pack->pmhd->uflx.x1f;
   auto flx2 = pmy_pack->pmhd->uflx.x2f;
   auto flx3 = pmy_pack->pmhd->uflx.x3f;
@@ -98,7 +100,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
     if (three_d) { kl = ks-1, ku = ke+1, kadd = 1; }
 
     // Estimate updated conserved variables and cell-centered fields
-    par_for("FOFC-newu", DevExeSpace(), 0, nmb-1, kl, ku, jl, ju, il, iu,
+    par_for_active("FOFC-newu", DevExeSpace(), active_lids, active_offset, nmb_active,
+    kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
       Real dtodx1 = beta_dt/size.d_view(m).dx1;
       Real dtodx2 = beta_dt/size.d_view(m).dx2;
@@ -217,7 +220,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
 
   // Replace fluxes with first-order LLF fluxes at i,j,k faces for any cell where FOFC
   // and/or excision is used (if GR+excising)
-  par_for("FOFC-flx", DevExeSpace(), 0, nmb-1, kl, ku, jl, ju, il, iu,
+  par_for_active("FOFC-flx", DevExeSpace(), active_lids, active_offset, nmb_active,
+  kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Check for FOFC flag
     bool fofc_flag = false;
@@ -366,7 +370,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
 
   // Replace fluxes with first-order LLF fluxes at i+1,j+1,k+1 faces for any cell where
   // FOFC and/or excision is used (if GR+excising)
-  par_for("FOFC-flx", DevExeSpace(), 0, nmb-1, kl, ku, jl, ju, il, iu,
+  par_for_active("FOFC-flx", DevExeSpace(), active_lids, active_offset, nmb_active,
+  kl, ku, jl, ju, il, iu,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
     // Check for FOFC flag
     bool fofc_flag = false;
@@ -525,7 +530,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
     auto &utest_ = pmy_pack->pmhd->utest;
 
     // Estimate updated density
-    par_for("FOFC-flx", DevExeSpace(), 0, nmb-1, kl, ku, jl, ju, il, iu,
+    par_for_active("FOFC-scalar-state", DevExeSpace(), active_lids, active_offset,
+    nmb_active, kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
       utest_(m,IDN,k,j,i) = gam0*u0_(m,IDN,k,j,i) + gam1*u1_(m,IDN,k,j,i);
       for (int n=0; n<nscal_; ++n) {
@@ -542,7 +548,8 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
     if (three_d) { alp_pp = 6.0, kl = ks, ku = ke+1; }
 
     // Positivity Presserving Limiter for scalar
-    par_for("FOFC-flx", DevExeSpace(), 0, nmb-1, kl, ku, jl, ju, il, iu,
+    par_for_active("FOFC-scalar-flx", DevExeSpace(), active_lids, active_offset,
+    nmb_active, kl, ku, jl, ju, il, iu,
     KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
       Real dtodx1 = beta_dt/size.d_view(m).dx1;
 
@@ -736,8 +743,19 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
 
   // reset FOFC flag (do not reset excision flag)
   if (use_fofc_) {
-    Kokkos::deep_copy(fofc_, false);
-    if (nscal_ > 0) {Kokkos::deep_copy(fofc_scal_, false);}
+    par_for_active("FOFC-reset", DevExeSpace(), active_lids, active_offset, nmb_active,
+    0, fofc_.extent_int(1)-1, 0, fofc_.extent_int(2)-1, 0, fofc_.extent_int(3)-1,
+    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+      fofc_(m,k,j,i) = false;
+    });
+    if (nscal_ > 0) {
+      par_for_active("FOFC-reset-scalars", DevExeSpace(), active_lids, active_offset,
+      nmb_active, 0, fofc_scal_.extent_int(1)-1, 0, fofc_scal_.extent_int(2)-1,
+      0, fofc_scal_.extent_int(3)-1, 0, fofc_scal_.extent_int(4)-1,
+      KOKKOS_LAMBDA(const int m, const int n, const int k, const int j, const int i) {
+        fofc_scal_(m,n,k,j,i) = false;
+      });
+    }
   }
 
   return;

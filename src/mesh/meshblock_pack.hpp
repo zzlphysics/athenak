@@ -55,6 +55,18 @@ class MeshBlockPack {
   int gids, gide;         // start/end of global IDs in this MeshBlockPack
   int nmb_thispack;       // number of MBs in this pack
 
+  // Compact maps from an active-block index to the original rank-local MeshBlock index.
+  // The first nmb_thispack entries are the identity map used by SetAllBlocksActive().
+  // Remaining entries are grouped by logical level; level_offsets/counts index those
+  // groups without changing the Z-order/GID layout of any MeshBlock data.
+  DualArray1D<int> active_lids;
+  std::vector<int> level_offsets;  // host metadata, indexed by absolute logical level
+  std::vector<int> level_counts;   // host metadata, indexed by absolute logical level
+  int active_level;                // selected logical level, or -1 for all MeshBlocks
+  int active_offset;               // first selected entry in active_lids
+  int nmb_active;                  // number of selected MeshBlocks on this rank
+  bool all_blocks_active;
+
   // following Grid/Physics objects are all pointers so they can be allocated after
   // MeshBlockPack is constructed with pointer to my_pack.
 
@@ -85,6 +97,9 @@ class MeshBlockPack {
   void AddPhysics(ParameterInput *pin);
   void AddMeshBlocks(ParameterInput *pin);
   void AddCoordinates(ParameterInput *pin);
+  void RebuildActiveBlockLists();
+  void SetActiveLevel(int level);
+  void SetAllBlocksActive();
 
  private:
   // data

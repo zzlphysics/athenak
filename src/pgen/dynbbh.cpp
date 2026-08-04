@@ -1145,10 +1145,13 @@ void SetADMVariablesToBBH(MeshBlockPack *pmbp) {
   const int n1 = indcs.nx1 + 2*ng;
   const int n2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*ng : 1;
   const int n3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*ng : 1;
-  const int nmb = pmbp->nmb_thispack;
+  auto active_lids = pmbp->active_lids.d_view;
+  const int active_offset = pmbp->active_offset;
+  const int nmb_active = pmbp->nmb_active;
   const BBHParameters parameters = bbh;
 
-  par_for("dynbbh_update_adm", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1-1,
+  par_for_active("dynbbh_update_adm", DevExeSpace(), active_lids, active_offset,
+  nmb_active, 0, n3-1, 0, n2-1, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
                                size.d_view(m).x1max);
@@ -1193,11 +1196,13 @@ void AugmentBBHExcisionMasks(MeshBlockPack *pmbp) {
   const int n1 = indcs.nx1 + 2*ng;
   const int n2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*ng : 1;
   const int n3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*ng : 1;
-  const int nmb = pmbp->nmb_thispack;
+  auto active_lids = pmbp->active_lids.d_view;
+  const int active_offset = pmbp->active_offset;
+  const int nmb_active = pmbp->nmb_active;
   const BBHParameters parameters = bbh;
 
-  par_for("dynbbh_geometric_excision", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1,
-          0, n1-1,
+  par_for_active("dynbbh_geometric_excision", DevExeSpace(), active_lids, active_offset,
+          nmb_active, 0, n3-1, 0, n2-1, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
                                size.d_view(m).x1max);
