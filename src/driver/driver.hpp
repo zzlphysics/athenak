@@ -25,11 +25,27 @@
 
 class Driver {
  public:
+  enum class SubcyclingMode { none, level };
+
+  // Runtime coordinates of a level-local advance.  This is deliberately independent
+  // of Mesh::time/dt so metric, boundary, and synchronization code can distinguish a
+  // fine-level stage from a globally synchronized state.  The legacy driver leaves the
+  // default context untouched.
+  struct LevelSubcyclingContext {
+    int active_level = -1;
+    int substep = 0;
+    Real time = 0.0;
+    Real dt = 0.0;
+    bool at_sync_point = true;
+  };
+
   Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptimer);
   ~Driver() = default;
 
   // data
   TimeEvolution time_evolution;
+  SubcyclingMode subcycling_mode = SubcyclingMode::none;
+  LevelSubcyclingContext level_subcycling;
   DvceArray6D<Real> impl_src;  // stiff source terms used in ImEx integrators
 
   // folowing data only relevant for runs involving time evolution
@@ -54,6 +70,12 @@ class Driver {
   void Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout);
   void Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout);
   void InitBoundaryValuesAndPrimitives(Mesh *pm);
+  bool LevelSubcyclingRequested() const {
+    return subcycling_mode == SubcyclingMode::level;
+  }
+  void SetLevelSubcyclingContext(int level, int substep, Real time, Real dt,
+                                 bool at_sync_point = false);
+  void ResetLevelSubcyclingContext();
 
  private:
   Kokkos::Timer run_time_;      // generalized timer for cpu/gpu/etc
@@ -62,5 +84,6 @@ class Driver {
   float lb_efficiency_;         // measure of how efficient was load balancing
   void OutputCycleDiagnostics(Mesh *pm);
   Real UpdateWallClock();
+  void ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const;
 };
 #endif // DRIVER_DRIVER_HPP_

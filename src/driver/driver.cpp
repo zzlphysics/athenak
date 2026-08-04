@@ -11,10 +11,12 @@
 #include <limits>
 #include <algorithm>
 #include <string> // string
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
 #include "parameter_input.hpp"
+#include "coordinates/adm.hpp"
 #include "mesh/mesh.hpp"
 #include "outputs/outputs.hpp"
 #include "hydro/hydro.hpp"
@@ -80,6 +82,26 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
       std::exit(EXIT_FAILURE);
     }
   } // extra brace to limit scope of string
+
+  // Parse the requested stepping topology independently from the RK integrator.  The
+  // default is the historical rank-wide timestep and therefore takes the exact legacy
+  // execution path below.
+  {
+    std::string subcycling = pin->GetOrAddString("time", "subcycling", "none");
+    if (subcycling == "none") {
+      subcycling_mode = SubcyclingMode::none;
+    } else if (subcycling == "level") {
+      subcycling_mode = SubcyclingMode::level;
+    } else {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<time>/subcycling='" << subcycling
+                  << "' is not implemented. Valid choices are [none,level]."
+                  << std::endl;
+      }
+      std::exit(EXIT_FAILURE);
+    }
+  }
 
   // read <time> parameters controlling driver if run requires time-evolution
   if (time_evolution != TimeEvolution::tstatic) {
@@ -277,6 +299,117 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
       exit(EXIT_FAILURE);
     }
   }
+
+  if (LevelSubcyclingRequested()) {
+    ValidateLevelSubcyclingConfiguration(pmesh);
+
+    // Keep this guard until level-time boundary interpolation plus cell-centered flux
+    // and face-centered EMF registers are connected to the recursive RK2 scheduler.
+    // Falling through to Execute() here would silently run the legacy global timestep
+    // while claiming that subcycling is active.
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "<time>/subcycling=level satisfies the current MVP configuration "
+                << "constraints, but the level scheduler is not armed."
+                << std::endl
+                << "Temporal coarse-to-fine boundary interpolation and conservative "
+                << "flux/EMF registers must be enabled before this mode can run."
+                << std::endl
+                << "Current MVP envelope: single-rank static SMR, RK2, MHD+CT with a "
+                << "prescribed dynamic ADM metric; no Z4c, radiation, particles, "
+                << "diffusion, source terms, turbulence, or shearing/orbital advection."
+                << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::ValidateLevelSubcyclingConfiguration()
+//! \brief Reject physics/topologies for which level-local kernels or synchronization are
+//! not part of the first level-subcycling implementation.
+
+void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
+  MeshBlockPack *pmbp = pmesh->pmb_pack;
+  std::vector<std::string> violations;
+
+  if (time_evolution != TimeEvolution::dynamic) {
+    violations.emplace_back("<time>/evolution must be dynamic");
+  }
+  if (integrator != "rk2") {
+    violations.emplace_back("<time>/integrator must be rk2");
+  }
+  if (!pmesh->multilevel || pmesh->adaptive ||
+      pmesh->max_level <= pmesh->root_level) {
+    violations.emplace_back("mesh refinement must be static SMR with at least two levels");
+  }
+  if (global_variable::nranks != 1 || pmesh->nmb_packs_thisrank != 1) {
+    violations.emplace_back("the initial implementation requires one MPI rank and one pack");
+  }
+  if (pmbp->pmhd == nullptr || pmbp->phydro != nullptr || pmbp->pionn != nullptr) {
+    violations.emplace_back("physics must be single-fluid MHD (not hydro or ion-neutral)");
+  }
+  if (pmbp->padm == nullptr || pmbp->pdyngr == nullptr || pmbp->pz4c != nullptr ||
+      (pmbp->padm != nullptr && !pmbp->padm->is_dynamic)) {
+    violations.emplace_back("GRMHD must use a prescribed dynamic <adm> metric without Z4c");
+  }
+  if (pmbp->prad != nullptr || pmbp->ppart != nullptr) {
+    violations.emplace_back("radiation and particles are not supported");
+  }
+  if (pmbp->pturb != nullptr) {
+    violations.emplace_back("turbulence driving is not supported");
+  }
+  if (pmbp->pmhd != nullptr &&
+      (pmbp->pmhd->pvisc != nullptr || pmbp->pmhd->presist != nullptr ||
+       pmbp->pmhd->pcond != nullptr || pmbp->pmhd->psrc != nullptr)) {
+    violations.emplace_back("MHD diffusion and built-in source terms are not supported");
+  }
+  if (pmbp->pmhd != nullptr &&
+      (pmbp->pmhd->porb_u != nullptr || pmbp->pmhd->porb_b != nullptr ||
+       pmbp->pmhd->psbox_u != nullptr || pmbp->pmhd->psbox_b != nullptr)) {
+    violations.emplace_back("shearing-box and orbital-advection modules are not supported");
+  }
+  if (pmesh->pgen != nullptr && (pmesh->pgen->user_srcs || pmesh->pgen->user_bcs)) {
+    violations.emplace_back("full-mesh user source terms and user boundaries are not supported");
+  }
+
+  if (!violations.empty()) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "<time>/subcycling=level is outside the current MVP envelope:"
+                << std::endl;
+      for (const auto &reason : violations) {
+        std::cout << "  - " << reason << std::endl;
+      }
+      std::cout << "Supported MVP: single-rank static SMR, RK2, MHD+CT with a "
+                << "prescribed dynamic ADM metric and no auxiliary physics/source "
+                << "modules." << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::SetLevelSubcyclingContext()
+//! \brief Publish the coordinates of a level-local step to task and metric callbacks.
+
+void Driver::SetLevelSubcyclingContext(int level, int substep, Real time, Real dt,
+                                       bool at_sync_point) {
+  level_subcycling.active_level = level;
+  level_subcycling.substep = substep;
+  level_subcycling.time = time;
+  level_subcycling.dt = dt;
+  level_subcycling.at_sync_point = at_sync_point;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::ResetLevelSubcyclingContext()
+//! \brief Restore the synchronized, inactive context used by the legacy driver.
+
+void Driver::ResetLevelSubcyclingContext() {
+  level_subcycling = LevelSubcyclingContext{};
 }
 
 //----------------------------------------------------------------------------------------
