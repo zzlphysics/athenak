@@ -85,5 +85,14 @@ class Driver {
   void OutputCycleDiagnostics(Mesh *pm);
   Real UpdateWallClock();
   void ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const;
+  Real ComputeLevelSubcyclingTimeStep(Mesh *pmesh);
+  void AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt);
+  void ExecuteLevelStage(Mesh *pmesh, int level, int substep, Real time, Real dt,
+                         int stage);
+  void PrepareFineLevelBoundaries(Mesh *pmesh, int coarse_level, int fine_level,
+                                  int fine_substep, Real time, Real coarse_dt,
+                                  Real theta);
+  void SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
+                            Real sync_time, Real coarse_dt);
 };
 #endif // DRIVER_DRIVER_HPP_

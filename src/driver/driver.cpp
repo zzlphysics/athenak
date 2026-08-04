@@ -6,6 +6,7 @@
 //! \file driver.cpp
 //  \brief implementation of functions in class Driver
 
+#include <cmath>
 #include <iostream>
 #include <iomanip>    // std::setprecision()
 #include <limits>
@@ -410,6 +411,147 @@ void Driver::SetLevelSubcyclingContext(int level, int substep, Real time, Real d
 
 void Driver::ResetLevelSubcyclingContext() {
   level_subcycling = LevelSubcyclingContext{};
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::ComputeLevelSubcyclingTimeStep()
+//! \brief Compute the synchronized root-level timestep from level-local CFL limits.
+//!
+//! A level l advances 2^(l-root) times per root cycle, so its CFL-limited local step
+//! constrains the root step by that same factor.  The caller remains responsible for the
+//! usual growth and tlim caps when this path is armed in Execute().
+
+Real Driver::ComputeLevelSubcyclingTimeStep(Mesh *pmesh) {
+  MeshBlockPack *pmbp = pmesh->pmb_pack;
+  Real dt_root = std::numeric_limits<Real>::max();
+
+  for (int level=pmesh->root_level; level<=pmesh->max_level; ++level) {
+    pmbp->SetActiveLevel(level);
+    if (pmbp->nmb_active == 0) {
+      continue;
+    }
+
+    // The guarded MVP supports MHD only.  NewTimeStep performs its reduction over the
+    // compact active list selected above and returns the raw (unit-CFL) level limit.
+    (void) pmbp->pmhd->NewTimeStep(this, nexp_stages);
+    const Real dt_level = pmesh->cfl_no*pmbp->pmhd->dtnew;
+    const Real root_candidate = std::ldexp(dt_level, level-pmesh->root_level);
+    dt_root = std::min(dt_root, root_candidate);
+  }
+
+  pmbp->SetAllBlocksActive();
+  ResetLevelSubcyclingContext();
+
+  if (!std::isfinite(dt_root) || !(dt_root > 0.0)) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Unable to construct a positive finite level-subcycling timestep."
+                << std::endl;
+    }
+    std::exit(EXIT_FAILURE);
+  }
+  return dt_root;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::ExecuteLevelStage()
+//! \brief Execute one RK stage with a level-local Mesh time/timestep and active list.
+
+void Driver::ExecuteLevelStage(Mesh *pmesh, int level, int substep, Real time, Real dt,
+                               int stage) {
+  pmesh->pmb_pack->SetActiveLevel(level);
+  SetLevelSubcyclingContext(level, substep, time, dt);
+  pmesh->time = time;
+  pmesh->dt = dt;
+  ExecuteTaskList(pmesh, "before_stagen", stage);
+  ExecuteTaskList(pmesh, "stagen", stage);
+  ExecuteTaskList(pmesh, "after_stagen", stage);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::PrepareFineLevelBoundaries()
+//! \brief Hook for time-interpolated coarse data needed by an upcoming fine step.
+//!
+//! This is intentionally inert until the temporal boundary-transfer calls are connected
+//! to the MHD task list.  theta is the fine-step start time within the coarse predictor,
+//! with 0, 1/2, and 1 denoting the old, midpoint, and predicted coarse states.
+
+void Driver::PrepareFineLevelBoundaries(Mesh *pmesh, int coarse_level, int fine_level,
+                                        int fine_substep, Real time, Real coarse_dt,
+                                        Real theta) {
+  (void) pmesh;
+  (void) coarse_level;
+  (void) fine_level;
+  (void) fine_substep;
+  (void) time;
+  (void) coarse_dt;
+  (void) theta;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::SynchronizeLevelPair()
+//! \brief Hook for restriction plus cell-flux and edge-EMF register synchronization.
+//!
+//! It remains a no-op while the constructor's not-armed guard is present.  Reflux and
+//! reflux-curl must be implemented here before the recursive schedule can be enabled.
+
+void Driver::SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
+                                  Real sync_time, Real coarse_dt) {
+  (void) pmesh;
+  (void) coarse_level;
+  (void) fine_level;
+  (void) sync_time;
+  (void) coarse_dt;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::AdvanceLevel()
+//! \brief Advance one logical level with RK2 predictor, fine substeps, and corrector.
+//!
+//! The parent predictor is retained in u0/b0 while u1/b1 hold its old state.  Each child
+//! then takes two half-steps.  Once the child catches up, the synchronization hook runs
+//! before the parent corrector.  Output, restart, and regridding are deliberately absent:
+//! they belong only at the root synchronization point in Execute().
+
+void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt) {
+  MeshBlockPack *pmbp = pmesh->pmb_pack;
+  pmbp->SetActiveLevel(level);
+  const bool has_active_blocks = (pmbp->nmb_active > 0);
+
+  if (has_active_blocks) {
+    SetLevelSubcyclingContext(level, substep, time, dt);
+    pmesh->time = time;
+    pmesh->dt = dt;
+    ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+    ExecuteLevelStage(pmesh, level, substep, time, dt, 1);
+  }
+
+  const int fine_level = level + 1;
+  if (fine_level <= pmesh->max_level) {
+    const Real fine_dt = 0.5*dt;
+    const int first_fine_substep = 2*substep;
+
+    PrepareFineLevelBoundaries(pmesh, level, fine_level, first_fine_substep,
+                               time, dt, 0.0);
+    AdvanceLevel(pmesh, fine_level, first_fine_substep, time, fine_dt);
+
+    PrepareFineLevelBoundaries(pmesh, level, fine_level, first_fine_substep + 1,
+                               time + fine_dt, dt, 0.5);
+    AdvanceLevel(pmesh, fine_level, first_fine_substep + 1, time + fine_dt, fine_dt);
+
+    // Restore the parent context before restriction/reflux and its RK2 corrector.
+    pmbp->SetActiveLevel(level);
+    SetLevelSubcyclingContext(level, substep, time, dt);
+    pmesh->time = time;
+    pmesh->dt = dt;
+    SynchronizeLevelPair(pmesh, level, fine_level, time + dt, dt);
+  }
+
+  if (has_active_blocks) {
+    ExecuteLevelStage(pmesh, level, substep, time, dt, 2);
+    ExecuteTaskList(pmesh, "after_timeintegrator", 1);
+  }
 }
 
 //----------------------------------------------------------------------------------------
