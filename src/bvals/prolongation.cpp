@@ -31,11 +31,15 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
                                                bool is_z4c) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
   //bool not_z4c = (pmbp->pz4c == nullptr)? true : false;
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  int nmnv = nmb*nnghbr*nvar;
+  int nmnv = nmb_loop*nnghbr*nvar;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
   auto &rbuf = recvbuf;
@@ -54,16 +58,17 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
   // coarser level and the other the same level is filled properly.
   // (Only needed in multidimensions)
 
-  if (multi_d) {
+  if (multi_d && nmb_loop > 0) {
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
     auto &cks = indcs.cks;
     // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
     Kokkos::parallel_for("ProlCCSame", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-      const int m = (tmember.league_rank())/(nnghbr*nvar);
-      const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-      const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+      const int aidx = (tmember.league_rank())/(nnghbr*nvar);
+      const int n = (tmember.league_rank() - aidx*(nnghbr*nvar))/nvar;
+      const int v = (tmember.league_rank() - aidx*(nnghbr*nvar) - n*nvar);
+      const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
       // only restrict when neighbor exists and is at SAME level
       if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
@@ -135,13 +140,17 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
     bool is_z4c) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
 
   // ptr to z4c, which requires different prolongation/restriction scheme
   //bool not_z4c = (pmbp->pz4c == nullptr)? true : false;
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  int nmnv = nmb*nnghbr*nvar;
+  int nmnv = nmb_loop*nnghbr*nvar;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
   auto &rbuf = recvbuf;
@@ -154,12 +163,15 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
   auto& prolong_2nd = pmy_pack->pmesh->pmr->weights.prolong_2nd;
   auto& prolong_4th = pmy_pack->pmesh->pmr->weights.prolong_4th;
 
+  if (nmb_loop <= 0) {return;}
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
   Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+    const int aidx = (tmember.league_rank())/(nnghbr*nvar);
+    const int n = (tmember.league_rank() - aidx*(nnghbr*nvar))/nvar;
+    const int v = (tmember.league_rank() - aidx*(nnghbr*nvar) - n*nvar);
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
@@ -221,6 +233,12 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
+  const bool all_blocks_active = pmy_pack->all_blocks_active;
+  const int active_offset = pmy_pack->active_offset;
+  const int nmb_target = all_blocks_active ? nmb : pmy_pack->nmb_active;
+  auto active_lids = pmy_pack->active_lids.d_view;
+
+  if (nmb_target <= 0) {return;}
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
@@ -232,7 +250,7 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
   // level. (Only needed in multidimensions)
 
   if (multi_d) {
-    int nmnv = 3*nmb*nnghbr;
+    int nmnv = 3*nmb_target*nnghbr;
     auto &rbuf = recvbuf;
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
@@ -240,9 +258,10 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
     // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
     Kokkos::parallel_for("ProlFCSame", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-      const int m = (tmember.league_rank())/(3*nnghbr);
-      const int n = (tmember.league_rank() - m*(3*nnghbr))/3;
-      const int v = (tmember.league_rank() - m*(3*nnghbr) - 3*n);
+      const int a = (tmember.league_rank())/(3*nnghbr);
+      const int m = all_blocks_active ? a : active_lids(active_offset + a);
+      const int n = (tmember.league_rank() - a*(3*nnghbr))/3;
+      const int v = (tmember.league_rank() - a*(3*nnghbr) - 3*n);
 
       // only restrict when neighbor exists and is at SAME level
       if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
@@ -316,6 +335,12 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
+  const bool all_blocks_active = pmy_pack->all_blocks_active;
+  const int active_offset = pmy_pack->active_offset;
+  const int nmb_target = all_blocks_active ? nmb : pmy_pack->nmb_active;
+  auto active_lids = pmy_pack->active_lids.d_view;
+
+  if (nmb_target <= 0) {return;}
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
@@ -328,13 +353,14 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // MeshRefinement::ProlongateInternalField() in C++ version
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(three field components)
-  {int nmnv = 3*nmb*nnghbr;
+  {int nmnv = 3*nmb_target*nnghbr;
   auto &rbuf = recvbuf;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
   Kokkos::parallel_for("ProFC-2d-shared", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(3*nnghbr);
-    const int n = (tmember.league_rank() - m*(3*nnghbr))/3;
-    const int v = (tmember.league_rank() - m*(3*nnghbr) - 3*n);
+    const int a = (tmember.league_rank())/(3*nnghbr);
+    const int m = all_blocks_active ? a : active_lids(active_offset + a);
+    const int n = (tmember.league_rank() - a*(3*nnghbr))/3;
+    const int v = (tmember.league_rank() - a*(3*nnghbr) - 3*n);
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
@@ -382,13 +408,14 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // interpolation formulae use these values.
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  {int nmn = nmb*nnghbr;
+  {int nmn = nmb_target*nnghbr;
   bool &one_d = pmy_pack->pmesh->one_d;
   auto &rbuf = recvbuf;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmn, Kokkos::AUTO);
   Kokkos::parallel_for("ProFC-2d-int", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr);
-    const int n = (tmember.league_rank() - m*(nnghbr));
+    const int a = (tmember.league_rank())/(nnghbr);
+    const int m = all_blocks_active ? a : active_lids(active_offset + a);
+    const int n = (tmember.league_rank() - a*(nnghbr));
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {

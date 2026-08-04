@@ -165,6 +165,8 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
 
   // functions to communicate CC data
   TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
+  TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
+                           const DvceArray5D<Real> &old_a, Real theta);
   TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
   // functions to communicate fluxes of CC data
   TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx);
@@ -180,6 +182,11 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
                              DvceArray5D<Real> &prim);
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, const DvceFaceFld4D<Real> &b,
                            DvceArray5D<Real> &cons);
+
+ private:
+  TaskStatus PackAndSendCCImpl(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
+                               const DvceArray5D<Real> &old_a, Real theta,
+                               bool temporal_interp);
 };
 
 //----------------------------------------------------------------------------------------
@@ -196,6 +203,8 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
   TaskStatus InitFluxRecv(const int nvar) override;
 
   TaskStatus PackAndSendFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
+  TaskStatus PackAndSendFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb,
+                           const DvceFaceFld4D<Real> &old_b, Real theta);
   TaskStatus RecvAndUnpackFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
   void FillCoarseInBndryFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
   void ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);

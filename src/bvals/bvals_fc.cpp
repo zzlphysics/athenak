@@ -39,9 +39,34 @@ MeshBoundaryValuesFC::MeshBoundaryValuesFC(MeshBlockPack *pp, ParameterInput *pi
 
 TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
                                                DvceFaceFld4D<Real> &cb) {
+  // Passing the current field as both temporal endpoints makes the legacy path exactly
+  // time independent.  The overload below only uses old_b for a coarse donor feeding an
+  // active finer-level destination.
+  return PackAndSendFC(b, cb, b, 1.0);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBoundaryValuesFC::PackAndSendFC()
+//! \brief Level-local variant with coarse-donor time interpolation.
+//!
+//! When a logical level is active, all local MeshBlocks remain available as donors, but
+//! only buffers whose destination is on that active level are populated.  A coarse face
+//! field sent to a finer active destination is interpolated componentwise between old_b
+//! and b.  Since the discrete divergence is a linear operator, interpolating the face
+//! fields before the usual divergence-preserving prolongation preserves div(B)=0 when it
+//! holds at both temporal endpoints.
+
+TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
+                                               DvceFaceFld4D<Real> &cb,
+                                               const DvceFaceFld4D<Real> &old_b,
+                                               Real theta) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
+  const bool all_blocks_active = pmy_pack->all_blocks_active;
+  const int active_level = pmy_pack->active_level;
+  const Real old_weight = 1.0 - theta;
+  const Real new_weight = theta;
 
   {int my_rank = global_variable::my_rank;
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -60,7 +85,8 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
     // scalar loop over neighbors to prevent race condition in overlapping assignments
     for (int n=0; n<nnghbr; ++n) {
       // only load buffers when neighbor exists
-      if (nghbr.d_view(m,n).gid >= 0) {
+      if ((nghbr.d_view(m,n).gid >= 0) &&
+          (all_blocks_active || nghbr.d_view(m,n).lev == active_level)) {
         // if neighbor is at coarser level, use cindices to pack buffer
         // Note indices can be different for each component of face-centered field.
         int il, iu, jl, ju, kl, ku, ndat;
@@ -105,6 +131,8 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
         if (nghbr.d_view(m,n).rank == my_rank) {
           // if neighbor is at same or finer level, load data from b0
           if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+            const bool interp_coarse_donor =
+                (nghbr.d_view(m,n).lev > mblev.d_view(m));
             Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkji),
             [&](const int idx) {
               int k = (idx)/nji;
@@ -113,11 +141,35 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
               k += kl;
               j += jl;
               if (v==0) {
-                rbuf[dn].vars(dm,i-il + ni*(j-jl + nj*(k-kl))) = b.x1f(m,k,j,i);
+                Real value = b.x1f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x1f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x1f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                rbuf[dn].vars(dm,i-il + ni*(j-jl + nj*(k-kl))) = value;
               } else if (v==1) {
-                rbuf[dn].vars(dm,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = b.x2f(m,k,j,i);
+                Real value = b.x2f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x2f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x2f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                rbuf[dn].vars(dm,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = value;
               } else if (v==2) {
-                rbuf[dn].vars(dm,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = b.x3f(m,k,j,i);
+                Real value = b.x3f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x3f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x3f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                rbuf[dn].vars(dm,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = value;
               }
             });
           // if neighbor is at coarser level, load data from coarse_b0
@@ -143,6 +195,8 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
         } else {
           // if neighbor is at same or finer level, load data from b0
           if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+            const bool interp_coarse_donor =
+                (nghbr.d_view(m,n).lev > mblev.d_view(m));
             Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkji),
             [&](const int idx) {
               int k = (idx)/nji;
@@ -151,11 +205,35 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
               k += kl;
               j += jl;
               if (v==0) {
-                sbuf[n].vars(m,i-il + ni*(j-jl + nj*(k-kl))) = b.x1f(m,k,j,i);
+                Real value = b.x1f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x1f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x1f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                sbuf[n].vars(m,i-il + ni*(j-jl + nj*(k-kl))) = value;
               } else if (v==1) {
-                sbuf[n].vars(m,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = b.x2f(m,k,j,i);
+                Real value = b.x2f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x2f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x2f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                sbuf[n].vars(m,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = value;
               } else if (v==2) {
-                sbuf[n].vars(m,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = b.x3f(m,k,j,i);
+                Real value = b.x3f(m,k,j,i);
+                if (interp_coarse_donor) {
+                  if (theta == 0.0) {
+                    value = old_b.x3f(m,k,j,i);
+                  } else if (theta != 1.0) {
+                    value = old_weight*old_b.x3f(m,k,j,i) + new_weight*value;
+                  }
+                }
+                sbuf[n].vars(m,ndat*v + i-il + ni*(j-jl + nj*(k-kl))) = value;
               }
             });
           // if neighbor is at coarser level, load data from coarse_b0
@@ -191,7 +269,8 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFC(DvceFaceFld4D<Real> &b,
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0) {  // neighbor exists and not a physical boundary
+      if ((nghbr.h_view(m,n).gid >= 0) &&
+          (all_blocks_active || nghbr.h_view(m,n).lev == active_level)) {
         // index and rank of destination Neighbor
         int dn = nghbr.h_view(m,n).dest;
         int drank = nghbr.h_view(m,n).rank;
@@ -237,6 +316,10 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFC(DvceFaceFld4D<Real> &b,
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
+  const bool all_blocks_active = pmy_pack->all_blocks_active;
+  const int active_offset = pmy_pack->active_offset;
+  const int nmb_target = all_blocks_active ? nmb : pmy_pack->nmb_active;
+  auto active_lids = pmy_pack->active_lids.d_view;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &rbuf = recvbuf;
 #if MPI_PARALLEL_ENABLED
@@ -244,7 +327,8 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFC(DvceFaceFld4D<Real> &b,
 
   bool bflag = false;
   bool no_errors=true;
-  for (int m=0; m<nmb; ++m) {
+  for (int a=0; a<nmb_target; ++a) {
+    int m = all_blocks_active ? a : pmy_pack->active_lids.h_view(active_offset + a);
     for (int n=0; n<nnghbr; ++n) {
       if (nghbr.h_view(m,n).gid >= 0) { // ID != -1, so not a physical boundary
         if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
@@ -269,13 +353,16 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFC(DvceFaceFld4D<Real> &b,
   if (bflag) {return TaskStatus::incomplete;}
 #endif
 
+  if (nmb_target <= 0) {return TaskStatus::complete;}
+
   //----- STEP 2: buffers have all completed, so unpack 3-components of field
 
   auto &mblev = pmy_pack->pmb->mb_lev;
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(three field components)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (3*nmb), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (3*nmb_target), Kokkos::AUTO);
   Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/3;
+    const int a = tmember.league_rank()/3;
+    const int m = all_blocks_active ? a : active_lids(active_offset + a);
     const int v = tmember.league_rank()%3;
 
     // scalar loop over neighbors to prevent race condition in overlapping assignments

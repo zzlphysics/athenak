@@ -36,6 +36,10 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
                                                  DvceArray5D<Real> &prim) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
 
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -53,11 +57,14 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
 
+  if (nmb_loop <= 0) {return;}
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb_loop*nnghbr), Kokkos::AUTO);
   Kokkos::parallel_for("Prol_C2P_CC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+    const int aidx = tmember.league_rank()/nnghbr;
+    const int n = tmember.league_rank() - aidx*nnghbr;
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only convert coarse vars when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
@@ -191,6 +198,10 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
                                                DvceArray5D<Real> &cons) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
 
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -208,11 +219,14 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
 
+  if (nmb_loop <= 0) {return;}
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb_loop*nnghbr), Kokkos::AUTO);
   Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+    const int aidx = tmember.league_rank()/nnghbr;
+    const int n = tmember.league_rank() - aidx*nnghbr;
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
@@ -304,6 +318,10 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
                                  const DvceFaceFld4D<Real> &b, DvceArray5D<Real> &prim) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
 
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -321,11 +339,14 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
 
+  if (nmb_loop <= 0) {return;}
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb_loop*nnghbr), Kokkos::AUTO);
   Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+    const int aidx = tmember.league_rank()/nnghbr;
+    const int n = tmember.league_rank() - aidx*nnghbr;
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only convert coarse vars when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
@@ -466,6 +487,10 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
                                const DvceFaceFld4D<Real> &b, DvceArray5D<Real> &cons) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
   int nnghbr = pmy_pack->pmb->nnghbr;
 
   auto &nghbr = pmy_pack->pmb->nghbr;
@@ -483,11 +508,14 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
 
+  if (nmb_loop <= 0) {return;}
+
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb_loop*nnghbr), Kokkos::AUTO);
   Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+    const int aidx = tmember.league_rank()/nnghbr;
+    const int n = tmember.league_rank() - aidx*nnghbr;
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {

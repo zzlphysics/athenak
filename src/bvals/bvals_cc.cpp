@@ -40,6 +40,33 @@ MeshBoundaryValuesCC::MeshBoundaryValuesCC(MeshBlockPack *pp, ParameterInput *pi
 
 TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
                                                DvceArray5D<Real> &ca) {
+  return PackAndSendCCImpl(a, ca, a, 0.0, false);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBoundaryValuesCC::PackAndSendCC()
+//! \brief Pack CC boundary values, interpolating coarse donors in time when requested.
+//!
+//! This overload is used by level subcycling.  old_a and a contain the coarse state at
+//! the beginning and predicted end of the coarse step, respectively.  Only data sent
+//! from a coarse source to a finer destination are interpolated; same-level and fine-to-
+//! coarse transfers retain their usual state.
+
+TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
+                                               DvceArray5D<Real> &ca,
+                                               const DvceArray5D<Real> &old_a,
+                                               Real theta) {
+  return PackAndSendCCImpl(a, ca, old_a, theta, true);
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Implementation shared by the legacy and time-interpolated CC packing paths.
+
+TaskStatus MeshBoundaryValuesCC::PackAndSendCCImpl(DvceArray5D<Real> &a,
+                                                   DvceArray5D<Real> &ca,
+                                                   const DvceArray5D<Real> &old_a,
+                                                   Real theta,
+                                                   bool temporal_interp) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -53,6 +80,12 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
   auto &rbuf = recvbuf;
   auto &is_z4c = is_z4c_;
   auto &multilevel = pmy_pack->pmesh->multilevel;
+  auto old = old_a;
+  const Real omt = 1.0 - theta;
+  const bool at_old_time = (theta == 0.0);
+  const bool at_new_time = (theta == 1.0);
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int active_level = pmy_pack->active_level;
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   int nmnv = nmb*nnghbr*nvar;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
@@ -62,7 +95,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
     const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
 
     // only load buffers when neighbor exists
-    if (nghbr.d_view(m,n).gid >= 0) {
+    if ((nghbr.d_view(m,n).gid >= 0) &&
+        (!active_only || nghbr.d_view(m,n).lev == active_level)) {
       // if neighbor is at coarser level, use coar indices to pack buffer
       int il, iu, jl, ju, kl, ku;
       if (nghbr.d_view(m,n).lev < mblev.d_view(m)) {
@@ -113,7 +147,18 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
           if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
             [&](const int i) {
-              rbuf[dn].vars(dm, (i-il + ni*(j-jl + nj*(k-kl + nk*v))) ) = a(m,v,k,j,i);
+              const int idx = i-il + ni*(j-jl + nj*(k-kl + nk*v));
+              if (temporal_interp && nghbr.d_view(m,n).lev > mblev.d_view(m)) {
+                if (at_old_time) {
+                  rbuf[dn].vars(dm, idx) = old(m,v,k,j,i);
+                } else if (at_new_time) {
+                  rbuf[dn].vars(dm, idx) = a(m,v,k,j,i);
+                } else {
+                  rbuf[dn].vars(dm, idx) = omt*old(m,v,k,j,i) + theta*a(m,v,k,j,i);
+                }
+              } else {
+                rbuf[dn].vars(dm, idx) = a(m,v,k,j,i);
+              }
             });
           // if neighbor is at coarser level, load data from coarse_u0
           } else {
@@ -130,7 +175,18 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
           if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember,il,iu+1),
             [&](const int i) {
-              sbuf[n].vars(m, (i-il + ni*(j-jl + nj*(k-kl + nk*v))) ) = a(m,v,k,j,i);
+              const int idx = i-il + ni*(j-jl + nj*(k-kl + nk*v));
+              if (temporal_interp && nghbr.d_view(m,n).lev > mblev.d_view(m)) {
+                if (at_old_time) {
+                  sbuf[n].vars(m, idx) = old(m,v,k,j,i);
+                } else if (at_new_time) {
+                  sbuf[n].vars(m, idx) = a(m,v,k,j,i);
+                } else {
+                  sbuf[n].vars(m, idx) = omt*old(m,v,k,j,i) + theta*a(m,v,k,j,i);
+                }
+              } else {
+                sbuf[n].vars(m, idx) = a(m,v,k,j,i);
+              }
             });
           // if neighbor is at coarser level, load data from coarse_u0
           } else {
@@ -151,7 +207,8 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
     const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
 
     // only load buffers when neighbor exists
-    if (nghbr.d_view(m,n).gid >= 0) {
+    if ((nghbr.d_view(m,n).gid >= 0) &&
+        (!active_only || nghbr.d_view(m,n).lev == active_level)) {
       int il, iu, jl, ju, kl, ku;
       // If neighbor is at same level and data is for Z4c module, append data from coarse
       // array for higher-order prolongation
@@ -212,7 +269,10 @@ TaskStatus MeshBoundaryValuesCC::PackAndSendCC(DvceArray5D<Real> &a,
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0) {  // neighbor exists and not a physical boundary
+      if ((nghbr.h_view(m,n).gid >= 0) &&
+          (pmy_pack->all_blocks_active ||
+           nghbr.h_view(m,n).lev == pmy_pack->active_level)) {
+        // neighbor exists and is a destination advanced by this level step
         // index and rank of destination Neighbor
         int dn = nghbr.h_view(m,n).dest;
         int drank = nghbr.h_view(m,n).rank;
@@ -300,13 +360,22 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   auto &mblev = pmy_pack->pmb->mb_lev;
+  const bool active_only = !(pmy_pack->all_blocks_active);
+  const int nmb_loop = active_only ? pmy_pack->nmb_active : nmb;
+  const int active_offset = pmy_pack->active_offset;
+  auto active_lids = pmy_pack->active_lids.d_view;
+
+  // Ranks without a block on this level have no local destination to unpack.  Level
+  // subcycling is currently restricted to one MPI rank, so no remote receives remain.
+  if (nmb_loop <= 0) {return TaskStatus::complete;}
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr*nvar), Kokkos::AUTO);
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb_loop*nnghbr*nvar), Kokkos::AUTO);
   Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+    const int aidx = (tmember.league_rank())/(nnghbr*nvar);
+    const int n = (tmember.league_rank() - aidx*(nnghbr*nvar))/nvar;
+    const int v = (tmember.league_rank() - aidx*(nnghbr*nvar) - n*nvar);
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
 
     // only unpack buffers when neighbor exists
     if (nghbr.d_view(m,n).gid >= 0) {
@@ -368,9 +437,10 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::parallel_for("RecvBuff", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+    const int aidx = (tmember.league_rank())/(nnghbr*nvar);
+    const int n = (tmember.league_rank() - aidx*(nnghbr*nvar))/nvar;
+    const int v = (tmember.league_rank() - aidx*(nnghbr*nvar) - n*nvar);
+    const int m = active_only ? active_lids(active_offset + aidx) : aidx;
     // only unpack buffers when neighbor exists
     if (nghbr.d_view(m,n).gid >= 0) {
       int il, iu, jl, ju, kl, ku;
