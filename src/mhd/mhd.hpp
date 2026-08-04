@@ -150,6 +150,13 @@ class MHD {
   // functions...
   void SetSaveWBcc();
   void AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
+  // Single-rank static-SMR synchronization used by the guarded level-subcycling path.
+  // Registers are allocated only when this initializer is called, so legacy stepping
+  // retains its historical memory footprint.
+  void InitializeLevelSubcyclingRegisters();
+  void ResetLevelSubcyclingRegisters(int coarse_level);
+  void ApplyLevelSubcyclingRegisters(int coarse_level);
+  void ApplyEMFReflux();
   // ...in "before_timeintegrator" task list
   TaskStatus SaveMHDState(Driver *d, int stage);
   // ...in "before_stagen_tl" task list

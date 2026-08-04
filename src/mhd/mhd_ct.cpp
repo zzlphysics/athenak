@@ -83,4 +83,63 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
 
   return TaskStatus::complete;
 }
+
+//----------------------------------------------------------------------------------------
+//! \fn MHD::ApplyEMFReflux()
+//! \brief Apply the curl of a time-integrated fine-minus-coarse EMF mismatch.
+//!
+//! The boundary layer has already assembled efld from the persistent EMF registers,
+//! including the same face/edge overlap rules used by the legacy CT synchronization.
+//! Consequently there is no RK coefficient here: efld has units E*dt.  Applying the
+//! correction as one discrete curl makes its discrete divergence telescope to roundoff,
+//! including at coarse/fine T-junctions.
+
+void MHD::ApplyEMFReflux() {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  auto active_lids = pmy_pack->active_lids.d_view;
+  const int active_offset = pmy_pack->active_offset;
+  const int nmb_active = pmy_pack->nmb_active;
+
+  const bool multi_d = pmy_pack->pmesh->multi_d;
+  const bool three_d = pmy_pack->pmesh->three_d;
+  auto e1 = efld.x1e;
+  auto e2 = efld.x2e;
+  auto e3 = efld.x3e;
+  auto &mbsize = pmy_pack->pmb->mb_size;
+
+  if (multi_d) {
+    auto bx1f = b0.x1f;
+    par_for_active("reflux-ct-b1", DevExeSpace(), active_lids, active_offset, nmb_active,
+    ks, ke, js, je, is, ie+1,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      bx1f(m,k,j,i) -= (e3(m,k,j+1,i) - e3(m,k,j,i))/mbsize.d_view(m).dx2;
+      if (three_d) {
+        bx1f(m,k,j,i) += (e2(m,k+1,j,i) - e2(m,k,j,i))/mbsize.d_view(m).dx3;
+      }
+    });
+  }
+
+  auto bx2f = b0.x2f;
+  par_for_active("reflux-ct-b2", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke, js, je+1, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    bx2f(m,k,j,i) += (e3(m,k,j,i+1) - e3(m,k,j,i))/mbsize.d_view(m).dx1;
+    if (three_d) {
+      bx2f(m,k,j,i) -= (e1(m,k+1,j,i) - e1(m,k,j,i))/mbsize.d_view(m).dx3;
+    }
+  });
+
+  auto bx3f = b0.x3f;
+  par_for_active("reflux-ct-b3", DevExeSpace(), active_lids, active_offset, nmb_active,
+  ks, ke+1, js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    bx3f(m,k,j,i) -= (e2(m,k,j,i+1) - e2(m,k,j,i))/mbsize.d_view(m).dx1;
+    if (multi_d) {
+      bx3f(m,k,j,i) += (e1(m,k,j+1,i) - e1(m,k,j,i))/mbsize.d_view(m).dx2;
+    }
+  });
+}
 } // namespace mhd

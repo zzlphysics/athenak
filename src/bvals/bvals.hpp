@@ -74,8 +74,10 @@ struct MeshBoundaryBuffer {
   // Maximum number of data elements (bie-bis+1) across 3 components of above
   int isame_ndat, isame_z4c_ndat, icoar_ndat, ifine_ndat, iflxs_ndat, iflxc_ndat;
 
-  // 2D Views that store buffer data on device, dimensioned (nmb, ndata)
-  DvceArray2D<Real> vars, flux;
+  // 2D Views that store buffer data on device, dimensioned (nmb, ndata).  flux_reg is
+  // deliberately not allocated by AllocateBuffers(); level subcycling opts in through
+  // the derived boundary class, so the legacy stepping path has no register allocation.
+  DvceArray2D<Real> vars, flux, flux_reg;
 
 #if MPI_PARALLEL_ENABLED
   // vectors of length (number of MBs) to hold MPI requests
@@ -172,6 +174,17 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx);
   TaskStatus RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx);
 
+  // Persistent, single-rank RK2 flux registers used by level subcycling.  Each receive-
+  // side register is keyed by (coarse MeshBlock, coarse-side neighbor index).  The stage
+  // weight is the RK quadrature weight including dt (dt/2 for both stages of RK2).
+  void InitializeFluxRegistersCC(int nvar);
+  TaskStatus ResetFluxRegistersCC(int coarse_level);
+  TaskStatus AccumulateFluxRegistersCC(DvceFaceFld5D<Real> &flx, Real stage_weight);
+  TaskStatus ApplyFluxRegistersCC(DvceArray5D<Real> &cons,
+                                  DvceFaceFld5D<Real> &flux_scratch,
+                                  int coarse_level);
+  bool FluxRegistersCCInitialized() const {return flux_reg_nvar_ > 0;}
+
   // functions to prolongate conserved and primitive CC variables
   void FillCoarseInBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
        bool is_z4c=false);
@@ -184,6 +197,7 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
                            DvceArray5D<Real> &cons);
 
  private:
+  int flux_reg_nvar_ = 0;
   TaskStatus PackAndSendCCImpl(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
                                const DvceArray5D<Real> &old_a, Real theta,
                                bool temporal_interp);
@@ -210,11 +224,18 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
   void ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
 
   TaskStatus PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx);
+  TaskStatus PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx, bool same_level_only);
   TaskStatus RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx);
+  TaskStatus RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx, bool same_level_only);
+  void InitializeFluxRegistersFC();
+  TaskStatus ResetFluxRegistersFC(int coarse_level);
+  TaskStatus AccumulateFluxRegistersFC(DvceEdgeFld4D<Real> &flx, Real stage_weight);
+  TaskStatus LoadFluxRegistersFC(DvceEdgeFld4D<Real> &flx_scratch, int coarse_level);
   void SumBoundaryFluxes(DvceEdgeFld4D<Real> &flx, const bool same_level,
                          DvceArray2D<int> &nflx);
   void ZeroFluxesAtBoundaryWithFiner(DvceEdgeFld4D<Real> &flx, DvceArray2D<int> &nflx);
-  void AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx, DvceArray2D<int> &nflx);
+  void AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx, DvceArray2D<int> &nflx,
+                             const bool same_level_only=false);
 };
 
 //----------------------------------------------------------------------------------------

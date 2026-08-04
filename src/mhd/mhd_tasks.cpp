@@ -85,6 +85,33 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
 }
 
 //----------------------------------------------------------------------------------------
+//! \brief Allocate the persistent CC/EMF registers used only by level subcycling.
+
+void MHD::InitializeLevelSubcyclingRegisters() {
+  pbval_u->InitializeFluxRegistersCC(nmhd + nscalars);
+  pbval_b->InitializeFluxRegistersFC();
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Start a new coarse-level step without disturbing an ancestor's register.
+
+void MHD::ResetLevelSubcyclingRegisters(int coarse_level) {
+  (void) pbval_u->ResetFluxRegistersCC(coarse_level);
+  (void) pbval_b->ResetFluxRegistersFC(coarse_level);
+  Kokkos::fence();
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Apply time-integrated conservative and CT synchronization corrections.
+
+void MHD::ApplyLevelSubcyclingRegisters(int coarse_level) {
+  (void) pbval_u->ApplyFluxRegistersCC(u0, uflx, coarse_level);
+  (void) pbval_b->LoadFluxRegistersFC(efld, coarse_level);
+  ApplyEMFReflux();
+  Kokkos::fence();
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn TaskStatus MHD::SaveMHDState
 //! \brief Copy primitives and bcc before step to enable computation of time derivatives,
 //! for example to compute jcon in GRMHD.
@@ -263,6 +290,12 @@ TaskStatus MHD::Fluxes(Driver *pdrive, int stage) {
 
 TaskStatus MHD::SendFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
+  if (pdrive->LevelSubcyclingRequested()) {
+    // Heun RK2 integrates the interface flux with dt/2 from each of its two RHS
+    // evaluations.  Driver::beta is {1,1/2} and therefore is not the quadrature weight.
+    const Real stage_weight = 0.5*pdrive->level_subcycling.dt;
+    return pbval_u->AccumulateFluxRegistersCC(uflx, stage_weight);
+  }
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel)  {
     tstat = pbval_u->PackAndSendFluxCC(uflx);
@@ -277,6 +310,9 @@ TaskStatus MHD::SendFlux(Driver *pdrive, int stage) {
 
 TaskStatus MHD::RecvFlux(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
+  if (pdrive->LevelSubcyclingRequested()) {
+    return tstat;
+  }
   // Only execute BoundaryValues function with SMR/SMR
   if (pmy_pack->pmesh->multilevel) {
     tstat = pbval_u->RecvAndUnpackFluxCC(uflx);
@@ -364,7 +400,16 @@ TaskStatus MHD::RestrictU(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to pack/send cell-centered conserved variables
 
 TaskStatus MHD::SendU(Driver *pdrive, int stage) {
-  TaskStatus tstat = pbval_u->PackAndSendCC(u0, coarse_u0);
+  TaskStatus tstat;
+  if (pdrive->LevelSubcyclingRequested()) {
+    Real theta = 1.0;
+    if (pdrive->level_subcycling.active_level > pmy_pack->pmesh->root_level) {
+      theta = ((pdrive->level_subcycling.substep & 1) == 0) ? 0.5 : 1.0;
+    }
+    tstat = pbval_u->PackAndSendCC(u0, coarse_u0, u1, theta);
+  } else {
+    tstat = pbval_u->PackAndSendCC(u0, coarse_u0);
+  }
   return tstat;
 }
 
@@ -431,7 +476,7 @@ TaskStatus MHD::EFieldSrc(Driver *pdrive, int stage) {
 
 TaskStatus MHD::SendE(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  tstat = pbval_b->PackAndSendFluxFC(efld);
+  tstat = pbval_b->PackAndSendFluxFC(efld, pdrive->LevelSubcyclingRequested());
   return tstat;
 }
 
@@ -442,7 +487,11 @@ TaskStatus MHD::SendE(Driver *pdrive, int stage) {
 
 TaskStatus MHD::RecvE(Driver *pdrive, int stage) {
   TaskStatus tstat = TaskStatus::complete;
-  tstat = pbval_b->RecvAndUnpackFluxFC(efld);
+  tstat = pbval_b->RecvAndUnpackFluxFC(efld, pdrive->LevelSubcyclingRequested());
+  if (tstat == TaskStatus::complete && pdrive->LevelSubcyclingRequested()) {
+    const Real stage_weight = 0.5*pdrive->level_subcycling.dt;
+    tstat = pbval_b->AccumulateFluxRegistersFC(efld, stage_weight);
+  }
   return tstat;
 }
 
@@ -483,7 +532,16 @@ TaskStatus MHD::RecvB_OA(Driver *pdrive, int stage) {
 //! \brief Wrapper task list function to pack/send face-centered magnetic fields
 
 TaskStatus MHD::SendB(Driver *pdrive, int stage) {
-  TaskStatus tstat = pbval_b->PackAndSendFC(b0, coarse_b0);
+  TaskStatus tstat;
+  if (pdrive->LevelSubcyclingRequested()) {
+    Real theta = 1.0;
+    if (pdrive->level_subcycling.active_level > pmy_pack->pmesh->root_level) {
+      theta = ((pdrive->level_subcycling.substep & 1) == 0) ? 0.5 : 1.0;
+    }
+    tstat = pbval_b->PackAndSendFC(b0, coarse_b0, b1, theta);
+  } else {
+    tstat = pbval_b->PackAndSendFC(b0, coarse_b0);
+  }
   return tstat;
 }
 

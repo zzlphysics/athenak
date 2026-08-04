@@ -7,6 +7,8 @@
 //! \brief functions to pack/send and recv/unpack fluxes (emfs) for face-centered fields
 //! (magnetic fields) at fine/coarse boundaries for the flux correction step.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 
@@ -15,6 +17,366 @@
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "bvals.hpp"
+
+namespace {
+
+bool IsFCFluxBuffer(const int n) {
+  return n >= 0 && n < 48;
+}
+
+[[noreturn]] void FluxRegisterFCError(const char *message) {
+  if (global_variable::my_rank == 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
+              << "Face-centered level EMF register: " << message << std::endl;
+  }
+  std::exit(EXIT_FAILURE);
+}
+
+void ValidateFluxRegistersFC(MeshBoundaryBuffer *rbuf, const int nnghbr,
+                             const int nmb) {
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    const int ndata = 3*rbuf[n].iflxc_ndat;
+    if (ndata > 0 &&
+        (rbuf[n].flux_reg.extent_int(0) < nmb ||
+         rbuf[n].flux_reg.extent_int(1) < ndata)) {
+      FluxRegisterFCError("register operation called before initialization");
+    }
+  }
+}
+
+}  // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn void MeshBoundaryValuesFC::InitializeFluxRegistersFC()
+//! \brief Explicitly allocate persistent receive-side EMF registers for subcycling.
+//!
+//! Registers are keyed by (coarse MeshBlock, coarse-side neighbor buffer).  They are
+//! deliberately separate from the transient same-level EMF communication buffers, and
+//! are allocated only when level subcycling opts in.
+
+void MeshBoundaryValuesFC::InitializeFluxRegistersFC() {
+  if (global_variable::nranks != 1 || pmy_pack->pmesh->nmb_packs_thisrank != 1) {
+    FluxRegisterFCError("the initial implementation requires one rank and one MeshBlockPack");
+  }
+  if (!(pmy_pack->pmesh->multilevel) || pmy_pack->pmesh->adaptive) {
+    FluxRegisterFCError("the initial implementation requires static mesh refinement");
+  }
+
+  const int nmb = std::max(pmy_pack->nmb_thispack,
+                           pmy_pack->pmesh->nmb_maxperrank);
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+
+  bool any_initialized = false;
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    any_initialized = any_initialized || (recvbuf[n].flux_reg.extent_int(0) > 0);
+  }
+  if (any_initialized) {
+    ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+    return;
+  }
+
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    const int ndata = 3*recvbuf[n].iflxc_ndat;
+    if (ndata > 0) {
+      Kokkos::realloc(recvbuf[n].flux_reg, nmb, ndata);
+      Kokkos::deep_copy(recvbuf[n].flux_reg, 0.0);
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesFC::ResetFluxRegistersFC()
+//! \brief Clear registers owned by coarse_level at interfaces with coarse_level+1.
+//!
+//! Registers owned by a coarser recursive caller remain intact while this level advances
+//! through either of its child steps.
+
+TaskStatus MeshBoundaryValuesFC::ResetFluxRegistersFC(int coarse_level) {
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+  auto &rbuf = recvbuf;
+
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    const int ndata = 3*rbuf[n].iflxc_ndat;
+    if (ndata <= 0) {
+      continue;
+    }
+    auto reg = rbuf[n].flux_reg;
+    Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb, Kokkos::AUTO);
+    Kokkos::parallel_for("reset_fc_emf_register", policy,
+    KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = tmember.league_rank();
+      if ((mblev.d_view(m) == coarse_level) &&
+          (nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev == coarse_level + 1)) {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+        [&](const int q) {
+          reg(m,q) = 0.0;
+        });
+      }
+    });
+  }
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC()
+//! \brief Add one RK2 stage to persistent coarse/fine EMF mismatch registers.
+//!
+//! stage_weight includes both the RK quadrature coefficient and the active-level dt; it
+//! is dt/2 for each stage of Heun RK2.  Active coarse blocks add -weight*E_coarse to
+//! their own coarse-side keys.  Active fine blocks restrict edge EMFs exactly as the
+//! legacy PackAndSendFluxFC path and atomically add +weight*E_fine to the destination
+//! coarse key.  The register therefore stores the time-integrated fine-minus-coarse EMF.
+
+TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
+    DvceEdgeFld4D<Real> &flx, Real stage_weight) {
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+  if (!(stage_weight > 0.0) || !std::isfinite(stage_weight)) {
+    FluxRegisterFCError("stage weight must be positive, finite, and include the RK time weight");
+  }
+  if (pmy_pack->all_blocks_active || pmy_pack->active_level < 0) {
+    FluxRegisterFCError("an explicit active logical level must be selected before accumulation");
+  }
+  if (pmy_pack->nmb_active <= 0) {
+    return TaskStatus::complete;
+  }
+
+  const int nactive = pmy_pack->nmb_active;
+  const int active_offset = pmy_pack->active_offset;
+  const int cis = pmy_pack->pmesh->mb_indcs.cis;
+  const int cjs = pmy_pack->pmesh->mb_indcs.cjs;
+  const int cks = pmy_pack->pmesh->mb_indcs.cks;
+  const int my_rank = global_variable::my_rank;
+  const bool one_d = pmy_pack->pmesh->one_d;
+  const bool two_d = pmy_pack->pmesh->two_d;
+
+  auto active_lids = pmy_pack->active_lids.d_view;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mbgid = pmy_pack->pmb->mb_gid;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+  auto &sbuf = sendbuf;
+  auto &rbuf = recvbuf;
+
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), 3*nactive*nnghbr, Kokkos::AUTO);
+  Kokkos::parallel_for("accumulate_fc_emf_register", policy,
+  KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/(3*nnghbr);
+    const int n = (tmember.league_rank() - a*(3*nnghbr))/3;
+    const int v = tmember.league_rank() - a*(3*nnghbr) - 3*n;
+    const int m = active_lids(active_offset + a);
+
+    if (n >= 48 || nghbr.d_view(m,n).gid < 0) {
+      return;
+    }
+    const bool component_used =
+        ((n < 8) && (v == 1 || v == 2)) ||
+        ((n >= 8 && n < 16) && (v == 0 || v == 2)) ||
+        ((n >= 16 && n < 24) && v == 2) ||
+        ((n >= 24 && n < 32) && (v == 0 || v == 1)) ||
+        ((n >= 32 && n < 40) && v == 1) ||
+        ((n >= 40) && v == 0);
+    if (!component_used) {
+      return;
+    }
+
+    const int source_level = mblev.d_view(m);
+    const int neighbor_level = nghbr.d_view(m,n).lev;
+    const bool source_is_coarse = (neighbor_level == source_level + 1);
+    const bool source_is_fine = (neighbor_level + 1 == source_level);
+    if (!(source_is_coarse || source_is_fine)) {
+      return;
+    }
+    if (source_is_fine && nghbr.d_view(m,n).rank != my_rank) {
+      return;
+    }
+
+    int dm = m;
+    int dn = n;
+    int il, iu, jl, ju, kl, ku, ndat;
+    if (source_is_coarse) {
+      il = rbuf[n].iflux_coar[v].bis;
+      iu = rbuf[n].iflux_coar[v].bie;
+      jl = rbuf[n].iflux_coar[v].bjs;
+      ju = rbuf[n].iflux_coar[v].bje;
+      kl = rbuf[n].iflux_coar[v].bks;
+      ku = rbuf[n].iflux_coar[v].bke;
+      ndat = rbuf[n].iflxc_ndat;
+    } else {
+      dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
+      dn = nghbr.d_view(m,n).dest;
+      il = sbuf[n].iflux_coar[v].bis;
+      iu = sbuf[n].iflux_coar[v].bie;
+      jl = sbuf[n].iflux_coar[v].bjs;
+      ju = sbuf[n].iflux_coar[v].bje;
+      kl = sbuf[n].iflux_coar[v].bks;
+      ku = sbuf[n].iflux_coar[v].bke;
+      ndat = sbuf[n].iflxc_ndat;
+    }
+    const int ni = iu - il + 1;
+    const int nj = ju - jl + 1;
+    const int nk = ku - kl + 1;
+    const int nji = nj*ni;
+    const int nkj = nk*nj;
+    const int nki = nk*ni;
+    const Real coefficient = source_is_coarse ? -stage_weight : stage_weight;
+
+    // x1faces: only x2e and x3e are tangential to the interface.
+    if (n < 8) {
+      const int fi = 2*il - cis;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj),
+      [&](const int idx) {
+        int k = idx/nj;
+        int j = idx - k*nj;
+        k += kl;
+        j += jl;
+        const int fj = 2*j - cjs;
+        const int fk = 2*k - cks;
+        Real emf;
+        if (v == 1) {
+          if (source_is_coarse) {
+            emf = flx.x2e(m,k,j,il);
+          } else if (one_d) {
+            emf = flx.x2e(m,0,0,fi);
+          } else if (two_d) {
+            emf = 0.5*(flx.x2e(m,0,fj,fi) + flx.x2e(m,0,fj+1,fi));
+          } else {
+            emf = 0.5*(flx.x2e(m,fk,fj,fi) + flx.x2e(m,fk,fj+1,fi));
+          }
+        } else {
+          if (source_is_coarse) {
+            emf = flx.x3e(m,k,j,il);
+          } else if (one_d) {
+            emf = flx.x3e(m,0,0,fi);
+          } else if (two_d) {
+            emf = flx.x3e(m,0,fj,fi);
+          } else {
+            emf = 0.5*(flx.x3e(m,fk,fj,fi) + flx.x3e(m,fk+1,fj,fi));
+          }
+        }
+        const int q = ndat*v + (j-jl + nj*(k-kl));
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+
+    // x2faces: only x1e and x3e are tangential to the interface.
+    } else if (n < 16) {
+      const int fj = 2*jl - cjs;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nki),
+      [&](const int idx) {
+        int k = idx/ni;
+        int i = idx - k*ni;
+        k += kl;
+        i += il;
+        const int fk = 2*k - cks;
+        const int fi = 2*i - cis;
+        Real emf;
+        if (v == 0) {
+          if (source_is_coarse) {
+            emf = flx.x1e(m,k,jl,i);
+          } else if (two_d) {
+            emf = 0.5*(flx.x1e(m,0,fj,fi) + flx.x1e(m,0,fj,fi+1));
+          } else {
+            emf = 0.5*(flx.x1e(m,fk,fj,fi) + flx.x1e(m,fk,fj,fi+1));
+          }
+        } else {
+          if (source_is_coarse) {
+            emf = flx.x3e(m,k,jl,i);
+          } else if (two_d) {
+            emf = flx.x3e(m,0,fj,fi);
+          } else {
+            emf = 0.5*(flx.x3e(m,fk,fj,fi) + flx.x3e(m,fk+1,fj,fi));
+          }
+        }
+        const int q = ndat*v + i-il + ni*(k-kl);
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+
+    // x1x2 edges: only x3e lives on the edge.
+    } else if (n < 24) {
+      const int fi = 2*il - cis;
+      const int fj = 2*jl - cjs;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nk),
+      [&](const int idx) {
+        const int k = idx + kl;
+        const int fk = 2*k - cks;
+        Real emf;
+        if (source_is_coarse) {
+          emf = flx.x3e(m,k,jl,il);
+        } else if (two_d) {
+          emf = flx.x3e(m,0,fj,fi);
+        } else {
+          emf = 0.5*(flx.x3e(m,fk,fj,fi) + flx.x3e(m,fk+1,fj,fi));
+        }
+        const int q = ndat*v + (k-kl);
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+
+    // x3faces: only x1e and x2e are tangential to the interface.
+    } else if (n < 32) {
+      const int fk = 2*kl - cks;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nji),
+      [&](const int idx) {
+        int j = idx/ni;
+        int i = idx - j*ni;
+        j += jl;
+        i += il;
+        const int fi = 2*i - cis;
+        const int fj = 2*j - cjs;
+        Real emf;
+        if (v == 0) {
+          emf = source_is_coarse
+              ? flx.x1e(m,kl,j,i)
+              : 0.5*(flx.x1e(m,fk,fj,fi) + flx.x1e(m,fk,fj,fi+1));
+        } else {
+          emf = source_is_coarse
+              ? flx.x2e(m,kl,j,i)
+              : 0.5*(flx.x2e(m,fk,fj,fi) + flx.x2e(m,fk,fj+1,fi));
+        }
+        const int q = ndat*v + i-il + ni*(j-jl);
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+
+    // x3x1 edges: only x2e lives on the edge.
+    } else if (n < 40) {
+      const int fi = 2*il - cis;
+      const int fk = 2*kl - cks;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nj),
+      [&](const int idx) {
+        const int j = idx + jl;
+        const int fj = 2*j - cjs;
+        const Real emf = source_is_coarse
+            ? flx.x2e(m,kl,j,il)
+            : 0.5*(flx.x2e(m,fk,fj,fi) + flx.x2e(m,fk,fj+1,fi));
+        const int q = ndat*v + (j-jl);
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+
+    // x2x3 edges: only x1e lives on the edge.
+    } else {
+      const int fj = 2*jl - cjs;
+      const int fk = 2*kl - cks;
+      Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ni),
+      [&](const int idx) {
+        const int i = idx + il;
+        const int fi = 2*i - cis;
+        const Real emf = source_is_coarse
+            ? flx.x1e(m,kl,jl,i)
+            : 0.5*(flx.x1e(m,fk,fj,fi) + flx.x1e(m,fk,fj,fi+1));
+        const int q = ndat*v + i-il;
+        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+      });
+    }
+    tmember.team_barrier();
+  });
+
+  return TaskStatus::complete;
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesFC::PackAndSendFluxFC()
@@ -27,6 +389,19 @@
 //! block boundaries.
 
 TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
+  return PackAndSendFluxFC(flx, false);
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Pack edge fields for the level-local path.
+//!
+//! With same_level_only=true this performs only the EMF synchronization required before
+//! CT on the active level.  Coarse/fine EMFs are deliberately excluded: subcycling must
+//! combine those through a time-integrated EMF register instead of replacing a coarse
+//! RK-stage value with a fine RK-stage value at a different physical time.
+
+TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx,
+                                                    bool same_level_only) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -43,6 +418,7 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
   auto &rbuf = recvbuf;
   auto &one_d = pmy_pack->pmesh->one_d;
   auto &two_d = pmy_pack->pmesh->two_d;
+  const int active_level = pmy_pack->active_level;
 
   // Outer loop over (# of MeshBlocks)*(# of neighbors)*(3 field components)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), (3*nmb*nnghbr), Kokkos::AUTO);
@@ -51,8 +427,13 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
     const int n = (tmember.league_rank() - m*(3*nnghbr))/3;
     const int v = (tmember.league_rank() - m*(3*nnghbr) - 3*n);
 
-    // only load buffers when neighbor exists and is at same or coarser level
-    if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev <= mblev.d_view(m))) {
+    // Legacy mode loads same/coarser destinations.  The subcycling path loads only
+    // same-level buffers sourced by the active level.
+    const bool source_is_active = (mblev.d_view(m) == active_level);
+    const bool eligible_neighbor = same_level_only
+        ? (source_is_active && nghbr.d_view(m,n).lev == mblev.d_view(m))
+        : (nghbr.d_view(m,n).lev <= mblev.d_view(m));
+    if ((nghbr.d_view(m,n).gid >= 0) && eligible_neighbor) {
       // if neighbor is at coarser level, use cindices to pack buffer
       // Note indices can be different for each component of flux
       int il, iu, jl, ju, kl, ku, ndat;
@@ -327,8 +708,11 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<nnghbr; ++n) {
-      if ( (nghbr.h_view(m,n).gid >=0) &&
-           (nghbr.h_view(m,n).lev <= mblev.h_view(m)) &&
+      const bool eligible_neighbor = same_level_only
+          ? (mblev.h_view(m) == active_level &&
+             nghbr.h_view(m,n).lev == mblev.h_view(m))
+          : (nghbr.h_view(m,n).lev <= mblev.h_view(m));
+      if ( (nghbr.h_view(m,n).gid >=0) && eligible_neighbor &&
            (n<48) ) {
         // index and rank of destination Neighbor
         int dn = nghbr.h_view(m,n).dest;
@@ -372,6 +756,14 @@ TaskStatus MeshBoundaryValuesFC::PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx) {
 //! with the average from MeshBlocks at finer levels.
 
 TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx) {
+  return RecvAndUnpackFluxFC(flx, false);
+}
+
+//----------------------------------------------------------------------------------------
+//! \brief Receive and average edge fields, optionally restricting work to active peers.
+
+TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx,
+                                                      bool same_level_only) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
 #if MPI_PARALLEL_ENABLED
@@ -386,8 +778,11 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx) {
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<nnghbr; ++n) {
-      if ( (nghbr.h_view(m,n).gid >=0) &&
-           (nghbr.h_view(m,n).lev >= mblev.h_view(m)) &&
+      const bool target_is_active = (mblev.h_view(m) == pmy_pack->active_level);
+      const bool eligible_neighbor = same_level_only
+          ? (target_is_active && nghbr.h_view(m,n).lev == mblev.h_view(m))
+          : (nghbr.h_view(m,n).lev >= mblev.h_view(m));
+      if ( (nghbr.h_view(m,n).gid >=0) && eligible_neighbor &&
            (n<48) ) {
         if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
           int test;
@@ -425,14 +820,83 @@ TaskStatus MeshBoundaryValuesFC::RecvAndUnpackFluxFC(DvceEdgeFld4D<Real> &flx) {
 
   // Zero EMFs at boundary that overlap with finer MeshBlocks (only use fine fluxes there)
   // Then unpack and sum fluxes from finer levels
-  if (pmy_pack->pmesh->multilevel) {
+  if (pmy_pack->pmesh->multilevel && !same_level_only) {
     ZeroFluxesAtBoundaryWithFiner(flx, nflx);
     SumBoundaryFluxes(flx, false, nflx);
   }
 
   // perform appropriate averaging depending on how many fluxes contributed to sums
-  AverageBoundaryFluxes(flx, nflx);
+  AverageBoundaryFluxes(flx, nflx, same_level_only);
 
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesFC::LoadFluxRegistersFC()
+//! \brief Materialize the time-integrated EMF mismatch in an edge-field scratch array.
+//!
+//! The persistent registers are copied into the transient receive buffers so the legacy
+//! fine-neighbor summation and T-junction averaging machinery can be reused exactly.
+//! flx_scratch is cleared first and contains only the fine-minus-coarse integrated EMF on
+//! coarse_level interfaces on return.  This routine does not apply a curl to B; its caller
+//! owns the CT stencil.  Registers for this level are reset after the scratch is complete.
+
+TaskStatus MeshBoundaryValuesFC::LoadFluxRegistersFC(
+    DvceEdgeFld4D<Real> &flx_scratch, int coarse_level) {
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+  auto &rbuf = recvbuf;
+
+  // The edge fields and transient receive buffers are disposable scratch at a level
+  // synchronization point.  Clearing every row prevents a non-active level from seeing
+  // stale stage communication when the legacy summation kernels traverse the whole pack.
+  Kokkos::deep_copy(flx_scratch.x1e, 0.0);
+  Kokkos::deep_copy(flx_scratch.x2e, 0.0);
+  Kokkos::deep_copy(flx_scratch.x3e, 0.0);
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    Kokkos::deep_copy(rbuf[n].flux, 0.0);
+  }
+
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb*nnghbr, Kokkos::AUTO);
+  Kokkos::parallel_for("load_fc_emf_register", policy,
+  KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int m = tmember.league_rank()/nnghbr;
+    const int n = tmember.league_rank() - m*nnghbr;
+    if (n >= 48 ||
+        mblev.d_view(m) != coarse_level ||
+        nghbr.d_view(m,n).gid < 0 ||
+        nghbr.d_view(m,n).lev != coarse_level + 1) {
+      return;
+    }
+    const int ndata = 3*rbuf[n].iflxc_ndat;
+    Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+    [&](const int q) {
+      rbuf[n].flux(m,q) = rbuf[n].flux_reg(m,q);
+    });
+    tmember.team_barrier();
+  });
+  Kokkos::fence();
+
+  // Start with the same self-contribution count as the legacy path, then zero it exactly
+  // where a finer neighbor replaces the coarse value.  Since each register key already
+  // contains its own coarse subtraction, averaging overlapping fine keys yields
+  // average(fine)-coarse at face seams, edges, and T-junctions.
+  DvceArray2D<int> nflx("fc_register_nflx", nmb, 48);
+  par_for("init_fc_register_nflx", DevExeSpace(), 0, nmb-1, 0, 47,
+  KOKKOS_LAMBDA(const int m, const int n) {
+    nflx(m,n) = 1;
+  });
+  ZeroFluxesAtBoundaryWithFiner(flx_scratch, nflx);
+  SumBoundaryFluxes(flx_scratch, false, nflx);
+  AverageBoundaryFluxes(flx_scratch, nflx, false);
+
+  // Prevent accidental double loading, and make the synchronization API host-complete.
+  (void) ResetFluxRegistersFC(coarse_level);
+  Kokkos::fence();
   return TaskStatus::complete;
 }
 
@@ -799,7 +1263,8 @@ void MeshBoundaryValuesFC::ZeroFluxesAtBoundaryWithFiner(DvceEdgeFld4D<Real> &fl
 //! elements being averaged together.
 
 void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
-                                                 DvceArray2D<int> &nflx) {
+                                                 DvceArray2D<int> &nflx,
+                                                 const bool same_level_only) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
   int nnghbr = pmy_pack->pmb->nnghbr;
@@ -855,7 +1320,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
               flx.x2e(m,k,j,il) *= 0.5;
             });
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             if (three_d) {
               int k = kl + (ku - kl + 1)/2;
               Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nj),
@@ -882,7 +1348,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
               flx.x3e(m,k,j,il) *= 0.5;
             });
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             if (multi_d) {
               int j = jl + (ju - jl + 1)/2;
               Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nk),
@@ -912,7 +1379,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
               flx.x1e(m,k,jl,i) *= 0.5;
             });
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             if (three_d) {
               int k = kl + (ku - kl + 1)/2;
               Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ni),
@@ -938,7 +1406,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
             });
             tmember.team_barrier();
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             int i = il + (iu - il + 1)/2;
             Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nk),
             [&](const int idx) {
@@ -976,7 +1445,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
             });
             tmember.team_barrier();
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             int j = jl + (ju - jl + 1)/2;
             Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember,ni),[&](const int idx){
               int i = idx + il;
@@ -999,7 +1469,8 @@ void MeshBoundaryValuesFC::AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx,
             });
             tmember.team_barrier();
           // finer level; divide EMFs that overlap at edges of fine faces by 2
-          } else if (nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
+          } else if (!same_level_only &&
+                     nghbr.d_view(m,n).lev >= mblev.d_view(m)) {
             int i = il + (iu - il + 1)/2;
             Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember,nj),[&](const int idx){
               int j = idx + jl;
