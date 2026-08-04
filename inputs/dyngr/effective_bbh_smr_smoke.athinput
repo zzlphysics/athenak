@@ -46,7 +46,7 @@ x3max =  12.0
 <time>
 evolution  = dynamic
 integrator = rk2
-subcycling = none
+subcycling = level
 cfl_number = 0.2
 nlim       = 2
 tlim       = 100.0
@@ -106,3 +106,23 @@ singularity_floor = 1.0e-3
 amr_condition    = track
 alpha_threshold  = 0.6
 refinement_radius = 6.0
+
+# Sparse validation outputs: initialization and finalization each write one small file.
+# These make the smoke test checkable for finite primitives and CT divergence without
+# enabling production-rate output.
+<output1>
+file_type   = hst
+data_format = %.17e
+dt          = 100.0
+
+<output2>
+file_type   = bin
+variable    = mhd_w_bcc
+dt          = 100.0
+ghost_zones = false
+
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dt          = 100.0
+ghost_zones = false

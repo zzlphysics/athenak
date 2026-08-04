@@ -303,26 +303,7 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
 
   if (LevelSubcyclingRequested()) {
     ValidateLevelSubcyclingConfiguration(pmesh);
-
-    // Keep this guard until level-time boundary interpolation plus cell-centered flux
-    // and face-centered EMF registers are connected to the recursive RK2 scheduler.
-    // Falling through to Execute() here would silently run the legacy global timestep
-    // while claiming that subcycling is active.
-    if (global_variable::my_rank == 0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl
-                << "<time>/subcycling=level satisfies the current MVP configuration "
-                << "constraints, but the level scheduler is not armed."
-                << std::endl
-                << "Temporal coarse-to-fine boundary interpolation and conservative "
-                << "flux/EMF registers must be enabled before this mode can run."
-                << std::endl
-                << "Current MVP envelope: single-rank static SMR, RK2, MHD+CT with a "
-                << "prescribed dynamic ADM metric; no Z4c, radiation, particles, "
-                << "diffusion, source terms, turbulence, or shearing/orbital advection."
-                << std::endl;
-    }
-    std::exit(EXIT_FAILURE);
+    pmesh->pmb_pack->pmhd->InitializeLevelSubcyclingRegisters();
   }
 }
 
@@ -342,8 +323,11 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
     violations.emplace_back("<time>/integrator must be rk2");
   }
   if (!pmesh->multilevel || pmesh->adaptive ||
-      pmesh->max_level <= pmesh->root_level) {
-    violations.emplace_back("mesh refinement must be static SMR with at least two levels");
+      pmesh->max_level != pmesh->root_level + 1) {
+    violations.emplace_back("mesh refinement must be static SMR with exactly two levels");
+  }
+  if (pmesh->pmr != nullptr && pmesh->pmr->prolong_prims) {
+    violations.emplace_back("<mesh_refinement>/prolong_primitives must be false");
   }
   if (global_variable::nranks != 1 || pmesh->nmb_packs_thisrank != 1) {
     violations.emplace_back("the initial implementation requires one MPI rank and one pack");
@@ -384,7 +368,7 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
       for (const auto &reason : violations) {
         std::cout << "  - " << reason << std::endl;
       }
-      std::cout << "Supported MVP: single-rank static SMR, RK2, MHD+CT with a "
+      std::cout << "Supported MVP: single-rank, two-level static SMR, RK2, MHD+CT with a "
                 << "prescribed dynamic ADM metric and no auxiliary physics/source "
                 << "modules." << std::endl;
     }
@@ -455,6 +439,29 @@ Real Driver::ComputeLevelSubcyclingTimeStep(Mesh *pmesh) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn Driver::SetLevelSubcyclingTimeStep()
+//! \brief Apply growth and end-time caps to the synchronized root-level CFL limit.
+
+void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
+  const Real previous_dt = pmesh->dt;
+  Real next_dt = ComputeLevelSubcyclingTimeStep(pmesh);
+
+  if (previous_dt == std::numeric_limits<float>::max()) {
+    pmesh->dtold = 0.0;
+  } else {
+    pmesh->dtold = previous_dt;
+    if (previous_dt > 0.0 && std::isfinite(previous_dt)) {
+      next_dt = std::min(next_dt, 2.0*previous_dt);
+    }
+  }
+  if ((pmesh->time < tlim) && (pmesh->time + next_dt > tlim)) {
+    next_dt = tlim - pmesh->time;
+  }
+  pmesh->dt = next_dt;
+  SetLevelSubcyclingContext(pmesh->root_level, 0, pmesh->time, next_dt, true);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn Driver::ExecuteLevelStage()
 //! \brief Execute one RK stage with a level-local Mesh time/timestep and active list.
 
@@ -471,38 +478,76 @@ void Driver::ExecuteLevelStage(Mesh *pmesh, int level, int substep, Real time, R
 
 //----------------------------------------------------------------------------------------
 //! \fn Driver::PrepareFineLevelBoundaries()
-//! \brief Hook for time-interpolated coarse data needed by an upcoming fine step.
+//! \brief Fill an upcoming fine step's boundaries from the coarse RK2 predictor.
 //!
-//! This is intentionally inert until the temporal boundary-transfer calls are connected
-//! to the MHD task list.  theta is the fine-step start time within the coarse predictor,
-//! with 0, 1/2, and 1 denoting the old, midpoint, and predicted coarse states.
+//! theta is the fine-step start time within the coarse predictor, with 0, 1/2, and 1
+//! denoting the old, midpoint, and predicted coarse states.
 
 void Driver::PrepareFineLevelBoundaries(Mesh *pmesh, int coarse_level, int fine_level,
                                         int fine_substep, Real time, Real coarse_dt,
                                         Real theta) {
-  (void) pmesh;
   (void) coarse_level;
-  (void) fine_level;
-  (void) fine_substep;
-  (void) time;
-  (void) coarse_dt;
-  (void) theta;
+  MeshBlockPack *pmbp = pmesh->pmb_pack;
+  mhd::MHD *pmhd = pmbp->pmhd;
+  const Real fine_dt = 0.5*coarse_dt;
+
+  pmbp->SetActiveLevel(fine_level);
+  SetLevelSubcyclingContext(fine_level, fine_substep, time, fine_dt);
+  pmesh->time = time;
+  pmesh->dt = fine_dt;
+
+  // Restriction builds the coarse representation used by any fine donor.  Packing is
+  // destination-driven in active mode, so inactive coarse blocks remain available as
+  // temporal donors while only fine-level ghost zones are written.
+  (void) pmhd->RestrictU(this, 0);
+  (void) pmhd->RestrictB(this, 0);
+  (void) pmhd->InitRecv(this, -1);
+  (void) pmhd->pbval_u->PackAndSendCC(pmhd->u0, pmhd->coarse_u0, pmhd->u1, theta);
+  (void) pmhd->pbval_b->PackAndSendFC(pmhd->b0, pmhd->coarse_b0, pmhd->b1, theta);
+  (void) pmhd->ClearSend(this, -1);
+  (void) pmhd->ClearRecv(this, -1);
+  (void) pmhd->pbval_u->RecvAndUnpackCC(pmhd->u0, pmhd->coarse_u0);
+  (void) pmhd->pbval_b->RecvAndUnpackFC(pmhd->b0, pmhd->coarse_b0);
+  (void) pmhd->ApplyPhysicalBCs(this, 0);
+  (void) pmhd->Prolongate(this, 0);
+  (void) pmbp->pdyngr->ConToPrim(this, 0);
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn Driver::SynchronizeLevelPair()
-//! \brief Hook for restriction plus cell-flux and edge-EMF register synchronization.
-//!
-//! It remains a no-op while the constructor's not-armed guard is present.  Reflux and
-//! reflux-curl must be implemented here before the recursive schedule can be enabled.
+//! \brief Refresh a parent from its synchronized child before/after the RK2 corrector.
 
 void Driver::SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
                                   Real sync_time, Real coarse_dt) {
-  (void) pmesh;
-  (void) coarse_level;
   (void) fine_level;
-  (void) sync_time;
-  (void) coarse_dt;
+  MeshBlockPack *pmbp = pmesh->pmb_pack;
+  mhd::MHD *pmhd = pmbp->pmhd;
+  const int coarse_substep = level_subcycling.substep;
+  Real theta = 1.0;
+  if (coarse_level > pmesh->root_level) {
+    theta = ((coarse_substep & 1) == 0) ? 0.5 : 1.0;
+  }
+
+  pmbp->SetActiveLevel(coarse_level);
+  SetLevelSubcyclingContext(coarse_level, coarse_substep,
+                            sync_time - coarse_dt, coarse_dt);
+  pmesh->time = sync_time - coarse_dt;
+  pmesh->dt = coarse_dt;
+
+  // Refresh the parent's same-level and fine-to-coarse ghost zones after the child has
+  // caught up.  A still-coarser donor is interpolated to this parent's endpoint.
+  (void) pmhd->RestrictU(this, 0);
+  (void) pmhd->RestrictB(this, 0);
+  (void) pmhd->InitRecv(this, -1);
+  (void) pmhd->pbval_u->PackAndSendCC(pmhd->u0, pmhd->coarse_u0, pmhd->u1, theta);
+  (void) pmhd->pbval_b->PackAndSendFC(pmhd->b0, pmhd->coarse_b0, pmhd->b1, theta);
+  (void) pmhd->ClearSend(this, -1);
+  (void) pmhd->ClearRecv(this, -1);
+  (void) pmhd->pbval_u->RecvAndUnpackCC(pmhd->u0, pmhd->coarse_u0);
+  (void) pmhd->pbval_b->RecvAndUnpackFC(pmhd->b0, pmhd->coarse_b0);
+  (void) pmhd->ApplyPhysicalBCs(this, 0);
+  (void) pmhd->Prolongate(this, 0);
+  (void) pmbp->pdyngr->ConToPrim(this, 0);
 }
 
 //----------------------------------------------------------------------------------------
@@ -510,25 +555,29 @@ void Driver::SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
 //! \brief Advance one logical level with RK2 predictor, fine substeps, and corrector.
 //!
 //! The parent predictor is retained in u0/b0 while u1/b1 hold its old state.  Each child
-//! then takes two half-steps.  Once the child catches up, the synchronization hook runs
-//! before the parent corrector.  Output, restart, and regridding are deliberately absent:
-//! they belong only at the root synchronization point in Execute().
+//! then takes two half-steps.  Once the child catches up, the parent boundaries are
+//! refreshed before its corrector; conservative flux and EMF registers are applied after
+//! the corrector.  Output, restart, and regridding occur only at the root sync point.
 
 void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt) {
   MeshBlockPack *pmbp = pmesh->pmb_pack;
   pmbp->SetActiveLevel(level);
   const bool has_active_blocks = (pmbp->nmb_active > 0);
+  const int fine_level = level + 1;
+  const bool has_finer_level = (fine_level <= pmesh->max_level);
 
   if (has_active_blocks) {
     SetLevelSubcyclingContext(level, substep, time, dt);
     pmesh->time = time;
     pmesh->dt = dt;
+    if (has_finer_level) {
+      pmbp->pmhd->ResetLevelSubcyclingRegisters(level);
+    }
     ExecuteTaskList(pmesh, "before_timeintegrator", 0);
     ExecuteLevelStage(pmesh, level, substep, time, dt, 1);
   }
 
-  const int fine_level = level + 1;
-  if (fine_level <= pmesh->max_level) {
+  if (has_finer_level) {
     const Real fine_dt = 0.5*dt;
     const int first_fine_substep = 2*substep;
 
@@ -550,6 +599,24 @@ void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real d
 
   if (has_active_blocks) {
     ExecuteLevelStage(pmesh, level, substep, time, dt, 2);
+    if (has_finer_level) {
+      // Both coarse RK fluxes and all child fluxes are now in the registers.  Apply the
+      // conservative corrections, rebuild the corrected parent ghosts/primitives, then
+      // seed the child ghosts with the corrected synchronized parent state.
+      pmbp->SetActiveLevel(level);
+      SetLevelSubcyclingContext(level, substep, time, dt);
+      pmesh->time = time;
+      pmesh->dt = dt;
+      pmbp->pmhd->ApplyLevelSubcyclingRegisters(level);
+      SynchronizeLevelPair(pmesh, level, fine_level, time + dt, dt);
+      PrepareFineLevelBoundaries(pmesh, level, fine_level, 2*substep + 2,
+                                 time + dt, dt, 1.0);
+      pmbp->SetActiveLevel(level);
+      SetLevelSubcyclingContext(level, substep, time, dt,
+                                level == pmesh->root_level);
+      pmesh->time = time;
+      pmesh->dt = dt;
+    }
     ExecuteTaskList(pmesh, "after_timeintegrator", 1);
   }
 }
@@ -607,7 +674,11 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
       (void) pmesh->pmb_pack->pz4c->NewTimeStep(this, nexp_stages);
     }
 
-    pmesh->NewTimeStep(tlim);
+    if (LevelSubcyclingRequested()) {
+      SetLevelSubcyclingTimeStep(pmesh);
+    } else {
+      pmesh->NewTimeStep(tlim);
+    }
   }
 
   //---- Step 3.  Cycle through output Types and load data / write files.
@@ -666,26 +737,44 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
-      // Execute TaskLists
-      // Work before time integrator indicated by "0" in stage
-      ExecuteTaskList(pmesh, "before_timeintegrator", 0);
-
-      // time-integrator tasks for each stage of integrator
-      for (int stage=1; stage<=(nexp_stages); ++stage) {
-        ExecuteTaskList(pmesh, "before_stagen", stage);
-        ExecuteTaskList(pmesh, "stagen", stage);
-        ExecuteTaskList(pmesh, "after_stagen", stage);
+      if (LevelSubcyclingRequested()) {
+        const Real root_time = pmesh->time;
+        const Real root_dt = pmesh->dt;
+        AdvanceLevel(pmesh, pmesh->root_level, 0, root_time, root_dt);
+        pmesh->pmb_pack->SetAllBlocksActive();
+        ResetLevelSubcyclingContext();
+        pmesh->time = root_time;
+        pmesh->dt = root_dt;
+      } else {
+        // Execute the historical rank-wide TaskLists.
+        ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+        for (int stage=1; stage<=(nexp_stages); ++stage) {
+          ExecuteTaskList(pmesh, "before_stagen", stage);
+          ExecuteTaskList(pmesh, "stagen", stage);
+          ExecuteTaskList(pmesh, "after_stagen", stage);
+        }
+        ExecuteTaskList(pmesh, "after_timeintegrator", 1);
       }
-
-      // Work after time integrator indicated by "1" in stage
-      ExecuteTaskList(pmesh, "after_timeintegrator", 1);
 
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
-      nmb_updated_ += pmesh->nmb_total;
+      if (LevelSubcyclingRequested()) {
+        SetLevelSubcyclingContext(pmesh->root_level, 0, pmesh->time, pmesh->dt, true);
+        std::uint64_t level_updates = 0;
+        const auto &counts = pmesh->pmb_pack->level_counts;
+        for (int level=pmesh->root_level; level<=pmesh->max_level; ++level) {
+          if (level < static_cast<int>(counts.size())) {
+            level_updates += static_cast<std::uint64_t>(counts[level])
+                           << (level - pmesh->root_level);
+          }
+        }
+        nmb_updated_ += level_updates;
+      } else {
+        nmb_updated_ += pmesh->nmb_total;
+      }
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency
       if (global_variable::nranks > 1) {
@@ -715,7 +804,11 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // AMR
       if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
       // compute new timestep AFTER all Meshblocks refined/derefined
-      pmesh->NewTimeStep(tlim);
+      if (LevelSubcyclingRequested()) {
+        SetLevelSubcyclingTimeStep(pmesh);
+      } else {
+        pmesh->NewTimeStep(tlim);
+      }
 
       // Update wall clock time if needed.
       if (wall_time > 0.) {

@@ -36,7 +36,7 @@ class Driver {
     int substep = 0;
     Real time = 0.0;
     Real dt = 0.0;
-    bool at_sync_point = true;
+    bool at_sync_point = false;
   };
 
   Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptimer);
@@ -86,6 +86,7 @@ class Driver {
   Real UpdateWallClock();
   void ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const;
   Real ComputeLevelSubcyclingTimeStep(Mesh *pmesh);
+  void SetLevelSubcyclingTimeStep(Mesh *pmesh);
   void AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt);
   void ExecuteLevelStage(Mesh *pmesh, int level, int substep, Real time, Real dt,
                          int stage);

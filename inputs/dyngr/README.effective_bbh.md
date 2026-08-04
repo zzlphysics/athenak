@@ -84,6 +84,21 @@ cutoff for superextremal half-mass terms during the canonical remnant interpolat
 - Radiation and Kerr-specific derived outputs such as `mhd_jcon` are not supported by
   this setup because those paths still assume a single stationary Kerr metric.
 
+### Experimental level subcycling
+
+`inputs/dyngr/effective_bbh_smr_smoke.athinput` exercises the initial 2:1 level-time
+subcycling implementation with `<time> subcycling=level`.  This path advances the fine
+level twice per root-level step, time-interpolates coarse boundary data, refluxes the MHD
+conserved variables, and applies an EMF reflux-curl for constrained transport.  Outputs
+and restart files are written only after both levels synchronize.
+
+The current implementation is deliberately fail-fast outside its validated envelope:
+exactly two static-SMR levels, one MPI rank and one MeshBlockPack, RK2, prescribed dynamic
+ADM GRMHD, conserved-variable prolongation, and no radiation, particles, Z4c, diffusion,
+source, turbulence, shearing-box, orbital-advection, or user boundary/source modules.
+Use `subcycling=none` for the historical global-timestep path.  The smoke input is far too
+coarse for scientific horizon or magnetic-structure measurements.
+
 The implementation uses second-order centered spacetime derivatives to construct
 `K_ij`.  Test `metric_fd_step` at `h/2`, `h`, and `2h`; making it arbitrarily small can
 increase floating-point and table-interpolation error.  The metric is an approximation
