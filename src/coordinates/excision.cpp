@@ -188,4 +188,5 @@ void Coordinates::UpdateExcisionMasks() {
       flux(m,k,j,i) = excise;
     });
   }
+  if (AugmentExcisionMasks != nullptr) AugmentExcisionMasks(pmy_pack);
 }

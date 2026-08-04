@@ -1,0 +1,130 @@
+# AthenaK input file for uniform magnetized gas in an effective BBH spacetime.
+# The circular trajectory is a coarse, unresolved CPU integration example, not a published
+# production setup.  Use trajectory_mode=table with a normalized 4PN-to-remnant table for
+# the spacetime described in arXiv:2403.13308.
+
+<comment>
+problem   = effective binary-black-hole GRMHD
+reference = Combi and Ressler, arXiv:2403.13308
+
+<job>
+basename = effective_bbh
+
+<mesh>
+nghost = 3
+nx1    = 48
+x1min  = -24.0
+x1max  =  24.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 48
+x2min  = -24.0
+x2max  =  24.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 48
+x3min  = -24.0
+x3max  =  24.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 48
+nx2 = 48
+nx3 = 48
+
+<mesh_refinement>
+refinement          = none
+num_levels          = 2
+max_nmb_per_rank    = 128
+ncycle_check        = 1
+refinement_interval = 1
+prolong_primitives  = false
+
+<amr_criterion0>
+method = user
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim       = -1
+tlim       = 1.0
+ndiag      = 1
+
+<coord>
+minkowski       = false
+excise          = true
+excision_scheme = lapse
+excise_lapse    = 0.25
+dexcise         = 1.0e-8
+pexcise         = 1.0e-10
+
+<adm>
+dynamic = true
+
+<mhd>
+eos             = ideal
+dyn_eos         = ideal
+dyn_error       = reset_floor
+gamma           = 1.3333333333333333
+reconstruct     = plm
+rsolver         = hlle
+dfloor          = 1.0e-8
+tfloor          = 1.0e-3
+dthreshold      = 1.01
+dyn_scratch     = 1
+fofc            = true
+enforce_maximum = false
+
+<problem>
+pgen_name        = dynbbh
+trajectory_mode  = circular
+trajectory_file  = none
+trajectory_time_offset = 0.0
+separation       = 20.0
+mass_ratio       = 1.0
+chi1             = 0.0
+chi2             = 0.0
+theta1           = 0.0
+theta2           = 0.0
+phi1             = 0.0
+phi2             = 0.0
+rho0             = 1.0e-5
+pgas0            = 1.0e-7
+u1                = 0.0
+u2                = 0.0
+u3                = 0.0
+b1               = 0.0
+b2               = 0.0
+b3               = 1.0e-6
+# Omit metric_fd_step to use the precision-aware default (5e-5 double, 5e-4 single).
+mass_scale1      = 1.0
+mass_scale2      = 1.0
+spin_buffer1     = 0.05
+spin_buffer2     = 0.05
+# Dimensionless relative to each component mass; the code also tapers inside r_+.
+singularity_floor = 1.0e-3
+amr_condition    = track
+alpha_threshold  = 0.6
+refinement_radius = 6.0
+
+# Production trajectory example:
+# trajectory_mode        = table
+# trajectory_file        = trajectories/4pn_merger.dat
+
+<output1>
+file_type = bin
+variable  = mhd_w
+dt        = 0.5
+
+<output2>
+file_type = bin
+variable  = adm
+dt        = 0.5
+
+<output3>
+file_type = rst
+dt        = 1.0

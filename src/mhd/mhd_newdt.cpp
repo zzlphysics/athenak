@@ -15,12 +15,50 @@
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 #include "driver/driver.hpp"
+#include "coordinates/adm.hpp"
 #include "eos/eos.hpp"
 #include "mhd.hpp"
 #include "diffusion/conduction.hpp"
 #include "srcterms/srcterms.hpp"
 
 namespace mhd {
+
+KOKKOS_INLINE_FUNCTION
+Real ADMCoordinateLightSpeed(const Real metric[NSPMETRIC], const Real shift[3],
+                             const Real lapse, const int direction) {
+  for (int n=0; n<NSPMETRIC; ++n) {
+    if (!isfinite(metric[n])) {
+      Kokkos::abort("Non-finite ADM metric while computing the GRMHD timestep");
+    }
+  }
+  for (int n=0; n<3; ++n) {
+    if (!isfinite(shift[n])) {
+      Kokkos::abort("Non-finite ADM shift while computing the GRMHD timestep");
+    }
+  }
+  const Real determinant = adm::SpatialDet(
+      metric[S11], metric[S12], metric[S13], metric[S22], metric[S23], metric[S33]);
+  const Real leading_minor2 = metric[S11]*metric[S22] - SQR(metric[S12]);
+  if (!isfinite(lapse) || !(metric[S11] > 0.0) || !(leading_minor2 > 0.0)
+      || !(determinant > 0.0) || !(lapse > 0.0)) {
+    Kokkos::abort("Invalid ADM metric while computing the GRMHD timestep");
+  }
+  Real guxx, guxy, guxz, guyy, guyz, guzz;
+  adm::SpatialInv(1.0/determinant,
+      metric[S11], metric[S12], metric[S13], metric[S22], metric[S23], metric[S33],
+      &guxx, &guxy, &guxz, &guyy, &guyz, &guzz);
+  const Real inverse_diagonal[3] = {guxx, guyy, guzz};
+  if (!(inverse_diagonal[direction] > 0.0)) {
+    Kokkos::abort("Non-positive inverse ADM metric while computing the GRMHD timestep");
+  }
+  const Real speed = fabs(shift[direction])
+      + lapse*sqrt(inverse_diagonal[direction]);
+  if (!isfinite(speed) || !(speed > 0.0)) {
+    Kokkos::abort(
+        "Invalid ADM coordinate light speed while computing the GRMHD timestep");
+  }
+  return speed;
+}
 
 //----------------------------------------------------------------------------------------
 // \!fn void MHD::NewTimeStep()
@@ -47,6 +85,8 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
   auto &is_special_relativistic_ = pmy_pack->pcoord->is_special_relativistic;
   auto &is_general_relativistic_ = pmy_pack->pcoord->is_general_relativistic;
   auto &is_dynamical_relativistic_ = pmy_pack->pcoord->is_dynamical_relativistic;
+  adm::ADM::ADM_vars adm_vars;
+  if (is_dynamical_relativistic_) adm_vars = pmy_pack->padm->adm;
   const int nmkji = (pmy_pack->nmb_thispack)*nx3*nx2*nx1;
   const int nkji = nx3*nx2*nx1;
   const int nji  = nx2*nx1;
@@ -82,8 +122,38 @@ TaskStatus MHD::NewTimeStep(Driver *pdriver, int stage) {
       j += js;
       Real max_dv1 = 0.0, max_dv2 = 0.0, max_dv3 = 0.0;
 
-      // timestep in GR MHD
-      if (is_general_relativistic_ || is_dynamical_relativistic_) {
+      // Bound each characteristic speed by the coordinate light speed at the same two
+      // face metrics used by the Riemann solver.  The old unit-speed assumption is unsafe
+      // for a boosted or otherwise time-dependent metric.
+      if (is_dynamical_relativistic_) {
+        Real face_metric[NSPMETRIC], face_shift[3], face_lapse;
+        adm::Face1Metric(m, k, j, i, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                         face_metric, face_shift, face_lapse);
+        max_dv1 = ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 0);
+        adm::Face1Metric(m, k, j, i+1, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                         face_metric, face_shift, face_lapse);
+        max_dv1 = fmax(max_dv1,
+                       ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 0));
+        if (nx2 > 1) {
+          adm::Face2Metric(m, k, j, i, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                           face_metric, face_shift, face_lapse);
+          max_dv2 = ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 1);
+          adm::Face2Metric(m, k, j+1, i, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                           face_metric, face_shift, face_lapse);
+          max_dv2 = fmax(max_dv2,
+                         ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 1));
+        }
+        if (nx3 > 1) {
+          adm::Face3Metric(m, k, j, i, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                           face_metric, face_shift, face_lapse);
+          max_dv3 = ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 2);
+          adm::Face3Metric(m, k+1, j, i, adm_vars.g_dd, adm_vars.beta_u, adm_vars.alpha,
+                           face_metric, face_shift, face_lapse);
+          max_dv3 = fmax(max_dv3,
+                         ADMCoordinateLightSpeed(face_metric, face_shift, face_lapse, 2));
+        }
+      // timestep in stationary GR MHD (analytic Kerr-Schild path)
+      } else if (is_general_relativistic_) {
         max_dv1 = 1.0;
         max_dv2 = 1.0;
         max_dv3 = 1.0;

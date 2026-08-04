@@ -72,6 +72,7 @@ class Coordinates {
   void SetExcisionMasks(DvceArray4D<bool> &floor, DvceArray4D<bool> &flux);
 
   void UpdateExcisionMasks();
+  void (*AugmentExcisionMasks)(MeshBlockPack *pm) = nullptr;
 
  private:
   MeshBlockPack* pmy_pack;

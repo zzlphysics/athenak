@@ -616,6 +616,11 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm) {
     (void) pmhd->ClearRecv(this, -4); // stage = -4 only clear RecvU_Shr, SendB_Shr
     (void) pmhd->RecvU_Shr(this, 0);
     (void) pmhd->RecvB_Shr(this, 0);
+    if (pdyngr != nullptr && pm->pmb_pack->pz4c == nullptr
+        && pm->pmb_pack->padm->is_dynamic
+        && pm->pmb_pack->pcoord->coord_data.bh_excise) {
+      pm->pmb_pack->pcoord->UpdateExcisionMasks();
+    }
     (void) pmhd->ApplyPhysicalBCs(this, 0);
     (void) pmhd->Prolongate(this, 0);
     if (pdyngr == nullptr) {

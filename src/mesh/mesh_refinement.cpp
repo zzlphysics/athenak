@@ -608,10 +608,14 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   pm->pmb_pack->nmb_thispack = pm->pmb_pack->gide - pm->pmb_pack->gids + 1;
 
   // Delete old then allocate new MeshBlocks and Coordinates (latter includes masks in GR)
+  // Preserve any problem-specific mask augmentation registered after Coordinates was
+  // originally constructed.
+  auto augment_excision_masks = pm->pmb_pack->pcoord->AugmentExcisionMasks;
   delete (pm->pmb_pack->pmb);
   delete (pm->pmb_pack->pcoord);
   pm->pmb_pack->AddMeshBlocks(pin);
   pm->pmb_pack->AddCoordinates(pin);
+  pm->pmb_pack->pcoord->AugmentExcisionMasks = augment_excision_masks;
   pm->pmb_pack->pmb->SetNeighbors(pm->ptree, pm->rank_eachmb);
 
   // clean-up
@@ -624,6 +628,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
     // With dynGRMHD, recalculate ADM variables
     if ((pz4c == nullptr) && (padm != nullptr)) {
       padm->SetADMVariables(pm->pmb_pack);
+      if (pm->pmb_pack->pcoord->coord_data.bh_excise) {
+        pm->pmb_pack->pcoord->UpdateExcisionMasks();
+      }
     }
     // With radiation, compute tetrads and associated mesh arrays
     if (prad != nullptr) {

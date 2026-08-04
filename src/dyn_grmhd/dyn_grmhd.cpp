@@ -149,6 +149,25 @@ DynGRMHD::DynGRMHD(MeshBlockPack *pp, ParameterInput *pin) :
 
   fixed_evolution = pin->GetOrAddBoolean("mhd", "fixed", false);
 
+  // The prescribed time-dependent ADM update below follows the two-register recurrence
+  // for SSPRK1/2/3.  Other explicit and IMEX schemes need their own stage abscissae.
+  if (pmy_pack->pz4c == nullptr && pmy_pack->padm->is_dynamic) {
+    const std::string evolution = pin->GetOrAddString("time", "evolution", "dynamic");
+    const std::string integrator = pin->GetOrAddString("time", "integrator", "rk2");
+    if (evolution != "dynamic") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Prescribed dynamic ADM requires time/evolution=dynamic"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (integrator != "rk1" && integrator != "rk2" && integrator != "rk3") {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Prescribed dynamic ADM supports only rk1, rk2, and rk3"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
   // allocate memory for temperature
   {
     int nmb = std::max((pmy_pack->nmb_thispack), (pmy_pack->pmesh->nmb_maxperrank));
@@ -221,21 +240,23 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::QueueDynGRMHDTasks() {
   pnr->QueueTask(&MHD::RestrictB, pmhd, MHD_RestB, "MHD_RestB", Task_Run, {MHD_CT});
   pnr->QueueTask(&MHD::SendB, pmhd, MHD_SendB, "MHD_SendB", Task_Run, {MHD_RestB});
   pnr->QueueTask(&MHD::RecvB, pmhd, MHD_RecvB, "MHD_RecvB", Task_Run, {MHD_SendB});
-  pnr->QueueTask(&MHD::ApplyPhysicalBCs, pmhd, MHD_BCS, "MHD_BCS", Task_Run, {MHD_RecvB});
-  //pnr->QueueTask(&DynGRMHD::ApplyPhysicalBCs, this, MHD_BCS, "MHD_BCS", Task_Run,
-  //                 {MHD_RecvB});
-  pnr->QueueTask(&MHD::Prolongate, pmhd, MHD_Prolong, "MHD_Prolong", Task_Run, {MHD_BCS});
-  if (pz4c == nullptr && padm->is_dynamic == true) {
+  const bool prescribed_dynamic = (pz4c == nullptr && padm->is_dynamic);
+  if (prescribed_dynamic) {
+    // All RHS and CT operations above use the metric at the beginning of this RK stage.
+    // Update to the time represented by the new stage state before BCs and C2P.
     pnr->QueueTask(&DynGRMHD::SetADMVariables, this, MHD_SetADM, "MHD_SetADM", Task_Run,
-                    {MHD_ExplRK});
-    pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
-                   "MHD_C2P", Task_Run, {MHD_Prolong, MHD_SetADM}, {Z4c_Excise});
+                   {MHD_RecvB});
     pnr->QueueTask(&DynGRMHD::UpdateExcisionMasks, this, MHD_Excise, "MHD_Excise",
                    Task_Run, {MHD_SetADM});
+    pnr->QueueTask(&MHD::ApplyPhysicalBCs, pmhd, MHD_BCS, "MHD_BCS", Task_Run,
+                   {MHD_Excise});
   } else {
-    pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
-                   "MHD_C2P", Task_Run, {MHD_Prolong}, {Z4c_Excise});
+    pnr->QueueTask(&MHD::ApplyPhysicalBCs, pmhd, MHD_BCS, "MHD_BCS", Task_Run,
+                   {MHD_RecvB});
   }
+  pnr->QueueTask(&MHD::Prolongate, pmhd, MHD_Prolong, "MHD_Prolong", Task_Run, {MHD_BCS});
+  pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
+                 "MHD_C2P", Task_Run, {MHD_Prolong}, {Z4c_Excise});
   pnr->QueueTask(&MHD::NewTimeStep, pmhd, MHD_Newdt, "MHD_Newdt", Task_Run, {MHD_C2P});
 
   // End task list
@@ -478,7 +499,17 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
 //! \brief
 
 TaskStatus DynGRMHD::SetADMVariables(Driver *pdrive, int stage) {
+  // Propagate a scalar time through the same two-register RK recurrence as the MHD
+  // state.  For SSPRK1/2/3 this gives {1}, {1,1}, and {1,1/2,1}, respectively.
+  Real stage_fraction = 0.0;
+  for (int n = 0; n < stage; ++n) {
+    stage_fraction = pdrive->gam0[n]*stage_fraction + pdrive->beta[n];
+  }
+  Mesh *pmesh = pmy_pack->pmesh;
+  const Real cycle_time = pmesh->time;
+  pmesh->time = cycle_time + stage_fraction*pmesh->dt;
   pmy_pack->padm->SetADMVariables(pmy_pack);
+  pmesh->time = cycle_time;
   return TaskStatus::complete;
 }
 
@@ -487,7 +518,7 @@ TaskStatus DynGRMHD::SetADMVariables(Driver *pdrive, int stage) {
 //! \brief
 
 TaskStatus DynGRMHD::UpdateExcisionMasks(Driver *pdrive, int stage) {
-  if (pmy_pack->pcoord->coord_data.bh_excise && stage == pdrive->nexp_stages) {
+  if (pmy_pack->pcoord->coord_data.bh_excise) {
     pmy_pack->pcoord->UpdateExcisionMasks();
   }
   return TaskStatus::complete;

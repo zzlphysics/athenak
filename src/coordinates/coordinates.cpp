@@ -44,7 +44,8 @@ Coordinates::Coordinates(ParameterInput *pin, MeshBlockPack *ppack) :
   if (is_general_relativistic || is_dynamical_relativistic) {
     coord_data.is_minkowski = pin->GetOrAddBoolean("coord","minkowski",false);
     if (!(coord_data.is_minkowski)) {
-      coord_data.bh_spin = pin->GetReal("coord","a");
+      coord_data.bh_spin = is_dynamical_relativistic ?
+          pin->GetOrAddReal("coord","a",0.0) : pin->GetReal("coord","a");
       coord_data.bh_excise = pin->GetOrAddBoolean("coord","excise",true);
     } else {
       coord_data.bh_spin = 0.0;
