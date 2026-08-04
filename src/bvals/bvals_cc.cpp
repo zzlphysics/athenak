@@ -332,6 +332,10 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   bool bflag = false;
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
+    if (!(pmy_pack->all_blocks_active) &&
+        pmy_pack->pmb->mb_lev.h_view(m) != pmy_pack->active_level) {
+      continue;
+    }
     for (int n=0; n<nnghbr; ++n) {
       if (nghbr.h_view(m,n).gid >= 0) { // neighbor exists and not a physical boundary
         if (nghbr.h_view(m,n).rank != global_variable::my_rank) {
@@ -365,8 +369,8 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackCC(DvceArray5D<Real> &a,
   const int active_offset = pmy_pack->active_offset;
   auto active_lids = pmy_pack->active_lids.d_view;
 
-  // Ranks without a block on this level have no local destination to unpack.  Level
-  // subcycling is currently restricted to one MPI rank, so no remote receives remain.
+  // Ranks without a block on this level have no local destination to unpack.  They may
+  // still have supplied remote donors, whose sends are cleared by the normal task list.
   if (nmb_loop <= 0) {return TaskStatus::complete;}
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)

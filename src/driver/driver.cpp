@@ -323,14 +323,14 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
     violations.emplace_back("<time>/integrator must be rk2");
   }
   if (!pmesh->multilevel || pmesh->adaptive ||
-      pmesh->max_level != pmesh->root_level + 1) {
-    violations.emplace_back("mesh refinement must be static SMR with exactly two levels");
+      pmesh->max_level <= pmesh->root_level) {
+    violations.emplace_back("mesh refinement must be static SMR with at least two levels");
   }
   if (pmesh->pmr != nullptr && pmesh->pmr->prolong_prims) {
     violations.emplace_back("<mesh_refinement>/prolong_primitives must be false");
   }
-  if (global_variable::nranks != 1 || pmesh->nmb_packs_thisrank != 1) {
-    violations.emplace_back("the initial implementation requires one MPI rank and one pack");
+  if (pmesh->nmb_packs_thisrank != 1) {
+    violations.emplace_back("level subcycling currently requires one MeshBlockPack per rank");
   }
   if (pmbp->pmhd == nullptr || pmbp->phydro != nullptr || pmbp->pionn != nullptr) {
     violations.emplace_back("physics must be single-fluid MHD (not hydro or ion-neutral)");
@@ -368,7 +368,9 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
       for (const auto &reason : violations) {
         std::cout << "  - " << reason << std::endl;
       }
-      std::cout << "Supported MVP: single-rank, two-level static SMR, RK2, MHD+CT with a "
+      std::cout << "Supported envelope: one MeshBlockPack per MPI rank, multilevel "
+                << "static SMR, "
+                << "RK2, MHD+CT with a "
                 << "prescribed dynamic ADM metric and no auxiliary physics/source "
                 << "modules." << std::endl;
     }
@@ -422,6 +424,23 @@ Real Driver::ComputeLevelSubcyclingTimeStep(Mesh *pmesh) {
     const Real root_candidate = std::ldexp(dt_level, level-pmesh->root_level);
     dt_root = std::min(dt_root, root_candidate);
   }
+
+#if MPI_PARALLEL_ENABLED
+  // Every rank must enter the recursive level schedule with the same root timestep.
+  // A rank without blocks on a given level contributes +max above; the global minimum
+  // therefore remains the most restrictive CFL limit among all active blocks.
+  int ierr = MPI_Allreduce(MPI_IN_PLACE, &dt_root, 1, MPI_ATHENA_REAL, MPI_MIN,
+                           MPI_COMM_WORLD);
+  if (ierr != MPI_SUCCESS) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "MPI error while reducing the level-subcycling timestep."
+                << std::endl;
+    }
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+#endif
 
   pmbp->SetAllBlocksActive();
   ResetLevelSubcyclingContext();
@@ -514,6 +533,28 @@ void Driver::PrepareFineLevelBoundaries(Mesh *pmesh, int coarse_level, int fine_
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn Driver::RefreshSynchronizedDescendants()
+//! \brief Refill every descendant level after an ancestor's endpoint reflux.
+//!
+//! A parent correction can change prolongation data needed more than one level below it.
+//! Refreshing only the direct child leaves deeper ghost zones stale at the root sync
+//! point, which is observable in derived outputs and restart data.  The endpoint ordinal
+//! doubles at each refinement level: root endpoint 1 maps to child endpoints 2, 4, 8, ...
+
+void Driver::RefreshSynchronizedDescendants(Mesh *pmesh, int parent_level,
+                                             int parent_end_ordinal, Real sync_time,
+                                             Real parent_dt) {
+  const int child_level = parent_level + 1;
+  if (child_level > pmesh->max_level) return;
+
+  const int child_end_ordinal = 2*parent_end_ordinal;
+  PrepareFineLevelBoundaries(pmesh, parent_level, child_level,
+                             child_end_ordinal, sync_time, parent_dt, 1.0);
+  RefreshSynchronizedDescendants(pmesh, child_level, child_end_ordinal,
+                                 sync_time, 0.5*parent_dt);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn Driver::SynchronizeLevelPair()
 //! \brief Refresh a parent from its synchronized child before/after the RK2 corrector.
 
@@ -562,20 +603,20 @@ void Driver::SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
 void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt) {
   MeshBlockPack *pmbp = pmesh->pmb_pack;
   pmbp->SetActiveLevel(level);
-  const bool has_active_blocks = (pmbp->nmb_active > 0);
   const int fine_level = level + 1;
   const bool has_finer_level = (fine_level <= pmesh->max_level);
 
-  if (has_active_blocks) {
-    SetLevelSubcyclingContext(level, substep, time, dt);
-    pmesh->time = time;
-    pmesh->dt = dt;
-    if (has_finer_level) {
-      pmbp->pmhd->ResetLevelSubcyclingRegisters(level);
-    }
-    ExecuteTaskList(pmesh, "before_timeintegrator", 0);
-    ExecuteLevelStage(pmesh, level, substep, time, dt, 1);
+  // All MPI ranks execute the identical recursive schedule.  A rank with no local block
+  // on this level still owns possible donor blocks and must participate in boundary and
+  // register communication for active destinations on another rank.
+  SetLevelSubcyclingContext(level, substep, time, dt);
+  pmesh->time = time;
+  pmesh->dt = dt;
+  if (has_finer_level) {
+    pmbp->pmhd->ResetLevelSubcyclingRegisters(level);
   }
+  ExecuteTaskList(pmesh, "before_timeintegrator", 0);
+  ExecuteLevelStage(pmesh, level, substep, time, dt, 1);
 
   if (has_finer_level) {
     const Real fine_dt = 0.5*dt;
@@ -597,28 +638,25 @@ void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real d
     SynchronizeLevelPair(pmesh, level, fine_level, time + dt, dt);
   }
 
-  if (has_active_blocks) {
-    ExecuteLevelStage(pmesh, level, substep, time, dt, 2);
-    if (has_finer_level) {
-      // Both coarse RK fluxes and all child fluxes are now in the registers.  Apply the
-      // conservative corrections, rebuild the corrected parent ghosts/primitives, then
-      // seed the child ghosts with the corrected synchronized parent state.
-      pmbp->SetActiveLevel(level);
-      SetLevelSubcyclingContext(level, substep, time, dt);
-      pmesh->time = time;
-      pmesh->dt = dt;
-      pmbp->pmhd->ApplyLevelSubcyclingRegisters(level);
-      SynchronizeLevelPair(pmesh, level, fine_level, time + dt, dt);
-      PrepareFineLevelBoundaries(pmesh, level, fine_level, 2*substep + 2,
-                                 time + dt, dt, 1.0);
-      pmbp->SetActiveLevel(level);
-      SetLevelSubcyclingContext(level, substep, time, dt,
-                                level == pmesh->root_level);
-      pmesh->time = time;
-      pmesh->dt = dt;
-    }
-    ExecuteTaskList(pmesh, "after_timeintegrator", 1);
+  ExecuteLevelStage(pmesh, level, substep, time, dt, 2);
+  if (has_finer_level) {
+    // Both coarse RK fluxes and all child fluxes are now in the registers.  Apply the
+    // conservative corrections, rebuild the corrected parent ghosts/primitives, then
+    // seed the child ghosts with the corrected synchronized parent state.
+    pmbp->SetActiveLevel(level);
+    SetLevelSubcyclingContext(level, substep, time, dt);
+    pmesh->time = time;
+    pmesh->dt = dt;
+    pmbp->pmhd->ApplyLevelSubcyclingRegisters(level);
+    SynchronizeLevelPair(pmesh, level, fine_level, time + dt, dt);
+    RefreshSynchronizedDescendants(pmesh, level, substep + 1, time + dt, dt);
+    pmbp->SetActiveLevel(level);
+    SetLevelSubcyclingContext(level, substep, time, dt,
+                              level == pmesh->root_level);
+    pmesh->time = time;
+    pmesh->dt = dt;
   }
+  ExecuteTaskList(pmesh, "after_timeintegrator", 1);
 }
 
 //----------------------------------------------------------------------------------------
@@ -763,13 +801,13 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       pmesh->dt_last_completed = pmesh->dt;
       if (LevelSubcyclingRequested()) {
         SetLevelSubcyclingContext(pmesh->root_level, 0, pmesh->time, pmesh->dt, true);
+        // lloc_eachmb is replicated global metadata, so this count is correct on rank 0
+        // without adding a per-cycle collective.  A level-l block advances 2^(l-root)
+        // times during one synchronized root step.
         std::uint64_t level_updates = 0;
-        const auto &counts = pmesh->pmb_pack->level_counts;
-        for (int level=pmesh->root_level; level<=pmesh->max_level; ++level) {
-          if (level < static_cast<int>(counts.size())) {
-            level_updates += static_cast<std::uint64_t>(counts[level])
-                           << (level - pmesh->root_level);
-          }
+        for (int m=0; m<pmesh->nmb_total; ++m) {
+          const int level = pmesh->lloc_eachmb[m].level;
+          level_updates += std::uint64_t{1} << (level - pmesh->root_level);
         }
         nmb_updated_ += level_updates;
       } else {

@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <cinttypes>
+#include <cmath>
 #include <limits> // numeric_limits<>
 #include <memory> // make_unique<>
 
@@ -22,6 +23,19 @@
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+namespace {
+
+bool LevelSubcyclingRequested(ParameterInput *pin) {
+  return pin->DoesParameterExist("time", "subcycling") &&
+         pin->GetString("time", "subcycling") == "level";
+}
+
+float LevelSubcyclingBlockCost(const LogicalLocation &lloc, int root_level) {
+  return std::ldexp(1.0f, lloc.level - root_level);
+}
+
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void Mesh::BuildTreeFromScratch():
@@ -252,9 +266,14 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   }
 #endif
 
-  // initialize cost array with the simplest estimate; all the blocks are equal
-  // TODO(@user): implement variable cost per MeshBlock as needed
-  for (int i=0; i<nmb_total; i++) {cost_eachmb[i] = 1.0;}
+  // A level-l block advances 2^(l-root) times per synchronized root step.  Weighting
+  // static partitions by that update frequency avoids assigning equal cost to blocks
+  // whose strict-subcycling work differs by powers of two.
+  const bool level_subcycling = LevelSubcyclingRequested(pin);
+  for (int i=0; i<nmb_total; i++) {
+    cost_eachmb[i] = level_subcycling
+        ? LevelSubcyclingBlockCost(lloc_eachmb[i], root_level) : 1.0f;
+  }
   LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
 
   // create MeshBlockPack for this rank
@@ -435,6 +454,21 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   }
   delete [] idlist;
   if (!adaptive) max_level = current_level;
+
+  // Checkpoints made before level-aware costs were introduced contain a uniform unit
+  // cost list.  Upgrade only that recognizable legacy case; otherwise preserve any
+  // measured or already-weighted costs stored in the restart.
+  if (LevelSubcyclingRequested(pin)) {
+    bool legacy_unit_costs = true;
+    for (int i=0; i<nmb_total; ++i) {
+      legacy_unit_costs = legacy_unit_costs && (cost_eachmb[i] == 1.0f);
+    }
+    if (legacy_unit_costs) {
+      for (int i=0; i<nmb_total; ++i) {
+        cost_eachmb[i] = LevelSubcyclingBlockCost(lloc_eachmb[i], root_level);
+      }
+    }
+  }
 
   // rebuild the MeshBlockTree
   ptree = std::make_unique<MeshBlockTree>(this);

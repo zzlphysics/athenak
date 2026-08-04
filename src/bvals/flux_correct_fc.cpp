@@ -29,6 +29,11 @@ bool IsFCFluxBuffer(const int n) {
     std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
               << "Face-centered level EMF register: " << message << std::endl;
   }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+#endif
   std::exit(EXIT_FAILURE);
 }
 
@@ -48,15 +53,16 @@ void ValidateFluxRegistersFC(MeshBoundaryBuffer *rbuf, const int nnghbr,
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesFC::InitializeFluxRegistersFC()
-//! \brief Explicitly allocate persistent receive-side EMF registers for subcycling.
+//! \brief Explicitly allocate persistent receive- and send-side EMF registers.
 //!
-//! Registers are keyed by (coarse MeshBlock, coarse-side neighbor buffer).  They are
-//! deliberately separate from the transient same-level EMF communication buffers, and
-//! are allocated only when level subcycling opts in.
+//! Receive registers are keyed by (coarse MeshBlock, coarse-side neighbor buffer), while
+//! outbound registers integrate fine EMFs for remote coarse owners.  They are deliberately
+//! separate from the transient same-level EMF communication buffers and are allocated only
+//! when level subcycling opts in.
 
 void MeshBoundaryValuesFC::InitializeFluxRegistersFC() {
-  if (global_variable::nranks != 1 || pmy_pack->pmesh->nmb_packs_thisrank != 1) {
-    FluxRegisterFCError("the initial implementation requires one rank and one MeshBlockPack");
+  if (pmy_pack->pmesh->nmb_packs_thisrank != 1) {
+    FluxRegisterFCError("level registers currently require one MeshBlockPack per rank");
   }
   if (!(pmy_pack->pmesh->multilevel) || pmy_pack->pmesh->adaptive) {
     FluxRegisterFCError("the initial implementation requires static mesh refinement");
@@ -68,18 +74,25 @@ void MeshBoundaryValuesFC::InitializeFluxRegistersFC() {
 
   bool any_initialized = false;
   for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
-    any_initialized = any_initialized || (recvbuf[n].flux_reg.extent_int(0) > 0);
+    any_initialized = any_initialized || (recvbuf[n].flux_reg.extent_int(0) > 0) ||
+                      (sendbuf[n].flux_reg.extent_int(0) > 0);
   }
   if (any_initialized) {
     ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+    ValidateFluxRegistersFC(sendbuf, nnghbr, nmb);
     return;
   }
 
   for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
-    const int ndata = 3*recvbuf[n].iflxc_ndat;
-    if (ndata > 0) {
-      Kokkos::realloc(recvbuf[n].flux_reg, nmb, ndata);
+    const int recv_ndata = 3*recvbuf[n].iflxc_ndat;
+    const int send_ndata = 3*sendbuf[n].iflxc_ndat;
+    if (recv_ndata > 0) {
+      Kokkos::realloc(recvbuf[n].flux_reg, nmb, recv_ndata);
       Kokkos::deep_copy(recvbuf[n].flux_reg, 0.0);
+    }
+    if (send_ndata > 0) {
+      Kokkos::realloc(sendbuf[n].flux_reg, nmb, send_ndata);
+      Kokkos::deep_copy(sendbuf[n].flux_reg, 0.0);
     }
   }
 }
@@ -95,17 +108,20 @@ TaskStatus MeshBoundaryValuesFC::ResetFluxRegistersFC(int coarse_level) {
   const int nmb = pmy_pack->nmb_thispack;
   const int nnghbr = pmy_pack->pmb->nnghbr;
   ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+  ValidateFluxRegistersFC(sendbuf, nnghbr, nmb);
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
   auto &rbuf = recvbuf;
 
   for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
-    const int ndata = 3*rbuf[n].iflxc_ndat;
-    if (ndata <= 0) {
+    const int recv_ndata = 3*rbuf[n].iflxc_ndat;
+    const int send_ndata = 3*sendbuf[n].iflxc_ndat;
+    if (recv_ndata <= 0 && send_ndata <= 0) {
       continue;
     }
     auto reg = rbuf[n].flux_reg;
+    auto outbound = sendbuf[n].flux_reg;
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb, Kokkos::AUTO);
     Kokkos::parallel_for("reset_fc_emf_register", policy,
     KOKKOS_LAMBDA(TeamMember_t tmember) {
@@ -113,9 +129,17 @@ TaskStatus MeshBoundaryValuesFC::ResetFluxRegistersFC(int coarse_level) {
       if ((mblev.d_view(m) == coarse_level) &&
           (nghbr.d_view(m,n).gid >= 0) &&
           (nghbr.d_view(m,n).lev == coarse_level + 1)) {
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, recv_ndata),
         [&](const int q) {
           reg(m,q) = 0.0;
+        });
+      }
+      if ((mblev.d_view(m) == coarse_level + 1) &&
+          (nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev == coarse_level)) {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, send_ndata),
+        [&](const int q) {
+          outbound(m,q) = 0.0;
         });
       }
     });
@@ -138,6 +162,7 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
   const int nmb = pmy_pack->nmb_thispack;
   const int nnghbr = pmy_pack->pmb->nnghbr;
   ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+  ValidateFluxRegistersFC(sendbuf, nnghbr, nmb);
   if (!(stage_weight > 0.0) || !std::isfinite(stage_weight)) {
     FluxRegisterFCError("stage weight must be positive, finite, and include the RK time weight");
   }
@@ -193,9 +218,8 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
     if (!(source_is_coarse || source_is_fine)) {
       return;
     }
-    if (source_is_fine && nghbr.d_view(m,n).rank != my_rank) {
-      return;
-    }
+    const bool remote_fine =
+        source_is_fine && nghbr.d_view(m,n).rank != my_rank;
 
     int dm = m;
     int dn = n;
@@ -209,8 +233,10 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
       ku = rbuf[n].iflux_coar[v].bke;
       ndat = rbuf[n].iflxc_ndat;
     } else {
-      dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
-      dn = nghbr.d_view(m,n).dest;
+      if (!remote_fine) {
+        dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
+        dn = nghbr.d_view(m,n).dest;
+      }
       il = sbuf[n].iflux_coar[v].bis;
       iu = sbuf[n].iflux_coar[v].bie;
       jl = sbuf[n].iflux_coar[v].bjs;
@@ -261,7 +287,11 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
           }
         }
         const int q = ndat*v + (j-jl + nj*(k-kl));
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
 
     // x2faces: only x1e and x3e are tangential to the interface.
@@ -294,7 +324,11 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
           }
         }
         const int q = ndat*v + i-il + ni*(k-kl);
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
 
     // x1x2 edges: only x3e lives on the edge.
@@ -314,7 +348,11 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
           emf = 0.5*(flx.x3e(m,fk,fj,fi) + flx.x3e(m,fk+1,fj,fi));
         }
         const int q = ndat*v + (k-kl);
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
 
     // x3faces: only x1e and x2e are tangential to the interface.
@@ -339,7 +377,11 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
               : 0.5*(flx.x2e(m,fk,fj,fi) + flx.x2e(m,fk,fj+1,fi));
         }
         const int q = ndat*v + i-il + ni*(j-jl);
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
 
     // x3x1 edges: only x2e lives on the edge.
@@ -354,7 +396,11 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
             ? flx.x2e(m,kl,j,il)
             : 0.5*(flx.x2e(m,fk,fj,fi) + flx.x2e(m,fk,fj+1,fi));
         const int q = ndat*v + (j-jl);
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
 
     // x2x3 edges: only x1e lives on the edge.
@@ -369,12 +415,137 @@ TaskStatus MeshBoundaryValuesFC::AccumulateFluxRegistersFC(
             ? flx.x1e(m,kl,jl,i)
             : 0.5*(flx.x1e(m,fk,fj,fi) + flx.x1e(m,fk,fj,fi+1));
         const int q = ndat*v + i-il;
-        Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        if (remote_fine) {
+          Kokkos::atomic_add(&sbuf[n].flux_reg(m,q), coefficient*emf);
+        } else {
+          Kokkos::atomic_add(&rbuf[dn].flux_reg(dm,q), coefficient*emf);
+        }
       });
     }
     tmember.team_barrier();
   });
 
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesFC::ExchangeFluxRegistersFC()
+//! \brief Exchange time-integrated fine EMFs once at a parent/child sync point.
+//!
+//! Same-level stage EMF communication uses the transient flux buffers.  Remote fine
+//! contributions are therefore accumulated in persistent send-side registers during the
+//! RK stages and moved into the coarse receive-side registers only after all stages have
+//! cleared their requests.  This keeps the two protocols disjoint and sends one message
+//! per remote interface per parent step.
+
+TaskStatus MeshBoundaryValuesFC::ExchangeFluxRegistersFC(int coarse_level) {
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  ValidateFluxRegistersFC(recvbuf, nnghbr, nmb);
+  ValidateFluxRegistersFC(sendbuf, nnghbr, nmb);
+
+#if MPI_PARALLEL_ENABLED
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+  const int my_rank = global_variable::my_rank;
+  bool no_errors = true;
+
+  Kokkos::fence();
+
+  // Post receive-side staging buffers owned by local coarse blocks.
+  for (int m=0; m<nmb; ++m) {
+    if (mblev.h_view(m) != coarse_level) continue;
+    for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+      if ((nghbr.h_view(m,n).gid < 0) ||
+          (nghbr.h_view(m,n).lev != coarse_level + 1) ||
+          (nghbr.h_view(m,n).rank == my_rank)) {
+        continue;
+      }
+      if (recvbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+        FluxRegisterFCError("receive request was still active at register exchange");
+      }
+      const int data_size = 3*recvbuf[n].iflxc_ndat;
+      auto recv_ptr = Kokkos::subview(recvbuf[n].flux, m, Kokkos::ALL);
+      const int tag = CreateBvals_MPI_Tag(m, n);
+      const int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_ATHENA_REAL,
+                                 nghbr.h_view(m,n).rank, tag, comm_flux,
+                                 &(recvbuf[n].flux_req[m]));
+      if (ierr != MPI_SUCCESS) no_errors = false;
+    }
+  }
+
+  // Send persistent outbound registers owned by local fine blocks.
+  for (int m=0; m<nmb; ++m) {
+    if (mblev.h_view(m) != coarse_level + 1) continue;
+    for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+      if ((nghbr.h_view(m,n).gid < 0) ||
+          (nghbr.h_view(m,n).lev != coarse_level) ||
+          (nghbr.h_view(m,n).rank == my_rank)) {
+        continue;
+      }
+      if (sendbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+        FluxRegisterFCError("send request was still active at register exchange");
+      }
+      const int drank = nghbr.h_view(m,n).rank;
+      const int dn = nghbr.h_view(m,n).dest;
+      const int lid = nghbr.h_view(m,n).gid -
+                      pmy_pack->pmesh->gids_eachrank[drank];
+      const int tag = CreateBvals_MPI_Tag(lid, dn);
+      const int data_size = 3*sendbuf[n].iflxc_ndat;
+      auto send_ptr = Kokkos::subview(sendbuf[n].flux_reg, m, Kokkos::ALL);
+      const int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL,
+                                 drank, tag, comm_flux,
+                                 &(sendbuf[n].flux_req[m]));
+      if (ierr != MPI_SUCCESS) no_errors = false;
+    }
+  }
+
+  // Complete all transfers before the staging buffers are added on device.
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+      if (recvbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+        const int ierr = MPI_Wait(&(recvbuf[n].flux_req[m]), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+      }
+    }
+  }
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+      if (sendbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+        const int ierr = MPI_Wait(&(sendbuf[n].flux_req[m]), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) no_errors = false;
+      }
+    }
+  }
+  if (!no_errors) {
+    FluxRegisterFCError("MPI failure during register exchange");
+  }
+
+  auto &rbuf = recvbuf;
+  for (int n=0; n<nnghbr && IsFCFluxBuffer(n); ++n) {
+    const int ndata = 3*rbuf[n].iflxc_ndat;
+    if (ndata <= 0) continue;
+    auto staging = rbuf[n].flux;
+    auto reg = rbuf[n].flux_reg;
+    Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb, Kokkos::AUTO);
+    Kokkos::parallel_for("unpack_remote_fc_emf_register", policy,
+    KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = tmember.league_rank();
+      if ((mblev.d_view(m) == coarse_level) &&
+          (nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev == coarse_level + 1) &&
+          (nghbr.d_view(m,n).rank != my_rank)) {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+        [&](const int q) {
+          reg(m,q) += staging(m,q);
+        });
+      }
+    });
+  }
+  Kokkos::fence();
+#else
+  (void) coarse_level;
+#endif
   return TaskStatus::complete;
 }
 
@@ -1525,14 +1696,20 @@ TaskStatus MeshBoundaryValuesFC::InitFluxRecv(const int nvars) {
     for (int n=0; n<nnghbr; ++n) {
       // only post receives for neighbors on FACES and EDGES at FINER and SAME levels
       // this is the only thing different from BoundaryValuesCC::InitRecvFlux()
-      if ( (nghbr.h_view(m,n).gid >=0) &&
-           (nghbr.h_view(m,n).lev >= pmy_pack->pmb->mb_lev.h_view(m)) &&
-           (n<48) ) {
+      const int target_level = pmy_pack->pmb->mb_lev.h_view(m);
+      const bool eligible_neighbor = pmy_pack->all_blocks_active
+          ? (nghbr.h_view(m,n).lev >= target_level)
+          : (target_level == pmy_pack->active_level &&
+             nghbr.h_view(m,n).lev == target_level);
+      if ( (nghbr.h_view(m,n).gid >=0) && eligible_neighbor && (n<48) ) {
         // rank of destination buffer
         int drank = nghbr.h_view(m,n).rank;
 
         // post non-blocking receive if neighboring MeshBlock on a different rank
         if (drank != global_variable::my_rank) {
+          if (recvbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+            FluxRegisterFCError("receive request was still active before stage communication");
+          }
           // create tag using local ID and buffer index of *receiving* MeshBlock
           int tag = CreateBvals_MPI_Tag(m, n);
 

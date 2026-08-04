@@ -1,0 +1,107 @@
+# Small three-level static-SMR problem for strict level-subcycling MPI tests.
+# Successively refining the central 2x2x2 blocks produces 56, 56, and 64
+# leaf blocks on levels 0, 1, and 2 (176 total).
+
+<job>
+basename = subcycling_smr_dyngrmhd
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = -0.5
+x1max  =  0.5
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2    = 32
+x2min  = -0.5
+x2max  =  0.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3    = 32
+x3min  = -0.5
+x3max  =  0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement          = static
+prolong_primitives  = false
+
+<refined_region1>
+level = 1
+x1min = -0.25
+x1max =  0.25
+x2min = -0.25
+x2max =  0.25
+x3min = -0.25
+x3max =  0.25
+
+<refined_region2>
+level = 2
+x1min = -0.125
+x1max =  0.125
+x2min = -0.125
+x2max =  0.125
+x3min = -0.125
+x3max =  0.125
+
+<coord>
+minkowski = true
+
+<adm>
+dynamic = true
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.2
+nlim       = 1
+tlim       = 100.0
+ndiag      = 1
+
+<mhd>
+reconstruct = plm
+rsolver     = hlle
+gamma       = 1.3333333333333333
+tfloor      = 1.0e-10
+dyn_eos     = ideal
+eos         = ideal
+dyn_error   = reset_floor
+dyn_scratch = 1
+
+<problem>
+pgen_name = linear_wave
+wave_flag = 0
+amp       = 1.0e-3
+dens      = 4.0
+pgas      = 1.0
+vx0       = -0.1
+vy0       = 0.3
+vz0       = -0.05
+bx0       = 2.5
+by0       = 1.8
+bz0       = -1.2
+along_x1  = false
+along_x2  = false
+along_x3  = false
+
+# A large cadence leaves only the initialization and final synchronized dumps.
+<output1>
+file_type   = bin
+variable    = mhd_w_bcc
+dt          = 100.0
+ghost_zones = false
+
+<output2>
+file_type   = bin
+variable    = mhd_divb
+dt          = 100.0
+ghost_zones = false

@@ -105,6 +105,10 @@ void MHD::ResetLevelSubcyclingRegisters(int coarse_level) {
 //! \brief Apply time-integrated conservative and CT synchronization corrections.
 
 void MHD::ApplyLevelSubcyclingRegisters(int coarse_level) {
+  // Stage communication has been cleared before this synchronization point.  Exchange
+  // each remote fine-side time integral once, then materialize the complete mismatch.
+  (void) pbval_u->ExchangeFluxRegistersCC(coarse_level);
+  (void) pbval_b->ExchangeFluxRegistersFC(coarse_level);
   (void) pbval_u->ApplyFluxRegistersCC(u0, uflx, coarse_level);
   (void) pbval_b->LoadFluxRegistersFC(efld, coarse_level);
   ApplyEMFReflux();

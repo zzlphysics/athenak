@@ -174,12 +174,15 @@ class MeshBoundaryValuesCC : public MeshBoundaryValues {
   TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx);
   TaskStatus RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx);
 
-  // Persistent, single-rank RK2 flux registers used by level subcycling.  Each receive-
-  // side register is keyed by (coarse MeshBlock, coarse-side neighbor index).  The stage
-  // weight is the RK quadrature weight including dt (dt/2 for both stages of RK2).
+  // Persistent RK2 flux registers used by level subcycling.  Each receive-side register
+  // is keyed by (coarse MeshBlock, coarse-side neighbor index).  Fine blocks whose coarse
+  // neighbor is remote accumulate into a matching outbound register until the level pair
+  // synchronizes.  The stage weight is the RK quadrature weight including dt (dt/2 for
+  // both stages of RK2).
   void InitializeFluxRegistersCC(int nvar);
   TaskStatus ResetFluxRegistersCC(int coarse_level);
   TaskStatus AccumulateFluxRegistersCC(DvceFaceFld5D<Real> &flx, Real stage_weight);
+  TaskStatus ExchangeFluxRegistersCC(int coarse_level);
   TaskStatus ApplyFluxRegistersCC(DvceArray5D<Real> &cons,
                                   DvceFaceFld5D<Real> &flux_scratch,
                                   int coarse_level);
@@ -233,6 +236,7 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
   void InitializeFluxRegistersFC();
   TaskStatus ResetFluxRegistersFC(int coarse_level);
   TaskStatus AccumulateFluxRegistersFC(DvceEdgeFld4D<Real> &flx, Real stage_weight);
+  TaskStatus ExchangeFluxRegistersFC(int coarse_level);
   TaskStatus LoadFluxRegistersFC(DvceEdgeFld4D<Real> &flx_scratch, int coarse_level);
   void SumBoundaryFluxes(DvceEdgeFld4D<Real> &flx, const bool same_level,
                          DvceArray2D<int> &nflx);

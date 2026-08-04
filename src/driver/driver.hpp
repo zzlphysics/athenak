@@ -93,6 +93,9 @@ class Driver {
   void PrepareFineLevelBoundaries(Mesh *pmesh, int coarse_level, int fine_level,
                                   int fine_substep, Real time, Real coarse_dt,
                                   Real theta);
+  void RefreshSynchronizedDescendants(Mesh *pmesh, int parent_level,
+                                      int parent_end_ordinal, Real sync_time,
+                                      Real parent_dt);
   void SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
                             Real sync_time, Real coarse_dt);
 };

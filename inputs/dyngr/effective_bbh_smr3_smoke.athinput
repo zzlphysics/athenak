@@ -1,0 +1,134 @@
+# Low-resolution three-level static-SMR effective-BBH test for recursive subcycling.
+# This input exercises two refinement interfaces; it is not scientifically resolved.
+
+<job>
+basename = effective_bbh_smr3_smoke
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = -24.0
+x1max  =  24.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 32
+x2min  = -24.0
+x2max  =  24.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -24.0
+x3max  =  24.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement          = static
+max_nmb_per_rank    = 240
+prolong_primitives  = false
+
+<refined_region1>
+level = 1
+x1min = -12.0
+x1max =  12.0
+x2min = -12.0
+x2max =  12.0
+x3min = -12.0
+x3max =  12.0
+
+<refined_region2>
+level = 2
+x1min = -6.0
+x1max =  6.0
+x2min = -6.0
+x2max =  6.0
+x3min = -6.0
+x3max =  6.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.2
+nlim       = 2
+tlim       = 100.0
+ndiag      = 1
+
+<coord>
+minkowski       = false
+excise          = true
+excision_scheme = lapse
+excise_lapse    = 0.25
+dexcise         = 1.0e-8
+pexcise         = 1.0e-10
+
+<adm>
+dynamic = true
+
+<mhd>
+eos             = ideal
+dyn_eos         = ideal
+dyn_error       = reset_floor
+gamma           = 1.3333333333333333
+reconstruct     = plm
+rsolver         = hlle
+dfloor          = 1.0e-8
+tfloor          = 1.0e-3
+dthreshold      = 1.01
+dyn_scratch     = 1
+fofc            = true
+enforce_maximum = false
+
+<problem>
+pgen_name          = dynbbh
+trajectory_mode    = circular
+trajectory_file    = none
+trajectory_time_offset = 0.0
+separation         = 20.0
+mass_ratio         = 1.0
+chi1               = 0.0
+chi2               = 0.0
+theta1             = 0.0
+theta2             = 0.0
+phi1               = 0.0
+phi2               = 0.0
+rho0               = 1.0e-5
+pgas0              = 1.0e-7
+u1                  = 0.0
+u2                  = 0.0
+u3                  = 0.0
+b1                  = 0.0
+b2                  = 0.0
+b3                  = 1.0e-6
+mass_scale1         = 1.0
+mass_scale2         = 1.0
+spin_buffer1        = 0.05
+spin_buffer2        = 0.05
+singularity_floor   = 1.0e-3
+amr_condition       = track
+alpha_threshold     = 0.6
+refinement_radius   = 6.0
+
+<output1>
+file_type   = hst
+data_format = %.17e
+dt          = 100.0
+
+<output2>
+file_type   = bin
+variable    = mhd_w_bcc
+dt          = 100.0
+ghost_zones = false
+
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dt          = 100.0
+ghost_zones = false

@@ -37,6 +37,13 @@ TaskStatus MeshBoundaryValues::InitRecv(const int nvars) {
   // Initialize communications of variables
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
+    // A level-local step only advances destinations on active_level.  Donor blocks on
+    // any level may still send to them, but posting receives for inactive destinations
+    // would leave unmatched MPI requests until the next synchronization point.
+    if (!(pmy_pack->all_blocks_active) &&
+        pmy_pack->pmb->mb_lev.h_view(m) != pmy_pack->active_level) {
+      continue;
+    }
     for (int n=0; n<nnghbr; ++n) {
       if (nghbr.h_view(m,n).gid >= 0) {
         // rank of destination buffer
@@ -94,6 +101,10 @@ TaskStatus MeshBoundaryValues::ClearRecv() {
 
   // wait for all non-blocking receives for vars to finish before continuing
   for (int m=0; m<nmb; ++m) {
+    if (!(pmy_pack->all_blocks_active) &&
+        pmy_pack->pmb->mb_lev.h_view(m) != pmy_pack->active_level) {
+      continue;
+    }
     for (int n=0; n<nnghbr; ++n) {
       if ( (nghbr.h_view(m,n).gid >= 0) &&
            (nghbr.h_view(m,n).rank != global_variable::my_rank) ) {
@@ -128,7 +139,9 @@ TaskStatus MeshBoundaryValues::ClearSend() {
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<nnghbr; ++n) {
       if ( (nghbr.h_view(m,n).gid >= 0) &&
-           (nghbr.h_view(m,n).rank != global_variable::my_rank) ) {
+           (nghbr.h_view(m,n).rank != global_variable::my_rank) &&
+           (pmy_pack->all_blocks_active ||
+            nghbr.h_view(m,n).lev == pmy_pack->active_level) ) {
         int ierr = MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
         if (ierr != MPI_SUCCESS) {no_errors=false;}
       }

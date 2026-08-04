@@ -28,6 +28,11 @@ bool IsCCFluxFace(const int n) {
     std::cout << "### FATAL ERROR in " << __FILE__ << std::endl
               << "Cell-centered level flux register: " << message << std::endl;
   }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+#endif
   std::exit(EXIT_FAILURE);
 }
 
@@ -35,18 +40,19 @@ bool IsCCFluxFace(const int n) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValuesCC::InitializeFluxRegistersCC()
-//! \brief Explicitly allocate persistent receive-side flux registers for level subcycling.
+//! \brief Explicitly allocate persistent flux registers for level subcycling.
 //!
-//! Register storage is keyed by (coarse MeshBlock, coarse-side neighbor buffer).  It is
-//! intentionally separate from the transient flux communication buffer and is allocated
-//! only when requested, leaving the legacy global-timestep path allocation-free.
+//! Receive-side storage is keyed by (coarse MeshBlock, coarse-side neighbor buffer).
+//! Send-side storage integrates fine fluxes whose coarse destination is on another rank.
+//! Both are separate from the transient flux communication buffer and are allocated only
+//! when requested, leaving the legacy global-timestep path allocation-free.
 
 void MeshBoundaryValuesCC::InitializeFluxRegistersCC(int nvar) {
   if (nvar <= 0) {
     FluxRegisterCCError("the number of variables must be positive");
   }
-  if (global_variable::nranks != 1 || pmy_pack->pmesh->nmb_packs_thisrank != 1) {
-    FluxRegisterCCError("the initial implementation requires one rank and one MeshBlockPack");
+  if (pmy_pack->pmesh->nmb_packs_thisrank != 1) {
+    FluxRegisterCCError("level registers currently require one MeshBlockPack per rank");
   }
   if (!(pmy_pack->pmesh->multilevel) || pmy_pack->pmesh->adaptive) {
     FluxRegisterCCError("the initial implementation requires static mesh refinement");
@@ -63,10 +69,15 @@ void MeshBoundaryValuesCC::InitializeFluxRegistersCC(int nvar) {
   const int nnghbr = pmy_pack->pmb->nnghbr;
   for (int n=0; n<nnghbr; ++n) {
     if (IsCCFluxFace(n)) {
-      const int ndata = nvar*recvbuf[n].iflxc_ndat;
-      if (ndata > 0) {
-        Kokkos::realloc(recvbuf[n].flux_reg, nmb, ndata);
+      const int recv_ndata = nvar*recvbuf[n].iflxc_ndat;
+      if (recv_ndata > 0) {
+        Kokkos::realloc(recvbuf[n].flux_reg, nmb, recv_ndata);
         Kokkos::deep_copy(recvbuf[n].flux_reg, 0.0);
+      }
+      const int send_ndata = nvar*sendbuf[n].iflxc_ndat;
+      if (send_ndata > 0) {
+        Kokkos::realloc(sendbuf[n].flux_reg, nmb, send_ndata);
+        Kokkos::deep_copy(sendbuf[n].flux_reg, 0.0);
       }
     }
   }
@@ -75,10 +86,11 @@ void MeshBoundaryValuesCC::InitializeFluxRegistersCC(int nvar) {
 
 //----------------------------------------------------------------------------------------
 //! \fn TaskStatus MeshBoundaryValuesCC::ResetFluxRegistersCC()
-//! \brief Clear only registers owned by coarse_level at interfaces with coarse_level+1.
+//! \brief Clear registers for the coarse_level/coarse_level+1 interface pair.
 //!
-//! Registers owned by a coarser recursive caller are deliberately preserved while this
-//! level takes either of its two child steps.
+//! Receive registers live on coarse blocks.  Outbound registers live on fine blocks whose
+//! coarse neighbor may be remote.  Registers owned by a coarser recursive caller are
+//! deliberately preserved while this level takes either of its two child steps.
 
 TaskStatus MeshBoundaryValuesCC::ResetFluxRegistersCC(int coarse_level) {
   if (flux_reg_nvar_ <= 0) {
@@ -89,17 +101,20 @@ TaskStatus MeshBoundaryValuesCC::ResetFluxRegistersCC(int coarse_level) {
   const int nnghbr = pmy_pack->pmb->nnghbr;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
+  auto &sbuf = sendbuf;
   auto &rbuf = recvbuf;
 
   for (int n=0; n<nnghbr; ++n) {
     if (!IsCCFluxFace(n)) {
       continue;
     }
-    const int ndata = flux_reg_nvar_*rbuf[n].iflxc_ndat;
-    if (ndata <= 0) {
+    const int recv_ndata = flux_reg_nvar_*rbuf[n].iflxc_ndat;
+    const int send_ndata = flux_reg_nvar_*sbuf[n].iflxc_ndat;
+    if (recv_ndata <= 0 && send_ndata <= 0) {
       continue;
     }
-    auto reg = rbuf[n].flux_reg;
+    auto recv_reg = rbuf[n].flux_reg;
+    auto send_reg = sbuf[n].flux_reg;
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb, Kokkos::AUTO);
     Kokkos::parallel_for("reset_cc_flux_register", policy,
     KOKKOS_LAMBDA(TeamMember_t tmember) {
@@ -107,9 +122,16 @@ TaskStatus MeshBoundaryValuesCC::ResetFluxRegistersCC(int coarse_level) {
       if ((mblev.d_view(m) == coarse_level) &&
           (nghbr.d_view(m,n).gid >= 0) &&
           (nghbr.d_view(m,n).lev == coarse_level + 1)) {
-        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, recv_ndata),
         [&](const int q) {
-          reg(m,q) = 0.0;
+          recv_reg(m,q) = 0.0;
+        });
+      } else if ((mblev.d_view(m) == coarse_level + 1) &&
+                 (nghbr.d_view(m,n).gid >= 0) &&
+                 (nghbr.d_view(m,n).lev == coarse_level)) {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, send_ndata),
+        [&](const int q) {
+          send_reg(m,q) = 0.0;
         });
       }
     });
@@ -124,8 +146,9 @@ TaskStatus MeshBoundaryValuesCC::ResetFluxRegistersCC(int coarse_level) {
 //! stage_weight includes both the RK quadrature coefficient and the active level dt.  For
 //! Heun RK2 it is dt/2 for both stages (not Driver::beta).  An active coarse block adds
 //! -weight*F_coarse to each finer-neighbor register.  An active fine block area-restricts
-//! its flux exactly as PackAndSendFluxCC and adds +weight*F_fine to the destination coarse
-//! block's receive-side register.
+//! its flux exactly as PackAndSendFluxCC.  A local coarse destination is updated directly;
+//! a remote destination is accumulated in an outbound register for exchange at the next
+//! synchronization point.
 
 TaskStatus MeshBoundaryValuesCC::AccumulateFluxRegistersCC(
     DvceFaceFld5D<Real> &flx, Real stage_weight) {
@@ -225,11 +248,8 @@ TaskStatus MeshBoundaryValuesCC::AccumulateFluxRegistersCC(
 
     // Fine contribution: area-restrict onto the matching destination coarse-side key.
     } else if (neighbor_level + 1 == source_level) {
-      // The MVP is single-rank/single-pack, so destination local ID is an array index.
-      if (nghbr.d_view(m,n).rank != my_rank) {
-        return;
-      }
-      const int dm = nghbr.d_view(m,n).gid - mbgid.d_view(0);
+      const bool remote_destination = (nghbr.d_view(m,n).rank != my_rank);
+      const int dm = remote_destination ? m : nghbr.d_view(m,n).gid - mbgid.d_view(0);
       const int dn = nghbr.d_view(m,n).dest;
       int il = sbuf[n].iflux_coar[0].bis;
       int iu = sbuf[n].iflux_coar[0].bie;
@@ -264,7 +284,11 @@ TaskStatus MeshBoundaryValuesCC::AccumulateFluxRegistersCC(
                                     flx.x1f(m,v,fk+1,fj+1,fi));
           }
           const int q = j-jl + nj*(k-kl + nk*v);
-          rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          if (remote_destination) {
+            sbuf[n].flux_reg(m,q) += stage_weight*restricted_flux;
+          } else {
+            rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          }
         });
       } else if (n < 16) {
         const int fj = 2*jl - cjs;
@@ -287,7 +311,11 @@ TaskStatus MeshBoundaryValuesCC::AccumulateFluxRegistersCC(
                                     flx.x2f(m,v,fk+1,fj,fi+1));
           }
           const int q = i-il + ni*(k-kl + nk*v);
-          rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          if (remote_destination) {
+            sbuf[n].flux_reg(m,q) += stage_weight*restricted_flux;
+          } else {
+            rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          }
         });
       } else {
         const int fk = 2*kl - cks;
@@ -303,12 +331,150 @@ TaskStatus MeshBoundaryValuesCC::AccumulateFluxRegistersCC(
               0.25*(flx.x3f(m,v,fk,fj  ,fi  ) + flx.x3f(m,v,fk,fj  ,fi+1) +
                     flx.x3f(m,v,fk,fj+1,fi  ) + flx.x3f(m,v,fk,fj+1,fi+1));
           const int q = i-il + ni*(j-jl + nj*v);
-          rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          if (remote_destination) {
+            sbuf[n].flux_reg(m,q) += stage_weight*restricted_flux;
+          } else {
+            rbuf[dn].flux_reg(dm,q) += stage_weight*restricted_flux;
+          }
         });
       }
     }
     tmember.team_barrier();
   });
+
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MeshBoundaryValuesCC::ExchangeFluxRegistersCC()
+//! \brief Transfer integrated fine-side registers to remote coarse owners.
+//!
+//! Every MPI rank must call this routine at the synchronization point for the same level
+//! pair, including ranks with no local coarse blocks.  The transient receive flux buffer is
+//! used only as staging so an MPI receive cannot overwrite the coarse contribution already
+//! stored in the persistent receive-side register.  All requests complete before return,
+//! allowing the normal flux buffers and tags to be reused by the next stage.
+
+TaskStatus MeshBoundaryValuesCC::ExchangeFluxRegistersCC(int coarse_level) {
+  if (flux_reg_nvar_ <= 0) {
+    FluxRegisterCCError("ExchangeFluxRegistersCC called before initialization");
+  }
+
+#if MPI_PARALLEL_ENABLED
+  const int nmb = pmy_pack->nmb_thispack;
+  const int nnghbr = pmy_pack->pmb->nnghbr;
+  const int my_rank = global_variable::my_rank;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+
+  Kokkos::fence();
+  bool no_errors = true;
+
+  // Post receives first.  One receive-side key has exactly one reciprocal fine sender.
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr; ++n) {
+      if (IsCCFluxFace(n) &&
+          mblev.h_view(m) == coarse_level &&
+          nghbr.h_view(m,n).gid >= 0 &&
+          nghbr.h_view(m,n).lev == coarse_level + 1 &&
+          nghbr.h_view(m,n).rank != my_rank) {
+        if (recvbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+          FluxRegisterCCError("receive request was still active at register exchange");
+        }
+        const int data_size = flux_reg_nvar_*recvbuf[n].iflxc_ndat;
+        auto recv_ptr = Kokkos::subview(recvbuf[n].flux, m, Kokkos::ALL);
+        const int tag = CreateBvals_MPI_Tag(m, n);
+        const int ierr = MPI_Irecv(recv_ptr.data(), data_size, MPI_ATHENA_REAL,
+                                   nghbr.h_view(m,n).rank, tag, comm_flux,
+                                   &(recvbuf[n].flux_req[m]));
+        if (ierr != MPI_SUCCESS) {no_errors = false;}
+      }
+    }
+  }
+
+  // Send the time-integrated restricted fine flux directly from its persistent register.
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr; ++n) {
+      if (IsCCFluxFace(n) &&
+          mblev.h_view(m) == coarse_level + 1 &&
+          nghbr.h_view(m,n).gid >= 0 &&
+          nghbr.h_view(m,n).lev == coarse_level &&
+          nghbr.h_view(m,n).rank != my_rank) {
+        if (sendbuf[n].flux_req[m] != MPI_REQUEST_NULL) {
+          FluxRegisterCCError("send request was still active at register exchange");
+        }
+        const int drank = nghbr.h_view(m,n).rank;
+        const int lid = nghbr.h_view(m,n).gid - pmy_pack->pmesh->gids_eachrank[drank];
+        const int tag = CreateBvals_MPI_Tag(lid, nghbr.h_view(m,n).dest);
+        const int data_size = flux_reg_nvar_*sendbuf[n].iflxc_ndat;
+        auto send_ptr = Kokkos::subview(sendbuf[n].flux_reg, m, Kokkos::ALL);
+        const int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
+                                   comm_flux, &(sendbuf[n].flux_req[m]));
+        if (ierr != MPI_SUCCESS) {no_errors = false;}
+      }
+    }
+  }
+  if (!no_errors) {
+    FluxRegisterCCError("MPI error while posting register exchange");
+  }
+
+  // Complete all incoming transfers before adding staging data on the device.
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr; ++n) {
+      if (IsCCFluxFace(n) &&
+          mblev.h_view(m) == coarse_level &&
+          nghbr.h_view(m,n).gid >= 0 &&
+          nghbr.h_view(m,n).lev == coarse_level + 1 &&
+          nghbr.h_view(m,n).rank != my_rank) {
+        const int ierr = MPI_Wait(&(recvbuf[n].flux_req[m]), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) {no_errors = false;}
+      }
+    }
+  }
+  if (!no_errors) {
+    FluxRegisterCCError("MPI error while receiving register exchange");
+  }
+
+  auto &rbuf = recvbuf;
+  for (int n=0; n<nnghbr; ++n) {
+    if (!IsCCFluxFace(n)) {continue;}
+    const int ndata = flux_reg_nvar_*rbuf[n].iflxc_ndat;
+    auto staging = rbuf[n].flux;
+    auto reg = rbuf[n].flux_reg;
+    Kokkos::TeamPolicy<> policy(DevExeSpace(), nmb, Kokkos::AUTO);
+    Kokkos::parallel_for("add_remote_cc_flux_register", policy,
+    KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = tmember.league_rank();
+      if ((mblev.d_view(m) == coarse_level) &&
+          (nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev == coarse_level + 1) &&
+          (nghbr.d_view(m,n).rank != my_rank)) {
+        Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, ndata),
+        [&](const int q) {
+          reg(m,q) += staging(m,q);
+        });
+      }
+    });
+  }
+
+  // Outbound storage remains immutable until every nonblocking send has completed.
+  for (int m=0; m<nmb; ++m) {
+    for (int n=0; n<nnghbr; ++n) {
+      if (IsCCFluxFace(n) &&
+          mblev.h_view(m) == coarse_level + 1 &&
+          nghbr.h_view(m,n).gid >= 0 &&
+          nghbr.h_view(m,n).lev == coarse_level &&
+          nghbr.h_view(m,n).rank != my_rank) {
+        const int ierr = MPI_Wait(&(sendbuf[n].flux_req[m]), MPI_STATUS_IGNORE);
+        if (ierr != MPI_SUCCESS) {no_errors = false;}
+      }
+    }
+  }
+  if (!no_errors) {
+    FluxRegisterCCError("MPI error while completing register exchange");
+  }
+  Kokkos::fence();
+#endif
 
   return TaskStatus::complete;
 }
@@ -728,6 +894,12 @@ TaskStatus MeshBoundaryValuesCC::RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx) {
 //! levels.  This is different than for fluxes of face-centered vars.
 
 TaskStatus MeshBoundaryValuesCC::InitFluxRecv(const int nvars) {
+  // Level subcycling integrates fine fluxes in persistent registers and exchanges them
+  // once per level-pair synchronization.  Posting the legacy per-stage receive here would
+  // leave it unmatched because MHD::SendFlux does not use PackAndSendFluxCC in this mode.
+  if (!(pmy_pack->all_blocks_active)) {
+    return TaskStatus::complete;
+  }
 #if MPI_PARALLEL_ENABLED
   int &nmb = pmy_pack->nmb_thispack;
   int &nnghbr = pmy_pack->pmb->nnghbr;
