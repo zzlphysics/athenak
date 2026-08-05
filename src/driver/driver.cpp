@@ -513,7 +513,7 @@ void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
   } else {
     pmesh->dtold = previous_dt;
     if (previous_dt > 0.0 && std::isfinite(previous_dt)) {
-      next_dt = std::min(next_dt, 2.0*previous_dt);
+      next_dt = std::min(next_dt, static_cast<Real>(2.0)*previous_dt);
     }
   }
   if ((pmesh->time < tlim) && (pmesh->time + next_dt > tlim)) {

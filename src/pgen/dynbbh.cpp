@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -17,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#if MPI_PARALLEL_ENABLED
+#include <mpi.h>
+#endif
+
 #include "athena.hpp"
 #include "coordinates/adm.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -24,6 +29,7 @@
 #include "coordinates/coordinates.hpp"
 #include "coordinates/superposed_bbh.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
+#include "eos/eos.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "mhd/mhd.hpp"
@@ -54,6 +60,7 @@ using binary_bh::Z1;
 using binary_bh::Z2;
 
 struct BBHParameters {
+  int initial_data;
   int use_table;
   Real separation;
   Real omega;
@@ -82,6 +89,57 @@ struct BBHParameters {
   binary_bh::MetricParameters metric;
 };
 
+enum class TorusMagneticField : int {
+  none = 0,
+  single_loop = 1
+};
+
+enum class TorusMagNorm : int {
+  density_weighted_beta = 0,
+  peak_beta = 1,
+  integrated_pressure = 2,
+  integrated_internal_energy = 3
+};
+
+const char *TorusMagNormName(const TorusMagNorm norm) {
+  switch (norm) {
+    case TorusMagNorm::density_weighted_beta: return "density_weighted_beta";
+    case TorusMagNorm::peak_beta: return "peak_beta";
+    case TorusMagNorm::integrated_pressure: return "integrated_pressure";
+    case TorusMagNorm::integrated_internal_energy: return "integrated_internal_energy";
+  }
+  return "unknown";
+}
+
+struct ReferenceFMTorusParameters {
+  Real gamma_adi;
+  Real reference_mass;
+  Real reference_center[3];
+  Real reference_velocity[3];
+  Real r_edge;
+  Real r_peak;
+  Real rho_max;
+  Real rho_min;
+  Real rho_pow;
+  Real pgas_min;
+  Real pgas_pow;
+  Real rho_atm;
+  Real temp_atm;
+  Real pert_amp;
+  Real potential_cutoff;
+  Real mag_target;
+  Real min_grid_peak_fraction;
+  Real l_peak;
+  Real log_h_edge;
+  Real rho_normalization;
+  Real r_outer;
+  int seed;
+  int min_magnetic_cells;
+  bool require_full_domain;
+  TorusMagneticField magnetic_field;
+  TorusMagNorm mag_norm;
+};
+
 struct TrajectorySample {
   Real time;
   std::array<Real, NTRAJ> state;
@@ -108,6 +166,7 @@ struct TrajectoryStencil {
 };
 
 BBHParameters bbh;
+ReferenceFMTorusParameters reference_torus;
 std::vector<TrajectorySample> trajectory_table;
 Real bbh_metric_time = 0.0;
 
@@ -126,6 +185,18 @@ void SetADMVariablesToBBH(MeshBlockPack *pmbp);
 void AugmentBBHExcisionMasks(MeshBlockPack *pmbp);
 void RefineAlphaMin(MeshBlockPack *pmbp);
 void RefineTracker(MeshBlockPack *pmbp);
+void InitializeReferenceFMTorus(MeshBlockPack *pmbp);
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusLogH(const ReferenceFMTorusParameters &torus, Real r,
+                          Real sin_theta);
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusDensity(const ReferenceFMTorusParameters &torus, Real x, Real y,
+                             Real z);
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusA1(const ReferenceFMTorusParameters &torus, Real x, Real y, Real z);
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusA2(const ReferenceFMTorusParameters &torus, Real x, Real y, Real z);
 
 KOKKOS_INLINE_FUNCTION
 void EvaluateMetric(const Real x, const Real y, const Real z, const Real state[NTRAJ],
@@ -312,6 +383,120 @@ void DecomposeMetric(const MetricWithDerivatives &metric, ADMPoint &result) {
   }
 }
 
+// The compact circumbinary-disk test in Combi & Ressler (2024) is initialized from a
+// constant-angular-momentum Fishbone-Moncrief torus around a single, nonspinning hole of
+// the total binary mass.  These helpers implement only that reference solution.  The
+// velocity is mapped into the actual binary ADM metric below, so this is intentionally an
+// approximate t=0 state rather than an equilibrium solution of the time-dependent metric.
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusLFromRPeak(const Real reference_mass, const Real r_peak) {
+  const Real dimensionless_r_peak = r_peak/reference_mass;
+  return reference_mass*sqrt(dimensionless_r_peak)
+      /(1.0 - 3.0/dimensionless_r_peak);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusLogH(const ReferenceFMTorusParameters &torus, const Real r,
+                          const Real sin_theta) {
+  const Real dimensionless_r = r/torus.reference_mass;
+  if (!(dimensionless_r > 2.0) || !(fabs(sin_theta) > 0.0)) return -1.0e30;
+  const Real sin2 = SQR(sin_theta);
+  const Real delta = SQR(dimensionless_r) - 2.0*dimensionless_r;
+  const Real sigma = SQR(dimensionless_r);
+  const Real aa = SQR(SQR(dimensionless_r));
+  const Real exp_2nu = sigma*delta/aa;
+  const Real exp_2psi = aa/sigma*sin2;
+  if (!(exp_2nu > 0.0) || !(exp_2psi > 0.0)) return -1.0e30;
+  const Real dimensionless_l = torus.l_peak/torus.reference_mass;
+  const Real var_a = sqrt(1.0 + 4.0*SQR(dimensionless_l)*exp_2nu/exp_2psi);
+  return 0.5*log((1.0 + var_a)/exp_2nu) - 0.5*var_a;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusDensity(const ReferenceFMTorusParameters &torus, const Real x,
+                             const Real y, const Real z) {
+  const Real x_relative = x-torus.reference_center[0];
+  const Real y_relative = y-torus.reference_center[1];
+  const Real z_relative = z-torus.reference_center[2];
+  const Real r = sqrt(SQR(x_relative) + SQR(y_relative) + SQR(z_relative));
+  if (!(r >= torus.r_edge)) return 0.0;
+  const Real cylindrical_radius = sqrt(SQR(x_relative) + SQR(y_relative));
+  const Real log_h = ReferenceFMTorusLogH(torus, r, cylindrical_radius/r)
+                   - torus.log_h_edge;
+  if (!(log_h > 0.0)) return 0.0;
+  const Real gm1 = torus.gamma_adi - 1.0;
+  const Real p_over_rho = gm1/torus.gamma_adi*(exp(log_h) - 1.0);
+  return pow(p_over_rho, 1.0/gm1)/torus.rho_normalization;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusAphi(const ReferenceFMTorusParameters &torus, const Real x,
+                          const Real y, const Real z) {
+  const Real rho = ReferenceFMTorusDensity(torus, x, y, z);
+  return fmax(rho/torus.rho_max - torus.potential_cutoff, 0.0);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusA1(const ReferenceFMTorusParameters &torus, const Real x,
+                        const Real y, const Real z) {
+  const Real x_relative = x-torus.reference_center[0];
+  const Real y_relative = y-torus.reference_center[1];
+  const Real cylindrical_radius2 = SQR(x_relative) + SQR(y_relative);
+  if (!(cylindrical_radius2 > 0.0)) return 0.0;
+  return -y_relative/cylindrical_radius2*ReferenceFMTorusAphi(torus, x, y, z);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusA2(const ReferenceFMTorusParameters &torus, const Real x,
+                        const Real y, const Real z) {
+  const Real x_relative = x-torus.reference_center[0];
+  const Real y_relative = y-torus.reference_center[1];
+  const Real cylindrical_radius2 = SQR(x_relative) + SQR(y_relative);
+  if (!(cylindrical_radius2 > 0.0)) return 0.0;
+  return x_relative/cylindrical_radius2*ReferenceFMTorusAphi(torus, x, y, z);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusOmega(const ReferenceFMTorusParameters &torus, const Real r,
+                           const Real sin_theta) {
+  const Real dimensionless_r = r/torus.reference_mass;
+  const Real dimensionless_l = torus.l_peak/torus.reference_mass;
+  const Real sin2 = SQR(sin_theta);
+  const Real delta = SQR(dimensionless_r) - 2.0*dimensionless_r;
+  const Real sigma = SQR(dimensionless_r);
+  const Real aa = SQR(SQR(dimensionless_r));
+  const Real g_00 = -(1.0 - 2.0/dimensionless_r);
+  const Real g_33 = sigma*sin2;
+  const Real exp_2nu = sigma*delta/aa;
+  const Real exp_2psi = aa/sigma*sin2;
+  const Real u_phi_projected = sqrt(0.5*(-1.0 + sqrt(
+      1.0 + 4.0*SQR(dimensionless_l)*exp_2nu/exp_2psi)));
+  const Real u3 = sqrt(sigma/aa)/sin_theta*u_phi_projected;
+  const Real u0 = -1.0/g_00*sqrt(-g_00*g_33*SQR(u3) - g_00);
+  return u3/u0/torus.reference_mass;
+}
+
+KOKKOS_INLINE_FUNCTION
+Real ReferenceFMTorusPerturbation(const int seed, const int gid, const int i,
+                                  const int j, const int k) {
+  // SplitMix64 gives a decomposition- and execution-order-independent cell perturbation.
+  std::uint64_t value = static_cast<std::uint64_t>(static_cast<std::uint32_t>(seed));
+  value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(gid))
+         * 0x9e3779b97f4a7c15ULL;
+  value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(i))
+         * 0xbf58476d1ce4e5b9ULL;
+  value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(j))
+         * 0x94d049bb133111ebULL;
+  value ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(k))
+         * 0xd6e8feb86659fd93ULL;
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30))*0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27))*0x94d049bb133111ebULL;
+  value ^= value >> 31;
+  const Real unit = static_cast<Real>(value >> 11)*static_cast<Real>(0x1.0p-53);
+  return 2.0*unit - 1.0;
+}
+
 } // namespace
 
 //----------------------------------------------------------------------------------------
@@ -417,6 +602,19 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real default_fd_step = 5.0e-5;
 #endif
   bbh.fd_step = pin->GetOrAddReal("problem", "metric_fd_step", default_fd_step);
+  const std::string initial_data =
+      pin->GetOrAddString("problem", "initial_data", "uniform");
+  if (initial_data == "uniform") {
+    bbh.initial_data = 0;
+  } else if (initial_data == "reference_fm_torus") {
+    bbh.initial_data = 1;
+  } else {
+    Fatal("unknown <problem> initial_data: " + initial_data);
+  }
+  const bool torus_r_edge_explicit =
+      pin->DoesParameterExist("problem", "torus_r_edge");
+  const bool torus_r_peak_explicit =
+      pin->DoesParameterExist("problem", "torus_r_peak");
   bbh.rho0 = pin->GetOrAddReal("problem", "rho0", 1.0e-5);
   bbh.pgas0 = pin->GetOrAddReal("problem", "pgas0", 1.0e-7);
   bbh.u10 = pin->GetOrAddReal("problem", "u1", 0.0);
@@ -442,6 +640,106 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "a2_buffer", 0.05));
   bbh.metric.singularity_floor = pin->GetOrAddReal("problem", "singularity_floor",
       pin->GetOrAddReal("problem", "cutoff_floor", 1.0e-3));
+
+  if (bbh.initial_data == 1) {
+    if (pmy_mesh_->mb_indcs.nx2 <= 1 || pmy_mesh_->mb_indcs.nx3 <= 1) {
+      Fatal("reference_fm_torus requires a three-dimensional mesh");
+    }
+    if (pin->GetString("mhd", "eos") != "ideal"
+        || pin->GetString("mhd", "dyn_eos") != "ideal") {
+      Fatal("reference_fm_torus currently requires mhd/eos=ideal and "
+            "mhd/dyn_eos=ideal");
+    }
+    reference_torus.gamma_adi = pmbp->pmhd->peos->eos_data.gamma;
+    reference_torus.r_edge = pin->GetOrAddReal("problem", "torus_r_edge", 18.0);
+    reference_torus.r_peak = pin->GetOrAddReal("problem", "torus_r_peak", 29.0);
+    reference_torus.rho_max = pin->GetOrAddReal("problem", "torus_rho_max", 1.0);
+    reference_torus.rho_min = pin->GetOrAddReal("problem", "torus_rho_min", 1.0e-5);
+    reference_torus.rho_pow = pin->GetOrAddReal("problem", "torus_rho_pow", -1.5);
+    reference_torus.pgas_min =
+        pin->GetOrAddReal("problem", "torus_pgas_min", 3.3333333333333334e-8);
+    reference_torus.pgas_pow =
+        pin->GetOrAddReal("problem", "torus_pgas_pow", -2.5);
+    reference_torus.rho_atm =
+        pin->GetOrAddReal("problem", "torus_rho_atm", 1.0e-10);
+    if (pin->DoesParameterExist("problem", "torus_pgas_atm")) {
+      Fatal("torus_pgas_atm has ambiguous pressure-floor semantics; use "
+            "torus_temp_atm for the Valencia temperature floor");
+    }
+    reference_torus.temp_atm =
+        pin->GetOrAddReal("problem", "torus_temp_atm", 3.3333333333333334e-13);
+    reference_torus.pert_amp =
+        pin->GetOrAddReal("problem", "torus_pert_amp", 0.02);
+    reference_torus.seed = pin->GetOrAddInteger("problem", "torus_seed", 1);
+    reference_torus.potential_cutoff =
+        pin->GetOrAddReal("problem", "torus_potential_cutoff", 0.2);
+    reference_torus.mag_target =
+        pin->GetOrAddReal("problem", "torus_mag_target", 100.0);
+    reference_torus.min_grid_peak_fraction = pin->GetOrAddReal(
+        "problem", "torus_min_grid_peak_fraction", 0.9);
+    reference_torus.min_magnetic_cells = pin->GetOrAddInteger(
+        "problem", "torus_min_magnetic_cells", 64);
+    reference_torus.require_full_domain = pin->GetOrAddBoolean(
+        "problem", "torus_require_full_domain", true);
+
+    const std::string magnetic_field =
+        pin->GetOrAddString("problem", "torus_magnetic_field", "single_loop");
+    if (magnetic_field == "single_loop") {
+      reference_torus.magnetic_field = TorusMagneticField::single_loop;
+    } else if (magnetic_field == "none") {
+      reference_torus.magnetic_field = TorusMagneticField::none;
+    } else {
+      Fatal("unknown <problem> torus_magnetic_field: " + magnetic_field);
+    }
+
+    const std::string mag_norm = pin->GetOrAddString(
+        "problem", "torus_mag_norm", "density_weighted_beta");
+    if (mag_norm == "density_weighted_beta") {
+      reference_torus.mag_norm = TorusMagNorm::density_weighted_beta;
+    } else if (mag_norm == "peak_beta") {
+      reference_torus.mag_norm = TorusMagNorm::peak_beta;
+    } else if (mag_norm == "integrated_pressure") {
+      reference_torus.mag_norm = TorusMagNorm::integrated_pressure;
+    } else if (mag_norm == "integrated_internal_energy") {
+      reference_torus.mag_norm = TorusMagNorm::integrated_internal_energy;
+    } else {
+      Fatal("unknown <problem> torus_mag_norm: " + mag_norm);
+    }
+
+    const Real torus_values[] = {
+      reference_torus.gamma_adi, reference_torus.r_edge, reference_torus.r_peak,
+      reference_torus.rho_max, reference_torus.rho_min, reference_torus.rho_pow,
+      reference_torus.pgas_min, reference_torus.pgas_pow, reference_torus.rho_atm,
+      reference_torus.temp_atm, reference_torus.pert_amp,
+      reference_torus.potential_cutoff, reference_torus.mag_target,
+      reference_torus.min_grid_peak_fraction
+    };
+    for (Real value : torus_values) {
+      if (!std::isfinite(value)) Fatal("reference_fm_torus parameters must be finite");
+    }
+    if (!(reference_torus.gamma_adi > 1.0)
+        || !(reference_torus.r_edge > 0.0)
+        || !(reference_torus.r_peak > reference_torus.r_edge)
+        || !(reference_torus.rho_max > 0.0)
+        || !(reference_torus.rho_min >= 0.0)
+        || !(reference_torus.pgas_min >= 0.0)
+        || !(reference_torus.rho_atm > 0.0)
+        || !(reference_torus.temp_atm > 0.0)
+        || !(reference_torus.pert_amp >= 0.0 && reference_torus.pert_amp < 1.0)
+        || !(reference_torus.potential_cutoff >= 0.0
+             && reference_torus.potential_cutoff < 1.0)
+        || !(reference_torus.mag_target > 0.0)
+        || !(reference_torus.min_grid_peak_fraction >= 0.0
+             && reference_torus.min_grid_peak_fraction <= 1.0)
+        || !(reference_torus.min_magnetic_cells >= 0)) {
+      Fatal("invalid reference_fm_torus parameter");
+    }
+    if (pin->GetReal("mhd", "dfloor") > reference_torus.rho_atm
+        || pin->GetReal("mhd", "tfloor") > reference_torus.temp_atm) {
+      Fatal("mhd density and temperature floors must not exceed the corresponding "
+            "reference_fm_torus atmosphere floors");
+    }
+  }
 
   const Real finite_parameters[] = {
     bbh.separation, bbh.omega, bbh.mass_ratio, bbh.chi1, bbh.chi2,
@@ -504,10 +802,151 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   ValidateTrajectorySignature(required_start, required_end);
 
+  Real inferred_torus_mass = 0.0;
+  Real inferred_torus_center[3] = {0.0, 0.0, 0.0};
+  Real inferred_torus_velocity[3] = {0.0, 0.0, 0.0};
+  if (bbh.initial_data == 1) {
+    Real initial_state[NTRAJ];
+    FindTrajectory(pmy_mesh_->time, initial_state);
+    const Real mass1 = initial_state[M1T]*bbh.metric.mass_scale1;
+    const Real mass2 = initial_state[M2T]*bbh.metric.mass_scale2;
+    inferred_torus_mass = mass1+mass2;
+    if (!std::isfinite(inferred_torus_mass) || !(inferred_torus_mass > 0.0)) {
+      Fatal("could not infer a positive reference_fm_torus mass from the trajectory");
+    }
+    inferred_torus_center[0] =
+        (mass1*initial_state[X1] + mass2*initial_state[X2])/inferred_torus_mass;
+    inferred_torus_center[1] =
+        (mass1*initial_state[Y1] + mass2*initial_state[Y2])/inferred_torus_mass;
+    inferred_torus_center[2] =
+        (mass1*initial_state[Z1] + mass2*initial_state[Z2])/inferred_torus_mass;
+    inferred_torus_velocity[0] =
+        (mass1*initial_state[VX1] + mass2*initial_state[VX2])/inferred_torus_mass;
+    inferred_torus_velocity[1] =
+        (mass1*initial_state[VY1] + mass2*initial_state[VY2])/inferred_torus_mass;
+    inferred_torus_velocity[2] =
+        (mass1*initial_state[VZ1] + mass2*initial_state[VZ2])/inferred_torus_mass;
+
+    reference_torus.reference_mass = pin->GetOrAddReal(
+        "problem", "torus_reference_mass", inferred_torus_mass);
+    reference_torus.reference_center[0] = pin->GetOrAddReal(
+        "problem", "torus_reference_center1", inferred_torus_center[0]);
+    reference_torus.reference_center[1] = pin->GetOrAddReal(
+        "problem", "torus_reference_center2", inferred_torus_center[1]);
+    reference_torus.reference_center[2] = pin->GetOrAddReal(
+        "problem", "torus_reference_center3", inferred_torus_center[2]);
+    reference_torus.reference_velocity[0] = pin->GetOrAddReal(
+        "problem", "torus_reference_velocity1", inferred_torus_velocity[0]);
+    reference_torus.reference_velocity[1] = pin->GetOrAddReal(
+        "problem", "torus_reference_velocity2", inferred_torus_velocity[1]);
+    reference_torus.reference_velocity[2] = pin->GetOrAddReal(
+        "problem", "torus_reference_velocity3", inferred_torus_velocity[2]);
+    if (!torus_r_edge_explicit) {
+      reference_torus.r_edge = 18.0*reference_torus.reference_mass;
+      pin->SetReal("problem", "torus_r_edge", reference_torus.r_edge);
+    }
+    if (!torus_r_peak_explicit) {
+      reference_torus.r_peak = 29.0*reference_torus.reference_mass;
+      pin->SetReal("problem", "torus_r_peak", reference_torus.r_peak);
+    }
+    const Real reference_values[] = {
+      reference_torus.reference_mass,
+      reference_torus.reference_center[0], reference_torus.reference_center[1],
+      reference_torus.reference_center[2], reference_torus.reference_velocity[0],
+      reference_torus.reference_velocity[1], reference_torus.reference_velocity[2]
+    };
+    for (Real value : reference_values) {
+      if (!std::isfinite(value)) Fatal("reference_fm_torus frame must be finite");
+    }
+    const Real reference_velocity2 =
+        SQR(reference_torus.reference_velocity[0])
+        + SQR(reference_torus.reference_velocity[1])
+        + SQR(reference_torus.reference_velocity[2]);
+    if (!(reference_torus.reference_mass > 0.0)
+        || !(reference_velocity2 < 1.0)
+        || !(reference_torus.r_edge > 2.0*reference_torus.reference_mass)
+        || !(reference_torus.r_peak > reference_torus.r_edge)) {
+      Fatal("reference_fm_torus requires |v_ref|<1 and "
+            "r_peak > r_edge > 2*M_ref");
+    }
+
+    reference_torus.l_peak = ReferenceFMTorusLFromRPeak(
+        reference_torus.reference_mass, reference_torus.r_peak);
+    reference_torus.log_h_edge = ReferenceFMTorusLogH(
+        reference_torus, reference_torus.r_edge, 1.0);
+    const Real log_h_peak = ReferenceFMTorusLogH(
+        reference_torus, reference_torus.r_peak, 1.0) - reference_torus.log_h_edge;
+    const Real gm1 = reference_torus.gamma_adi - 1.0;
+    const Real p_over_rho_peak =
+        gm1/reference_torus.gamma_adi*(std::exp(log_h_peak) - 1.0);
+    reference_torus.rho_normalization =
+        std::pow(p_over_rho_peak, 1.0/gm1)/reference_torus.rho_max;
+    if (!std::isfinite(reference_torus.l_peak)
+        || !std::isfinite(reference_torus.log_h_edge)
+        || !(log_h_peak > 0.0)
+        || !std::isfinite(reference_torus.rho_normalization)
+        || !(reference_torus.rho_normalization > 0.0)) {
+      Fatal("reference_fm_torus geometry does not define a finite torus");
+    }
+
+    Real outer_lower = reference_torus.r_peak;
+    Real outer_upper = 2.0*reference_torus.r_peak;
+    Real outer_surface = ReferenceFMTorusLogH(
+        reference_torus, outer_upper, 1.0) - reference_torus.log_h_edge;
+    for (int bracket=0; bracket<64 && outer_surface > 0.0; ++bracket) {
+      outer_upper *= 2.0;
+      outer_surface = ReferenceFMTorusLogH(
+          reference_torus, outer_upper, 1.0) - reference_torus.log_h_edge;
+    }
+    if (!std::isfinite(outer_upper) || !(outer_surface <= 0.0)) {
+      Fatal("could not bracket the reference_fm_torus outer edge");
+    }
+    for (int iteration=0; iteration<100; ++iteration) {
+      const Real middle = 0.5*(outer_lower+outer_upper);
+      const Real middle_surface = ReferenceFMTorusLogH(
+          reference_torus, middle, 1.0) - reference_torus.log_h_edge;
+      if (middle_surface > 0.0) {
+        outer_lower = middle;
+      } else {
+        outer_upper = middle;
+      }
+    }
+    reference_torus.r_outer = 0.5*(outer_lower+outer_upper);
+    if (reference_torus.require_full_domain) {
+      const RegionSize &domain = pmy_mesh_->mesh_size;
+      if (reference_torus.reference_center[0]-reference_torus.r_outer < domain.x1min
+          || reference_torus.reference_center[0]+reference_torus.r_outer > domain.x1max
+          || reference_torus.reference_center[1]-reference_torus.r_outer < domain.x2min
+          || reference_torus.reference_center[1]+reference_torus.r_outer > domain.x2max
+          || reference_torus.reference_center[2]-reference_torus.r_outer < domain.x3min
+          || reference_torus.reference_center[2]+reference_torus.r_outer > domain.x3max) {
+        Fatal("reference_fm_torus is not fully contained in the mesh; enlarge the domain "
+              "or explicitly set torus_require_full_domain=false");
+      }
+    }
+  }
+
   if (global_variable::my_rank == 0) {
     std::cout << "Effective BBH metric: trajectory=" << trajectory_mode;
     if (bbh.use_table) std::cout << " file=" << trajectory_filename;
-    std::cout << ", finite-difference step=" << bbh.fd_step << std::endl;
+    std::cout << ", finite-difference step=" << bbh.fd_step
+              << ", initial_data=" << initial_data << std::endl;
+    if (bbh.initial_data == 1) {
+      std::cout << "Reference FM torus: M_ref=" << reference_torus.reference_mass
+                << " (trajectory total=" << inferred_torus_mass << "), center=("
+                << reference_torus.reference_center[0] << ","
+                << reference_torus.reference_center[1] << ","
+                << reference_torus.reference_center[2] << "), velocity=("
+                << reference_torus.reference_velocity[0] << ","
+                << reference_torus.reference_velocity[1] << ","
+                << reference_torus.reference_velocity[2] << "), r_edge="
+                << reference_torus.r_edge
+                << ", r_peak=" << reference_torus.r_peak
+                << ", r_outer=" << reference_torus.r_outer
+                << ", rho_max=" << reference_torus.rho_max
+                << ", magnetic norm=" << TorusMagNormName(reference_torus.mag_norm)
+                << ", magnetic target=" << reference_torus.mag_target << std::endl;
+    }
   }
   ValidateMetricKernel();
 
@@ -531,26 +970,456 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int nscalars = pmbp->pmhd->nscalars;
   const BBHParameters parameters = bbh;
 
-  par_for("dynbbh_uniform_gas", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
-    w0(m, IDN, k, j, i) = parameters.rho0;
-    w0(m, IVX, k, j, i) = parameters.u10;
-    w0(m, IVY, k, j, i) = parameters.u20;
-    w0(m, IVZ, k, j, i) = parameters.u30;
-    w0(m, IPR, k, j, i) = parameters.pgas0;
-    for (int n = 0; n < nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
-    bcc0(m, IBX, k, j, i) = parameters.b10;
-    bcc0(m, IBY, k, j, i) = parameters.b20;
-    bcc0(m, IBZ, k, j, i) = parameters.b30;
-  });
-  Kokkos::deep_copy(DevExeSpace(), b0.x1f, bbh.b10);
-  Kokkos::deep_copy(DevExeSpace(), b0.x2f, bbh.b20);
-  Kokkos::deep_copy(DevExeSpace(), b0.x3f, bbh.b30);
+  if (bbh.initial_data == 0) {
+    par_for("dynbbh_uniform_gas", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      w0(m, IDN, k, j, i) = parameters.rho0;
+      w0(m, IVX, k, j, i) = parameters.u10;
+      w0(m, IVY, k, j, i) = parameters.u20;
+      w0(m, IVZ, k, j, i) = parameters.u30;
+      w0(m, IPR, k, j, i) = parameters.pgas0;
+      for (int n = 0; n < nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
+      bcc0(m, IBX, k, j, i) = parameters.b10;
+      bcc0(m, IBY, k, j, i) = parameters.b20;
+      bcc0(m, IBZ, k, j, i) = parameters.b30;
+    });
+    Kokkos::deep_copy(DevExeSpace(), b0.x1f, bbh.b10);
+    Kokkos::deep_copy(DevExeSpace(), b0.x2f, bbh.b20);
+    Kokkos::deep_copy(DevExeSpace(), b0.x3f, bbh.b30);
+  } else {
+    InitializeReferenceFMTorus(pmbp);
+  }
 
   pmbp->pdyngr->PrimToConInit(is, ie, js, je, ks, ke);
 }
 
 namespace {
+
+void InitializeReferenceFMTorus(MeshBlockPack *pmbp) {
+  auto &indcs = pmbp->pmesh->mb_indcs;
+  const int is = indcs.is;
+  const int ie = indcs.ie;
+  const int js = indcs.js;
+  const int je = indcs.je;
+  const int ks = indcs.ks;
+  const int ke = indcs.ke;
+  const int nmb = pmbp->nmb_thispack;
+  const int nscalars = pmbp->pmhd->nscalars;
+  const int nx1 = indcs.nx1;
+  const int nx2 = indcs.nx2;
+  const int nx3 = indcs.nx3;
+  auto &size = pmbp->pmb->mb_size;
+  auto &mb_gid = pmbp->pmb->mb_gid;
+  auto &adm = pmbp->padm->adm;
+  auto &w0 = pmbp->pmhd->w0;
+  auto &b0 = pmbp->pmhd->b0;
+  auto &bcc0 = pmbp->pmhd->bcc0;
+  auto &excision_floor = pmbp->pcoord->excision_floor;
+  const Real dexcise = pmbp->pcoord->coord_data.dexcise;
+  const Real pexcise = pmbp->pcoord->coord_data.pexcise;
+  const ReferenceFMTorusParameters torus = reference_torus;
+
+  Kokkos::deep_copy(DevExeSpace(), b0.x1f, 0.0);
+  Kokkos::deep_copy(DevExeSpace(), b0.x2f, 0.0);
+  Kokkos::deep_copy(DevExeSpace(), b0.x3f, 0.0);
+
+  par_for("dynbbh_reference_fm_torus", DevExeSpace(), 0, nmb-1, ks, ke, js, je,
+          is, ie, KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                              size.d_view(m).x1max);
+    const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                              size.d_view(m).x2max);
+    const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                              size.d_view(m).x3max);
+    const Real x_relative = x-torus.reference_center[0];
+    const Real y_relative = y-torus.reference_center[1];
+    const Real z_relative = z-torus.reference_center[2];
+    const Real r = sqrt(SQR(x_relative) + SQR(y_relative) + SQR(z_relative));
+    const Real r_background = fmax(r/torus.reference_mass, 1.0);
+    const Real rho_background = fmax(torus.rho_atm,
+        torus.rho_min*pow(r_background, torus.rho_pow));
+    const Real pgas_background = fmax(rho_background*torus.temp_atm,
+        torus.pgas_min*pow(r_background, torus.pgas_pow));
+    const Real rho_torus = ReferenceFMTorusDensity(torus, x, y, z);
+
+    const bool excised = excision_floor(m,k,j,i);
+    Real rho = excised ? dexcise : rho_background;
+    Real pgas = excised ? pexcise : pgas_background;
+    Real utilde[3] = {0.0, 0.0, 0.0};
+    if (!excised && rho_torus > 0.0) {
+      const Real cylindrical_radius = sqrt(SQR(x_relative) + SQR(y_relative));
+      const Real log_h = ReferenceFMTorusLogH(torus, r, cylindrical_radius/r)
+                       - torus.log_h_edge;
+      const Real p_over_rho = (torus.gamma_adi - 1.0)/torus.gamma_adi
+                            *(exp(log_h) - 1.0);
+      const Real perturbation = torus.pert_amp*ReferenceFMTorusPerturbation(
+          torus.seed, mb_gid.d_view(m), i-is, j-js, k-ks);
+      rho = fmax(rho_torus, rho_background);
+      pgas = fmax(rho_torus*p_over_rho*(1.0 + perturbation), pgas_background);
+      pgas = fmax(pgas, rho*torus.temp_atm);
+
+      const Real omega = ReferenceFMTorusOmega(torus, r, cylindrical_radius/r);
+      const Real coordinate_velocity[3] = {
+        torus.reference_velocity[0]-omega*y_relative,
+        torus.reference_velocity[1]+omega*x_relative,
+        torus.reference_velocity[2]
+      };
+      Real normal_velocity[3];
+      for (int a = 0; a < 3; ++a) {
+        normal_velocity[a] = coordinate_velocity[a] + adm.beta_u(m,a,k,j,i);
+      }
+      Real normal_velocity2 = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        for (int c = 0; c < 3; ++c) {
+          normal_velocity2 += adm.g_dd(m,a,c,k,j,i)
+                            *normal_velocity[a]*normal_velocity[c];
+        }
+      }
+      const Real timelike_margin = SQR(adm.alpha(m,k,j,i)) - normal_velocity2;
+      if (!isfinite(timelike_margin) || !(timelike_margin > 0.0)) {
+        Kokkos::abort("reference_fm_torus velocity is not timelike in the BBH metric");
+      }
+      const Real u0 = 1.0/sqrt(timelike_margin);
+      for (int a = 0; a < 3; ++a) utilde[a] = u0*normal_velocity[a];
+    }
+
+    w0(m, IDN, k, j, i) = rho;
+    w0(m, IVX, k, j, i) = utilde[0];
+    w0(m, IVY, k, j, i) = utilde[1];
+    w0(m, IVZ, k, j, i) = utilde[2];
+    w0(m, IPR, k, j, i) = pgas;
+    for (int n = 0; n < nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
+    bcc0(m, IBX, k, j, i) = 0.0;
+    bcc0(m, IBY, k, j, i) = 0.0;
+    bcc0(m, IBZ, k, j, i) = 0.0;
+  });
+
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  Real grid_rho_max = 0.0;
+  Real min_timelike_margin = std::numeric_limits<Real>::max();
+  Kokkos::parallel_reduce("dynbbh_torus_checks",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nkji),
+      KOKKOS_LAMBDA(const int idx, Real &rho_max, Real &margin_min) {
+    const int m = idx/nkji;
+    const int k0 = (idx-m*nkji)/nji;
+    const int j0 = (idx-m*nkji-k0*nji)/nx1;
+    const int i = idx-m*nkji-k0*nji-j0*nx1+is;
+    const int k = k0+ks;
+    const int j = j0+js;
+    const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                              size.d_view(m).x1max);
+    const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                              size.d_view(m).x2max);
+    const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                              size.d_view(m).x3max);
+    if (excision_floor(m,k,j,i)) return;
+    const Real rho_torus = ReferenceFMTorusDensity(torus, x, y, z);
+    rho_max = fmax(rho_max, rho_torus);
+    if (rho_torus > 0.0) {
+      const Real x_relative = x-torus.reference_center[0];
+      const Real y_relative = y-torus.reference_center[1];
+      const Real z_relative = z-torus.reference_center[2];
+      const Real r = sqrt(SQR(x_relative) + SQR(y_relative) + SQR(z_relative));
+      const Real omega = ReferenceFMTorusOmega(
+          torus, r, sqrt(SQR(x_relative)+SQR(y_relative))/r);
+      const Real coordinate_velocity[3] = {
+        torus.reference_velocity[0]-omega*y_relative,
+        torus.reference_velocity[1]+omega*x_relative,
+        torus.reference_velocity[2]
+      };
+      Real normal_velocity[3];
+      for (int a = 0; a < 3; ++a) {
+        normal_velocity[a] = coordinate_velocity[a] + adm.beta_u(m,a,k,j,i);
+      }
+      Real normal_velocity2 = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        for (int c = 0; c < 3; ++c) {
+          normal_velocity2 += adm.g_dd(m,a,c,k,j,i)
+                            *normal_velocity[a]*normal_velocity[c];
+        }
+      }
+      margin_min = fmin(margin_min, SQR(adm.alpha(m,k,j,i))-normal_velocity2);
+    }
+  }, Kokkos::Max<Real>(grid_rho_max), Kokkos::Min<Real>(min_timelike_margin));
+
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &grid_rho_max, 1, MPI_ATHENA_REAL, MPI_MAX,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &min_timelike_margin, 1, MPI_ATHENA_REAL, MPI_MIN,
+                MPI_COMM_WORLD);
+#endif
+  if (!(grid_rho_max > 0.0) || !std::isfinite(grid_rho_max)
+      || !(min_timelike_margin > 0.0) || !std::isfinite(min_timelike_margin)) {
+    Fatal("the mesh does not resolve a finite, timelike reference_fm_torus");
+  }
+  if (grid_rho_max < torus.min_grid_peak_fraction*torus.rho_max) {
+    std::ostringstream message;
+    message << "reference_fm_torus grid peak is only "
+            << grid_rho_max/torus.rho_max << " of the analytic rho_max; required "
+            << torus.min_grid_peak_fraction;
+    Fatal(message.str());
+  }
+
+  if (torus.magnetic_field == TorusMagneticField::none) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "Reference FM torus initialized: grid rho_max=" << grid_rho_max
+                << ", minimum timelike margin=" << min_timelike_margin
+                << ", magnetic field=none" << std::endl;
+    }
+    return;
+  }
+
+  std::int64_t magnetic_cells = 0;
+  Kokkos::parallel_reduce("dynbbh_torus_magnetic_cells",
+      Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nkji),
+      KOKKOS_LAMBDA(const int idx, std::int64_t &count) {
+    const int m = idx/nkji;
+    const int k0 = (idx-m*nkji)/nji;
+    const int j0 = (idx-m*nkji-k0*nji)/nx1;
+    const int i = idx-m*nkji-k0*nji-j0*nx1+is;
+    const int k = k0+ks;
+    const int j = j0+js;
+    if (excision_floor(m,k,j,i)) return;
+    const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                              size.d_view(m).x1max);
+    const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                              size.d_view(m).x2max);
+    const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                              size.d_view(m).x3max);
+    if (ReferenceFMTorusDensity(torus, x, y, z)
+        > torus.potential_cutoff*torus.rho_max) {
+      ++count;
+    }
+  }, Kokkos::Sum<std::int64_t>(magnetic_cells));
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &magnetic_cells, 1, MPI_INT64_T, MPI_SUM,
+                MPI_COMM_WORLD);
+#endif
+  if (magnetic_cells < torus.min_magnetic_cells) {
+    std::ostringstream message;
+    message << "reference_fm_torus magnetic loop has only " << magnetic_cells
+            << " active cells; required " << torus.min_magnetic_cells;
+    Fatal(message.str());
+  }
+
+  const int ncells1 = nx1 + 2*indcs.ng;
+  const int ncells2 = nx2 + 2*indcs.ng;
+  const int ncells3 = nx3 + 2*indcs.ng;
+  DvceArray4D<Real> a1("dynbbh_torus_a1", nmb, ncells3, ncells2, ncells1);
+  DvceArray4D<Real> a2("dynbbh_torus_a2", nmb, ncells3, ncells2, ncells1);
+  auto &nghbr = pmbp->pmb->nghbr;
+  auto &mblev = pmbp->pmb->mb_lev;
+
+  par_for("dynbbh_torus_vector_potential", DevExeSpace(), 0, nmb-1, ks, ke+1,
+          js, je+1, is, ie+1, KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real x1v = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                                size.d_view(m).x1max);
+    const Real x1f = LeftEdgeX(i-is, nx1, size.d_view(m).x1min,
+                              size.d_view(m).x1max);
+    const Real x2v = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                                size.d_view(m).x2max);
+    const Real x2f = LeftEdgeX(j-js, nx2, size.d_view(m).x2min,
+                              size.d_view(m).x2max);
+    const Real x3v = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                                size.d_view(m).x3max);
+    const Real x3f = LeftEdgeX(k-ks, nx3, size.d_view(m).x3min,
+                              size.d_view(m).x3max);
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+
+    a1(m,k,j,i) = ReferenceFMTorusA1(torus, x1v, x2f, x3f);
+    a2(m,k,j,i) = ReferenceFMTorusA2(torus, x1f, x2v, x3f);
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 1,
+        i, j, k, is, ie, js, je, ks, ke)) {
+      a1(m,k,j,i) = 0.5*(ReferenceFMTorusA1(torus, x1v+0.25*dx1, x2f, x3f)
+                         + ReferenceFMTorusA1(torus, x1v-0.25*dx1, x2f, x3f));
+    }
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 2,
+        i, j, k, is, ie, js, je, ks, ke)) {
+      a2(m,k,j,i) = 0.5*(ReferenceFMTorusA2(torus, x1f, x2v+0.25*dx2, x3f)
+                         + ReferenceFMTorusA2(torus, x1f, x2v-0.25*dx2, x3f));
+    }
+  });
+
+  par_for("dynbbh_torus_curl_a", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+          KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    b0.x1f(m,k,j,i) = -(a2(m,k+1,j,i)-a2(m,k,j,i))/dx3;
+    b0.x2f(m,k,j,i) =  (a1(m,k+1,j,i)-a1(m,k,j,i))/dx3;
+    b0.x3f(m,k,j,i) =  (a2(m,k,j,i+1)-a2(m,k,j,i))/dx1
+                         -(a1(m,k,j+1,i)-a1(m,k,j,i))/dx2;
+    if (i == ie) {
+      b0.x1f(m,k,j,i+1) = -(a2(m,k+1,j,i+1)-a2(m,k,j,i+1))/dx3;
+    }
+    if (j == je) {
+      b0.x2f(m,k,j+1,i) = (a1(m,k+1,j+1,i)-a1(m,k,j+1,i))/dx3;
+    }
+    if (k == ke) {
+      b0.x3f(m,k+1,j,i) = (a2(m,k+1,j,i+1)-a2(m,k+1,j,i))/dx1
+                            -(a1(m,k+1,j+1,i)-a1(m,k+1,j,i))/dx2;
+    }
+  });
+
+  par_for("dynbbh_torus_cell_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+          KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    bcc0(m,IBX,k,j,i) = 0.5*(b0.x1f(m,k,j,i)+b0.x1f(m,k,j,i+1));
+    bcc0(m,IBY,k,j,i) = 0.5*(b0.x2f(m,k,j,i)+b0.x2f(m,k,j+1,i));
+    bcc0(m,IBZ,k,j,i) = 0.5*(b0.x3f(m,k,j,i)+b0.x3f(m,k+1,j,i));
+  });
+
+  Real gas_measure = 0.0;
+  Real magnetic_measure = 0.0;
+  if (torus.mag_norm == TorusMagNorm::peak_beta) {
+    Kokkos::parallel_reduce("dynbbh_torus_peak_beta",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nkji),
+        KOKKOS_LAMBDA(const int idx, Real &gas_max, Real &magnetic_max) {
+      const int m = idx/nkji;
+      const int k0 = (idx-m*nkji)/nji;
+      const int j0 = (idx-m*nkji-k0*nji)/nx1;
+      const int i = idx-m*nkji-k0*nji-j0*nx1+is;
+      const int k = k0+ks;
+      const int j = j0+js;
+      const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                                size.d_view(m).x1max);
+      const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                                size.d_view(m).x2max);
+      const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                                size.d_view(m).x3max);
+      if (excision_floor(m,k,j,i)) return;
+      if (!(ReferenceFMTorusDensity(torus, x, y, z) > 0.0)) return;
+      const Real detg = adm::SpatialDet(
+          adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),
+          adm.g_dd(m,0,2,k,j,i), adm.g_dd(m,1,1,k,j,i),
+          adm.g_dd(m,1,2,k,j,i), adm.g_dd(m,2,2,k,j,i));
+      const Real inv_sqrt_detg = 1.0/sqrt(detg);
+      Real velocity_lower[3] = {0.0, 0.0, 0.0};
+      Real velocity2 = 0.0;
+      Real magnetic_lower[3] = {0.0, 0.0, 0.0};
+      for (int a = 0; a < 3; ++a) {
+        for (int c = 0; c < 3; ++c) {
+          velocity_lower[a] += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+c,k,j,i);
+          velocity2 += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+a,k,j,i)
+                     *w0(m,IVX+c,k,j,i);
+          magnetic_lower[a] += adm.g_dd(m,a,c,k,j,i)*bcc0(m,c,k,j,i)
+                              *inv_sqrt_detg;
+        }
+      }
+      Real magnetic_dot_velocity = 0.0;
+      Real magnetic2 = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        magnetic_dot_velocity += bcc0(m,a,k,j,i)*velocity_lower[a]*inv_sqrt_detg;
+        magnetic2 += bcc0(m,a,k,j,i)*magnetic_lower[a]*inv_sqrt_detg;
+      }
+      const Real bsq = (magnetic2+SQR(magnetic_dot_velocity))/(1.0+velocity2);
+      gas_max = fmax(gas_max, w0(m,IPR,k,j,i));
+      magnetic_max = fmax(magnetic_max, 0.5*bsq);
+    }, Kokkos::Max<Real>(gas_measure), Kokkos::Max<Real>(magnetic_measure));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &gas_measure, 1, MPI_ATHENA_REAL, MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &magnetic_measure, 1, MPI_ATHENA_REAL, MPI_MAX,
+                  MPI_COMM_WORLD);
+#endif
+  } else {
+    Kokkos::parallel_reduce("dynbbh_torus_integrated_beta",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nkji),
+        KOKKOS_LAMBDA(const int idx, Real &gas_sum, Real &magnetic_sum) {
+      const int m = idx/nkji;
+      const int k0 = (idx-m*nkji)/nji;
+      const int j0 = (idx-m*nkji-k0*nji)/nx1;
+      const int i = idx-m*nkji-k0*nji-j0*nx1+is;
+      const int k = k0+ks;
+      const int j = j0+js;
+      const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                                size.d_view(m).x1max);
+      const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                                size.d_view(m).x2max);
+      const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                                size.d_view(m).x3max);
+      if (excision_floor(m,k,j,i)) return;
+      if (!(ReferenceFMTorusDensity(torus, x, y, z) > 0.0)) return;
+      const Real detg = adm::SpatialDet(
+          adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),
+          adm.g_dd(m,0,2,k,j,i), adm.g_dd(m,1,1,k,j,i),
+          adm.g_dd(m,1,2,k,j,i), adm.g_dd(m,2,2,k,j,i));
+      const Real sqrt_detg = sqrt(detg);
+      const Real inv_sqrt_detg = 1.0/sqrt_detg;
+      Real velocity_lower[3] = {0.0, 0.0, 0.0};
+      Real velocity2 = 0.0;
+      Real magnetic_lower[3] = {0.0, 0.0, 0.0};
+      for (int a = 0; a < 3; ++a) {
+        for (int c = 0; c < 3; ++c) {
+          velocity_lower[a] += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+c,k,j,i);
+          velocity2 += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+a,k,j,i)
+                     *w0(m,IVX+c,k,j,i);
+          magnetic_lower[a] += adm.g_dd(m,a,c,k,j,i)*bcc0(m,c,k,j,i)
+                              *inv_sqrt_detg;
+        }
+      }
+      Real magnetic_dot_velocity = 0.0;
+      Real magnetic2 = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        magnetic_dot_velocity += bcc0(m,a,k,j,i)*velocity_lower[a]*inv_sqrt_detg;
+        magnetic2 += bcc0(m,a,k,j,i)*magnetic_lower[a]*inv_sqrt_detg;
+      }
+      const Real bsq = (magnetic2+SQR(magnetic_dot_velocity))/(1.0+velocity2);
+      const Real volume = size.d_view(m).dx1*size.d_view(m).dx2
+                        * size.d_view(m).dx3*sqrt_detg;
+      Real gas_weight = 1.0;
+      if (torus.mag_norm == TorusMagNorm::density_weighted_beta) {
+        gas_weight = w0(m,IDN,k,j,i);
+      }
+      Real gas_energy = w0(m,IPR,k,j,i);
+      if (torus.mag_norm == TorusMagNorm::integrated_internal_energy) {
+        gas_energy /= torus.gamma_adi-1.0;
+      }
+      gas_sum += gas_weight*gas_energy*volume;
+      magnetic_sum += gas_weight*0.5*bsq*volume;
+    }, Kokkos::Sum<Real>(gas_measure), Kokkos::Sum<Real>(magnetic_measure));
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &gas_measure, 1, MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &magnetic_measure, 1, MPI_ATHENA_REAL, MPI_SUM,
+                  MPI_COMM_WORLD);
+#endif
+  }
+
+  if (!std::isfinite(gas_measure) || !(gas_measure > 0.0)
+      || !std::isfinite(magnetic_measure) || !(magnetic_measure > 0.0)) {
+    Fatal("reference_fm_torus magnetic loop is unresolved or has invalid energy");
+  }
+  const Real unnormalized_ratio = gas_measure/magnetic_measure;
+  const Real magnetic_normalization = sqrt(unnormalized_ratio/torus.mag_target);
+  if (!std::isfinite(magnetic_normalization) || !(magnetic_normalization > 0.0)) {
+    Fatal("reference_fm_torus magnetic normalization is not finite");
+  }
+
+  par_for("dynbbh_torus_normalize_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je,
+          is, ie, KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    b0.x1f(m,k,j,i) *= magnetic_normalization;
+    b0.x2f(m,k,j,i) *= magnetic_normalization;
+    b0.x3f(m,k,j,i) *= magnetic_normalization;
+    if (i == ie) b0.x1f(m,k,j,i+1) *= magnetic_normalization;
+    if (j == je) b0.x2f(m,k,j+1,i) *= magnetic_normalization;
+    if (k == ke) b0.x3f(m,k+1,j,i) *= magnetic_normalization;
+    bcc0(m,IBX,k,j,i) = 0.5*(b0.x1f(m,k,j,i)+b0.x1f(m,k,j,i+1));
+    bcc0(m,IBY,k,j,i) = 0.5*(b0.x2f(m,k,j,i)+b0.x2f(m,k,j+1,i));
+    bcc0(m,IBZ,k,j,i) = 0.5*(b0.x3f(m,k,j,i)+b0.x3f(m,k+1,j,i));
+  });
+
+  if (global_variable::my_rank == 0) {
+    std::cout << "Reference FM torus initialized: grid rho_max=" << grid_rho_max
+              << ", minimum timelike margin=" << min_timelike_margin
+              << ", magnetic cells=" << magnetic_cells
+              << ", " << TorusMagNormName(torus.mag_norm)
+              << " unnormalized ratio=" << unnormalized_ratio
+              << ", magnetic scale=" << magnetic_normalization
+              << ", normalized target=" << torus.mag_target << std::endl;
+  }
+}
 
 void ValidateMetricKernel() {
 #if SINGLE_PRECISION_ENABLED
@@ -662,7 +1531,7 @@ void ValidateMetricKernel() {
       transition_spin, state[M1T], parameters.spin_buffer1,
       parameters.singularity_floor);
   const Real transition_points[] = {
-    0.0, 0.5*regularization_radius, regularization_radius
+    0.0, static_cast<Real>(0.5)*regularization_radius, regularization_radius
   };
   for (Real z : transition_points) {
     DifferentiateMetric(0.0, 0.0, z, static_trajectory, test_parameters,
@@ -1114,7 +1983,7 @@ void ValidateTrajectorySignature(Real table_time_start, Real table_time_end) {
     Real validation_duration = duration;
     if (bbh.omega != 0.0) {
       validation_duration = std::min(duration,
-          2.0*std::acos(-1.0)/std::abs(bbh.omega));
+          static_cast<Real>(2.0*std::acos(-1.0))/std::abs(bbh.omega));
     }
     const int samples = (validation_duration > 0.0) ? 32 : 0;
     for (int sample = 0; sample <= samples; ++sample) {
@@ -1316,14 +2185,15 @@ void RefineTracker(MeshBlockPack *pmbp) {
   const Real lookahead = 2.0*last_dt;
   const Real sample_horizon = std::min(lookahead, remaining_time);
   const Real sample_times[3] = {
-    pmesh->time, pmesh->time+0.5*sample_horizon, pmesh->time+sample_horizon
+    pmesh->time, pmesh->time+static_cast<Real>(0.5)*sample_horizon,
+    pmesh->time+sample_horizon
   };
   std::array<std::array<Real, NTRAJ>, 3> states{};
   for (int sample=0; sample<3; ++sample) {
     FindTrajectory(sample_times[sample], states[sample].data());
   }
   const Real padding =
-      std::max(0.25*sample_horizon, lookahead-sample_horizon);
+      std::max(static_cast<Real>(0.25)*sample_horizon, lookahead-sample_horizon);
   for (int m = 0; m < nmb; ++m) {
     const RegionSize &block = size.h_view(m);
     Real minimum_distance = std::numeric_limits<Real>::infinity();

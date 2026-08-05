@@ -1,0 +1,169 @@
+# NON-RUNNABLE PLANNING TEMPLATE -- NOT A SCIENTIFIC PRODUCTION INPUT.
+#
+# This file records a paper-reference physical setup but deliberately ships with a
+# placeholder trajectory, a 32^3 unrefined resource-guard mesh, and a two-cycle limit.
+# Replace the trajectory, design and budget the refinement hierarchy, add validated
+# moving-hole diagnostics/forcing, and complete convergence tests before running it.
+# Never interpret output from the shipped mesh as physical.
+#
+# Resolution target after resource approval:
+#   domain       = [-1000M,1000M]^3
+#   target       = dx <= M/64 near both horizons and in all science-measurement regions
+#   hierarchy    = ten nested refinement levels (levels 1..10) over an nx=128 root
+#   achieved dx  = (2000/128)/2^10 M = 0.0152587890625M, slightly finer than M/64
+# The complete level boxes are intentionally not enabled here: their extents must follow
+# the trajectory and disk science region, and their memory/output cost must be measured.
+
+<comment>
+problem   = paper-reference circumbinary torus planning template
+reference = Fishbone and Moncrief 1976; Combi and Ressler arXiv:2403.13308
+
+<job>
+basename = effective_bbh_torus_production_TEMPLATE
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = -1000.0
+x1max  =  1000.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 32
+x2min  = -1000.0
+x2max  =  1000.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -1000.0
+x3max  =  1000.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+# RESOURCE GUARD: this is intentionally unrefined.  Do not change to static/adaptive
+# until the ten-level boxes, MeshBlock count, GPU memory, storage, and transfer plan have
+# been reviewed.  The intended root mesh is 128^3, not the placeholder 32^3 below, and
+# max_nmb_per_rank must be recomputed for the chosen rank count before enabling it.
+<mesh_refinement>
+refinement         = none
+max_nmb_per_rank   = 128
+prolong_primitives = false
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.3
+nlim       = 2
+tlim       = 10000.0
+ndiag      = 1
+
+<coord>
+minkowski       = false
+excise          = true
+excision_scheme = lapse
+excise_lapse    = 0.25
+dexcise         = 1.0e-10
+pexcise         = 3.333333333333e-13
+
+<adm>
+dynamic = true
+
+<mhd>
+eos             = ideal
+dyn_eos         = ideal
+dyn_error       = reset_floor
+gamma           = 1.3333333333333333
+reconstruct     = wenoz
+rsolver         = hlle
+dfloor          = 1.0e-10
+tfloor          = 3.333333333333e-13
+dthreshold      = 1.01
+dyn_scratch     = 1
+fofc            = true
+enforce_maximum = false
+
+<problem>
+pgen_name              = dynbbh
+# This placeholder is intentional and must fail at startup until replaced by a verified,
+# normalized PN-to-remnant table whose coverage includes both metric finite differences.
+trajectory_mode        = table
+trajectory_file        = REPLACE_WITH_VERIFIED_4PN_TO_REMNANT_TRAJECTORY.dat
+trajectory_time_offset = 0.0
+separation             = 20.0
+mass_ratio             = 1.0
+chi1                   = 0.0
+chi2                   = 0.0
+theta1                 = 0.0
+theta2                 = 0.0
+phi1                   = 0.0
+phi2                   = 0.0
+metric_fd_step         = 5.0e-5
+mass_scale1            = 1.0
+mass_scale2            = 1.0
+spin_buffer1           = 0.05
+spin_buffer2           = 0.05
+singularity_floor      = 1.0e-3
+amr_condition          = track
+alpha_threshold        = 0.6
+# Finest-level protection radius from the paper.  With ratio=2 this implies successively
+# wider parent shells; increasing it to 6M would refine nearly the whole root domain.
+refinement_radius      = 1.0
+refinement_radius_ratio = 2.0
+refinement_hysteresis  = 1.25
+
+initial_data              = reference_fm_torus
+torus_reference_mass      = 1.0
+torus_reference_center1   = 0.0
+torus_reference_center2   = 0.0
+torus_reference_center3   = 0.0
+torus_reference_velocity1 = 0.0
+torus_reference_velocity2 = 0.0
+torus_reference_velocity3 = 0.0
+torus_r_edge              = 18.0
+torus_r_peak              = 29.0
+torus_rho_max             = 1.0
+torus_rho_min             = 1.0e-5
+torus_rho_pow             = -1.5
+torus_pgas_min            = 3.333333333333e-8
+torus_pgas_pow            = -2.5
+torus_rho_atm             = 1.0e-10
+torus_temp_atm            = 3.333333333333e-13
+torus_pert_amp            = 0.02
+torus_seed                = 1
+torus_magnetic_field      = single_loop
+torus_potential_cutoff    = 0.2
+torus_mag_norm            = density_weighted_beta
+torus_mag_target          = 100.0
+torus_min_grid_peak_fraction = 0.9
+torus_min_magnetic_cells  = 64
+torus_require_full_domain = true
+
+# These cadences are placeholders.  Derive them from the science diagnostics and a
+# measured bytes-per-dump budget before enabling the production hierarchy.
+<output1>
+file_type   = hst
+data_format = %.17e
+dt          = 10.0
+
+<output2>
+file_type   = bin
+variable    = mhd_w_bcc
+dt          = 100.0
+ghost_zones = false
+
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dt          = 100.0
+ghost_zones = false
+
+<output4>
+file_type = rst
+dt        = 500.0
