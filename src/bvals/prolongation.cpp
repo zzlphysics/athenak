@@ -250,21 +250,24 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
   // level. (Only needed in multidimensions)
 
   if (multi_d) {
-    int nmnv = 3*nmb_target*nnghbr;
+    int nmnv = 3*nmb_target;
     auto &rbuf = recvbuf;
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
     auto &cks = indcs.cks;
-    // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
+    // Face-centered boundary buffers overlap at edges and corners.  Keep neighbor
+    // updates in a fixed scalar order so multiple teams cannot race on the same face.
+    // This mirrors the ordering used by PackAndSendFC() and RecvAndUnpackFC().
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
     Kokkos::parallel_for("ProlFCSame", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-      const int a = (tmember.league_rank())/(3*nnghbr);
+      const int a = tmember.league_rank()/3;
       const int m = all_blocks_active ? a : active_lids(active_offset + a);
-      const int n = (tmember.league_rank() - a*(3*nnghbr))/3;
-      const int v = (tmember.league_rank() - a*(3*nnghbr) - 3*n);
+      const int v = tmember.league_rank()%3;
 
-      // only restrict when neighbor exists and is at SAME level
-      if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
+      for (int n=0; n<nnghbr; ++n) {
+        // only restrict when neighbor exists and is at SAME level
+        if ((nghbr.d_view(m,n).gid >= 0) &&
+            (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
         // loop over indices for receives at same level, but convert loop limits to
         // coarse array
         int il = (rbuf[n].isame[v].bis + cis)/2;
@@ -319,9 +322,10 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
                                     + b.x3f(m,fk,fj+1,fi) + b.x3f(m,fk,fj+1,fi+1));
             }
           }
-        });
+          });
+        }
+        tmember.team_barrier();
       }
-      tmember.team_barrier();
     });
   }
   return;
@@ -355,18 +359,21 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // Code here is based on MeshRefinement::ProlongateSharedFieldX1/2/3() and
   // MeshRefinement::ProlongateInternalField() in C++ version
 
-  // Outer loop over (# of MeshBlocks)*(# of buffers)*(three field components)
-  {int nmnv = 3*nmb_target*nnghbr;
+  // Face-centered coarse/fine buffers overlap at edges and corners.  Use one team per
+  // block/component and a fixed scalar neighbor order to make the final writer
+  // deterministic and avoid concurrent stores to the same face.
+  {int nmnv = 3*nmb_target;
   auto &rbuf = recvbuf;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
   Kokkos::parallel_for("ProFC-2d-shared", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int a = (tmember.league_rank())/(3*nnghbr);
+    const int a = tmember.league_rank()/3;
     const int m = all_blocks_active ? a : active_lids(active_offset + a);
-    const int n = (tmember.league_rank() - a*(3*nnghbr))/3;
-    const int v = (tmember.league_rank() - a*(3*nnghbr) - 3*n);
+    const int v = tmember.league_rank()%3;
 
-    // only prolongate when neighbor exists and is at coarser level
-    if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
+    for (int n=0; n<nnghbr; ++n) {
+      // only prolongate when neighbor exists and is at coarser level
+      if ((nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       int il = rbuf[n].iprol[v].bis;
       int iu = rbuf[n].iprol[v].bie;
       int jl = rbuf[n].iprol[v].bjs;
@@ -400,9 +407,10 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
         } else {
           ProlongFCSharedX3Face(m,k,j,i,fk,fj,fi,multi_d,cb.x3f,b.x3f);
         }
-      });
+        });
+      }
+      tmember.team_barrier();
     }
-    tmember.team_barrier();
   });}
 
   // Now prolongate b.x1f/b.x2f/b.x3f at interior fine cells using the 2nd-order
@@ -410,18 +418,20 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // Note prolongation at shared coarse/fine cell edges must be completed first as
   // interpolation formulae use these values.
 
-  // Outer loop over (# of MeshBlocks)*(# of buffers)
-  {int nmn = nmb_target*nnghbr;
+  // The interior interpolation for adjacent edge/corner buffers can also touch the same
+  // face, so retain the same fixed neighbor order for this second phase.
+  {int nmn = nmb_target;
   bool &one_d = pmy_pack->pmesh->one_d;
   auto &rbuf = recvbuf;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmn, Kokkos::AUTO);
   Kokkos::parallel_for("ProFC-2d-int", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int a = (tmember.league_rank())/(nnghbr);
+    const int a = tmember.league_rank();
     const int m = all_blocks_active ? a : active_lids(active_offset + a);
-    const int n = (tmember.league_rank() - a*(nnghbr));
 
-    // only prolongate when neighbor exists and is at coarser level
-    if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
+    for (int n=0; n<nnghbr; ++n) {
+      // only prolongate when neighbor exists and is at coarser level
+      if ((nghbr.d_view(m,n).gid >= 0) &&
+          (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // use prolongation indices of different field components for interior fine cells
       int il = rbuf[n].iprol[2].bis;
       int iu = rbuf[n].iprol[2].bie;
@@ -454,9 +464,10 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
           // in multi-D call inlined prolongation operator for FC fields at internal faces
           ProlongFCInternal(m,fk,fj,fi,three_d,root_dx1,root_dx2,root_dx3,b);
         }
-      });
+        });
+      }
+      tmember.team_barrier();
     }
-    tmember.team_barrier();
   });}
 
   return;
