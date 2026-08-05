@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -86,6 +87,10 @@ struct BBHParameters {
   Real refinement_radius;
   Real refinement_radius_ratio;
   Real refinement_hysteresis;
+  Real refinement_horizon_factor;
+  Real refinement_floor_radius;
+  Real refinement_floor_center[3];
+  int refinement_floor_level;
   Real run_end_time;
   binary_bh::MetricParameters metric;
 };
@@ -166,9 +171,17 @@ struct TrajectoryStencil {
   Real inverse_time_width;
 };
 
+struct SignatureValidationStats {
+  std::uint64_t points = 0;
+  Real minimum_alpha_squared = std::numeric_limits<Real>::infinity();
+  Real minimum_spatial_pivot = std::numeric_limits<Real>::infinity();
+};
+
 BBHParameters bbh;
 ReferenceFMTorusParameters reference_torus;
 std::vector<TrajectorySample> trajectory_table;
+std::vector<Real> refinement_shell_radii;
+std::string trajectory_content_fingerprint;  // NOLINT(runtime/string)
 Real bbh_metric_time = 0.0;
 
 [[noreturn]] void Fatal(const std::string &message) {
@@ -180,6 +193,7 @@ void FindTrajectory(Real simulation_time, Real state[NTRAJ]);
 void FindTrajectoryAtTableTime(Real table_time, Real state[NTRAJ]);
 void TimeDerivativeEndpoints(Real center, Real &earlier, Real &later);
 void LoadTrajectoryTable(const std::string &filename);
+void ValidateOrStoreTrajectoryRestartContract(ParameterInput *pin, bool restart);
 void ValidateTrajectorySignature(Real table_time_start, Real table_time_end);
 void ValidateMetricKernel();
 void SetADMVariablesToBBH(MeshBlockPack *pmbp);
@@ -630,6 +644,18 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "refinement_radius_ratio", 2.0);
   bbh.refinement_hysteresis =
       pin->GetOrAddReal("problem", "refinement_hysteresis", 1.25);
+  bbh.refinement_horizon_factor =
+      pin->GetOrAddReal("problem", "refinement_horizon_factor", 1.25);
+  bbh.refinement_floor_radius =
+      pin->GetOrAddReal("problem", "refinement_floor_radius", 0.0);
+  bbh.refinement_floor_center[0] =
+      pin->GetOrAddReal("problem", "refinement_floor_center1", 0.0);
+  bbh.refinement_floor_center[1] =
+      pin->GetOrAddReal("problem", "refinement_floor_center2", 0.0);
+  bbh.refinement_floor_center[2] =
+      pin->GetOrAddReal("problem", "refinement_floor_center3", 0.0);
+  bbh.refinement_floor_level =
+      pin->GetOrAddInteger("problem", "refinement_floor_level", 0);
   bbh.run_end_time = pin->GetReal("time", "tlim");
   bbh.metric.mass_scale1 = pin->GetOrAddReal("problem", "mass_scale1",
       pin->GetOrAddReal("problem", "adjust_mass1", 1.0));
@@ -641,6 +667,27 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "a2_buffer", 0.05));
   bbh.metric.singularity_floor = pin->GetOrAddReal("problem", "singularity_floor",
       pin->GetOrAddReal("problem", "cutoff_floor", 1.0e-3));
+
+  const int tracked_levels = pmy_mesh_->max_level-pmy_mesh_->root_level;
+  refinement_shell_radii.clear();
+  refinement_shell_radii.resize(tracked_levels+1, 0.0);
+  bool has_explicit_shell_radius = false;
+  for (int level=1; level<=tracked_levels; ++level) {
+    const std::string name = "refinement_radius_level_" + std::to_string(level);
+    has_explicit_shell_radius =
+        has_explicit_shell_radius || pin->DoesParameterExist("problem", name);
+  }
+  for (int level=1; level<=tracked_levels; ++level) {
+    const std::string name = "refinement_radius_level_" + std::to_string(level);
+    if (has_explicit_shell_radius && !pin->DoesParameterExist("problem", name)) {
+      Fatal("explicit track AMR requires every " + name
+          + " through the configured finest level");
+    }
+    const Real default_radius = bbh.refinement_radius*std::pow(
+        bbh.refinement_radius_ratio, tracked_levels-level);
+    refinement_shell_radii[level] =
+        pin->GetOrAddReal("problem", name, default_radius);
+  }
 
   if (bbh.initial_data == 1) {
     if (pmy_mesh_->mb_indcs.nx2 <= 1 || pmy_mesh_->mb_indcs.nx3 <= 1) {
@@ -747,7 +794,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     bbh.theta1, bbh.theta2, bbh.phi1, bbh.phi2, bbh.time_offset, bbh.fd_step,
     bbh.rho0, bbh.pgas0, bbh.u10, bbh.u20, bbh.u30, bbh.b10, bbh.b20, bbh.b30,
     bbh.alpha_threshold, bbh.refinement_radius, bbh.refinement_radius_ratio,
-    bbh.refinement_hysteresis, bbh.run_end_time,
+    bbh.refinement_hysteresis, bbh.refinement_horizon_factor, bbh.run_end_time,
+    bbh.refinement_floor_radius, bbh.refinement_floor_center[0],
+    bbh.refinement_floor_center[1], bbh.refinement_floor_center[2],
     bbh.metric.mass_scale1,
     bbh.metric.mass_scale2, bbh.metric.spin_buffer1, bbh.metric.spin_buffer2,
     bbh.metric.singularity_floor
@@ -762,8 +811,26 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       || !(bbh.metric.spin_buffer1 >= 0.0) || !(bbh.metric.spin_buffer2 >= 0.0)
       || !(bbh.metric.singularity_floor > 0.0) || !(bbh.refinement_radius > 0.0)
       || !(bbh.refinement_radius_ratio >= 1.0)
-      || !(bbh.refinement_hysteresis > 1.0)) {
+      || !(bbh.refinement_hysteresis > 1.0)
+      || !(bbh.refinement_horizon_factor > 0.0)) {
     Fatal("invalid non-positive dynbbh parameter");
+  }
+  if (!(bbh.refinement_floor_radius >= 0.0)
+      || bbh.refinement_floor_level < 0
+      || bbh.refinement_floor_level > tracked_levels
+      || ((bbh.refinement_floor_radius == 0.0)
+          != (bbh.refinement_floor_level == 0))) {
+    Fatal("track AMR refinement floor requires radius>0 with a physical level in "
+          "[1, num_levels-1], or radius=level=0 to disable it");
+  }
+  for (int level=1; level<=tracked_levels; ++level) {
+    const Real radius = refinement_shell_radii[level];
+    if (!std::isfinite(radius) || !(radius > 0.0)) {
+      Fatal("track AMR refinement radii must be finite and positive");
+    }
+    if (level > 1 && radius > refinement_shell_radii[level-1]) {
+      Fatal("track AMR refinement radii must be non-increasing toward finer levels");
+    }
   }
   if (bbh.metric.spin_buffer1 + bbh.metric.singularity_floor > 1.0
       || bbh.metric.spin_buffer2 + bbh.metric.singularity_floor > 1.0) {
@@ -800,7 +867,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     }
   } else {
     trajectory_table.clear();
+    trajectory_content_fingerprint = "analytic-circular";
   }
+  ValidateOrStoreTrajectoryRestartContract(pin, restart);
   ValidateTrajectorySignature(required_start, required_end);
 
   Real inferred_torus_mass = 0.0;
@@ -929,9 +998,27 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
   if (global_variable::my_rank == 0) {
     std::cout << "Effective BBH metric: trajectory=" << trajectory_mode;
-    if (bbh.use_table) std::cout << " file=" << trajectory_filename;
+    if (bbh.use_table) {
+      std::cout << " file=" << trajectory_filename
+                << " fingerprint=" << trajectory_content_fingerprint;
+    }
     std::cout << ", finite-difference step=" << bbh.fd_step
               << ", initial_data=" << initial_data << std::endl;
+    if (!refinement_shell_radii.empty() && refinement_shell_radii.size() > 1) {
+      std::cout << "BBH track AMR radii:";
+      for (std::size_t level=1; level<refinement_shell_radii.size(); ++level) {
+        std::cout << " L" << level << "=" << refinement_shell_radii[level];
+      }
+      std::cout << ", horizon factor=" << bbh.refinement_horizon_factor << std::endl;
+      if (bbh.refinement_floor_level > 0) {
+        std::cout << "BBH AMR resolution floor: radius="
+                  << bbh.refinement_floor_radius << " through L"
+                  << bbh.refinement_floor_level << ", center=("
+                  << bbh.refinement_floor_center[0] << ","
+                  << bbh.refinement_floor_center[1] << ","
+                  << bbh.refinement_floor_center[2] << ")" << std::endl;
+      }
+    }
     if (bbh.initial_data == 1) {
       std::cout << "Reference FM torus: M_ref=" << reference_torus.reference_mass
                 << " (trajectory total=" << inferred_torus_mass << "), center=("
@@ -1692,9 +1779,94 @@ void ValidateMetricKernel() {
   }
 }
 
+std::string FingerprintTrajectoryBytes(const std::string &contents) {
+  std::uint64_t hash1 = 14695981039346656037ULL;
+  std::uint64_t hash2 = 7809847782465536322ULL;
+  for (char byte : contents) {
+    const std::uint64_t value = static_cast<unsigned char>(byte);
+    hash1 = (hash1 ^ value)*1099511628211ULL;
+    hash2 ^= value + 0x9e3779b97f4a7c15ULL + (hash2 << 6) + (hash2 >> 2);
+    hash2 *= 0xbf58476d1ce4e5b9ULL;
+  }
+  const std::uint64_t bytes = static_cast<std::uint64_t>(contents.size());
+
+  std::uint64_t local[3] = {hash1, hash2, bytes};
+#if MPI_PARALLEL_ENABLED
+  std::uint64_t minimum[3];
+  std::uint64_t maximum[3];
+  MPI_Allreduce(local, minimum, 3, MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(local, maximum, 3, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+  for (int n=0; n<3; ++n) {
+    if (minimum[n] != maximum[n]) {
+      Fatal("MPI ranks read different trajectory-table contents");
+    }
+  }
+#endif
+
+  std::ostringstream result;
+  result << "content128-v1:" << std::hex << std::setfill('0')
+         << std::setw(16) << local[0] << std::setw(16) << local[1]
+         << std::dec << ":" << local[2];
+  return result.str();
+}
+
+std::string CurrentTrajectoryRestartContract() {
+  std::ostringstream contract;
+  contract << std::setprecision(std::numeric_limits<Real>::max_digits10)
+           << "dynbbh-trajectory-v1;mode=" << (bbh.use_table ? "table" : "circular")
+           << ";content=" << trajectory_content_fingerprint
+           << ";time_offset=" << bbh.time_offset
+           << ";metric_fd_step=" << bbh.fd_step
+           << ";mass_scale1=" << bbh.metric.mass_scale1
+           << ";mass_scale2=" << bbh.metric.mass_scale2
+           << ";spin_buffer1=" << bbh.metric.spin_buffer1
+           << ";spin_buffer2=" << bbh.metric.spin_buffer2
+           << ";singularity_floor=" << bbh.metric.singularity_floor;
+  if (!bbh.use_table) {
+    contract << ";separation=" << bbh.separation << ";omega=" << bbh.omega
+             << ";mass_ratio=" << bbh.mass_ratio
+             << ";chi1=" << bbh.chi1 << ";chi2=" << bbh.chi2
+             << ";theta1=" << bbh.theta1 << ";theta2=" << bbh.theta2
+             << ";phi1=" << bbh.phi1 << ";phi2=" << bbh.phi2;
+  }
+  return contract.str();
+}
+
+void ValidateOrStoreTrajectoryRestartContract(ParameterInput *pin, bool restart) {
+  constexpr const char *contract_name = "trajectory_restart_contract";
+  const std::string current = CurrentTrajectoryRestartContract();
+  if (restart) {
+    if (!pin->DoesParameterExist("problem", contract_name)) {
+      Fatal("dynbbh restart lacks a trajectory contract; restart from a checkpoint "
+            "written by the current code instead of silently accepting an unverified "
+            "trajectory");
+    }
+    const std::string stored = pin->GetString("problem", contract_name);
+    if (stored != current) {
+      Fatal("dynbbh trajectory or metric parameters differ from the restart contract; "
+            "the trajectory table, time offset, finite-difference step, mass scaling, "
+            "and regularization parameters must remain unchanged");
+    }
+  } else {
+    if (pin->DoesParameterExist("problem", contract_name)) {
+      Fatal(std::string("<problem> ") + contract_name
+          + " is reserved for restart provenance and must not be supplied by the user");
+    }
+    pin->SetString("problem", contract_name, current);
+  }
+}
+
 void LoadTrajectoryTable(const std::string &filename) {
-  std::ifstream input(filename);
-  if (!input.is_open()) Fatal("could not open trajectory table: " + filename);
+  // Read once, then fingerprint and parse the same immutable byte snapshot.  This keeps
+  // the restart identity coupled to the states actually evolved even if an external
+  // process replaces the path while startup is in progress.
+  std::ifstream source(filename, std::ios::binary);
+  if (!source.is_open()) Fatal("could not open trajectory table: " + filename);
+  const std::string contents{
+      std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+  if (source.bad()) Fatal("failed while reading trajectory table: " + filename);
+  trajectory_content_fingerprint = FingerprintTrajectoryBytes(contents);
+  std::istringstream input(contents);
 
   trajectory_table.clear();
   std::string line;
@@ -1888,7 +2060,7 @@ void FindTrajectoryAtTableTime(Real table_time, Real state[NTRAJ]) {
 
 bool HasLorentzianADMDecomposition(const Real state[NTRAJ], const Real x,
                                    const Real y, const Real z,
-                                   Real &alpha_squared) {
+                                   Real &alpha_squared, Real &spatial_pivot) {
   Real metric[4][4];
   binary_bh::ComputeMetric(x, y, z, state, bbh.metric, metric);
   for (int a = 0; a < 4; ++a) {
@@ -1901,6 +2073,13 @@ bool HasLorentzianADMDecomposition(const Real state[NTRAJ], const Real x,
       metric[1][1], metric[1][2], metric[1][3],
       metric[2][2], metric[2][3], metric[3][3]);
   const Real leading_minor2 = metric[1][1]*metric[2][2] - SQR(metric[1][2]);
+  spatial_pivot = metric[1][1];
+  if (metric[1][1] > 0.0) {
+    spatial_pivot = std::min(spatial_pivot, leading_minor2/metric[1][1]);
+  }
+  if (leading_minor2 > 0.0) {
+    spatial_pivot = std::min(spatial_pivot, determinant/leading_minor2);
+  }
   if (!(metric[1][1] > 0.0) || !(leading_minor2 > 0.0)
       || !(determinant > 0.0) || !std::isfinite(determinant)) {
     return false;
@@ -1963,19 +2142,28 @@ void GlobalPointAtKerrRadius(const Real position[3], const Real velocity[3],
   }
 }
 
-void ValidateTrajectoryStateSignature(const Real table_time, const Real state[NTRAJ]) {
+void ValidateTrajectoryStateSignature(const Real table_time, const Real state[NTRAJ],
+                                      SignatureValidationStats &stats) {
   auto CheckPoint = [&](const Real x, const Real y, const Real z) {
     Real alpha_squared = -std::numeric_limits<Real>::infinity();
-    if (!HasLorentzianADMDecomposition(state, x, y, z, alpha_squared)) {
+    Real spatial_pivot = -std::numeric_limits<Real>::infinity();
+    if (!HasLorentzianADMDecomposition(
+            state, x, y, z, alpha_squared, spatial_pivot)) {
       std::ostringstream message;
       message << "effective BBH metric has no Lorentzian ADM decomposition at "
               << "trajectory time "
               << table_time << " near (" << x << ", " << y << ", " << z
               << "), alpha^2=" << alpha_squared
+              << ", minimum spatial LDL pivot=" << spatial_pivot
               << ". Start the inspiral-to-remnant transition earlier or increase the "
               << "circular smoke-test separation.";
       Fatal(message.str());
     }
+    ++stats.points;
+    stats.minimum_alpha_squared =
+        std::min(stats.minimum_alpha_squared, alpha_squared);
+    stats.minimum_spatial_pivot =
+        std::min(stats.minimum_spatial_pivot, spatial_pivot);
   };
 
   const Real positions[2][3] = {
@@ -2089,6 +2277,7 @@ void ValidateTrajectorySignature(Real table_time_start, Real table_time_end) {
   if (!(table_time_end >= table_time_start)) {
     Fatal("metric-signature validation interval is reversed");
   }
+  SignatureValidationStats stats;
   Real state[NTRAJ];
   if (!bbh.use_table) {
     const Real duration = table_time_end-table_time_start;
@@ -2103,33 +2292,40 @@ void ValidateTrajectorySignature(Real table_time_start, Real table_time_end) {
           static_cast<Real>(sample)/static_cast<Real>(samples) : 0.0;
       const Real time = table_time_start + weight*validation_duration;
       FindTrajectoryAtTableTime(time, state);
-      ValidateTrajectoryStateSignature(time, state);
+      ValidateTrajectoryStateSignature(time, state, stats);
     }
-    return;
-  }
-
-  FindTrajectoryAtTableTime(table_time_start, state);
-  ValidateTrajectoryStateSignature(table_time_start, state);
-  const auto first_upper = std::upper_bound(
-      trajectory_table.begin(), trajectory_table.end(), table_time_start,
-      [](Real value, const TrajectorySample &sample) { return value < sample.time; });
-  std::size_t interval = (first_upper == trajectory_table.begin()) ? 0
-      : static_cast<std::size_t>(first_upper-trajectory_table.begin()-1);
-  while (interval+1 < trajectory_table.size()
-         && trajectory_table[interval].time < table_time_end) {
-    const Real segment_start = std::max(
-        table_time_start, trajectory_table[interval].time);
-    const Real segment_end = std::min(
-        table_time_end, trajectory_table[interval+1].time);
-    if (segment_end > segment_start) {
-      const Real fractions[] = {0.25, 0.5, 0.75, 1.0};
-      for (Real fraction : fractions) {
-        const Real time = segment_start + fraction*(segment_end-segment_start);
-        FindTrajectoryAtTableTime(time, state);
-        ValidateTrajectoryStateSignature(time, state);
+  } else {
+    FindTrajectoryAtTableTime(table_time_start, state);
+    ValidateTrajectoryStateSignature(table_time_start, state, stats);
+    const auto first_upper = std::upper_bound(
+        trajectory_table.begin(), trajectory_table.end(), table_time_start,
+        [](Real value, const TrajectorySample &sample) { return value < sample.time; });
+    std::size_t interval = (first_upper == trajectory_table.begin()) ? 0
+        : static_cast<std::size_t>(first_upper-trajectory_table.begin()-1);
+    while (interval+1 < trajectory_table.size()
+           && trajectory_table[interval].time < table_time_end) {
+      const Real segment_start = std::max(
+          table_time_start, trajectory_table[interval].time);
+      const Real segment_end = std::min(
+          table_time_end, trajectory_table[interval+1].time);
+      if (segment_end > segment_start) {
+        const Real fractions[] = {0.25, 0.5, 0.75, 1.0};
+        for (Real fraction : fractions) {
+          const Real time = segment_start + fraction*(segment_end-segment_start);
+          FindTrajectoryAtTableTime(time, state);
+          ValidateTrajectoryStateSignature(time, state, stats);
+        }
       }
+      ++interval;
     }
-    ++interval;
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << std::setprecision(std::numeric_limits<Real>::max_digits10)
+              << "Effective BBH signature certificate: interval=["
+              << table_time_start << "," << table_time_end << "], points="
+              << stats.points << ", min(alpha^2)=" << stats.minimum_alpha_squared
+              << ", min(spatial LDL pivot)=" << stats.minimum_spatial_pivot
+              << std::endl;
   }
 }
 
@@ -2265,8 +2461,9 @@ void RefineAlphaMin(MeshBlockPack *pmbp) {
       int i = index-k*cells_per_plane-j*nx1;
       value = fmin(value, alpha(m, k+ks, j+js, i+is));
     }, Kokkos::Min<Real>(minimum));
-    if (minimum < threshold) refine_flag.d_view(m+meshblock_start) = 1;
-    if (minimum > 1.25*threshold) refine_flag.d_view(m+meshblock_start) = -1;
+    int &flag = refine_flag.d_view(m+meshblock_start);
+    if (minimum < threshold) flag = 1;
+    if (minimum > 1.25*threshold && flag == 0) flag = -1;
   });
   refine_flag.template modify<DevExeSpace>();
   refine_flag.template sync<HostMemSpace>();
@@ -2277,6 +2474,88 @@ Real DistanceSquaredToBlock(Real x, Real y, Real z, const RegionSize &block) {
   const Real dy = std::max(std::max(block.x2min-y, Real(0.0)), y-block.x2max);
   const Real dz = std::max(std::max(block.x3min-z, Real(0.0)), z-block.x3max);
   return SQR(dx) + SQR(dy) + SQR(dz);
+}
+
+struct TrackingTarget {
+  Real position[3];
+  Real velocity[3];
+  Real spin[3];
+  Real mass;
+};
+
+bool TrackingValuesCoincide(const Real first, const Real second) {
+  const Real scale = std::max(Real(1.0), std::max(std::abs(first), std::abs(second)));
+  return std::abs(first-second)
+      <= 128.0*std::numeric_limits<Real>::epsilon()*scale;
+}
+
+void LoadTrackingTarget(const Real state[NTRAJ], const int hole,
+                        TrackingTarget &target) {
+  const int position_index[2][3] = {{X1, Y1, Z1}, {X2, Y2, Z2}};
+  const int velocity_index[2][3] = {{VX1, VY1, VZ1}, {VX2, VY2, VZ2}};
+  const int spin_index[2][3] = {{AX1, AY1, AZ1}, {AX2, AY2, AZ2}};
+  const Real scale = (hole == 0) ? bbh.metric.mass_scale1 : bbh.metric.mass_scale2;
+  for (int direction=0; direction<3; ++direction) {
+    target.position[direction] = state[position_index[hole][direction]];
+    target.velocity[direction] = state[velocity_index[hole][direction]];
+    target.spin[direction] = state[spin_index[hole][direction]]*scale;
+  }
+  target.mass = state[(hole == 0) ? M1T : M2T]*scale;
+}
+
+int BuildTrackingTargets(const Real state[NTRAJ], TrackingTarget targets[2]) {
+  LoadTrackingTarget(state, 0, targets[0]);
+  LoadTrackingTarget(state, 1, targets[1]);
+  const bool active1 = targets[0].mass > 0.0;
+  const bool active2 = targets[1].mass > 0.0;
+  if (!active1 && !active2) return 0;
+  if (!active1) {
+    targets[0] = targets[1];
+    return 1;
+  }
+  if (!active2) return 1;
+
+  bool coincident = true;
+  for (int direction=0; direction<3; ++direction) {
+    coincident = coincident
+        && TrackingValuesCoincide(targets[0].position[direction],
+                                  targets[1].position[direction])
+        && TrackingValuesCoincide(targets[0].velocity[direction],
+                                  targets[1].velocity[direction])
+        && TrackingValuesCoincide(targets[0].spin[direction],
+                                  targets[1].spin[direction]);
+  }
+  if (!coincident) return 2;
+
+  targets[0].mass += targets[1].mass;
+  for (int direction=0; direction<3; ++direction) {
+    targets[0].position[direction] =
+        0.5*(targets[0].position[direction]+targets[1].position[direction]);
+    targets[0].velocity[direction] =
+        0.5*(targets[0].velocity[direction]+targets[1].velocity[direction]);
+    targets[0].spin[direction] =
+        0.5*(targets[0].spin[direction]+targets[1].spin[direction]);
+  }
+  return 1;
+}
+
+Real HorizonEnclosingRadius(const TrackingTarget &target) {
+  const Real spin2 = SQR(target.spin[0]) + SQR(target.spin[1]) + SQR(target.spin[2]);
+  const Real horizon_radius = target.mass
+      + sqrt(std::max(SQR(target.mass)-spin2, Real(0.0)));
+  const Real rest_enclosing_radius = sqrt(spin2+SQR(horizon_radius));
+  const Real velocity2 = SQR(target.velocity[0]) + SQR(target.velocity[1])
+      + SQR(target.velocity[2]);
+  return rest_enclosing_radius/sqrt(1.0-velocity2);
+}
+
+Real TrackingShellRadius(const TrackingTarget &target, const int physical_level) {
+  // The user-specified shells already encode the nesting geometry.  The horizon
+  // guard is a physical lower bound at every level, not another geometric shell:
+  // scaling it by the number of parent levels would refine most of a large domain.
+  const Real horizon_radius = bbh.refinement_horizon_factor
+      *HorizonEnclosingRadius(target);
+  return std::max(refinement_shell_radii[physical_level], horizon_radius);
 }
 
 void RefineTracker(MeshBlockPack *pmbp) {
@@ -2308,35 +2587,56 @@ void RefineTracker(MeshBlockPack *pmbp) {
       std::max(static_cast<Real>(0.25)*sample_horizon, lookahead-sample_horizon);
   for (int m = 0; m < nmb; ++m) {
     const RegionSize &block = size.h_view(m);
-    Real minimum_distance = std::numeric_limits<Real>::infinity();
-    for (const auto &state : states) {
-      if (state[M1T]*bbh.metric.mass_scale1 > 0.0) {
-        minimum_distance = std::min(minimum_distance, DistanceSquaredToBlock(
-            state[X1], state[Y1], state[Z1], block));
-      }
-      if (state[M2T]*bbh.metric.mass_scale2 > 0.0) {
-        minimum_distance = std::min(minimum_distance, DistanceSquaredToBlock(
-            state[X2], state[Y2], state[Z2], block));
-      }
-    }
     const int level = pmbp->pmb->mb_lev.h_view(m);
-    int flag = 0;
+    const int physical_level = level-pmesh->root_level;
+    bool tracker_refine = false;
+    if (physical_level < bbh.refinement_floor_level) {
+      tracker_refine = DistanceSquaredToBlock(
+          bbh.refinement_floor_center[0], bbh.refinement_floor_center[1],
+          bbh.refinement_floor_center[2], block) < SQR(bbh.refinement_floor_radius);
+    }
     if (level < pmesh->max_level) {
-      // refinement_radius is the protected radius on the finest level.  Successively
-      // wider parent shells guarantee proper nesting while the swept-orbit padding
-      // keeps a subluminal hole inside the hierarchy until the next root sync point.
-      const int child_shells = pmesh->max_level - (level + 1);
-      const Real child_radius = bbh.refinement_radius*
-          std::pow(bbh.refinement_radius_ratio, child_shells) + padding;
-      if (minimum_distance < SQR(child_radius)) flag = 1;
+      const int child_physical_level = physical_level+1;
+      for (const auto &state : states) {
+        TrackingTarget targets[2];
+        const int count = BuildTrackingTargets(state.data(), targets);
+        for (int target=0; target<count; ++target) {
+          const Real radius =
+              TrackingShellRadius(targets[target], child_physical_level)+padding;
+          tracker_refine = tracker_refine ||
+              DistanceSquaredToBlock(targets[target].position[0],
+                                     targets[target].position[1],
+                                     targets[target].position[2], block) < SQR(radius);
+        }
+      }
     }
-    if (flag == 0 && level > pmesh->root_level) {
-      const int level_shells = pmesh->max_level - level;
-      const Real keep_radius = bbh.refinement_hysteresis*bbh.refinement_radius*
-          std::pow(bbh.refinement_radius_ratio, level_shells) + padding;
-      if (minimum_distance > SQR(keep_radius)) flag = -1;
+    bool tracker_derefine = level > pmesh->root_level;
+    if (!tracker_refine && tracker_derefine) {
+      for (const auto &state : states) {
+        TrackingTarget targets[2];
+        const int count = BuildTrackingTargets(state.data(), targets);
+        for (int target=0; target<count; ++target) {
+          const Real keep_radius = bbh.refinement_hysteresis
+              *TrackingShellRadius(targets[target], physical_level)+padding;
+          if (DistanceSquaredToBlock(targets[target].position[0],
+                                     targets[target].position[1],
+                                     targets[target].position[2], block)
+              <= SQR(keep_radius)) {
+            tracker_derefine = false;
+          }
+        }
+      }
+      if (physical_level <= bbh.refinement_floor_level
+          && DistanceSquaredToBlock(
+                 bbh.refinement_floor_center[0], bbh.refinement_floor_center[1],
+                 bbh.refinement_floor_center[2], block)
+              <= SQR(bbh.refinement_hysteresis*bbh.refinement_floor_radius)) {
+        tracker_derefine = false;
+      }
     }
-    refine_flag.h_view(m+meshblock_start) = flag;
+    int &flag = refine_flag.h_view(m+meshblock_start);
+    if (tracker_refine) flag = 1;
+    if (tracker_derefine && flag == 0) flag = -1;
   }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();

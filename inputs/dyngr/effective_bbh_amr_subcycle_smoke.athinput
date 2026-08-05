@@ -110,6 +110,17 @@ alpha_threshold       = 0.6
 refinement_radius     = 6.0
 refinement_radius_ratio = 2.0
 refinement_hysteresis = 1.25
+refinement_horizon_factor = 1.25
+# Radius of the region promoted to each physical level (root is L0).  Listing every
+# level avoids changing the outer protection shell when a finer convergence level is
+# added.
+refinement_radius_level_1 = 12.0
+refinement_radius_level_2 = 6.0
+refinement_floor_radius = 0.0
+refinement_floor_level  = 0
+refinement_floor_center1 = 0.0
+refinement_floor_center2 = 0.0
+refinement_floor_center3 = 0.0
 
 # Per-cycle dumps expose topology creation and motion.  Keep the smoke-test cadence out
 # of production inputs; production output volume must be budgeted separately.

@@ -1,0 +1,242 @@
+{
+  "schema_version": 1,
+  "campaign_id": "effective-bbh-4pn-amr-convergence-v1",
+  "status": "qualification_candidate_not_publication_certification",
+  "trajectory": {
+    "declared_model": "4PN_to_single_remnant",
+    "required_provenance_schema_version": 2,
+    "required_source_revision_pattern": "^[0-9a-f]{40}$",
+    "expected_source_revision": "2ce68e3d49e8758b32efc8841d239354d8d619d6",
+    "expected_source_sha256": "94f9f7cf848ba51f9186fa27506f526ffd3466fefb0d4a8af5337cf4e8864751",
+    "expected_ascii_sha256": "42575c6b6a07f4a4fad22b6fecedbf4719aada11093b91556c46475379a9cac0",
+    "expected_provenance_sha256": "64247d4d8b018d48d3d8ba9b4c7048d86418e36ba4923f8fecc48d10b489bf1e",
+    "reference_trajectory_time_offset_M": 0.20394132257931097,
+    "format": "AthenaK dynbbh 21-column ASCII",
+    "columns": [
+      "t",
+      "x1",
+      "y1",
+      "z1",
+      "x2",
+      "y2",
+      "z2",
+      "vx1",
+      "vy1",
+      "vz1",
+      "vx2",
+      "vy2",
+      "vz2",
+      "a1x",
+      "a1y",
+      "a1z",
+      "a2x",
+      "a2y",
+      "a2z",
+      "m1_full",
+      "m2_full"
+    ],
+    "baseline": {
+      "initial_total_mass_M": 1.0,
+      "mass_ratio": 1.0,
+      "dimensionless_spins": [0.0, 0.0],
+      "initial_separation_M": 20.0,
+      "separation_tolerance_M": 0.5,
+      "normalization_tolerance": 1e-06
+    },
+    "maximum_horizon_guard_radius_M": 2.5,
+    "required_external_provenance": [
+      "4PN approximant and implementation revision",
+      "PN-to-remnant stitching prescription and parameters",
+      "converter command and manifest",
+      "ASCII SHA-256",
+      "canonical stitch sidecar SHA-256"
+    ]
+  },
+  "common": {
+    "mesh": {
+      "domain_half_extent_M": 1024.0,
+      "root_cells_per_dimension": 128,
+      "meshblock_cells_per_dimension": 16,
+      "nghost": 4,
+      "root_dx_M": 16.0
+    },
+    "time": {
+      "integrator": "rk2",
+      "subcycling": "level",
+      "refinement_time_ratio": 2,
+      "cfl_number": 0.3,
+      "metric_fd_step_M": 0.00005,
+      "metric_fd_step_variants_M": [0.000025, 0.00005, 0.0001],
+      "publication_precision": "double"
+    },
+    "amr": {
+      "refinement": "adaptive",
+      "criterion": "track",
+      "ncycle_check": 1,
+      "refinement_interval": 1,
+      "prolong_primitives": false,
+      "hysteresis": 1.25,
+      "horizon_factor": 1.25,
+      "disk_floor_radius_M": 80.0,
+      "disk_floor_physical_level": 4,
+      "disk_floor_center_M": [0.0, 0.0, 0.0]
+    },
+    "outputs": {
+      "history_dt_M": 1.0,
+      "full_state_dt_M": 50.0,
+      "divb_dt_M": 100.0,
+      "restart_dt_M": 500.0,
+      "estimated_bytes_per_meshblock": {
+        "full_state_mhd_w_bcc": 147456,
+        "divb": 16384,
+        "restart_double_precision_dynadm": 2778624
+      }
+    },
+    "resource_model": {
+      "reference_duration_M": 10000.0,
+      "empirical_peak_MiB_per_meshblock": 14.33,
+      "empirical_memory_precision": "double",
+      "empirical_memory_source": "A100 MPI preflight with Athena_SINGLE_PRECISION=OFF",
+      "gpu_memory_usable_fraction": 0.8,
+      "topology_margin_fraction": 0.25,
+      "per_rank_partition_margin_fraction": 0.08,
+      "initial_topology_measurement": "AthenaK -m with the generated refined_region seeds",
+      "load_balance_partition_ordering": "contiguous MeshBlock GIDs (Z-order)",
+      "max_nmb_rounding": 64,
+      "streaming_minimum_drain_MiB_per_second": 8.0,
+      "remote_disk_stop_threshold_percent": 80,
+      "remote_disk_emergency_threshold_percent": 85
+    }
+  },
+  "tiers": {
+    "L": {
+      "num_levels": 10,
+      "finest_physical_level": 9,
+      "finest_dx_M": 0.03125,
+      "shell_radii_M": {
+        "1": 16.0,
+        "2": 16.0,
+        "3": 16.0,
+        "4": 16.0,
+        "5": 16.0,
+        "6": 8.0,
+        "7": 4.0,
+        "8": 2.0,
+        "9": 1.0
+      },
+      "topology_estimate": {
+        "initial_preseed_meshblocks_athena_m": 6952,
+        "initial_preseed_alignment_probe_max_meshblocks": 6952,
+        "initial_preseed_weighted_meshblock_cycles_per_root_cycle": 924032,
+        "premerger_meshblocks": 2976,
+        "premerger_weighted_meshblock_cycles_per_root_cycle": 336872,
+        "postmerger_2p5M_guard_meshblocks": 3480,
+        "postmerger_2p5M_guard_weighted_meshblock_cycles_per_root_cycle": 711272,
+        "campaign_meshblock_gate": 8690,
+        "rank_partition_qualification": {
+          "topology_artifact": "frozen-v3 reference-offset initial preseed",
+          "mesh_structure_sha256": "09f834aba0cc50616b6d912fae53a598eb624434db085110ca8957fef6497e9a",
+          "topology_meshblocks": 6952,
+          "mpi_ranks": 4,
+          "meshblocks_per_rank_range": [1738, 1738],
+          "weighted_cost_per_rank_range": [231008, 231008],
+          "max_nmb_per_rank_hard_floor": 1920
+        }
+      },
+      "resource_gate": {
+        "aggregate_memory_lower_bound_A100_40G_gpus": 4,
+        "qualified_launch_A100_40G_gpus": 4,
+        "minimum_streaming_scratch_GiB": 128,
+        "projected_undrained_output_GiB_at_10000M": 749.4,
+        "minimum_undrained_scratch_GiB_at_10000M": 940
+      }
+    },
+    "M": {
+      "num_levels": 11,
+      "finest_physical_level": 10,
+      "finest_dx_M": 0.015625,
+      "shell_radii_M": {
+        "1": 16.0,
+        "2": 16.0,
+        "3": 16.0,
+        "4": 16.0,
+        "5": 16.0,
+        "6": 8.0,
+        "7": 4.0,
+        "8": 2.0,
+        "9": 1.5,
+        "10": 1.0
+      },
+      "topology_estimate": {
+        "initial_preseed_meshblocks_athena_m": 9976,
+        "initial_preseed_alignment_probe_max_meshblocks": 9976,
+        "initial_preseed_weighted_meshblock_cycles_per_root_cycle": 4241792,
+        "premerger_meshblocks": 5552,
+        "premerger_weighted_meshblock_cycles_per_root_cycle": 2978792,
+        "postmerger_2p5M_guard_meshblocks": 8520,
+        "postmerger_2p5M_guard_weighted_meshblock_cycles_per_root_cycle": 6240872,
+        "campaign_meshblock_gate": 12470,
+        "rank_partition_qualification": {
+          "topology_artifact": "frozen-v3 reference-offset initial preseed",
+          "mesh_structure_sha256": "edf4c8723b5bcadb911a543dd5c0ab8e1f236fb271dad0045407b8730d0c2c34",
+          "topology_meshblocks": 9976,
+          "mpi_ranks": 8,
+          "meshblocks_per_rank_range": [1247, 1247],
+          "weighted_cost_per_rank_range": [530224, 530224],
+          "max_nmb_per_rank_hard_floor": 1408
+        }
+      },
+      "resource_gate": {
+        "aggregate_memory_lower_bound_A100_40G_gpus": 6,
+        "qualified_launch_A100_40G_gpus": 8,
+        "minimum_streaming_scratch_GiB": 256,
+        "projected_undrained_output_GiB_at_10000M": 1075.3,
+        "minimum_undrained_scratch_GiB_at_10000M": 1350
+      }
+    },
+    "H": {
+      "num_levels": 12,
+      "finest_physical_level": 11,
+      "finest_dx_M": 0.0078125,
+      "shell_radii_M": {
+        "1": 16.0,
+        "2": 16.0,
+        "3": 16.0,
+        "4": 16.0,
+        "5": 16.0,
+        "6": 8.0,
+        "7": 4.0,
+        "8": 2.0,
+        "9": 1.75,
+        "10": 1.375,
+        "11": 1.0
+      },
+      "topology_estimate": {
+        "initial_preseed_meshblocks_athena_m": 37024,
+        "initial_preseed_alignment_probe_max_meshblocks": 40440,
+        "initial_preseed_weighted_meshblock_cycles_per_root_cycle": 57356672,
+        "premerger_meshblocks": 15744,
+        "premerger_weighted_meshblock_cycles_per_root_cycle": 25158632,
+        "postmerger_2p5M_guard_meshblocks": 44304,
+        "postmerger_2p5M_guard_weighted_meshblock_cycles_per_root_cycle": 84761192,
+        "campaign_meshblock_gate": 55380,
+        "rank_partition_qualification": {
+          "topology_artifact": "frozen-v3 nearby-phase alignment probe",
+          "mesh_structure_sha256": "c9f49565fdeee76794c512661721a367f5bcfa7fac85b9575a452f928f43069c",
+          "topology_meshblocks": 40440,
+          "mpi_ranks": 32,
+          "meshblocks_per_rank_range": [985, 1893],
+          "weighted_cost_per_rank_range": [1968128, 1970584],
+          "max_nmb_per_rank_hard_floor": 2048
+        }
+      },
+      "resource_gate": {
+        "aggregate_memory_lower_bound_A100_40G_gpus": 25,
+        "qualified_launch_A100_40G_gpus": 32,
+        "minimum_streaming_scratch_GiB": 512,
+        "projected_undrained_output_GiB_at_10000M": 4775.4,
+        "minimum_undrained_scratch_GiB_at_10000M": 6000
+      }
+    }
+  }
+}

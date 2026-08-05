@@ -31,7 +31,33 @@ python3 scripts/bbh_trajectory_h5_to_ascii.py trajectory.h5 trajectory.dat
 The converter normalizes all dimensional columns by the initial total mass unless
 `--mass-unit` is supplied.  Legacy files with missing spin datasets are rejected; use
 `--assume-missing-spin-zero` only after confirming that the omitted components really are
-zero.  Existing outputs are not overwritten unless `--force` is passed.
+zero.  Existing outputs are not overwritten unless `--force` is passed.  Conversion
+creates `trajectory.dat.manifest.json` by default (or the path selected by
+`--manifest`).  This deterministic sidecar records the input and output SHA-256 hashes,
+schema, normalization, row/time coverage, endpoint masses, separation, velocities and
+Kerr parameters, plus the maximum interior finite-difference velocity mismatch and its
+zero-based data-row index.  One-sided endpoint differences are excluded for tables with
+more than two rows and this scope is explicit in the manifest.  Use `--no-manifest` only
+for a legacy workflow that cannot accept a sidecar.  Both artifacts are staged and
+flushed before atomic renames; a validation or ordinary publication failure does not
+leave a newly generated half-pair.
+
+For a publication baseline, make velocity consistency and the expected equal-mass,
+initially nonspinning symmetry contractual rather than advisory:
+
+```bash
+python3 scripts/bbh_trajectory_h5_to_ascii.py trajectory.h5 trajectory.dat \
+  --strict-velocity-mismatch --velocity-tolerance 5e-2 \
+  --validation-profile q1-nonspinning
+```
+
+The `q1-nonspinning` profile checks equal initial masses, a centered and stationary
+initial center of mass, zero initial spins, and an unambiguous final remnant.  The final
+row must either use two identical position/velocity/spin terms or make at least one term
+massless.  `--validation-tolerance` controls these mixed absolute/relative checks in the
+normalized output units.  This profile is intentionally opt-in: unequal-mass, spinning,
+or kicked systems remain supported by the general converter and require their own
+documented physical validation.
 
 The ASCII schema is one row per time and 21 columns:
 
@@ -63,7 +89,16 @@ start its smooth inspiral-to-remnant transition before this check fails; a pre-m
 table cannot simply be evolved through close approach.  The circular mode is deliberately
 rejected at unsafe small separations.  This dense host-side scan is a one-time startup
 cost; expect large trajectory tables with tens of thousands of rows to take tens of
-seconds to validate on one CPU rank.
+seconds to validate on one CPU rank.  A successful scan prints its interval, number of
+spatial samples, minimum lapse squared, and minimum spatial-metric LDL pivot as a compact
+signature certificate.
+
+AthenaK fingerprints the trajectory's complete byte content on every MPI rank.  A fresh
+checkpoint stores that fingerprint together with the trajectory time offset, metric
+finite-difference step, mass scales, and regularization parameters.  Restart is allowed
+from a relocated byte-identical table, but fails closed if any locked content or metric
+parameter changes.  Legacy checkpoints without this contract must be restarted with the
+older executable and rewritten by the current code; they are not silently accepted.
 
 The generated reference C hides a negative lapse squared with an absolute value.  This
 implementation does not do that, because it would no longer be the ADM decomposition of
@@ -211,14 +246,32 @@ Two inputs deliberately separate software coverage from production planning:
   unrefined resource guard, and a two-cycle limit, so it is not directly runnable as a
   production calculation.
 
-The production resolution goal is `dx <= M/64` near both horizons and throughout every
-region used for science diagnostics.  On the exact `[-1000M,1000M]` domain, a planned
-`128^3` root plus ten dyadic refinement levels gives
-`dx=2000/(128*2^10) M=0.0152587890625M`, slightly finer than `M/64`.  The template does
-not enable these boxes: their extents must follow the verified trajectory while retaining
-the cavity and disk science region, and the resulting MeshBlock count, GPU memory,
-checkpoint size, output cadence, and NAS transfer rate must be measured first.  Merely
-resolving the horizons does not resolve the MRI or justify a magnetic-structure claim.
+The executable campaign assets are `effective_bbh_4pn_campaign.json` and
+`generate_effective_bbh_4pn_campaign.py`.  They define a common
+`[-1024M,1024M]^3`, `128^3` root mesh and the three exact dyadic targets `M/32`,
+`M/64`, and `M/128`.  The generator validates the trajectory and provenance, pre-seeds
+the complete initial hierarchy, and refuses GPU-memory or scratch-storage declarations
+below the audited gate.  Generated files remain qualification candidates until their
+short-run topology, memory, restart, and diagnostic gates pass.
+
+Moving-hole shells can be specified independently with
+`refinement_radius_level_1` through the configured finest physical level.  If any one is
+present, every level must be listed, values must be positive and non-increasing, and
+adding a finer convergence level no longer enlarges the outer shells.  The legacy
+`refinement_radius*refinement_radius_ratio^n` construction is used only when none are
+listed.  `refinement_horizon_factor` imposes a physical lower bound from the instantaneous
+boosted Kerr horizon at every level; it is not geometrically amplified toward the root.
+After the two terms become one canonical remnant, the guard follows its combined mass and
+spin.  `refinement_floor_radius` and `refinement_floor_level` union a persistent central
+disk/cavity sphere with the moving-hole criterion.
+
+Adaptive refinement can add at most one level per root regrid.  A scientific run must
+therefore include `<refined_region...>` seeds at the initial hole positions and for the
+central floor so the torus and constrained-transport field are initialized on the final
+hierarchy.  Allowing the tree to grow during the first several coarse steps changes the
+initial-value problem and invalidates a clean L/M/H convergence comparison.  Merely
+resolving the horizons still does not resolve the MRI or justify a magnetic-structure
+claim.
 
 Before a paper run, replace the placeholder with a provenance-recorded PN-to-remnant
 trajectory, test `metric_fd_step`, add validated moving-hole accretion and magnetic-flux
