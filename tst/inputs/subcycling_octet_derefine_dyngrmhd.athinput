@@ -1,0 +1,110 @@
+# Deterministic 3D octet de-refinement regression for strict 2:1 level subcycling.
+# Four root MeshBlocks lie along x1.  Cycle 1 refines the first root block into a
+# complete octet; cycles 2 and 3 move it through neighboring root blocks, and cycle 4
+# de-refines the final octet.  The 1:2:2 cell aspect ratio deliberately exercises the
+# face-area and directional mixed-term scaling in Toth-Roe magnetic prolongation.
+
+<job>
+basename = subcycling_octet_derefine_dyngrmhd
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = -0.5
+x1max  =  0.5
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2    = 8
+x2min  = -0.25
+x2max  =  0.25
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3    = 8
+x3min  = -0.25
+x3max  =  0.25
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement          = adaptive
+max_nmb_per_rank    = 32
+num_levels          = 2
+ncycle_check        = 1
+refinement_interval = 1
+prolong_primitives  = false
+
+<amr_criterion0>
+method = user
+
+<coord>
+minkowski = true
+
+<adm>
+dynamic = true
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.2
+nlim       = 4
+tlim       = 100.0
+ndiag      = 1
+
+<mhd>
+reconstruct = plm
+rsolver     = hlle
+gamma       = 1.3333333333333333
+tfloor      = 1.0e-10
+dyn_eos     = ideal
+eos         = ideal
+dyn_error   = reset_floor
+dyn_scratch = 1
+
+<problem>
+pgen_name           = linear_wave
+wave_flag           = 0
+amp                 = 1.0e-2
+dens                = 4.0
+pgas                = 1.0
+vx0                 = -0.1
+vy0                 = 0.3
+vz0                 = -0.05
+bx0                 = 2.5
+by0                 = 1.8
+bz0                 = -1.2
+along_x1            = false
+along_x2            = false
+along_x3            = false
+scripted_moving_amr = true
+scripted_amr_radius = 0.06
+test_anisotropic_fc_prolongation = true
+
+<output1>
+file_type   = hst
+dcycle      = 1
+data_format = %.17e
+
+<output2>
+file_type   = bin
+variable    = mhd_u_bcc
+dcycle      = 1
+ghost_zones = false
+
+<output3>
+file_type   = bin
+variable    = mhd_divb
+dcycle      = 1
+ghost_zones = false
+
+<output4>
+file_type           = rst
+dcycle               = 0
+single_file_per_rank = false

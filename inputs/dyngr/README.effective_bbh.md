@@ -100,6 +100,11 @@ rank layout.  `inputs/dyngr/effective_bbh_smr3_smoke.athinput` exercises three p
 levels; `inputs/dyngr/effective_bbh_amr_subcycle_smoke.athinput` creates, moves, and removes
 three-level refinement regions around the holes.
 
+The regression suite also moves and fully de-refines a 3D magnetic octet on cells with a
+`1:2:2` aspect ratio.  It checks divergence- and curl-preserving Toth-Roe face-flux
+prolongation, same-rank and MPI de-refinement, and a three-to-two-rank restart at every
+synchronized root cycle.
+
 The implementation remains deliberately fail-fast outside its validated physics envelope:
 one MeshBlockPack per MPI rank, RK2, single-fluid MHD+CT with a prescribed dynamic ADM
 metric, conserved-variable prolongation, and no radiation, particles, Z4c, diffusion,

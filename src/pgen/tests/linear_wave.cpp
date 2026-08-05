@@ -30,6 +30,7 @@
 #include "parameter_input.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/prolongation.hpp"
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -119,6 +120,83 @@ void ScriptedMovingAMRRefinement(MeshBlockPack *pmbp) {
   }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void TestAnisotropicFCProlongation()
+//! \brief Check the mixed Toth-Roe terms against reference values on a non-cubic cell.
+
+void TestAnisotropicFCProlongation() {
+  constexpr Real dx1 = 1.0;
+  constexpr Real dx2 = 2.0;
+  constexpr Real dx3 = 3.0;
+  constexpr Real area1 = dx2*dx3;
+  constexpr Real area2 = dx1*dx3;
+  constexpr Real area3 = dx1*dx2;
+
+  // The external face fluxes contain a nonzero i*j*k mode.  Ordinary piecewise-linear
+  // AMR data do not excite this mode, so a div(B)-only regression cannot distinguish the
+  // anisotropic Toth-Roe curl prescription from its cubic-cell specialization.
+  DvceFaceFld4D<Real> test_b("anisotropic_fc_prolongation", 1, 2, 2, 2);
+  Kokkos::deep_copy(test_b.x1f, 0.0);
+  Kokkos::deep_copy(test_b.x2f, 0.0);
+  Kokkos::deep_copy(test_b.x3f, 0.0);
+  Kokkos::parallel_for(
+      "initialize anisotropic FC prolongation test",
+      Kokkos::RangePolicy<DevExeSpace>(0, 1),
+      KOKKOS_LAMBDA(const int) {
+        for (int kk=0; kk<2; ++kk) {
+          const int ksgn = 2*kk - 1;
+          for (int jj=0; jj<2; ++jj) {
+            const int jsgn = 2*jj - 1;
+            for (int ii=0; ii<2; ++ii) {
+              const int isgn = 2*ii - 1;
+              const int ijk = isgn*jsgn*ksgn;
+              test_b.x1f(0,kk,jj,2*ii) = (1.0 + 2.0*ijk)/area1;
+              test_b.x2f(0,kk,2*jj,ii) = (2.0 + 3.0*ijk)/area2;
+              test_b.x3f(0,2*kk,jj,ii) = (3.0 + 5.0*ijk)/area3;
+            }
+          }
+        }
+        ProlongFCInternal(0, 0, 0, 0, true, dx1, dx2, dx3, test_b);
+      });
+  Kokkos::fence();
+
+  auto h_x1f = Kokkos::create_mirror_view_and_copy(HostMemSpace(), test_b.x1f);
+  auto h_x2f = Kokkos::create_mirror_view_and_copy(HostMemSpace(), test_b.x2f);
+  auto h_x3f = Kokkos::create_mirror_view_and_copy(HostMemSpace(), test_b.x3f);
+  const Real expected_x1[2][2] = {{-19.0/20.0, 23.0/60.0},
+                                  {-1.0/20.0, 77.0/60.0}};
+  const Real expected_x2[2][2] = {{-5.0/39.0, 7.0/13.0},
+                                  {31.0/39.0, 19.0/13.0}};
+  const Real expected_x3[2][2] = {{271.0/260.0, 349.0/260.0},
+                                  {431.0/260.0, 509.0/260.0}};
+  Real max_error = 0.0;
+  auto update_error = [&max_error](const Real actual, const Real expected) {
+    const Real error = std::abs(actual - expected);
+    max_error = std::isfinite(error) ? std::max(max_error, error) : error;
+  };
+  for (int kk=0; kk<2; ++kk) {
+    for (int jj=0; jj<2; ++jj) {
+      update_error(h_x1f(0,kk,jj,1), expected_x1[kk][jj]);
+    }
+    for (int ii=0; ii<2; ++ii) {
+      update_error(h_x2f(0,kk,1,ii), expected_x2[kk][ii]);
+    }
+  }
+  for (int jj=0; jj<2; ++jj) {
+    for (int ii=0; ii<2; ++ii) {
+      update_error(h_x3f(0,1,jj,ii), expected_x3[jj][ii]);
+    }
+  }
+  if (!std::isfinite(max_error) ||
+      max_error > 256.0*std::numeric_limits<Real>::epsilon()) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "anisotropic face-centered prolongation reference error = "
+              << max_error << std::endl;
+    exit(EXIT_FAILURE);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -316,6 +394,9 @@ void ProblemGenerator::LinearWave(ParameterInput *pin, const bool restart) {
       exit(EXIT_FAILURE);
     }
     user_ref_func = ScriptedMovingAMRRefinement;
+  }
+  if (pin->GetOrAddBoolean("problem", "test_anisotropic_fc_prolongation", false)) {
+    TestAnisotropicFCProlongation();
   }
   if (restart) return;
 

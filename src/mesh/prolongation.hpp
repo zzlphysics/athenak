@@ -163,7 +163,19 @@ void ProlongFCSharedX3Face(const int m, const int k, const int j, const int i,
 
 KOKKOS_INLINE_FUNCTION
 void ProlongFCInternal(const int m, const int fk, const int fj, const int fi,
-                       const bool three_d, const DvceFaceFld4D<Real> &b) {
+                       const bool three_d, const Real dx1, const Real dx2,
+                       const Real dx3, const DvceFaceFld4D<Real> &b) {
+  // The Toth & Roe operator is written for face-integrated fluxes.  AthenaK stores
+  // field components, so convert each orientation with its physical face area while
+  // combining components.  The old common-area cancellation was only valid for cells
+  // with dx1=dx2=dx3 (or dx1=dx2 in 2D).
+  const Real area1 = three_d ? dx2*dx3 : dx2;
+  const Real area2 = three_d ? dx1*dx3 : dx1;
+  const Real area3 = dx1*dx2;
+  const Real dx1_sq = dx1*dx1;
+  const Real dx2_sq = dx2*dx2;
+  const Real dx3_sq = dx3*dx3;
+
   // Prolongate internal fields in 3D
   if (three_d) {
     Real Uxx  = 0.0, Vyy  = 0.0, Wzz  = 0.0;
@@ -174,58 +186,85 @@ void ProlongFCInternal(const int m, const int fk, const int fj, const int fi,
       for (int ii=0; ii<2; ii++) {
         int isgn = 2*ii - 1;
         int fii = fi + ii, fip = fi + 2*ii;
-        Uxx += isgn*(jsgn*(b.x2f(m,fk  ,fjp,fii) + b.x2f(m,fk+1,fjp,fii)) +
-                          (b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii)));
+        Uxx += isgn*(jsgn*area2*(b.x2f(m,fk  ,fjp,fii) +
+                                 b.x2f(m,fk+1,fjp,fii)) +
+                          area3*(b.x3f(m,fk+2,fjj,fii) -
+                                 b.x3f(m,fk  ,fjj,fii)));
 
-        Vyy += jsgn*(     (b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii)) +
-                     isgn*(b.x1f(m,fk  ,fjj,fip) + b.x1f(m,fk+1,fjj,fip)));
+        Vyy += jsgn*(     area3*(b.x3f(m,fk+2,fjj,fii) -
+                                 b.x3f(m,fk  ,fjj,fii)) +
+                     isgn*area1*(b.x1f(m,fk  ,fjj,fip) +
+                                  b.x1f(m,fk+1,fjj,fip)));
 
-        Wzz +=       isgn*(b.x1f(m,fk+1,fjj,fip) - b.x1f(m,fk  ,fjj,fip)) +
-                     jsgn*(b.x2f(m,fk+1,fjp,fii) - b.x2f(m,fk  ,fjp,fii));
+        Wzz += isgn*area1*(b.x1f(m,fk+1,fjj,fip) -
+                           b.x1f(m,fk  ,fjj,fip)) +
+               jsgn*area2*(b.x2f(m,fk+1,fjp,fii) -
+                            b.x2f(m,fk  ,fjp,fii));
 
-        Uxyz += isgn*jsgn*(b.x1f(m,fk+1,fjj,fip) - b.x1f(m,fk  ,fjj,fip));
-        Vxyz += isgn*jsgn*(b.x2f(m,fk+1,fjp,fii) - b.x2f(m,fk  ,fjp,fii));
-        Wxyz += isgn*jsgn*(b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii));
+        Uxyz += isgn*jsgn*area1*(b.x1f(m,fk+1,fjj,fip) -
+                                 b.x1f(m,fk  ,fjj,fip));
+        Vxyz += isgn*jsgn*area2*(b.x2f(m,fk+1,fjp,fii) -
+                                 b.x2f(m,fk  ,fjp,fii));
+        Wxyz += isgn*jsgn*area3*(b.x3f(m,fk+2,fjj,fii) -
+                                 b.x3f(m,fk  ,fjj,fii));
       }
     }
-    Uxx *= 0.125;  Vyy *= 0.125;  Wzz *= 0.125;
-    Uxyz *= 0.0625; Vxyz *= 0.0625; Wxyz *= 0.0625;
+    Uxx *= 0.125; Vyy *= 0.125; Wzz *= 0.125;
+    Uxyz *= 0.125/(dx2_sq + dx3_sq);
+    Vxyz *= 0.125/(dx1_sq + dx3_sq);
+    Wxyz *= 0.125/(dx1_sq + dx2_sq);
 
-    b.x1f(m,fk  ,fj  ,fi+1) = 0.5*(b.x1f(m,fk  ,fj  ,fi  ) + b.x1f(m,fk  ,fj  ,fi+2))
-                            + Uxx - Vxyz - Wxyz;
-    b.x1f(m,fk  ,fj+1,fi+1) = 0.5*(b.x1f(m,fk  ,fj+1,fi  ) + b.x1f(m,fk  ,fj+1,fi+2))
-                            + Uxx - Vxyz + Wxyz;
-    b.x1f(m,fk+1,fj  ,fi+1) = 0.5*(b.x1f(m,fk+1,fj  ,fi  ) + b.x1f(m,fk+1,fj  ,fi+2))
-                            + Uxx + Vxyz - Wxyz;
-    b.x1f(m,fk+1,fj+1,fi+1) = 0.5*(b.x1f(m,fk+1,fj+1,fi  ) + b.x1f(m,fk+1,fj+1,fi+2))
-                            + Uxx + Vxyz + Wxyz;
-    b.x2f(m,fk  ,fj+1,fi  ) = 0.5*(b.x2f(m,fk  ,fj  ,fi  ) + b.x2f(m,fk  ,fj+2,fi  ))
-                            + Vyy - Uxyz - Wxyz;
-    b.x2f(m,fk  ,fj+1,fi+1) = 0.5*(b.x2f(m,fk  ,fj  ,fi+1) + b.x2f(m,fk  ,fj+2,fi+1))
-                            + Vyy - Uxyz + Wxyz;
-    b.x2f(m,fk+1,fj+1,fi  ) = 0.5*(b.x2f(m,fk+1,fj  ,fi  ) + b.x2f(m,fk+1,fj+2,fi  ))
-                            + Vyy + Uxyz - Wxyz;
-    b.x2f(m,fk+1,fj+1,fi+1) = 0.5*(b.x2f(m,fk+1,fj  ,fi+1) + b.x2f(m,fk+1,fj+2,fi+1))
-                            + Vyy + Uxyz + Wxyz;
-    b.x3f(m,fk+1,fj  ,fi  ) = 0.5*(b.x3f(m,fk+2,fj  ,fi  ) + b.x3f(m,fk  ,fj  ,fi  ))
-                            + Wzz - Uxyz - Vxyz;
-    b.x3f(m,fk+1,fj  ,fi+1) = 0.5*(b.x3f(m,fk+2,fj  ,fi+1) + b.x3f(m,fk  ,fj  ,fi+1))
-                            + Wzz - Uxyz + Vxyz;
-    b.x3f(m,fk+1,fj+1,fi  ) = 0.5*(b.x3f(m,fk+2,fj+1,fi  ) + b.x3f(m,fk  ,fj+1,fi  ))
-                            + Wzz + Uxyz - Vxyz;
-    b.x3f(m,fk+1,fj+1,fi+1) = 0.5*(b.x3f(m,fk+2,fj+1,fi+1) + b.x3f(m,fk  ,fj+1,fi+1))
-                            + Wzz + Uxyz + Vxyz;
+    b.x1f(m,fk  ,fj  ,fi+1) = 0.5*(b.x1f(m,fk  ,fj  ,fi  ) +
+                                    b.x1f(m,fk  ,fj  ,fi+2)) +
+                               (Uxx - dx3_sq*Vxyz - dx2_sq*Wxyz)/area1;
+    b.x1f(m,fk  ,fj+1,fi+1) = 0.5*(b.x1f(m,fk  ,fj+1,fi  ) +
+                                    b.x1f(m,fk  ,fj+1,fi+2)) +
+                               (Uxx - dx3_sq*Vxyz + dx2_sq*Wxyz)/area1;
+    b.x1f(m,fk+1,fj  ,fi+1) = 0.5*(b.x1f(m,fk+1,fj  ,fi  ) +
+                                    b.x1f(m,fk+1,fj  ,fi+2)) +
+                               (Uxx + dx3_sq*Vxyz - dx2_sq*Wxyz)/area1;
+    b.x1f(m,fk+1,fj+1,fi+1) = 0.5*(b.x1f(m,fk+1,fj+1,fi  ) +
+                                    b.x1f(m,fk+1,fj+1,fi+2)) +
+                               (Uxx + dx3_sq*Vxyz + dx2_sq*Wxyz)/area1;
+    b.x2f(m,fk  ,fj+1,fi  ) = 0.5*(b.x2f(m,fk  ,fj  ,fi  ) +
+                                    b.x2f(m,fk  ,fj+2,fi  )) +
+                               (Vyy - dx3_sq*Uxyz - dx1_sq*Wxyz)/area2;
+    b.x2f(m,fk  ,fj+1,fi+1) = 0.5*(b.x2f(m,fk  ,fj  ,fi+1) +
+                                    b.x2f(m,fk  ,fj+2,fi+1)) +
+                               (Vyy - dx3_sq*Uxyz + dx1_sq*Wxyz)/area2;
+    b.x2f(m,fk+1,fj+1,fi  ) = 0.5*(b.x2f(m,fk+1,fj  ,fi  ) +
+                                    b.x2f(m,fk+1,fj+2,fi  )) +
+                               (Vyy + dx3_sq*Uxyz - dx1_sq*Wxyz)/area2;
+    b.x2f(m,fk+1,fj+1,fi+1) = 0.5*(b.x2f(m,fk+1,fj  ,fi+1) +
+                                    b.x2f(m,fk+1,fj+2,fi+1)) +
+                               (Vyy + dx3_sq*Uxyz + dx1_sq*Wxyz)/area2;
+    b.x3f(m,fk+1,fj  ,fi  ) = 0.5*(b.x3f(m,fk+2,fj  ,fi  ) +
+                                    b.x3f(m,fk  ,fj  ,fi  )) +
+                               (Wzz - dx2_sq*Uxyz - dx1_sq*Vxyz)/area3;
+    b.x3f(m,fk+1,fj  ,fi+1) = 0.5*(b.x3f(m,fk+2,fj  ,fi+1) +
+                                    b.x3f(m,fk  ,fj  ,fi+1)) +
+                               (Wzz - dx2_sq*Uxyz + dx1_sq*Vxyz)/area3;
+    b.x3f(m,fk+1,fj+1,fi  ) = 0.5*(b.x3f(m,fk+2,fj+1,fi  ) +
+                                    b.x3f(m,fk  ,fj+1,fi  )) +
+                               (Wzz + dx2_sq*Uxyz - dx1_sq*Vxyz)/area3;
+    b.x3f(m,fk+1,fj+1,fi+1) = 0.5*(b.x3f(m,fk+2,fj+1,fi+1) +
+                                    b.x3f(m,fk  ,fj+1,fi+1)) +
+                               (Wzz + dx2_sq*Uxyz + dx1_sq*Vxyz)/area3;
 
   // Prolongate internal fields in 2D
   } else {
-    Real tmp1 = 0.25*(b.x2f(m,fk,fj+2,fi+1) - b.x2f(m,fk,fj,  fi+1)
-                    - b.x2f(m,fk,fj+2,fi  ) + b.x2f(m,fk,fj,  fi  ));
-    Real tmp2 = 0.25*(b.x1f(m,fk,fj,  fi  ) - b.x1f(m,fk,fj,  fi+2)
-                    - b.x1f(m,fk,fj+1,fi  ) + b.x1f(m,fk,fj+1,fi+2));
-    b.x1f(m,fk,fj  ,fi+1) = 0.5*(b.x1f(m,fk,fj,  fi  ) + b.x1f(m,fk,fj,  fi+2)) + tmp1;
-    b.x1f(m,fk,fj+1,fi+1) = 0.5*(b.x1f(m,fk,fj+1,fi  ) + b.x1f(m,fk,fj+1,fi+2)) + tmp1;
-    b.x2f(m,fk,fj+1,fi  ) = 0.5*(b.x2f(m,fk,fj,  fi  ) + b.x2f(m,fk,fj+2,fi  )) + tmp2;
-    b.x2f(m,fk,fj+1,fi+1) = 0.5*(b.x2f(m,fk,fj,  fi+1) + b.x2f(m,fk,fj+2,fi+1)) + tmp2;
+    Real tmp1 = 0.25*area2*(b.x2f(m,fk,fj+2,fi+1) - b.x2f(m,fk,fj,  fi+1)
+                             - b.x2f(m,fk,fj+2,fi  ) + b.x2f(m,fk,fj,  fi  ));
+    Real tmp2 = 0.25*area1*(b.x1f(m,fk,fj,  fi  ) - b.x1f(m,fk,fj,  fi+2)
+                             - b.x1f(m,fk,fj+1,fi  ) + b.x1f(m,fk,fj+1,fi+2));
+    b.x1f(m,fk,fj  ,fi+1) = 0.5*(b.x1f(m,fk,fj,  fi  ) +
+                                  b.x1f(m,fk,fj,  fi+2)) + tmp1/area1;
+    b.x1f(m,fk,fj+1,fi+1) = 0.5*(b.x1f(m,fk,fj+1,fi  ) +
+                                  b.x1f(m,fk,fj+1,fi+2)) + tmp1/area1;
+    b.x2f(m,fk,fj+1,fi  ) = 0.5*(b.x2f(m,fk,fj,  fi  ) +
+                                  b.x2f(m,fk,fj+2,fi  )) + tmp2/area2;
+    b.x2f(m,fk,fj+1,fi+1) = 0.5*(b.x2f(m,fk,fj,  fi+1) +
+                                  b.x2f(m,fk,fj+2,fi+1)) + tmp2/area2;
   }
   return;
 }
@@ -285,4 +324,3 @@ void HighOrderProlongCC(const int m, const int v, const int k, const int j, cons
 }
 
 #endif // MESH_PROLONGATION_HPP_
-

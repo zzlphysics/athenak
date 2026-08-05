@@ -1,0 +1,292 @@
+"""3D magnetic-AMR regression for strict 2:1 level subcycling."""
+
+import re
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import bin_convert
+import test_suite.testutils as testutils
+
+
+INPUT_FILE = "inputs/subcycling_octet_derefine_dyngrmhd.athinput"
+BASENAME = "subcycling_octet_derefine_dyngrmhd"
+STATE_VARIABLE = "mhd_u_bcc"
+DIVB_VARIABLE = "mhd_divb"
+MPI_TIMEOUT_SECONDS = 180
+MAX_DIVB = 2.0e-13
+EXPECTED_FULL_UPDATES = 61
+EXPECTED_SPLIT_UPDATES = 23
+EXPECTED_RESTART_UPDATES = 38
+MAX_TEST_OUTPUT_BYTES = 64 * 1024 * 1024
+
+
+def _run_mpi(run_dir: Path, ranks: int, restart=None, nlim=4, overrides=()):
+    """Run Athena under a process-tree timeout and return this run's log."""
+    timeout_executable = shutil.which("timeout")
+    assert timeout_executable is not None, "GNU timeout is required by this MPI test"
+
+    command = [
+        timeout_executable,
+        "--signal=TERM",
+        "--kill-after=10s",
+        f"{MPI_TIMEOUT_SECONDS}s",
+        "mpirun",
+        "-np",
+        str(ranks),
+        "./athena",
+    ]
+    if restart is None:
+        command += ["-i", INPUT_FILE]
+    else:
+        command += ["-r", str(Path(restart).resolve())]
+    command += [
+        "-d",
+        str(run_dir),
+        f"job/basename={BASENAME}",
+        f"time/nlim={nlim}",
+    ]
+    command += list(overrides)
+
+    log_path = Path(testutils.LOG_FILE_PATH)
+    log_offset = log_path.stat().st_size if log_path.exists() else 0
+    success = testutils.run_command(command)
+    with log_path.open("rb") as log_file:
+        log_file.seek(log_offset)
+        log_output = log_file.read().decode("utf-8", errors="replace")
+    assert success, (
+        f"{ranks}-rank Athena run failed or exceeded {MPI_TIMEOUT_SECONDS} s:\n"
+        f"{log_output[-8000:]}"
+    )
+    return log_output
+
+
+def _read_dumps(run_dir: Path, variable: str):
+    paths = sorted((run_dir / "bin").glob(f"{BASENAME}.{variable}.*.bin"))
+    assert paths, f"No {variable} dumps found in {run_dir}"
+    return [(path, bin_convert.read_binary(str(path))) for path in paths]
+
+
+def _latest_by_cycle(dumps):
+    """Discard the duplicate endpoint dump emitted during finalization."""
+    result = {}
+    for path, dump in dumps:
+        result[dump["cycle"]] = (path, dump)
+    return {cycle: item[1] for cycle, item in result.items()}
+
+
+def _canonical_order(dump):
+    logical = np.asarray(dump["mb_logical"])
+    return np.asarray(
+        sorted(
+            range(dump["n_mbs"]),
+            key=lambda gid: (
+                int(logical[gid, 3]),
+                int(logical[gid, 2]),
+                int(logical[gid, 1]),
+                int(logical[gid, 0]),
+            ),
+        )
+    )
+
+
+def _canonical_field(dump, variable: str):
+    return np.stack(dump["mb_data"][variable], axis=0)[_canonical_order(dump)]
+
+
+def _relative_level_counts(dump):
+    levels = np.asarray(dump["mb_logical"])[:, 3].astype(int)
+    root_level = int(np.min(levels))
+    unique, counts = np.unique(levels - root_level, return_counts=True)
+    return dict(zip(unique.tolist(), counts.tolist()))
+
+
+def _fine_locations(dump):
+    logical = np.asarray(dump["mb_logical"])
+    root_level = int(np.min(logical[:, 3]))
+    return {
+        tuple(location.tolist())
+        for location in logical[logical[:, 3] == root_level + 1]
+    }
+
+
+def _expected_octet(x1_begin: int):
+    return {
+        (i, j, k, 1)
+        for i in (x1_begin, x1_begin + 1)
+        for j in (0, 1)
+        for k in (0, 1)
+    }
+
+
+def _assert_scripted_topology(dumps_by_cycle):
+    assert set(range(5)).issubset(dumps_by_cycle)
+    assert _relative_level_counts(dumps_by_cycle[0]) == {0: 4}
+    for cycle, x1_begin in ((1, 0), (2, 2), (3, 4)):
+        assert _relative_level_counts(dumps_by_cycle[cycle]) == {0: 3, 1: 8}
+        assert _fine_locations(dumps_by_cycle[cycle]) == _expected_octet(x1_begin)
+    assert _relative_level_counts(dumps_by_cycle[4]) == {0: 4}
+
+    # Each move must de-refine all eight old children, not retain an overlapping slab.
+    for old_cycle, new_cycle in ((1, 2), (2, 3)):
+        assert _fine_locations(dumps_by_cycle[old_cycle]).isdisjoint(
+            _fine_locations(dumps_by_cycle[new_cycle])
+        )
+
+
+def _assert_same_topology(reference, candidate):
+    for name in ("Nx1", "Nx2", "Nx3", "nx1_mb", "nx2_mb", "nx3_mb", "n_mbs"):
+        assert candidate[name] == reference[name], f"Topology differs in {name}"
+
+    reference_order = _canonical_order(reference)
+    candidate_order = _canonical_order(candidate)
+    np.testing.assert_array_equal(
+        np.asarray(candidate["mb_logical"])[candidate_order],
+        np.asarray(reference["mb_logical"])[reference_order],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(candidate["mb_index"])[candidate_order],
+        np.asarray(reference["mb_index"])[reference_order],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(candidate["mb_geometry"])[candidate_order],
+        np.asarray(reference["mb_geometry"])[reference_order],
+    )
+
+
+def _assert_state_close(reference, candidate, description):
+    _assert_same_topology(reference, candidate)
+    assert candidate["var_names"] == reference["var_names"]
+    assert candidate["cycle"] == reference["cycle"]
+    assert candidate["time"] == pytest.approx(reference["time"], rel=2.0e-14)
+    for variable in reference["var_names"]:
+        reference_values = _canonical_field(reference, variable)
+        candidate_values = _canonical_field(candidate, variable)
+        assert np.isfinite(reference_values).all()
+        assert np.isfinite(candidate_values).all()
+        np.testing.assert_allclose(
+            candidate_values,
+            reference_values,
+            rtol=2.0e-13,
+            atol=2.0e-14,
+            err_msg=f"{description} changed {variable}",
+        )
+
+
+def _assert_divb_bounded(*run_dirs):
+    maxima_by_run = []
+    for run_dir in run_dirs:
+        maxima_by_cycle = {}
+        for path, dump in _read_dumps(run_dir, DIVB_VARIABLE):
+            values = _canonical_field(dump, "divb")
+            assert np.isfinite(values).all(), f"Non-finite div(B) in {path}"
+            maximum = float(np.max(np.abs(values)))
+            assert maximum < MAX_DIVB, (
+                f"Magnetic constraint violation in {path}: "
+                f"max|div(B)|={maximum:.16e}"
+            )
+            maxima_by_cycle[dump["cycle"]] = maximum
+        maxima_by_run.append(maxima_by_cycle)
+    return maxima_by_run
+
+
+def _meshblock_updates(log_output):
+    matches = re.findall(r"MeshBlock-cycles\s*=\s*(\d+)", log_output)
+    assert matches, "Run log did not report MeshBlock-cycles"
+    return int(matches[-1])
+
+
+def _amr_counts(log_output):
+    matches = re.findall(r"(\d+) MeshBlocks created, (\d+) deleted by AMR", log_output)
+    assert matches, "Run log did not report AMR creation/deletion counts"
+    return tuple(map(int, matches[-1]))
+
+
+def _communicated_blocks(log_output):
+    matches = re.findall(r"(\d+) communicated for load balancing", log_output)
+    assert matches, "Run log did not report load-balancing communication"
+    return int(matches[-1])
+
+
+def test_subcycling_preserves_divb_on_anisotropic_2d_cells(tmp_path):
+    """Cover the separate 2D Toth-Roe formula with dx1:dx2=1:2."""
+    run_dir = tmp_path / "anisotropic_2d"
+    log_output = _run_mpi(
+        run_dir,
+        ranks=1,
+        nlim=2,
+        overrides=("mesh/nx3=1", "meshblock/nx3=1"),
+    )
+    assert _meshblock_updates(log_output) == 15
+    assert _amr_counts(log_output) == (6, 3)
+    maxima = _assert_divb_bounded(run_dir)[0]
+    assert maxima[1] < MAX_DIVB
+    assert maxima[2] < MAX_DIVB
+
+
+def test_subcycling_preserves_divb_through_3d_octet_amr_and_restart(tmp_path):
+    one_dir = tmp_path / "one_rank"
+    three_dir = tmp_path / "three_ranks"
+    split_dir = tmp_path / "split_three_ranks"
+    restart_dir = tmp_path / "restart_two_ranks"
+
+    one_log = _run_mpi(one_dir, ranks=1)
+    three_log = _run_mpi(three_dir, ranks=3)
+    split_log = _run_mpi(
+        split_dir,
+        ranks=3,
+        nlim=2,
+        overrides=("output4/dcycle=2",),
+    )
+    split_restarts = sorted((split_dir / "rst").glob(f"{BASENAME}.*.rst"))
+    assert split_restarts, "Expected a cycle-2 split checkpoint"
+    restart_log = _run_mpi(
+        restart_dir,
+        ranks=2,
+        restart=split_restarts[-1],
+        nlim=4,
+        overrides=("output4/dcycle=0",),
+    )
+
+    assert _meshblock_updates(one_log) == EXPECTED_FULL_UPDATES
+    assert _meshblock_updates(three_log) == EXPECTED_FULL_UPDATES
+    assert _meshblock_updates(split_log) == EXPECTED_SPLIT_UPDATES
+    assert _meshblock_updates(restart_log) == EXPECTED_RESTART_UPDATES
+    assert _amr_counts(one_log) == (21, 21)
+    assert _amr_counts(three_log) == (21, 21)
+    assert _amr_counts(split_log) == (14, 7)
+    assert _amr_counts(restart_log) == (7, 14)
+    assert _communicated_blocks(three_log) > 0
+    assert _communicated_blocks(split_log) > 0
+    assert _communicated_blocks(restart_log) > 0
+
+    divb_maxima = _assert_divb_bounded(one_dir, three_dir, split_dir, restart_dir)
+    # Cycle 1 catches missing face-area scaling on anisotropic cells; cycle 2 catches
+    # stale coarse_b0 scratch consumed by complete-octet de-refinement.
+    for maxima in divb_maxima[:3]:
+        assert maxima[1] < MAX_DIVB
+        assert maxima[2] < MAX_DIVB
+
+    one_states = _latest_by_cycle(_read_dumps(one_dir, STATE_VARIABLE))
+    three_states = _latest_by_cycle(_read_dumps(three_dir, STATE_VARIABLE))
+    split_states = _latest_by_cycle(_read_dumps(split_dir, STATE_VARIABLE))
+    restart_states = _latest_by_cycle(_read_dumps(restart_dir, STATE_VARIABLE))
+    _assert_scripted_topology(one_states)
+    _assert_scripted_topology(three_states)
+    _assert_scripted_topology({**split_states, **restart_states})
+
+    _assert_state_close(one_states[4], three_states[4], "MPI decomposition")
+    _assert_state_close(three_states[2], split_states[2], "early termination")
+    _assert_state_close(
+        three_states[4], restart_states[4], "three-to-two-rank restart"
+    )
+
+    total_bytes = sum(
+        path.stat().st_size for path in tmp_path.rglob("*") if path.is_file()
+    )
+    assert total_bytes < MAX_TEST_OUTPUT_BYTES, (
+        f"Regression generated {total_bytes / 1024**2:.1f} MiB, "
+        f"exceeding its storage budget"
+    )

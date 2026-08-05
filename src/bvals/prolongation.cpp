@@ -347,6 +347,9 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   auto &mblev = pmy_pack->pmb->mb_lev;
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;
+  const Real root_dx1 = pmy_pack->pmesh->mesh_size.dx1;
+  const Real root_dx2 = pmy_pack->pmesh->mesh_size.dx2;
+  const Real root_dx3 = pmy_pack->pmesh->mesh_size.dx3;
 
   // Prolongate b.x1f/b.x2f/b.x3f at all shared coarse/fine cell edges
   // Code here is based on MeshRefinement::ProlongateSharedFieldX1/2/3() and
@@ -449,7 +452,7 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
           b.x1f(m,fk,fj,fi+1) = 0.5*(b.x1f(m,fk,fj,fi) + b.x1f(m,fk,fj,fi+2));
         } else {
           // in multi-D call inlined prolongation operator for FC fields at internal faces
-          ProlongFCInternal(m,fk,fj,fi,three_d,b);
+          ProlongFCInternal(m,fk,fj,fi,three_d,root_dx1,root_dx2,root_dx3,b);
         }
       });
     }
