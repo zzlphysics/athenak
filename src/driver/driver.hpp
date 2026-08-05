@@ -82,6 +82,7 @@ class Driver {
   std::uint64_t nmb_updated_;   // running total of MB updated during run
   std::uint64_t npart_updated_; // running total of particles updated during run
   float lb_efficiency_;         // measure of how efficient was load balancing
+  std::uint64_t lb_efficiency_samples_; // completed cycles sampled in this run segment
   int finest_occupied_level_ = -1; // cached global leaf-tree depth for current root step
   void OutputCycleDiagnostics(Mesh *pm);
   Real UpdateWallClock();

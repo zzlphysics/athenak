@@ -100,13 +100,14 @@ def _initial_command(run_dir: Path, trajectory: Path) -> list[str]:
         "-i",
         str(INPUT_FILE),
         f"job/basename={BASENAME}",
+        "mesh/nghost=4",
         "mesh/nx1=8",
         "mesh/nx2=8",
         "mesh/nx3=8",
         "meshblock/nx1=4",
         "meshblock/nx2=8",
         "meshblock/nx3=8",
-        "mesh_refinement/refinement=none",
+        "mesh_refinement/refinement=adaptive",
         "time/nlim=1",
         "time/tlim=0.01",
         "problem/trajectory_mode=table",
@@ -133,6 +134,17 @@ def _restart_command(
 
 def _require_success(result: subprocess.CompletedProcess[str], label: str) -> None:
     assert result.returncode == 0, f"{label} failed:\n{result.stdout[-8000:]}"
+
+
+def _load_balance_efficiency(
+    result: subprocess.CompletedProcess[str], label: str
+) -> float:
+    matches = re.findall(
+        r"load balancing efficiency = ([0-9.eE+-]+) \(this run segment\)",
+        result.stdout,
+    )
+    assert matches, f"{label} did not report segment-local load balance efficiency"
+    return float(matches[-1])
 
 
 def _require_contract_failure(
@@ -162,6 +174,7 @@ def test_table_trajectory_restart_contract_is_path_independent_and_fail_closed(
         _initial_command(initial_dir, original_table), "initial table run"
     )
     _require_success(initial, "initial table run")
+    assert _load_balance_efficiency(initial, "initial table run") == 1.0
     fingerprints = re.findall(
         r"fingerprint=(content128-v1:[0-9a-f]{32}:[0-9]+)", initial.stdout
     )
@@ -180,6 +193,7 @@ def test_table_trajectory_restart_contract_is_path_independent_and_fail_closed(
         "same-content relocated restart",
     )
     _require_success(moved, "same-content relocated restart")
+    assert _load_balance_efficiency(moved, "same-content relocated restart") == 1.0
     assert f"file={relocated_table.resolve()}" in moved.stdout
     assert f"fingerprint={fingerprints[0]}" in moved.stdout
 

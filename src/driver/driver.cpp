@@ -65,6 +65,7 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   nmb_updated_(0),
   npart_updated_(0),
   lb_efficiency_(0),
+  lb_efficiency_samples_(0),
   pwall_clock_(ptimer),
   wall_time(wtlim),
   impl_src("ru",1,1,1,1,1,1) {
@@ -879,6 +880,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           lb_efficiency_ += static_cast<float>(minnmb*(global_variable::nranks))/
               static_cast<float>(pmesh->nmb_total);
         }
+        ++lb_efficiency_samples_;
       }
 
       // Regridding is legal only after every descendant has reached the root endpoint
@@ -985,7 +987,15 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           << pmesh->pmr->nmb_deleted << " deleted by AMR" << std::endl;
 #if MPI_PARALLEL_ENABLED
         std::cout << pmesh->pmr->nmb_sent_thisrank << " communicated for load balancing, "
-          <<"load balancing efficiency = " << (lb_efficiency_/pmesh->ncycle) << std::endl;
+                  << "load balancing efficiency = ";
+        if (global_variable::nranks == 1) {
+          std::cout << 1.0;
+        } else if (lb_efficiency_samples_ > 0) {
+          std::cout << (lb_efficiency_/static_cast<float>(lb_efficiency_samples_));
+        } else {
+          std::cout << "N/A";
+        }
+        std::cout << " (this run segment)" << std::endl;
 #endif
       }
 
