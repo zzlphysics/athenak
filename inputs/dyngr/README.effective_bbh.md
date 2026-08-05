@@ -84,20 +84,34 @@ cutoff for superextremal half-mass terms during the canonical remnant interpolat
 - Radiation and Kerr-specific derived outputs such as `mhd_jcon` are not supported by
   this setup because those paths still assume a single stationary Kerr metric.
 
-### Experimental level subcycling
+### Strict 2:1 level subcycling
 
-`inputs/dyngr/effective_bbh_smr_smoke.athinput` exercises the initial 2:1 level-time
-subcycling implementation with `<time> subcycling=level`.  This path advances the fine
-level twice per root-level step, time-interpolates coarse boundary data, refluxes the MHD
-conserved variables, and applies an EMF reflux-curl for constrained transport.  Outputs
-and restart files are written only after both levels synchronize.
+Set `<time> subcycling=level` to advance every physical refinement level with exactly
+twice as many steps as its parent.  The recursive driver time-interpolates coarse boundary
+data, accumulates conserved-variable flux registers, and applies a constrained-transport
+EMF reflux-curl whenever a child catches its parent.  Regridding, diagnostics, output, and
+restart are permitted only at synchronized root-level endpoints.
 
-The current implementation is deliberately fail-fast outside its validated envelope:
-exactly two static-SMR levels, one MPI rank and one MeshBlockPack, RK2, prescribed dynamic
-ADM GRMHD, conserved-variable prolongation, and no radiation, particles, Z4c, diffusion,
-source, turbulence, shearing-box, orbital-advection, or user boundary/source modules.
-Use `subcycling=none` for the historical global-timestep path.  The smoke input is far too
-coarse for scientific horizon or magnetic-structure measurements.
+The validated path supports multilevel static SMR and synchronized moving AMR, including
+weighted load balancing over multiple MPI ranks.  Shared restart files may be resumed with
+a different rank count.  Per-rank restart files record their writer partition, AMR
+derefinement counters, and a 128-bit checkpoint identity, and therefore require the same
+rank layout.  `inputs/dyngr/effective_bbh_smr3_smoke.athinput` exercises three physical
+levels; `inputs/dyngr/effective_bbh_amr_subcycle_smoke.athinput` creates, moves, and removes
+three-level refinement regions around the holes.
+
+The implementation remains deliberately fail-fast outside its validated physics envelope:
+one MeshBlockPack per MPI rank, RK2, single-fluid MHD+CT with a prescribed dynamic ADM
+metric, conserved-variable prolongation, and no radiation, particles, Z4c, diffusion,
+built-in source terms, turbulence, shearing-box, orbital-advection, or full-mesh user
+boundary/source modules.  `mhd_jcon` output is also unavailable because it is not
+time-consistent on intermediate levels and assumes a single Kerr metric.  Use
+`subcycling=none` for the historical global-timestep path.
+
+Reducing the number of MeshBlock updates does not guarantee a GPU wall-clock speedup on a
+small mesh: level-local kernel launches and synchronization can dominate when individual
+levels underfill the device.  Benchmark with the intended block count and MPI layout.  The
+smoke inputs are far too coarse for scientific horizon or magnetic-structure measurements.
 
 The implementation uses second-order centered spacetime derivatives to construct
 `K_ij`.  Test `metric_fd_step` at `h/2`, `h`, and `2h`; making it arbitrarily small can
