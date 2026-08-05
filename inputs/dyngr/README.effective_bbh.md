@@ -179,6 +179,12 @@ The magnetic normalization choices are:
 - `integrated_internal_energy`: volume-integrated internal energy divided by
   volume-integrated magnetic pressure.
 
+The three sum-based choices form compensated double-precision sums within each
+MeshBlock, gather the block contributions in global-GID order, and compute and broadcast
+one field scale from rank zero.  This keeps fresh initial data invariant when the same
+mesh and homogeneous platform are repartitioned across MPI ranks.  It is not a promise of
+bitwise identity across different CPU/GPU architectures or compiler math modes.
+
 The paper says density-averaged beta but does not publish its exact averaging formula.
 `density_weighted_beta` above is therefore AthenaK's explicit reproducible convention,
 not a claim that the private paper implementation is algebraically identical.  The

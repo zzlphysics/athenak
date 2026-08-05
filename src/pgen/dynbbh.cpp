@@ -1324,77 +1324,178 @@ void InitializeReferenceFMTorus(MeshBlockPack *pmbp) {
                   MPI_COMM_WORLD);
 #endif
   } else {
-    Kokkos::parallel_reduce("dynbbh_torus_integrated_beta",
-        Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb*nkji),
-        KOKKOS_LAMBDA(const int idx, Real &gas_sum, Real &magnetic_sum) {
-      const int m = idx/nkji;
-      const int k0 = (idx-m*nkji)/nji;
-      const int j0 = (idx-m*nkji-k0*nji)/nx1;
-      const int i = idx-m*nkji-k0*nji-j0*nx1+is;
-      const int k = k0+ks;
-      const int j = j0+js;
-      const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
-                                size.d_view(m).x1max);
-      const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
-                                size.d_view(m).x2max);
-      const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
-                                size.d_view(m).x3max);
-      if (excision_floor(m,k,j,i)) return;
-      if (!(ReferenceFMTorusDensity(torus, x, y, z) > 0.0)) return;
-      const Real detg = adm::SpatialDet(
-          adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),
-          adm.g_dd(m,0,2,k,j,i), adm.g_dd(m,1,1,k,j,i),
-          adm.g_dd(m,1,2,k,j,i), adm.g_dd(m,2,2,k,j,i));
-      const Real sqrt_detg = sqrt(detg);
-      const Real inv_sqrt_detg = 1.0/sqrt_detg;
-      Real velocity_lower[3] = {0.0, 0.0, 0.0};
-      Real velocity2 = 0.0;
-      Real magnetic_lower[3] = {0.0, 0.0, 0.0};
-      for (int a = 0; a < 3; ++a) {
-        for (int c = 0; c < 3; ++c) {
-          velocity_lower[a] += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+c,k,j,i);
-          velocity2 += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+a,k,j,i)
-                     *w0(m,IVX+c,k,j,i);
-          magnetic_lower[a] += adm.g_dd(m,a,c,k,j,i)*bcc0(m,c,k,j,i)
-                              *inv_sqrt_detg;
+    // Preserve the beta normalization across MPI decompositions.  A single device-wide
+    // floating-point reduction changes its association when the local MeshBlock count
+    // changes.  Instead, form one deterministic compensated sum per global block,
+    // gather those values in GID order, and add them once in that fixed order on rank 0.
+    DvceArray2D<double> block_measure("dynbbh_torus_block_beta", nmb, 2);
+    Kokkos::parallel_for("dynbbh_torus_integrated_beta_by_block",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, nmb),
+        KOKKOS_LAMBDA(const int m) {
+      double gas_sum = 0.0;
+      double magnetic_sum = 0.0;
+      double gas_compensation = 0.0;
+      double magnetic_compensation = 0.0;
+      for (int k = ks; k <= ke; ++k) {
+        for (int j = js; j <= je; ++j) {
+          for (int i = is; i <= ie; ++i) {
+            if (excision_floor(m,k,j,i)) continue;
+            const Real x = CellCenterX(i-is, nx1, size.d_view(m).x1min,
+                                      size.d_view(m).x1max);
+            const Real y = CellCenterX(j-js, nx2, size.d_view(m).x2min,
+                                      size.d_view(m).x2max);
+            const Real z = CellCenterX(k-ks, nx3, size.d_view(m).x3min,
+                                      size.d_view(m).x3max);
+            if (!(ReferenceFMTorusDensity(torus, x, y, z) > 0.0)) continue;
+            const Real detg = adm::SpatialDet(
+                adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),
+                adm.g_dd(m,0,2,k,j,i), adm.g_dd(m,1,1,k,j,i),
+                adm.g_dd(m,1,2,k,j,i), adm.g_dd(m,2,2,k,j,i));
+            const Real sqrt_detg = sqrt(detg);
+            const Real inv_sqrt_detg = 1.0/sqrt_detg;
+            Real velocity_lower[3] = {0.0, 0.0, 0.0};
+            Real velocity2 = 0.0;
+            Real magnetic_lower[3] = {0.0, 0.0, 0.0};
+            for (int a = 0; a < 3; ++a) {
+              for (int c = 0; c < 3; ++c) {
+                velocity_lower[a] += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+c,k,j,i);
+                velocity2 += adm.g_dd(m,a,c,k,j,i)*w0(m,IVX+a,k,j,i)
+                           *w0(m,IVX+c,k,j,i);
+                magnetic_lower[a] += adm.g_dd(m,a,c,k,j,i)*bcc0(m,c,k,j,i)
+                                    *inv_sqrt_detg;
+              }
+            }
+            Real magnetic_dot_velocity = 0.0;
+            Real magnetic2 = 0.0;
+            for (int a = 0; a < 3; ++a) {
+              magnetic_dot_velocity += bcc0(m,a,k,j,i)*velocity_lower[a]*inv_sqrt_detg;
+              magnetic2 += bcc0(m,a,k,j,i)*magnetic_lower[a]*inv_sqrt_detg;
+            }
+            const Real bsq = (magnetic2+SQR(magnetic_dot_velocity))/(1.0+velocity2);
+            const Real volume = size.d_view(m).dx1*size.d_view(m).dx2
+                              * size.d_view(m).dx3*sqrt_detg;
+            Real gas_weight = 1.0;
+            if (torus.mag_norm == TorusMagNorm::density_weighted_beta) {
+              gas_weight = w0(m,IDN,k,j,i);
+            }
+            Real gas_energy = w0(m,IPR,k,j,i);
+            if (torus.mag_norm == TorusMagNorm::integrated_internal_energy) {
+              gas_energy /= torus.gamma_adi-1.0;
+            }
+            const Real gas_cell_measure = gas_weight*gas_energy*volume;
+            const double gas_value = static_cast<double>(gas_cell_measure);
+            const double gas_increment = gas_value-gas_compensation;
+            const double new_gas_sum = gas_sum+gas_increment;
+            gas_compensation = (new_gas_sum-gas_sum)-gas_increment;
+            gas_sum = new_gas_sum;
+            const Real magnetic_cell_measure = gas_weight*0.5*bsq*volume;
+            const double magnetic_value = static_cast<double>(magnetic_cell_measure);
+            const double magnetic_increment = magnetic_value-magnetic_compensation;
+            const double new_magnetic_sum = magnetic_sum+magnetic_increment;
+            magnetic_compensation =
+                (new_magnetic_sum-magnetic_sum)-magnetic_increment;
+            magnetic_sum = new_magnetic_sum;
+          }
         }
       }
-      Real magnetic_dot_velocity = 0.0;
-      Real magnetic2 = 0.0;
-      for (int a = 0; a < 3; ++a) {
-        magnetic_dot_velocity += bcc0(m,a,k,j,i)*velocity_lower[a]*inv_sqrt_detg;
-        magnetic2 += bcc0(m,a,k,j,i)*magnetic_lower[a]*inv_sqrt_detg;
-      }
-      const Real bsq = (magnetic2+SQR(magnetic_dot_velocity))/(1.0+velocity2);
-      const Real volume = size.d_view(m).dx1*size.d_view(m).dx2
-                        * size.d_view(m).dx3*sqrt_detg;
-      Real gas_weight = 1.0;
-      if (torus.mag_norm == TorusMagNorm::density_weighted_beta) {
-        gas_weight = w0(m,IDN,k,j,i);
-      }
-      Real gas_energy = w0(m,IPR,k,j,i);
-      if (torus.mag_norm == TorusMagNorm::integrated_internal_energy) {
-        gas_energy /= torus.gamma_adi-1.0;
-      }
-      gas_sum += gas_weight*gas_energy*volume;
-      magnetic_sum += gas_weight*0.5*bsq*volume;
-    }, Kokkos::Sum<Real>(gas_measure), Kokkos::Sum<Real>(magnetic_measure));
+      block_measure(m,0) = gas_sum;
+      block_measure(m,1) = magnetic_sum;
+    });
+
+    auto block_measure_h =
+        Kokkos::create_mirror_view_and_copy(HostMemSpace(), block_measure);
+    std::vector<double> local_gas(nmb);
+    std::vector<double> local_magnetic(nmb);
+    for (int m = 0; m < nmb; ++m) {
+      local_gas[m] = block_measure_h(m,0);
+      local_magnetic[m] = block_measure_h(m,1);
+    }
+
+    const int nmb_total = pmbp->pmesh->nmb_total;
+    int gid_order_valid =
+        (nmb == pmbp->pmesh->nmb_eachrank[global_variable::my_rank]) ? 1 : 0;
+    const int first_gid = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
+    for (int m = 0; m < nmb; ++m) {
+      if (mb_gid.h_view(m) != first_gid+m) gid_order_valid = 0;
+    }
 #if MPI_PARALLEL_ENABLED
-    MPI_Allreduce(MPI_IN_PLACE, &gas_measure, 1, MPI_ATHENA_REAL, MPI_SUM,
-                  MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, &magnetic_measure, 1, MPI_ATHENA_REAL, MPI_SUM,
-                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &gid_order_valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 #endif
+    if (gid_order_valid == 0) {
+      Fatal("reference_fm_torus deterministic magnetic normalization requires "
+            "contiguous MeshBlock GIDs on every rank");
+    }
+    std::vector<double> gas_by_gid;
+    std::vector<double> magnetic_by_gid;
+    if (global_variable::my_rank == 0) {
+      gas_by_gid.resize(nmb_total);
+      magnetic_by_gid.resize(nmb_total);
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Gatherv(local_gas.data(), nmb, MPI_DOUBLE,
+                global_variable::my_rank == 0 ? gas_by_gid.data() : nullptr,
+                pmbp->pmesh->nmb_eachrank, pmbp->pmesh->gids_eachrank,
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_magnetic.data(), nmb, MPI_DOUBLE,
+                global_variable::my_rank == 0 ? magnetic_by_gid.data() : nullptr,
+                pmbp->pmesh->nmb_eachrank, pmbp->pmesh->gids_eachrank,
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+#else
+    gas_by_gid = local_gas;
+    magnetic_by_gid = local_magnetic;
+#endif
+    if (global_variable::my_rank == 0) {
+      double gas_sum = 0.0;
+      double magnetic_sum = 0.0;
+      double gas_compensation = 0.0;
+      double magnetic_compensation = 0.0;
+      for (int gid = 0; gid < nmb_total; ++gid) {
+        const double gas_value = gas_by_gid[gid];
+        const double new_gas_sum = gas_sum+gas_value;
+        if (std::abs(gas_sum) >= std::abs(gas_value)) {
+          gas_compensation += (gas_sum-new_gas_sum)+gas_value;
+        } else {
+          gas_compensation += (gas_value-new_gas_sum)+gas_sum;
+        }
+        gas_sum = new_gas_sum;
+        const double magnetic_value = magnetic_by_gid[gid];
+        const double new_magnetic_sum = magnetic_sum+magnetic_value;
+        if (std::abs(magnetic_sum) >= std::abs(magnetic_value)) {
+          magnetic_compensation +=
+              (magnetic_sum-new_magnetic_sum)+magnetic_value;
+        } else {
+          magnetic_compensation +=
+              (magnetic_value-new_magnetic_sum)+magnetic_sum;
+        }
+        magnetic_sum = new_magnetic_sum;
+      }
+      gas_measure = static_cast<Real>(gas_sum+gas_compensation);
+      magnetic_measure = static_cast<Real>(magnetic_sum+magnetic_compensation);
+    }
   }
 
-  if (!std::isfinite(gas_measure) || !(gas_measure > 0.0)
-      || !std::isfinite(magnetic_measure) || !(magnetic_measure > 0.0)) {
-    Fatal("reference_fm_torus magnetic loop is unresolved or has invalid energy");
+  Real unnormalized_ratio = 0.0;
+  Real magnetic_normalization = 0.0;
+  int normalization_valid = 1;
+  if (global_variable::my_rank == 0) {
+    if (!std::isfinite(gas_measure) || !(gas_measure > 0.0)
+        || !std::isfinite(magnetic_measure) || !(magnetic_measure > 0.0)) {
+      normalization_valid = 0;
+    } else {
+      unnormalized_ratio = gas_measure/magnetic_measure;
+      magnetic_normalization = sqrt(unnormalized_ratio/torus.mag_target);
+      if (!std::isfinite(magnetic_normalization)
+          || !(magnetic_normalization > 0.0)) {
+        normalization_valid = 0;
+      }
+    }
   }
-  const Real unnormalized_ratio = gas_measure/magnetic_measure;
-  const Real magnetic_normalization = sqrt(unnormalized_ratio/torus.mag_target);
-  if (!std::isfinite(magnetic_normalization) || !(magnetic_normalization > 0.0)) {
-    Fatal("reference_fm_torus magnetic normalization is not finite");
+#if MPI_PARALLEL_ENABLED
+  MPI_Bcast(&normalization_valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&magnetic_normalization, 1, MPI_ATHENA_REAL, 0, MPI_COMM_WORLD);
+#endif
+  if (normalization_valid == 0) {
+    Fatal("reference_fm_torus magnetic loop has invalid normalization energy");
   }
 
   par_for("dynbbh_torus_normalize_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je,

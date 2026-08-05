@@ -113,11 +113,9 @@ def test_bbh_torus_initial_data_is_mpi_decomposition_invariant(tmp_path):
 
     assert one_state["var_names"] == two_state["var_names"]
     for variable in one_state["var_names"]:
-        np.testing.assert_allclose(
+        np.testing.assert_array_equal(
             _canonical_field(two_state, variable),
             _canonical_field(one_state, variable),
-            rtol=3.0e-7,
-            atol=1.0e-10,
             err_msg=f"MPI decomposition changed {variable}",
         )
 
