@@ -35,6 +35,19 @@
 #include <mpi.h>
 #endif
 
+namespace {
+
+bool LevelSubcyclingRequested(ParameterInput *pin) {
+  return pin->DoesParameterExist("time", "subcycling") &&
+         pin->GetString("time", "subcycling") == "level";
+}
+
+float LevelSubcyclingBlockCost(const LogicalLocation &lloc, int root_level) {
+  return std::ldexp(1.0f, lloc.level-root_level);
+}
+
+}  // namespace
+
 //----------------------------------------------------------------------------------------
 // MeshRefinement constructor:
 // called from Mesh::BuildTree (before physics modules are enrolled)
@@ -57,8 +70,16 @@ MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
   prolong_prims(false) {
   if (pin->DoesBlockExist("mesh_refinement")) {
     // read interval (in cycles) between check of AMR and derefinement
-    ncyc_check_amr = pin->GetOrAddReal("mesh_refinement", "ncycle_check", 1);
-    refinement_interval = pin->GetOrAddReal("mesh_refinement", "refinement_interval", 5);
+    ncyc_check_amr = pin->GetOrAddInteger("mesh_refinement", "ncycle_check", 1);
+    refinement_interval =
+        pin->GetOrAddInteger("mesh_refinement", "refinement_interval", 5);
+    if (ncyc_check_amr <= 0 || refinement_interval <= 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "<mesh_refinement>/ncycle_check and refinement_interval must be "
+                << "positive integers." << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
     // read prolongate primitives flag
     if (pin->DoesParameterExist("mesh_refinement", "prolong_primitives")) {
       prolong_prims = pin->GetBoolean("mesh_refinement", "prolong_primitives");
@@ -122,18 +143,23 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
     RedistAndRefineMeshBlocks(pin, nnew, ndel);
     pdriver->InitBoundaryValuesAndPrimitives(pmy_mesh);
 
-    MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
-    if (pmbp->phydro != nullptr) {
-      (void) pmbp->phydro->NewTimeStep(pdriver, pdriver->nexp_stages);
-    }
-    if (pmbp->pmhd != nullptr) {
-      (void) pmbp->pmhd->NewTimeStep(pdriver, pdriver->nexp_stages);
-    }
-    if (pmbp->prad != nullptr) {
-      (void) pmbp->prad->NewTimeStep(pdriver, pdriver->nexp_stages);
-    }
-    if (pmbp->pz4c != nullptr) {
-      (void) pmbp->pz4c->NewTimeStep(pdriver, pdriver->nexp_stages);
+    // The level-subcycling driver recomputes a synchronized root timestep over the
+    // rebuilt per-level active lists immediately after this function returns.  Preserve
+    // the legacy whole-pack update only for the global-timestep path.
+    if (!pdriver->LevelSubcyclingRequested()) {
+      MeshBlockPack* pmbp = pmy_mesh->pmb_pack;
+      if (pmbp->phydro != nullptr) {
+        (void) pmbp->phydro->NewTimeStep(pdriver, pdriver->nexp_stages);
+      }
+      if (pmbp->pmhd != nullptr) {
+        (void) pmbp->pmhd->NewTimeStep(pdriver, pdriver->nexp_stages);
+      }
+      if (pmbp->prad != nullptr) {
+        (void) pmbp->prad->NewTimeStep(pdriver, pdriver->nexp_stages);
+      }
+      if (pmbp->pz4c != nullptr) {
+        (void) pmbp->pz4c->NewTimeStep(pdriver, pdriver->nexp_stages);
+      }
     }
 
     nmb_created += nnew;
@@ -428,23 +454,45 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   }
 
   // Step 3.
-  // Calculate new load balance. Initialize new cost array with the simplest estimate
-  // possible: all the blocks are equal
-  // TODO(@user): implement variable cost per MeshBlock as needed
+  // Calculate the new load balance.  A level-l block advances 2^(l-root) times during
+  // each synchronized root step, so adaptive repartitioning must preserve the same
+  // subcycling work weights used for initial construction and restart.
   new_cost_eachmb = new float[new_nmb];
   new_rank_eachmb = new int[new_nmb];
   new_gids_eachrank = new int[global_variable::nranks];
   new_nmb_eachrank = new int[global_variable::nranks];
 
-  for (int i=0; i<new_nmb; i++) {new_cost_eachmb[i] = 1.0;}
+  const bool level_subcycling = LevelSubcyclingRequested(pin);
+  for (int i=0; i<new_nmb; i++) {
+    new_cost_eachmb[i] = level_subcycling
+        ? LevelSubcyclingBlockCost(new_lloc_eachmb[i], pm->root_level) : 1.0f;
+  }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
                   new_nmb_total);
-  if (new_nmb_eachrank[global_variable::my_rank] > pm->nmb_maxperrank) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-        << "Number of MeshBlocks in this rank on new tree = "
-        << new_nmb_eachrank[global_variable::my_rank] << " on rank = "
-        << global_variable::my_rank <<" exceeds <mesh_refinement>/max_nmb_per_rank = "
-        << pm->nmb_maxperrank << std::endl;
+  // Every rank has the replicated partition metadata, so detect capacity violations
+  // globally before any rank posts migration receives into fixed-capacity arrays.  A
+  // local std::exit here can strand peers in AMR communication; fail collectively.
+  int over_capacity_rank = -1;
+  for (int rank=0; rank<global_variable::nranks; ++rank) {
+    if (new_nmb_eachrank[rank] > pm->nmb_maxperrank) {
+      over_capacity_rank = rank;
+      break;
+    }
+  }
+  if (over_capacity_rank >= 0) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Number of MeshBlocks in new tree = "
+                << new_nmb_eachrank[over_capacity_rank] << " on rank = "
+                << over_capacity_rank
+                << " exceeds <mesh_refinement>/max_nmb_per_rank = "
+                << pm->nmb_maxperrank << std::endl;
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+#endif
     std::exit(EXIT_FAILURE);
   }
 
@@ -1140,7 +1188,10 @@ void MeshRefinement::RefineFC(DualArray1D<int> &n2o, DvceFaceFld4D<Real> &b,
 
 void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
     bool is_z4c) {
-  int nmb  = u.extent_int(0);  // TODO(@user): 1st index from L of in array must be NMB
+  // AMR physics Views are provisioned to max_nmb_per_rank.  Only the rows belonging to
+  // the current pack contain MeshBlocks; sweeping spare capacity on every level stage is
+  // both unnecessary and expensive when the safety margin is large.
+  int nmb = pmy_mesh->pmb_pack->nmb_thispack;
   int nvar = u.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
 
   auto &indcs = pmy_mesh->mb_indcs;
@@ -1203,7 +1254,7 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
 //! \brief Restricts face-centered variables to coarse mesh
 
 void MeshRefinement::RestrictFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb) {
-  int nmb  = b.x1f.extent_int(0);  // TODO(@user): 1st idx from L of in array must be NMB
+  int nmb = pmy_mesh->pmb_pack->nmb_thispack;
 
   auto &cis = pmy_mesh->mb_indcs.cis;
   auto &cie = pmy_mesh->mb_indcs.cie;

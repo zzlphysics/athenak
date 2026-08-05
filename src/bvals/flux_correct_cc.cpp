@@ -54,8 +54,8 @@ void MeshBoundaryValuesCC::InitializeFluxRegistersCC(int nvar) {
   if (pmy_pack->pmesh->nmb_packs_thisrank != 1) {
     FluxRegisterCCError("level registers currently require one MeshBlockPack per rank");
   }
-  if (!(pmy_pack->pmesh->multilevel) || pmy_pack->pmesh->adaptive) {
-    FluxRegisterCCError("the initial implementation requires static mesh refinement");
+  if (!(pmy_pack->pmesh->multilevel)) {
+    FluxRegisterCCError("level registers require a multilevel mesh");
   }
   if (flux_reg_nvar_ != 0) {
     if (flux_reg_nvar_ != nvar) {

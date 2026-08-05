@@ -6,11 +6,15 @@
 //! \file build_tree.cpp
 //! \brief Functions to build MeshBlock, both for new runs and restarts
 
+#include <algorithm>
 #include <iostream>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <limits> // numeric_limits<>
 #include <memory> // make_unique<>
+#include <string>
+#include <vector>
 
 #include "athena.hpp"
 #include "globals.hpp"
@@ -26,6 +30,12 @@
 
 namespace {
 
+constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
+constexpr int kAmrCycleCounterVersion = 1;
+constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
+constexpr int kPerRankPartitionVersion = 2;
+constexpr int kCheckpointIdentityWords = 2;
+
 bool LevelSubcyclingRequested(ParameterInput *pin) {
   return pin->DoesParameterExist("time", "subcycling") &&
          pin->GetString("time", "subcycling") == "level";
@@ -33,6 +43,52 @@ bool LevelSubcyclingRequested(ParameterInput *pin) {
 
 float LevelSubcyclingBlockCost(const LogicalLocation &lloc, int root_level) {
   return std::ldexp(1.0f, lloc.level - root_level);
+}
+
+[[noreturn]] void BuildTreeError(const std::string &message) {
+  if (global_variable::my_rank == 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << message << std::endl;
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+#endif
+  std::exit(EXIT_FAILURE);
+}
+
+int ValidatedMaxBlocksPerRank(ParameterInput *pin, bool adaptive,
+                              const int *nmb_eachrank) {
+  int max_blocks = nmb_eachrank[global_variable::my_rank];
+  if (adaptive) {
+    if (!pin->DoesParameterExist("mesh_refinement", "max_nmb_per_rank")) {
+      BuildTreeError("With AMR, <mesh_refinement>/max_nmb_per_rank must be specified");
+    }
+    max_blocks = pin->GetInteger("mesh_refinement", "max_nmb_per_rank");
+    if (max_blocks < 1) {
+      BuildTreeError("<mesh_refinement>/max_nmb_per_rank must be a positive integer");
+    }
+    for (int rank=0; rank<global_variable::nranks; ++rank) {
+      if (nmb_eachrank[rank] > max_blocks) {
+        BuildTreeError("Initial weighted partition assigns " +
+                       std::to_string(nmb_eachrank[rank]) + " MeshBlocks to rank " +
+                       std::to_string(rank) + ", exceeding max_nmb_per_rank=" +
+                       std::to_string(max_blocks));
+      }
+    }
+  }
+
+#if MPI_PARALLEL_ENABLED
+  int largest_partition = 0;
+  for (int rank=0; rank<global_variable::nranks; ++rank) {
+    largest_partition = std::max(largest_partition, nmb_eachrank[rank]);
+  }
+  if (std::max(max_blocks, largest_partition) > (1 << NUM_BITS_LID)) {
+    BuildTreeError("Maximum number of MeshBlocks per rank exceeds the MPI tag limit");
+  }
+#endif
+  return max_blocks;
 }
 
 }  // namespace
@@ -275,6 +331,7 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
         ? LevelSubcyclingBlockCost(lloc_eachmb[i], root_level) : 1.0f;
   }
   LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  nmb_maxperrank = ValidatedMaxBlocksPerRank(pin, adaptive, nmb_eachrank);
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];
@@ -285,35 +342,6 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
   nmb_packs_thisrank = 1;
   pmb_pack->AddMeshBlocks(pin);
   pmb_pack->pmb->SetNeighbors(ptree, rank_eachmb);
-
-  // Fix maximum number of MeshBlocks per rank with AMR
-  nmb_maxperrank = nmb_thisrank;
-  if (adaptive) {
-    if (pin->DoesParameterExist("mesh_refinement", "max_nmb_per_rank")) {
-      nmb_maxperrank = pin->GetReal("mesh_refinement", "max_nmb_per_rank");
-      if (nmb_maxperrank < nmb_thisrank) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-          << std::endl << "On rank=" << global_variable::my_rank << " Root grid requires "
-          << "more MeshBlocks (nmb_thisrank=" << nmb_thisrank << ") than specified by "
-          << "<mesh_refinement>/max_nmb_per_rank=" << nmb_maxperrank << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-    } else {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-        << std::endl << "With AMR maximum number of MeshBlocks per rank must be "
-        << "specified in input file using <mesh_refinement>/max_nmb_per_rank"
-        << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-  }
-#if MPI_PARALLEL_ENABLED
-  if (nmb_maxperrank > (1 << (NUM_BITS_LID))) {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-      << "Maximum number of MeshBlocks per rank cannot exceed 2^(NUM_BITS_LID) due to MPI"
-      << " tag limits" << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-#endif
 
   // Create new MeshRefinement object with either SMR or AMR (SMR needs Restrict fns)
   if (multilevel) {
@@ -340,7 +368,6 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
                                                      bool single_file_per_rank) {
   // At this point, the restartfile is already open and the ParameterInput (input file)
   // data has already been read in main(). Thus the file pointer is set to after <par_end>
-  IOWrapperSizeT headeroffset = resfile.GetPosition();
 
   // following must be identical to calculation of headeroffset (excluding size of
   // ParameterInput data) in restart.cpp
@@ -351,12 +378,12 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   // the master process reads the header data if single_file_per_rank is false
   if (global_variable::my_rank == 0 || single_file_per_rank) {
     IOWrapperSizeT read_size = resfile.Read_bytes(headerdata, 1, headersize,
-                                                  single_file_per_rank);
+                                                  single_file_per_rank, true);
     if (read_size != headersize) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Header size read from restart file is incorrect, "
                 << "expected " << headersize << ", got " << read_size << std::endl;
-      exit(EXIT_FAILURE);
+      BuildTreeError("Restart header is truncated");
     }
   }
 
@@ -369,7 +396,7 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
       int length_of_error_string;
       MPI_Error_string(mpi_err, error_string, &length_of_error_string);
       std::cout << "MPI_Bcast failed with error: " << error_string << std::endl;
-      exit(EXIT_FAILURE);
+      BuildTreeError("Could not broadcast the restart header");
     }
   }
 #endif
@@ -394,12 +421,16 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   hdos += sizeof(Real);
   std::memcpy(&ncycle, &(headerdata[hdos]), sizeof(int));
   delete [] headerdata;
+  dt_last_completed =
+      (ncycle > 0 && std::isfinite(dt) && dt > 0.0 &&
+       dt != std::numeric_limits<float>::max()) ? dt : 0.0;
 
   // calculate the number of MeshBlocks at root level in each dir
   nmb_rootx1 = mesh_indcs.nx1/mb_indcs.nx1;
   nmb_rootx2 = mesh_indcs.nx2/mb_indcs.nx2;
   nmb_rootx3 = mesh_indcs.nx3/mb_indcs.nx3;
   int current_level = root_level;
+  std::vector<int> restart_cycle_counters;
 
   // Error check properties of input paraemters for SMR/AMR meshes.
   if (adaptive) {
@@ -408,7 +439,7 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Number of refinement levels must be smaller than "
                 << 31 - root_level + 1 << std::endl;
-      std::exit(EXIT_FAILURE);
+      BuildTreeError("Restart requests too many refinement levels");
     }
   } else {
     max_level = 31;
@@ -426,12 +457,12 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   char *idlist = new char[listsize*nmb_total];
   // only the master process reads the ID list
   if (global_variable::my_rank == 0 || single_file_per_rank) {
-    if (resfile.Read_bytes(idlist,listsize,nmb_total,single_file_per_rank) !=
+    if (resfile.Read_bytes(idlist, listsize, nmb_total, single_file_per_rank, true) !=
         static_cast<unsigned int>(nmb_total)) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Incorrect number of MeshBlocks in restart file; "
                 << "restart file is broken." << std::endl;
-      std::exit(EXIT_FAILURE);
+      BuildTreeError("Restart MeshBlock list is truncated");
     }
   }
 #if MPI_PARALLEL_ENABLED
@@ -453,6 +484,134 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
     if (lloc_eachmb[i].level > current_level) current_level = lloc_eachmb[i].level;
   }
   delete [] idlist;
+
+  // Each per-rank file contains only its writer's MeshBlock field stream.  Bind that
+  // stream to the exact writer partition.  Legacy files without this metadata cannot
+  // be restored safely because the original rank count and GID range are unknowable.
+  int writer_gid_start = -1;
+  int writer_nmb = -1;
+  std::uint64_t checkpoint_identity[kCheckpointIdentityWords] = {0, 0};
+  if (single_file_per_rank) {
+    std::uint64_t partition_magic = 0;
+    int partition_version = 0;
+    int writer_nranks = 0;
+    int writer_rank = -1;
+    const bool partition_read_ok =
+        resfile.Read_bytes(&partition_magic, 1, sizeof(partition_magic), true, true) ==
+            sizeof(partition_magic) &&
+        resfile.Read_bytes(&partition_version, 1, sizeof(partition_version), true,
+                           true) ==
+            sizeof(partition_version) &&
+        resfile.Read_bytes(&writer_nranks, 1, sizeof(writer_nranks), true, true) ==
+            sizeof(writer_nranks) &&
+        resfile.Read_bytes(&writer_rank, 1, sizeof(writer_rank), true, true) ==
+            sizeof(writer_rank) &&
+        resfile.Read_bytes(&writer_gid_start, 1, sizeof(writer_gid_start), true, true) ==
+            sizeof(writer_gid_start) &&
+        resfile.Read_bytes(&writer_nmb, 1, sizeof(writer_nmb), true, true) ==
+            sizeof(writer_nmb) &&
+        resfile.Read_bytes(checkpoint_identity, 1, sizeof(checkpoint_identity), true,
+                           true) == sizeof(checkpoint_identity);
+    if (!partition_read_ok || partition_magic != kPerRankPartitionMagic ||
+        partition_version != kPerRankPartitionVersion) {
+      BuildTreeError("Per-rank restart lacks valid writer-partition metadata; "
+                     "legacy per-rank files cannot be restored safely");
+    }
+    if (writer_nranks != global_variable::nranks ||
+        writer_rank != global_variable::my_rank || writer_gid_start < 0 ||
+        writer_nmb < 1 || writer_gid_start + writer_nmb > nmb_total) {
+      BuildTreeError("Per-rank restart writer/current MPI rank layout is incompatible");
+    }
+#if MPI_PARALLEL_ENABLED
+    std::uint64_t rank_zero_identity[kCheckpointIdentityWords] = {0, 0};
+    if (global_variable::my_rank == 0) {
+      rank_zero_identity[0] = checkpoint_identity[0];
+      rank_zero_identity[1] = checkpoint_identity[1];
+    }
+    MPI_Bcast(rank_zero_identity, sizeof(rank_zero_identity), MPI_BYTE, 0,
+              MPI_COMM_WORLD);
+    int identity_matches =
+        (checkpoint_identity[0] == rank_zero_identity[0] &&
+         checkpoint_identity[1] == rank_zero_identity[1]) ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &identity_matches, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    if (identity_matches == 0) {
+      BuildTreeError("Per-rank checkpoint identity mismatch across rank files");
+    }
+#endif
+  }
+
+  // Versioned metadata is appended to the legacy location/cost list.  Probe the file
+  // marker itself instead of a ParameterInput key: restart parameters can legitimately
+  // be overridden from an input file or the command line.  If the marker is absent,
+  // restore the old-format file position before reading the remaining object state.
+  int counter_extension_present = 0;
+  if (global_variable::my_rank == 0 || single_file_per_rank) {
+    const IOWrapperSizeT extension_offset =
+        resfile.GetPosition(single_file_per_rank);
+    std::uint64_t counter_magic = 0;
+    const std::size_t magic_bytes =
+        resfile.Read_bytes(&counter_magic, 1, sizeof(counter_magic),
+                           single_file_per_rank);
+    if (magic_bytes == sizeof(counter_magic) &&
+        counter_magic == kAmrCycleCounterMagic) {
+      counter_extension_present = 1;
+    } else if (resfile.Seek(extension_offset, single_file_per_rank) != 0) {
+      BuildTreeError("Could not restore the legacy restart file position");
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  if (single_file_per_rank) {
+    int extension_min = 0;
+    int extension_max = 0;
+    MPI_Allreduce(&counter_extension_present, &extension_min, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&counter_extension_present, &extension_max, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (extension_min != extension_max) {
+      BuildTreeError("Per-rank restart files disagree on AMR counter metadata");
+    }
+  } else {
+    MPI_Bcast(&counter_extension_present, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  }
+#endif
+
+  if (counter_extension_present != 0) {
+    int stored_version = 0;
+    int counter_count = 0;
+    int metadata_read_ok = 1;
+    restart_cycle_counters.resize(nmb_total);
+    if (global_variable::my_rank == 0 || single_file_per_rank) {
+      metadata_read_ok =
+          (resfile.Read_bytes(&stored_version, 1, sizeof(stored_version),
+                              single_file_per_rank, true) == sizeof(stored_version)) &&
+          (resfile.Read_bytes(&counter_count, 1, sizeof(counter_count),
+                              single_file_per_rank, true) == sizeof(counter_count));
+      if (metadata_read_ok && stored_version == kAmrCycleCounterVersion &&
+          counter_count == nmb_total) {
+        metadata_read_ok =
+            resfile.Read_bytes(restart_cycle_counters.data(), sizeof(int), nmb_total,
+                               single_file_per_rank, true) ==
+            static_cast<std::size_t>(nmb_total);
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (!single_file_per_rank) {
+      MPI_Bcast(&stored_version, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      MPI_Bcast(&counter_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      MPI_Bcast(&metadata_read_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+#endif
+    if (!metadata_read_ok || stored_version != kAmrCycleCounterVersion ||
+        counter_count != nmb_total) {
+      BuildTreeError("AMR cycle-counter metadata in restart is invalid");
+    }
+#if MPI_PARALLEL_ENABLED
+    if (!single_file_per_rank) {
+      MPI_Bcast(restart_cycle_counters.data(), nmb_total, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+#endif
+  }
   if (!adaptive) max_level = current_level;
 
   // Checkpoints made before level-aware costs were introduced contain a uniform unit
@@ -502,6 +661,20 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
 #endif
 
   LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  if (single_file_per_rank) {
+    int partition_matches =
+        (gids_eachrank[global_variable::my_rank] == writer_gid_start &&
+         nmb_eachrank[global_variable::my_rank] == writer_nmb) ? 1 : 0;
+#if MPI_PARALLEL_ENABLED
+    MPI_Allreduce(MPI_IN_PLACE, &partition_matches, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+#endif
+    if (partition_matches == 0) {
+      BuildTreeError("Per-rank restart writer GID partition differs from the current "
+                     "load-balanced partition");
+    }
+  }
+  nmb_maxperrank = ValidatedMaxBlocksPerRank(pin, adaptive, nmb_eachrank);
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];
@@ -512,30 +685,14 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   pmb_pack->AddMeshBlocks(pin);
   pmb_pack->pmb->SetNeighbors(ptree, rank_eachmb);
 
-  // Fix maximum number of MeshBlocks per rank with AMR
-  nmb_maxperrank = nmb_thisrank;
-  if (adaptive) {
-    if (pin->DoesParameterExist("mesh_refinement", "max_nmb_per_rank")) {
-      nmb_maxperrank = pin->GetReal("mesh_refinement", "max_nmb_per_rank");
-      if (nmb_maxperrank < nmb_thisrank) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-          << std::endl << "On rank=" << global_variable::my_rank << " Root grid requires "
-          << "more MeshBlocks (nmb_thisrank=" << nmb_thisrank << ") than specified by "
-          << "<mesh_refinement>/max_nmb_per_rank=" << nmb_maxperrank << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
-    } else {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-        << std::endl << "With AMR maximum number of MeshBlocks per rank must be "
-        << "specified in input file using <mesh_refinement>/max_nmb_per_rank"
-        << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-  }
-
   // Create new MeshRefinement object with either SMR or AMR (SMR needs Restrict fns)
   if (multilevel) {
     pmr = new MeshRefinement(this, pin);
+    if (!restart_cycle_counters.empty()) {
+      for (int m=0; m<nmb_total; ++m) {
+        pmr->ncyc_since_ref(m) = restart_cycle_counters[m];
+      }
+    }
   }
 
   // set remaining parameters, output diagnostics

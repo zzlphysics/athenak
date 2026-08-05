@@ -174,7 +174,7 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
     char *rng_data = new char[sizeof(RNG_State)];
     // the master process reads the variables data
     if (global_variable::my_rank == 0 || single_file_per_rank) {
-      if (resfile.Read_bytes(rng_data, 1, sizeof(RNG_State), single_file_per_rank)
+      if (resfile.Read_bytes(rng_data, 1, sizeof(RNG_State), single_file_per_rank, true)
           != sizeof(RNG_State)) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "RNG data size read from restart file is incorrect, "
@@ -195,7 +195,7 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
   IOWrapperSizeT variablesize = sizeof(IOWrapperSizeT);
   char *variabledata = new char[variablesize];
   if (global_variable::my_rank == 0 || single_file_per_rank) {
-    if (resfile.Read_bytes(variabledata, 1, variablesize, single_file_per_rank)
+    if (resfile.Read_bytes(variabledata, 1, variablesize, single_file_per_rank, true)
         != variablesize) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl << "Variable data size read from restart file is incorrect, "

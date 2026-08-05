@@ -82,10 +82,12 @@ class Driver {
   std::uint64_t nmb_updated_;   // running total of MB updated during run
   std::uint64_t npart_updated_; // running total of particles updated during run
   float lb_efficiency_;         // measure of how efficient was load balancing
+  int finest_occupied_level_ = -1; // cached global leaf-tree depth for current root step
   void OutputCycleDiagnostics(Mesh *pm);
   Real UpdateWallClock();
-  void ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const;
+  void ValidateLevelSubcyclingConfiguration(ParameterInput *pin, Mesh *pmesh) const;
   Real ComputeLevelSubcyclingTimeStep(Mesh *pmesh);
+  int FinestOccupiedLevel(const Mesh *pmesh) const;
   void SetLevelSubcyclingTimeStep(Mesh *pmesh);
   void AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real dt);
   void ExecuteLevelStage(Mesh *pmesh, int level, int substep, Real time, Real dt,

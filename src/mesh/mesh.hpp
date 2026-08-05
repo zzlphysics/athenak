@@ -51,6 +51,69 @@ struct NeighborBlock {
   int dest;    // index of recv buffer in target NeighborBlocks
 };
 
+// Problem generators inspect fixed neighbor-index groups when making a vector
+// potential continuous across coarse/fine interfaces. Lower-dimensional meshes
+// allocate fewer groups, so keep all probes inside the actual view extents.
+template <typename NeighborView>
+KOKKOS_INLINE_FUNCTION
+bool AnyFinerNeighbor(const NeighborView &neighbors, int m, int level,
+                      int first, int last) {
+  const int nmb = static_cast<int>(neighbors.extent(0));
+  const int nneighbor = static_cast<int>(neighbors.extent(1));
+  if (m < 0 || m >= nmb || first > last) {
+    return false;
+  }
+  const int begin = (first > 0) ? first : 0;
+  const int end = (last < nneighbor - 1) ? last : nneighbor - 1;
+  for (int n = begin; n <= end; ++n) {
+    if (neighbors(m,n).lev > level) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename NeighborView>
+KOKKOS_INLINE_FUNCTION
+bool EdgeTouchesFinerNeighbor(const NeighborView &neighbors, int m, int level, int a_dir,
+                              int i, int j, int k, int is, int ie, int js, int je,
+                              int ks, int ke) {
+  if (a_dir == 1) {
+    return (j == js && AnyFinerNeighbor(neighbors, m, level, 8, 11)) ||
+           (j == je + 1 && AnyFinerNeighbor(neighbors, m, level, 12, 15)) ||
+           (k == ks && AnyFinerNeighbor(neighbors, m, level, 24, 27)) ||
+           (k == ke + 1 && AnyFinerNeighbor(neighbors, m, level, 28, 31)) ||
+           (j == js && k == ks && AnyFinerNeighbor(neighbors, m, level, 40, 41)) ||
+           (j == je + 1 && k == ks && AnyFinerNeighbor(neighbors, m, level, 42, 43)) ||
+           (j == js && k == ke + 1 && AnyFinerNeighbor(neighbors, m, level, 44, 45)) ||
+           (j == je + 1 && k == ke + 1 &&
+            AnyFinerNeighbor(neighbors, m, level, 46, 47));
+  }
+  if (a_dir == 2) {
+    return (i == is && AnyFinerNeighbor(neighbors, m, level, 0, 3)) ||
+           (i == ie + 1 && AnyFinerNeighbor(neighbors, m, level, 4, 7)) ||
+           (k == ks && AnyFinerNeighbor(neighbors, m, level, 24, 27)) ||
+           (k == ke + 1 && AnyFinerNeighbor(neighbors, m, level, 28, 31)) ||
+           (i == is && k == ks && AnyFinerNeighbor(neighbors, m, level, 32, 33)) ||
+           (i == ie + 1 && k == ks && AnyFinerNeighbor(neighbors, m, level, 34, 35)) ||
+           (i == is && k == ke + 1 && AnyFinerNeighbor(neighbors, m, level, 36, 37)) ||
+           (i == ie + 1 && k == ke + 1 &&
+            AnyFinerNeighbor(neighbors, m, level, 38, 39));
+  }
+  if (a_dir == 3) {
+    return (i == is && AnyFinerNeighbor(neighbors, m, level, 0, 3)) ||
+           (i == ie + 1 && AnyFinerNeighbor(neighbors, m, level, 4, 7)) ||
+           (j == js && AnyFinerNeighbor(neighbors, m, level, 8, 11)) ||
+           (j == je + 1 && AnyFinerNeighbor(neighbors, m, level, 12, 15)) ||
+           (i == is && j == js && AnyFinerNeighbor(neighbors, m, level, 16, 17)) ||
+           (i == ie + 1 && j == js && AnyFinerNeighbor(neighbors, m, level, 18, 19)) ||
+           (i == is && j == je + 1 && AnyFinerNeighbor(neighbors, m, level, 20, 21)) ||
+           (i == ie + 1 && j == je + 1 &&
+            AnyFinerNeighbor(neighbors, m, level, 22, 23));
+  }
+  return false;
+}
+
 //----------------------------------------------------------------------------------------
 //! \struct LogicalLocation
 //! \brief logical location and level of MeshBlock stored as POD

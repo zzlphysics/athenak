@@ -499,30 +499,8 @@ void SetupBinary(ParameterInput *pin, Mesh* pmy_mesh_) {
     // faces is identical.
 
     // Correct A1 at x2-faces, x3-faces, and x2x3-edges
-    if ((nghbr.d_view(m,8 ).lev > mblev.d_view(m) && j==js) ||
-        (nghbr.d_view(m,9 ).lev > mblev.d_view(m) && j==js) ||
-        (nghbr.d_view(m,10).lev > mblev.d_view(m) && j==js) ||
-        (nghbr.d_view(m,11).lev > mblev.d_view(m) && j==js) ||
-        (nghbr.d_view(m,12).lev > mblev.d_view(m) && j==je+1) ||
-        (nghbr.d_view(m,13).lev > mblev.d_view(m) && j==je+1) ||
-        (nghbr.d_view(m,14).lev > mblev.d_view(m) && j==je+1) ||
-        (nghbr.d_view(m,15).lev > mblev.d_view(m) && j==je+1) ||
-        (nghbr.d_view(m,24).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,25).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,26).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,27).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,28).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,29).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,30).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,31).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,40).lev > mblev.d_view(m) && j==js && k==ks) ||
-        (nghbr.d_view(m,41).lev > mblev.d_view(m) && j==js && k==ks) ||
-        (nghbr.d_view(m,42).lev > mblev.d_view(m) && j==je+1 && k==ks) ||
-        (nghbr.d_view(m,43).lev > mblev.d_view(m) && j==je+1 && k==ks) ||
-        (nghbr.d_view(m,44).lev > mblev.d_view(m) && j==js && k==ke+1) ||
-        (nghbr.d_view(m,45).lev > mblev.d_view(m) && j==js && k==ke+1) ||
-        (nghbr.d_view(m,46).lev > mblev.d_view(m) && j==je+1 && k==ke+1) ||
-        (nghbr.d_view(m,47).lev > mblev.d_view(m) && j==je+1 && k==ke+1)) {
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 1,
+        i, j, k, is, ie, js, je, ks, ke)) {
       Real xl = x1v + 0.25 * dx1;
       Real xr = x1v - 0.25 * dx1;
 
@@ -545,30 +523,8 @@ void SetupBinary(ParameterInput *pin, Mesh* pmy_mesh_) {
     }
 
     // Correct A2 at x1-faces, x3-faces, and x1x3-edges
-    if ((nghbr.d_view(m,0 ).lev > mblev.d_view(m) && i==is) ||
-        (nghbr.d_view(m,1 ).lev > mblev.d_view(m) && i==is) ||
-        (nghbr.d_view(m,2 ).lev > mblev.d_view(m) && i==is) ||
-        (nghbr.d_view(m,3 ).lev > mblev.d_view(m) && i==is) ||
-        (nghbr.d_view(m,4 ).lev > mblev.d_view(m) && i==ie+1) ||
-        (nghbr.d_view(m,5 ).lev > mblev.d_view(m) && i==ie+1) ||
-        (nghbr.d_view(m,6 ).lev > mblev.d_view(m) && i==ie+1) ||
-        (nghbr.d_view(m,7 ).lev > mblev.d_view(m) && i==ie+1) ||
-        (nghbr.d_view(m,24).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,25).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,26).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,27).lev > mblev.d_view(m) && k==ks) ||
-        (nghbr.d_view(m,28).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,29).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,30).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,31).lev > mblev.d_view(m) && k==ke+1) ||
-        (nghbr.d_view(m,32).lev > mblev.d_view(m) && i==is && k==ks) ||
-        (nghbr.d_view(m,33).lev > mblev.d_view(m) && i==is && k==ks) ||
-        (nghbr.d_view(m,34).lev > mblev.d_view(m) && i==ie+1 && k==ks) ||
-        (nghbr.d_view(m,35).lev > mblev.d_view(m) && i==ie+1 && k==ks) ||
-        (nghbr.d_view(m,36).lev > mblev.d_view(m) && i==is && k==ke+1) ||
-        (nghbr.d_view(m,37).lev > mblev.d_view(m) && i==is && k==ke+1) ||
-        (nghbr.d_view(m,38).lev > mblev.d_view(m) && i==ie+1 && k==ke+1) ||
-        (nghbr.d_view(m,39).lev > mblev.d_view(m) && i==ie+1 && k==ke+1)) {
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 2,
+        i, j, k, is, ie, js, je, ks, ke)) {
       Real xl = x2v + 0.25 * dx2;
       Real xr = x2v - 0.25 * dx2;
 

@@ -24,12 +24,13 @@
 //========================================================================================
 
 // C/C++ headers
-#include <cstdlib>
-#include <iostream>
-#include <string>
-#include <memory>
 #include <cstdio> // sscanf
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>  // Include this for std::ifstream
+#include <iostream>
+#include <memory>
+#include <string>
 
 // Athena headers
 #include "athena.hpp"
@@ -234,28 +235,50 @@ int main(int argc, char *argv[]) {
   // read parameters from restart file
   bool single_file_per_rank = false; // DBF: flag for single_file_per_rank for rst files
   if (res_flag) {
-    // Check if the path contains "rank_" directory
-    size_t rank_pos = restart_file.find("/rank_");
-    single_file_per_rank = (rank_pos != std::string::npos);
-
-    // If single_file_per_rank is true, modify the path for the current rank
-    if (single_file_per_rank) {
-        // Extract the base directory and file name
-        size_t last_slash = restart_file.rfind('/');
-        std::string base_dir = restart_file.substr(0, rank_pos);
-        std::string file_name = restart_file.substr(last_slash + 1);
-
-        // Construct the path for the current rank
-        char rank_dir[20];
-        std::snprintf(rank_dir, sizeof(rank_dir), "rank_%08d", global_variable::my_rank);
-        restart_file = base_dir + "/" + rank_dir + "/" + file_name;
+    // Detect only an exact rank_######## parent directory.  Other path components and
+    // the checkpoint basename may legitimately contain the substring "rank_".
+    const std::filesystem::path restart_path(restart_file);
+    const std::string rank_component =
+        restart_path.parent_path().filename().string();
+    single_file_per_rank =
+        rank_component.size() == 13 && rank_component.compare(0, 5, "rank_") == 0;
+    for (size_t i=5; single_file_per_rank && i<rank_component.size(); ++i) {
+      single_file_per_rank = rank_component[i] >= '0' && rank_component[i] <= '9';
     }
 
-    // Now use restart_file for opening the file
-    std::ifstream file_check(restart_file);
-    if (!file_check.good()) {
-        std::cerr << "Error: Unable to open restart file: " << restart_file << std::endl;
-        // Handle the error (e.g., exit the program or use a default configuration)
+    if (single_file_per_rank) {
+      // Replace the rank directory while retaining the exact base path and filename.
+      char rank_dir[20];
+      std::snprintf(rank_dir, sizeof(rank_dir), "rank_%08d", global_variable::my_rank);
+      restart_file =
+          (restart_path.parent_path().parent_path() / rank_dir /
+           restart_path.filename()).string();
+    }
+
+    // Check every rank's selected path before any process enters restart I/O.  In
+    // single-file-per-rank mode this prevents one missing file from leaving the other
+    // ranks blocked in later collectives.
+    std::ifstream file_check(restart_file, std::ios::binary);
+    int restart_file_available = file_check.good() ? 1 : 0;
+    file_check.close();
+#if MPI_PARALLEL_ENABLED
+    int all_restart_files_available = 0;
+    MPI_Allreduce(&restart_file_available, &all_restart_files_available, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+#else
+    int all_restart_files_available = restart_file_available;
+#endif
+    if (all_restart_files_available == 0) {
+      if (restart_file_available == 0) {
+        std::cerr << "Error: Unable to open restart file on rank "
+                  << global_variable::my_rank << ": " << restart_file << std::endl;
+      }
+#if MPI_PARALLEL_ENABLED
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+#endif
+      delete pinput;
+      Kokkos::finalize();
+      return EXIT_FAILURE;
     }
 
     // read parameters from restart file

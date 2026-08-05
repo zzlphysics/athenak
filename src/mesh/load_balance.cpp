@@ -7,9 +7,12 @@
 //! \brief Contains various Mesh and MeshRefinement functions associated with
 //! load balancing when MPI is used, both for uniform grids and with SMR/AMR.
 
+#include <algorithm> // max
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits> // numeric_limits<>
-#include <algorithm> // max
+#include <string>
 #include <utility> // make_pair
 
 #include "athena.hpp"
@@ -24,6 +27,23 @@
 #include <mpi.h>
 #endif
 
+namespace {
+
+[[noreturn]] void LoadBalanceError(const std::string &message) {
+  if (global_variable::my_rank == 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << message << std::endl;
+  }
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::nranks > 1) {
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+#endif
+  std::exit(EXIT_FAILURE);
+}
+
+}  // namespace
+
 //----------------------------------------------------------------------------------------
 //! \fn void Mesh::LoadBalance(double *clist, int *rlist, int *slist, int *nlist, int nb)
 //! \brief Calculate distribution of MeshBlocks across ranks based on input cost list
@@ -36,48 +56,105 @@
 //! just for SMR/AMR, which is why it is part of the Mesh and not MeshRefinement class.
 
 void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb) {
-  float min_cost = std::numeric_limits<float>::max();
-  float max_cost = 0.0, totalcost = 0.0;
-  // find min/max and total cost in clist
-  for (int i=0; i<nb; i++) {
-    totalcost += clist[i];
-    min_cost = std::min(min_cost,clist[i]);
-    max_cost = std::max(max_cost,clist[i]);
+  const int nranks = global_variable::nranks;
+  if (nranks < 1) {
+    LoadBalanceError("Cannot load balance over fewer than one MPI rank");
+  }
+  if (nb < nranks) {
+    LoadBalanceError("Cannot load balance " + std::to_string(nb) +
+                     " MeshBlocks over " + std::to_string(nranks) +
+                     " ranks while keeping at least one MeshBlock per rank");
   }
 
-  int j = (global_variable::nranks) - 1;
-  float targetcost = totalcost/global_variable::nranks;
-  float mycost = 0.0;
-  // create rank list from the end: the master MPI rank should have less load
-  for (int i=nb-1; i>=0; i--) {
-    if (targetcost == 0.0) {
-      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "There is at least one process which has no MeshBlock"
-                << std::endl << "Decrease the number of processes or use smaller "
-                << "MeshBlocks." << std::endl;
-      std::exit(EXIT_FAILURE);
+  float min_cost = std::numeric_limits<float>::max();
+  float max_cost = 0.0;
+  double total_cost = 0.0;
+  // Find min/max and total cost in clist.  A non-positive or non-finite cost cannot
+  // define a meaningful weighted partition and usually indicates a broken restart.
+  for (int i=0; i<nb; ++i) {
+    if (!std::isfinite(clist[i]) || !(clist[i] > 0.0f)) {
+      LoadBalanceError("MeshBlock " + std::to_string(i) +
+                       " has invalid load-balance cost " + std::to_string(clist[i]));
     }
-    mycost += clist[i];
-    rlist[i] = j;
-    if (mycost >= targetcost && j>0) {
-      j--;
-      totalcost -= mycost;
-      mycost = 0.0;
-      targetcost = totalcost/(j+1);
-    }
+    total_cost += static_cast<double>(clist[i]);
+    min_cost = std::min(min_cost, clist[i]);
+    max_cost = std::max(max_cost, clist[i]);
   }
+
+  for (int rank=0; rank<nranks; ++rank) {
+    slist[rank] = 0;
+    nlist[rank] = 0;
+  }
+
+  // Preserve contiguous Z-order ranges while balancing their weighted costs.  Work from
+  // the final rank towards rank zero so ties leave the master rank no more work.  For
+  // each rank, choose the segment boundary closest to the mean remaining cost, but never
+  // consume the one-block minimum reserved for every lower rank.  The reservation is the
+  // essential invariant missing from the previous threshold-only greedy algorithm.
+  int segment_end = nb;
+  double remaining_cost = total_cost;
+  for (int rank=nranks-1; rank>0; --rank) {
+    int segment_begin = segment_end - 1;
+    double segment_cost = static_cast<double>(clist[segment_begin]);
+    const double target_cost = remaining_cost/static_cast<double>(rank + 1);
+
+    // segment_begin == rank leaves exactly one block for each lower rank.  Positive
+    // costs make distance from target unimodal as preceding blocks are added, so the
+    // first worsening candidate is also the globally best boundary for this segment.
+    while (segment_begin > rank) {
+      const double candidate_cost =
+          segment_cost + static_cast<double>(clist[segment_begin-1]);
+      if (std::abs(candidate_cost-target_cost) >
+          std::abs(segment_cost-target_cost)) {
+        break;
+      }
+      --segment_begin;
+      segment_cost = candidate_cost;
+    }
+
+    slist[rank] = segment_begin;
+    nlist[rank] = segment_end - segment_begin;
+    for (int i=segment_begin; i<segment_end; ++i) {
+      rlist[i] = rank;
+    }
+    segment_end = segment_begin;
+    remaining_cost = std::max(0.0, remaining_cost-segment_cost);
+  }
+
   slist[0] = 0;
-  j = 0;
-  for (int i=1; i<nb; i++) { // make the list of nbstart and nblocks
-    if (rlist[i] != rlist[i-1]) {
-      nlist[j] = i-slist[j];
-      slist[++j] = i;
-    }
+  nlist[0] = segment_end;
+  for (int i=0; i<segment_end; ++i) {
+    rlist[i] = 0;
   }
-  nlist[j] = nb-slist[j];
+
+  // Validate the complete replicated partition before callers allocate rank-local
+  // MeshBlockPacks.  Failing collectively here is much clearer than constructing a
+  // zero-sized pack or discovering inconsistent GID metadata in later communication.
+  int next_gid = 0;
+  for (int rank=0; rank<nranks; ++rank) {
+    if (nlist[rank] < 1 || slist[rank] != next_gid) {
+      LoadBalanceError("Internal weighted-partition error for rank " +
+                       std::to_string(rank) + ": start=" +
+                       std::to_string(slist[rank]) + ", count=" +
+                       std::to_string(nlist[rank]) + ", expected start=" +
+                       std::to_string(next_gid));
+    }
+    for (int i=slist[rank]; i<slist[rank]+nlist[rank]; ++i) {
+      if (i < 0 || i >= nb || rlist[i] != rank) {
+        LoadBalanceError("Internal weighted-partition rank map is inconsistent at GID " +
+                         std::to_string(i));
+      }
+    }
+    next_gid += nlist[rank];
+  }
+  if (next_gid != nb) {
+    LoadBalanceError("Internal weighted partition assigned " +
+                     std::to_string(next_gid) + " of " + std::to_string(nb) +
+                     " MeshBlocks");
+  }
 
 #if MPI_PARALLEL_ENABLED
-  if (nb % global_variable::nranks != 0
+  if (nb % nranks != 0
      && !adaptive && max_cost == min_cost && global_variable::my_rank == 0) {
     std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "Number of MeshBlocks cannot be divided evenly by number of MPI ranks. "

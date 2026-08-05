@@ -69,6 +69,58 @@ namespace {
 // global variable to control computation of initial conditions versus errors
 bool set_initial_conditions = true;
 
+// Test-only moving-AMR radius.  The target position is derived entirely from the
+// absolute root-cycle count, so restart runs reproduce the same refinement decisions.
+Real scripted_amr_radius = 0.0;
+
+//----------------------------------------------------------------------------------------
+//! \fn void ScriptedMovingAMRRefinement(MeshBlockPack *pmbp)
+//! \brief Deterministic two-level AMR motion used by the level-subcycling regression.
+
+void ScriptedMovingAMRRefinement(MeshBlockPack *pmbp) {
+  Mesh *pmesh = pmbp->pmesh;
+  auto &refine_flag = pmesh->pmr->refine_flag;
+  auto &size = pmbp->pmb->mb_size;
+  const int nmb = pmbp->nmb_thispack;
+  const int meshblock_start = pmesh->gids_eachrank[global_variable::my_rank];
+
+  // Cycles 1--3 move refinement through three root columns, cycle 4 returns the
+  // entire mesh to the root level, cycle 5 refines the fourth column, and cycle 6
+  // moves back to the first column.  Repeating the six-cycle sequence is harmless,
+  // but the regression stops at cycle 6.
+  const int phase = pmesh->ncycle % 6;
+  bool refine_region = true;
+  Real target_fraction = 0.125;
+  if (phase == 2) {
+    target_fraction = 0.375;
+  } else if (phase == 3) {
+    target_fraction = 0.625;
+  } else if (phase == 4) {
+    refine_region = false;
+  } else if (phase == 5) {
+    target_fraction = 0.875;
+  }
+
+  const RegionSize &mesh = pmesh->mesh_size;
+  const Real target_x1 = mesh.x1min + target_fraction*(mesh.x1max-mesh.x1min);
+  const Real target_x2 = 0.5*(mesh.x2min+mesh.x2max);
+  const Real target_x3 = 0.5*(mesh.x3min+mesh.x3max);
+  for (int m=0; m<nmb; ++m) {
+    const RegionSize &block = size.h_view(m);
+    const Real dx1 = std::max(std::max(block.x1min-target_x1, Real(0.0)),
+                              target_x1-block.x1max);
+    const Real dx2 = std::max(std::max(block.x2min-target_x2, Real(0.0)),
+                              target_x2-block.x2max);
+    const Real dx3 = std::max(std::max(block.x3min-target_x3, Real(0.0)),
+                              target_x3-block.x3max);
+    const bool overlaps_target =
+        refine_region && (SQR(dx1)+SQR(dx2)+SQR(dx3) < SQR(scripted_amr_radius));
+    refine_flag.h_view(m+meshblock_start) = overlaps_target ? 1 : -1;
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn Real A1(const Real x1,const Real x2,const Real x3)
 //! \brief A1: 1-component of vector potential, using a gauge such that Ax = 0, and Ay,
@@ -244,6 +296,27 @@ void QuarticRoots(Real a3, Real a2, Real a1, Real a0, Real *px1, Real *px2,
 void ProblemGenerator::LinearWave(ParameterInput *pin, const bool restart) {
   // set linear wave errors function
   pgen_final_func = LinearWaveErrors;
+
+  // Enroll the deterministic moving-AMR criterion before the restart return.  All of
+  // its state comes from the input and absolute ncycle, so no hidden callback state is
+  // lost when the problem generator is reconstructed from a checkpoint.
+  const bool use_scripted_amr =
+      pin->GetOrAddBoolean("problem", "scripted_moving_amr", false);
+  if (use_scripted_amr) {
+    scripted_amr_radius = pin->GetOrAddReal("problem", "scripted_amr_radius", 0.06);
+    if (!pmy_mesh_->adaptive ||
+        pmy_mesh_->max_level != pmy_mesh_->root_level+1 ||
+        pmy_mesh_->pmr->ncyc_check_amr != 1 ||
+        !std::isfinite(scripted_amr_radius) || scripted_amr_radius <= 0.0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "scripted_moving_amr requires adaptive AMR with exactly two levels, "
+                << "ncycle_check=1, and a positive finite radius"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    user_ref_func = ScriptedMovingAMRRefinement;
+  }
   if (restart) return;
 
   // Read and/or calculate direction of wavevector
@@ -573,90 +646,24 @@ void ProblemGenerator::LinearWave(ParameterInput *pin, const bool restart) {
       // faces is identical.
 
       // Correct A1 at x2-faces, x3-faces, and x2x3-edges
-      if ((nghbr.d_view(m,8 ).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,9 ).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,10).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,11).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,12).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,13).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,14).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,15).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,24).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,25).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,26).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,27).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,28).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,29).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,30).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,31).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,40).lev > mblev.d_view(m) && j==js && k==ks) ||
-          (nghbr.d_view(m,41).lev > mblev.d_view(m) && j==js && k==ks) ||
-          (nghbr.d_view(m,42).lev > mblev.d_view(m) && j==je+1 && k==ks) ||
-          (nghbr.d_view(m,43).lev > mblev.d_view(m) && j==je+1 && k==ks) ||
-          (nghbr.d_view(m,44).lev > mblev.d_view(m) && j==js && k==ke+1) ||
-          (nghbr.d_view(m,45).lev > mblev.d_view(m) && j==js && k==ke+1) ||
-          (nghbr.d_view(m,46).lev > mblev.d_view(m) && j==je+1 && k==ke+1) ||
-          (nghbr.d_view(m,47).lev > mblev.d_view(m) && j==je+1 && k==ke+1)) {
+      if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 1,
+          i, j, k, is, ie, js, je, ks, ke)) {
         Real xl = x1v + 0.25*dx1;
         Real xr = x1v - 0.25*dx1;
         a1(m,k,j,i) = 0.5*(A1(xl,x2f,x3f,lwv) + A1(xr,x2f,x3f,lwv));
       }
 
       // Correct A2 at x1-faces, x3-faces, and x1x3-edges
-      if ((nghbr.d_view(m,0 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,1 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,2 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,3 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,4 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,5 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,6 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,7 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,24).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,25).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,26).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,27).lev > mblev.d_view(m) && k==ks) ||
-          (nghbr.d_view(m,28).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,29).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,30).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,31).lev > mblev.d_view(m) && k==ke+1) ||
-          (nghbr.d_view(m,32).lev > mblev.d_view(m) && i==is && k==ks) ||
-          (nghbr.d_view(m,33).lev > mblev.d_view(m) && i==is && k==ks) ||
-          (nghbr.d_view(m,34).lev > mblev.d_view(m) && i==ie+1 && k==ks) ||
-          (nghbr.d_view(m,35).lev > mblev.d_view(m) && i==ie+1 && k==ks) ||
-          (nghbr.d_view(m,36).lev > mblev.d_view(m) && i==is && k==ke+1) ||
-          (nghbr.d_view(m,37).lev > mblev.d_view(m) && i==is && k==ke+1) ||
-          (nghbr.d_view(m,38).lev > mblev.d_view(m) && i==ie+1 && k==ke+1) ||
-          (nghbr.d_view(m,39).lev > mblev.d_view(m) && i==ie+1 && k==ke+1)) {
+      if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 2,
+          i, j, k, is, ie, js, je, ks, ke)) {
         Real xl = x2v + 0.25*dx2;
         Real xr = x2v - 0.25*dx2;
         a2(m,k,j,i) = 0.5*(A2(x1f,xl,x3f,lwv) + A2(x1f,xr,x3f,lwv));
       }
 
       // Correct A3 at x1-faces, x2-faces, and x1x2-edges
-      if ((nghbr.d_view(m,0 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,1 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,2 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,3 ).lev > mblev.d_view(m) && i==is) ||
-          (nghbr.d_view(m,4 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,5 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,6 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,7 ).lev > mblev.d_view(m) && i==ie+1) ||
-          (nghbr.d_view(m,8 ).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,9 ).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,10).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,11).lev > mblev.d_view(m) && j==js) ||
-          (nghbr.d_view(m,12).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,13).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,14).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,15).lev > mblev.d_view(m) && j==je+1) ||
-          (nghbr.d_view(m,16).lev > mblev.d_view(m) && i==is && j==js) ||
-          (nghbr.d_view(m,17).lev > mblev.d_view(m) && i==is && j==js) ||
-          (nghbr.d_view(m,18).lev > mblev.d_view(m) && i==ie+1 && j==js) ||
-          (nghbr.d_view(m,19).lev > mblev.d_view(m) && i==ie+1 && j==js) ||
-          (nghbr.d_view(m,20).lev > mblev.d_view(m) && i==is && j==je+1) ||
-          (nghbr.d_view(m,21).lev > mblev.d_view(m) && i==is && j==je+1) ||
-          (nghbr.d_view(m,22).lev > mblev.d_view(m) && i==ie+1 && j==je+1) ||
-          (nghbr.d_view(m,23).lev > mblev.d_view(m) && i==ie+1 && j==je+1)) {
+      if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 3,
+          i, j, k, is, ie, js, je, ks, ke)) {
         Real xl = x3v + 0.25*dx3;
         Real xr = x3v - 0.25*dx3;
         a3(m,k,j,i) = 0.5*(A3(x1f,x2f,xl,lwv) + A3(x1f,x2f,xr,lwv));

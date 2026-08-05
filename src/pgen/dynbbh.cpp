@@ -76,6 +76,9 @@ struct BBHParameters {
   Real b30;
   Real alpha_threshold;
   Real refinement_radius;
+  Real refinement_radius_ratio;
+  Real refinement_hysteresis;
+  Real run_end_time;
   binary_bh::MetricParameters metric;
 };
 
@@ -326,12 +329,24 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   for (const auto &input_block : pin->block) {
     if (input_block.block_name.compare(0, 6, "output") != 0) continue;
-    for (const auto &input_line : input_block.line) {
-      const bool is_variable = (input_line.param_name == "variable"
-                                || input_line.param_name == "variable_2");
-      if (is_variable && input_line.param_value == "mhd_jcon") {
-        Fatal("dynbbh does not support mhd_jcon, which assumes a single Kerr metric");
-      }
+    const std::string &block_name = input_block.block_name;
+    const bool active = pin->DoesParameterExist(block_name, "dcycle")
+                            ? pin->GetInteger(block_name, "dcycle") != 0
+                            : pin->GetReal(block_name, "dt") > 0.0;
+    if (!active) continue;
+    const std::string file_type = pin->GetString(block_name, "file_type");
+    const bool consumes_variables =
+        (file_type != "hst" && file_type != "rst" && file_type != "log" &&
+         file_type != "trk");
+    if (!consumes_variables) continue;
+    bool requests_jcon = pin->GetString(block_name, "variable") == "mhd_jcon";
+    if (file_type == "pdf" && pin->DoesParameterExist(block_name, "variable_2") &&
+        pin->GetOrAddInteger(block_name, "nbin2", 0) > 1) {
+      requests_jcon = requests_jcon ||
+                      pin->GetString(block_name, "variable_2") == "mhd_jcon";
+    }
+    if (requests_jcon) {
+      Fatal("dynbbh does not support mhd_jcon, which assumes a single Kerr metric");
     }
   }
   if (!pmbp->pcoord->coord_data.bh_excise) {
@@ -353,6 +368,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     user_ref_func = RefineAlphaMin;
   } else if (amr_condition == "track") {
     user_ref_func = RefineTracker;
+    if (pmy_mesh_->adaptive &&
+        (pmy_mesh_->pmr->ncyc_check_amr != 1 ||
+         pmy_mesh_->pmr->refinement_interval != 1)) {
+      Fatal("moving-BBH track AMR requires ncycle_check=1 and refinement_interval=1");
+    }
   } else {
     Fatal("unknown <problem> amr_condition: " + amr_condition);
   }
@@ -407,6 +427,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   bbh.b30 = pin->GetOrAddReal("problem", "b3", 0.0);
   bbh.alpha_threshold = pin->GetOrAddReal("problem", "alpha_threshold", 0.6);
   bbh.refinement_radius = pin->GetOrAddReal("problem", "refinement_radius", 6.0);
+  bbh.refinement_radius_ratio =
+      pin->GetOrAddReal("problem", "refinement_radius_ratio", 2.0);
+  bbh.refinement_hysteresis =
+      pin->GetOrAddReal("problem", "refinement_hysteresis", 1.25);
+  bbh.run_end_time = pin->GetReal("time", "tlim");
   bbh.metric.mass_scale1 = pin->GetOrAddReal("problem", "mass_scale1",
       pin->GetOrAddReal("problem", "adjust_mass1", 1.0));
   bbh.metric.mass_scale2 = pin->GetOrAddReal("problem", "mass_scale2",
@@ -422,7 +447,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     bbh.separation, bbh.omega, bbh.mass_ratio, bbh.chi1, bbh.chi2,
     bbh.theta1, bbh.theta2, bbh.phi1, bbh.phi2, bbh.time_offset, bbh.fd_step,
     bbh.rho0, bbh.pgas0, bbh.u10, bbh.u20, bbh.u30, bbh.b10, bbh.b20, bbh.b30,
-    bbh.alpha_threshold, bbh.refinement_radius, bbh.metric.mass_scale1,
+    bbh.alpha_threshold, bbh.refinement_radius, bbh.refinement_radius_ratio,
+    bbh.refinement_hysteresis, bbh.run_end_time,
+    bbh.metric.mass_scale1,
     bbh.metric.mass_scale2, bbh.metric.spin_buffer1, bbh.metric.spin_buffer2,
     bbh.metric.singularity_floor
   };
@@ -434,7 +461,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       || !(bbh.fd_step > 0.0) || !(bbh.rho0 > 0.0) || !(bbh.pgas0 > 0.0)
       || !(bbh.metric.mass_scale1 > 0.0) || !(bbh.metric.mass_scale2 > 0.0)
       || !(bbh.metric.spin_buffer1 >= 0.0) || !(bbh.metric.spin_buffer2 >= 0.0)
-      || !(bbh.metric.singularity_floor > 0.0) || !(bbh.refinement_radius > 0.0)) {
+      || !(bbh.metric.singularity_floor > 0.0) || !(bbh.refinement_radius > 0.0)
+      || !(bbh.refinement_radius_ratio >= 1.0)
+      || !(bbh.refinement_hysteresis > 1.0)) {
     Fatal("invalid non-positive dynbbh parameter");
   }
   if (bbh.metric.spin_buffer1 + bbh.metric.singularity_floor > 1.0
@@ -1275,21 +1304,57 @@ void RefineTracker(MeshBlockPack *pmbp) {
   auto &size = pmbp->pmb->mb_size;
   const int nmb = pmbp->nmb_thispack;
   const int meshblock_start = pmesh->gids_eachrank[global_variable::my_rank];
-  Real state[NTRAJ];
-  FindTrajectory(pmesh->time, state);
+  // AMR is evaluated at a synchronized root endpoint, before the next CFL timestep is
+  // known.  Its growth limiter allows that next root step to be at most twice the last
+  // completed step.  Sample the complete look-ahead interval and enlarge each sample
+  // sphere by a light-speed half-sample bound, so a subluminal hole cannot leave the
+  // refined region before the next synchronized regrid.  Near the configured tlim the
+  // trajectory may not be available for the full interval; the unsampled remainder is
+  // covered by the same speed bound so a final checkpoint can safely extend its tlim.
+  const Real last_dt = (std::isfinite(pmesh->dt) && pmesh->dt > 0.0) ? pmesh->dt : 0.0;
+  const Real remaining_time = std::max(bbh.run_end_time-pmesh->time, Real(0.0));
+  const Real lookahead = 2.0*last_dt;
+  const Real sample_horizon = std::min(lookahead, remaining_time);
+  const Real sample_times[3] = {
+    pmesh->time, pmesh->time+0.5*sample_horizon, pmesh->time+sample_horizon
+  };
+  std::array<std::array<Real, NTRAJ>, 3> states{};
+  for (int sample=0; sample<3; ++sample) {
+    FindTrajectory(sample_times[sample], states[sample].data());
+  }
+  const Real padding =
+      std::max(0.25*sample_horizon, lookahead-sample_horizon);
   for (int m = 0; m < nmb; ++m) {
     const RegionSize &block = size.h_view(m);
     Real minimum_distance = std::numeric_limits<Real>::infinity();
-    if (state[M1T]*bbh.metric.mass_scale1 > 0.0) {
-      minimum_distance = DistanceSquaredToBlock(
-          state[X1], state[Y1], state[Z1], block);
+    for (const auto &state : states) {
+      if (state[M1T]*bbh.metric.mass_scale1 > 0.0) {
+        minimum_distance = std::min(minimum_distance, DistanceSquaredToBlock(
+            state[X1], state[Y1], state[Z1], block));
+      }
+      if (state[M2T]*bbh.metric.mass_scale2 > 0.0) {
+        minimum_distance = std::min(minimum_distance, DistanceSquaredToBlock(
+            state[X2], state[Y2], state[Z2], block));
+      }
     }
-    if (state[M2T]*bbh.metric.mass_scale2 > 0.0) {
-      minimum_distance = std::min(minimum_distance, DistanceSquaredToBlock(
-          state[X2], state[Y2], state[Z2], block));
+    const int level = pmbp->pmb->mb_lev.h_view(m);
+    int flag = 0;
+    if (level < pmesh->max_level) {
+      // refinement_radius is the protected radius on the finest level.  Successively
+      // wider parent shells guarantee proper nesting while the swept-orbit padding
+      // keeps a subluminal hole inside the hierarchy until the next root sync point.
+      const int child_shells = pmesh->max_level - (level + 1);
+      const Real child_radius = bbh.refinement_radius*
+          std::pow(bbh.refinement_radius_ratio, child_shells) + padding;
+      if (minimum_distance < SQR(child_radius)) flag = 1;
     }
-    refine_flag.h_view(m+meshblock_start) =
-        (minimum_distance < SQR(bbh.refinement_radius)) ? 1 : -1;
+    if (flag == 0 && level > pmesh->root_level) {
+      const int level_shells = pmesh->max_level - level;
+      const Real keep_radius = bbh.refinement_hysteresis*bbh.refinement_radius*
+          std::pow(bbh.refinement_radius_ratio, level_shells) + padding;
+      if (minimum_distance > SQR(keep_radius)) flag = -1;
+    }
+    refine_flag.h_view(m+meshblock_start) = flag;
   }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();

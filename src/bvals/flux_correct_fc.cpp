@@ -64,8 +64,8 @@ void MeshBoundaryValuesFC::InitializeFluxRegistersFC() {
   if (pmy_pack->pmesh->nmb_packs_thisrank != 1) {
     FluxRegisterFCError("level registers currently require one MeshBlockPack per rank");
   }
-  if (!(pmy_pack->pmesh->multilevel) || pmy_pack->pmesh->adaptive) {
-    FluxRegisterFCError("the initial implementation requires static mesh refinement");
+  if (!(pmy_pack->pmesh->multilevel)) {
+    FluxRegisterFCError("level registers require a multilevel mesh");
   }
 
   const int nmb = std::max(pmy_pack->nmb_thispack,

@@ -1,0 +1,51 @@
+# Minimal mesh-only regression for weighted, contiguous Z-order load balancing.
+#
+# The nested 1D hierarchy has Z-ordered level costs [4, 4, 2, 1].  The historical
+# threshold-only partition assigned no block to rank 0 with three MPI ranks.  Running
+# Athena with -m exercises Mesh::LoadBalance before any physics module is constructed.
+
+<job>
+basename = load_balance_weighted
+
+<mesh>
+nghost = 2
+nx1    = 16
+x1min  = 0.0
+x1max  = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 1
+x2min  = 0.0
+x2max  = 1.0
+
+nx3    = 1
+x3min  = 0.0
+x3max  = 1.0
+
+<meshblock>
+nx1 = 8
+nx2 = 1
+nx3 = 1
+
+<mesh_refinement>
+refinement = static
+
+<refined_region1>
+level = 1
+x1min = 0.0
+x1max = 0.5
+
+<refined_region2>
+level = 2
+x1min = 0.0
+x1max = 0.25
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.4
+nlim       = 0
+tlim       = 1.0
+ndiag      = 1

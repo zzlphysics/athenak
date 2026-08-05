@@ -302,7 +302,7 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
   }
 
   if (LevelSubcyclingRequested()) {
-    ValidateLevelSubcyclingConfiguration(pmesh);
+    ValidateLevelSubcyclingConfiguration(pin, pmesh);
     pmesh->pmb_pack->pmhd->InitializeLevelSubcyclingRegisters();
   }
 }
@@ -312,7 +312,8 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
 //! \brief Reject physics/topologies for which level-local kernels or synchronization are
 //! not part of the first level-subcycling implementation.
 
-void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
+void Driver::ValidateLevelSubcyclingConfiguration(ParameterInput *pin,
+                                                  Mesh *pmesh) const {
   MeshBlockPack *pmbp = pmesh->pmb_pack;
   std::vector<std::string> violations;
 
@@ -322,9 +323,8 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
   if (integrator != "rk2") {
     violations.emplace_back("<time>/integrator must be rk2");
   }
-  if (!pmesh->multilevel || pmesh->adaptive ||
-      pmesh->max_level <= pmesh->root_level) {
-    violations.emplace_back("mesh refinement must be static SMR with at least two levels");
+  if (!pmesh->multilevel || pmesh->max_level <= pmesh->root_level) {
+    violations.emplace_back("mesh refinement must provide at least two levels");
   }
   if (pmesh->pmr != nullptr && pmesh->pmr->prolong_prims) {
     violations.emplace_back("<mesh_refinement>/prolong_primitives must be false");
@@ -358,6 +358,29 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
   if (pmesh->pgen != nullptr && (pmesh->pgen->user_srcs || pmesh->pgen->user_bcs)) {
     violations.emplace_back("full-mesh user source terms and user boundaries are not supported");
   }
+  for (const auto &input_block : pin->block) {
+    if (input_block.block_name.compare(0, 6, "output") != 0) continue;
+    const std::string &block_name = input_block.block_name;
+    const bool active = pin->DoesParameterExist(block_name, "dcycle")
+                            ? pin->GetInteger(block_name, "dcycle") != 0
+                            : pin->GetReal(block_name, "dt") > 0.0;
+    if (!active) continue;
+    const std::string file_type = pin->GetString(block_name, "file_type");
+    const bool consumes_variables =
+        (file_type != "hst" && file_type != "rst" && file_type != "log" &&
+         file_type != "trk");
+    if (!consumes_variables) continue;
+    bool requests_jcon = pin->GetString(block_name, "variable") == "mhd_jcon";
+    if (file_type == "pdf" && pin->DoesParameterExist(block_name, "variable_2") &&
+        pin->GetOrAddInteger(block_name, "nbin2", 0) > 1) {
+      requests_jcon = requests_jcon ||
+                      pin->GetString(block_name, "variable_2") == "mhd_jcon";
+    }
+    if (requests_jcon) {
+      violations.emplace_back(
+          "mhd_jcon output is not time-consistent with level subcycling");
+    }
+  }
 
   if (!violations.empty()) {
     if (global_variable::my_rank == 0) {
@@ -369,7 +392,7 @@ void Driver::ValidateLevelSubcyclingConfiguration(Mesh *pmesh) const {
         std::cout << "  - " << reason << std::endl;
       }
       std::cout << "Supported envelope: one MeshBlockPack per MPI rank, multilevel "
-                << "static SMR, "
+                << "static SMR or synchronized AMR, "
                 << "RK2, MHD+CT with a "
                 << "prescribed dynamic ADM metric and no auxiliary physics/source "
                 << "modules." << std::endl;
@@ -410,8 +433,10 @@ void Driver::ResetLevelSubcyclingContext() {
 Real Driver::ComputeLevelSubcyclingTimeStep(Mesh *pmesh) {
   MeshBlockPack *pmbp = pmesh->pmb_pack;
   Real dt_root = std::numeric_limits<Real>::max();
+  const int finest_level = FinestOccupiedLevel(pmesh);
+  finest_occupied_level_ = finest_level;
 
-  for (int level=pmesh->root_level; level<=pmesh->max_level; ++level) {
+  for (int level=pmesh->root_level; level<=finest_level; ++level) {
     pmbp->SetActiveLevel(level);
     if (pmbp->nmb_active == 0) {
       continue;
@@ -455,6 +480,24 @@ Real Driver::ComputeLevelSubcyclingTimeStep(Mesh *pmesh) {
     std::exit(EXIT_FAILURE);
   }
   return dt_root;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::FinestOccupiedLevel()
+//! \brief Return the deepest level that currently contains a leaf MeshBlock.
+//!
+//! For adaptive meshes Mesh::max_level is the configured refinement ceiling, not the
+//! deepest level currently present in the tree.  The recursive scheduler must stop at
+//! the latter: descending through empty allowed levels would perform exponentially many
+//! empty substeps before those levels have ever been created.  lloc_eachmb is replicated
+//! on every rank, so this result is global and requires no collective communication.
+
+int Driver::FinestOccupiedLevel(const Mesh *pmesh) const {
+  int finest_level = pmesh->root_level;
+  for (int m=0; m<pmesh->nmb_total; ++m) {
+    finest_level = std::max(finest_level, static_cast<int>(pmesh->lloc_eachmb[m].level));
+  }
+  return finest_level;
 }
 
 //----------------------------------------------------------------------------------------
@@ -545,7 +588,7 @@ void Driver::RefreshSynchronizedDescendants(Mesh *pmesh, int parent_level,
                                              int parent_end_ordinal, Real sync_time,
                                              Real parent_dt) {
   const int child_level = parent_level + 1;
-  if (child_level > pmesh->max_level) return;
+  if (child_level > finest_occupied_level_) return;
 
   const int child_end_ordinal = 2*parent_end_ordinal;
   PrepareFineLevelBoundaries(pmesh, parent_level, child_level,
@@ -604,7 +647,7 @@ void Driver::AdvanceLevel(Mesh *pmesh, int level, int substep, Real time, Real d
   MeshBlockPack *pmbp = pmesh->pmb_pack;
   pmbp->SetActiveLevel(level);
   const int fine_level = level + 1;
-  const bool has_finer_level = (fine_level <= pmesh->max_level);
+  const bool has_finer_level = (fine_level <= finest_occupied_level_);
 
   // All MPI ranks execute the identical recursive schedule.  A rank with no local block
   // on this level still owns possible donor blocks and must participate in boundary and
@@ -816,15 +859,54 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       npart_updated_ += pmesh->nprtcl_total;
       // load balancing efficiency
       if (global_variable::nranks > 1) {
-        int minnmb = std::numeric_limits<int>::max();
-        for (int i=0; i<global_variable::nranks; ++i) {
-          minnmb = std::min(minnmb, pmesh->nmb_eachrank[i]);
+        if (LevelSubcyclingRequested()) {
+          std::vector<double> cost_eachrank(global_variable::nranks, 0.0);
+          double total_cost = 0.0;
+          for (int m=0; m<pmesh->nmb_total; ++m) {
+            const double cost = static_cast<double>(pmesh->cost_eachmb[m]);
+            cost_eachrank[pmesh->rank_eachmb[m]] += cost;
+            total_cost += cost;
+          }
+          const double min_cost =
+              *std::min_element(cost_eachrank.begin(), cost_eachrank.end());
+          lb_efficiency_ += static_cast<float>(global_variable::nranks*min_cost/
+                                               total_cost);
+        } else {
+          int minnmb = std::numeric_limits<int>::max();
+          for (int i=0; i<global_variable::nranks; ++i) {
+            minnmb = std::min(minnmb, pmesh->nmb_eachrank[i]);
+          }
+          lb_efficiency_ += static_cast<float>(minnmb*(global_variable::nranks))/
+              static_cast<float>(pmesh->nmb_total);
         }
-        lb_efficiency_ += static_cast<float>(minnmb*(global_variable::nranks))/
-            static_cast<float>(pmesh->nmb_total);
       }
 
-      // Test for/make outputs
+      // Regridding is legal only after every descendant has reached the root endpoint
+      // and all level-pair flux/EMF registers have been applied.  The legacy driver is
+      // synchronized by construction; make the stricter subcycling invariant explicit.
+      if (pmesh->adaptive) {
+        if (LevelSubcyclingRequested() &&
+            (!level_subcycling.at_sync_point ||
+             level_subcycling.active_level != pmesh->root_level)) {
+          if (global_variable::my_rank == 0) {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                      << std::endl
+                      << "Level-subcycling AMR was requested outside a root "
+                      << "synchronization point." << std::endl;
+          }
+#if MPI_PARALLEL_ENABLED
+          if (global_variable::nranks > 1) {
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+          }
+#endif
+          std::exit(EXIT_FAILURE);
+        }
+        pmesh->pmr->AdaptiveMeshRefinement(this, pin);
+      }
+
+      // Make synchronized outputs after AMR so a checkpoint contains the exact topology
+      // used by the next root step.  In particular, writing a restart before regridding
+      // would cause a resumed run to skip the refinement decision at this endpoint.
       for (auto &out : pout->pout_list) {
         // compare at floating point (32-bit) precision to reduce effect of round off
         float time_32 = static_cast<float>(pmesh->time);
@@ -839,8 +921,6 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         }
       }
 
-      // AMR
-      if (pmesh->adaptive) {pmesh->pmr->AdaptiveMeshRefinement(this, pin);}
       // compute new timestep AFTER all Meshblocks refined/derefined
       if (LevelSubcyclingRequested()) {
         SetLevelSubcyclingTimeStep(pmesh);

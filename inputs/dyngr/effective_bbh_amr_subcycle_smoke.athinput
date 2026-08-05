@@ -1,0 +1,132 @@
+# Low-resolution moving-BBH AMR test for strict level subcycling.
+#
+# This is a software regression input, not a scientifically resolved torus model.  It
+# starts with a root-only mesh, creates two refinement levels around the moving holes,
+# and then moves the tracked regions across MeshBlock boundaries.  The deliberately fast
+# circular orbit remains subluminal and shortens the topology-change test.
+
+<job>
+basename = effective_bbh_amr_subcycle_smoke
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = -48.0
+x1max  =  48.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 32
+x2min  = -48.0
+x2max  =  48.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -48.0
+x3max  =  48.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 3
+max_nmb_per_rank    = 320
+ncycle_check        = 1
+refinement_interval = 1
+prolong_primitives  = false
+
+<amr_criterion0>
+method = user
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.2
+nlim       = 30
+tlim       = 100.0
+ndiag      = 1
+
+<coord>
+minkowski       = false
+excise          = true
+excision_scheme = lapse
+excise_lapse    = 0.25
+dexcise         = 1.0e-8
+pexcise         = 1.0e-10
+
+<adm>
+dynamic = true
+
+<mhd>
+eos             = ideal
+dyn_eos         = ideal
+dyn_error       = reset_floor
+gamma           = 1.3333333333333333
+reconstruct     = plm
+rsolver         = hlle
+dfloor          = 1.0e-8
+tfloor          = 1.0e-3
+dthreshold      = 1.01
+dyn_scratch     = 1
+fofc            = true
+enforce_maximum = false
+
+<problem>
+pgen_name             = dynbbh
+trajectory_mode       = circular
+trajectory_file       = none
+trajectory_time_offset = 0.0
+separation            = 20.0
+omega                 = 0.05
+mass_ratio            = 1.0
+chi1                  = 0.0
+chi2                  = 0.0
+theta1                = 0.0
+theta2                = 0.0
+phi1                  = 0.0
+phi2                  = 0.0
+rho0                  = 1.0e-5
+pgas0                 = 1.0e-7
+u1                    = 0.0
+u2                    = 0.0
+u3                    = 0.0
+b1                    = 0.0
+b2                    = 0.0
+b3                    = 1.0e-6
+mass_scale1           = 1.0
+mass_scale2           = 1.0
+spin_buffer1          = 0.05
+spin_buffer2          = 0.05
+singularity_floor     = 1.0e-3
+amr_condition         = track
+alpha_threshold       = 0.6
+refinement_radius     = 6.0
+refinement_radius_ratio = 2.0
+refinement_hysteresis = 1.25
+
+# Per-cycle dumps expose topology creation and motion.  Keep the smoke-test cadence out
+# of production inputs; production output volume must be budgeted separately.
+<output1>
+file_type   = bin
+variable    = mhd_w_bcc
+dcycle      = 1
+ghost_zones = false
+
+<output2>
+file_type   = bin
+variable    = mhd_divb
+dcycle      = 1
+ghost_zones = false
+
+<output3>
+file_type   = rst
+dcycle      = 4
+# Deliberately ignored by rst: only outputs that consume this variable are restricted.
+variable    = mhd_jcon

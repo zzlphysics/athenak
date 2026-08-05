@@ -36,7 +36,8 @@ class IOWrapper {
   // wrapper functions for basic I/O tasks
   int Open(const char* fname, FileMode rw, bool single_file_per_rank = false);
   std::size_t Read_bytes(void *buf, IOWrapperSizeT size, IOWrapperSizeT count,
-                         bool single_file_per_rank = false);
+                         bool single_file_per_rank = false,
+                         bool require_full_read = false);
   std::size_t Read_bytes_at(void *buf, IOWrapperSizeT size, IOWrapperSizeT count,
                             IOWrapperSizeT offset, bool single_file_per_rank = false);
   std::size_t Read_bytes_at_all(void *buf, IOWrapperSizeT size, IOWrapperSizeT count,

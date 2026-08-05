@@ -9,10 +9,15 @@
 #include <sys/stat.h>  // mkdir
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>      // fwrite(), fclose(), fopen(), fnprintf(), snprintf()
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <sstream>
 #include <string>
 #include <utility> // make_pair
@@ -30,6 +35,53 @@
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
 //#include "outputs.hpp"
+
+namespace {
+
+constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
+constexpr int kAmrCycleCounterVersion = 1;
+constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
+constexpr int kPerRankPartitionVersion = 2;
+constexpr int kCheckpointIdentityWords = 2;
+
+std::uint64_t MixCheckpointIdentity(std::uint64_t value) {
+  value ^= value >> 30;
+  value *= UINT64_C(0xbf58476d1ce4e5b9);
+  value ^= value >> 27;
+  value *= UINT64_C(0x94d049bb133111eb);
+  value ^= value >> 31;
+  return value;
+}
+
+void GenerateCheckpointIdentity(int cycle, int file_number,
+                                std::uint64_t identity[kCheckpointIdentityWords]) {
+  static std::uint64_t sequence = 0;
+  std::random_device entropy;
+  std::uint64_t seed_low =
+      (static_cast<std::uint64_t>(entropy()) << 32) ^
+      static_cast<std::uint64_t>(entropy());
+  std::uint64_t seed_high =
+      (static_cast<std::uint64_t>(entropy()) << 32) ^
+      static_cast<std::uint64_t>(entropy());
+  const std::uint64_t high_clock = static_cast<std::uint64_t>(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  const std::uint64_t steady_clock = static_cast<std::uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  const std::uint64_t current_sequence = ++sequence;
+  seed_low ^= high_clock;
+  seed_low ^= (static_cast<std::uint64_t>(cycle) << 32);
+  seed_low ^= current_sequence * UINT64_C(0x9e3779b97f4a7c15);
+  seed_high ^= steady_clock;
+  seed_high ^= (static_cast<std::uint64_t>(file_number) << 32);
+  seed_high ^= current_sequence * UINT64_C(0xd1b54a32d192ed03);
+  identity[0] = MixCheckpointIdentity(seed_low);
+  identity[1] = MixCheckpointIdentity(seed_high);
+  if ((identity[0] | identity[1]) == 0) {
+    identity[1] = UINT64_C(0x9e3779b97f4a7c15);
+  }
+}
+
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 // constructor: also calls BaseTypeOutput base class constructor
@@ -165,6 +217,17 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     nadm = padm->nadm;
   }
   bool single_file_per_rank = out_params.single_file_per_rank;
+  std::uint64_t checkpoint_identity[kCheckpointIdentityWords] = {0, 0};
+  if (single_file_per_rank) {
+    if (global_variable::my_rank == 0) {
+      GenerateCheckpointIdentity(pm->ncycle, out_params.file_number,
+                                 checkpoint_identity);
+    }
+#if MPI_PARALLEL_ENABLED
+    MPI_Bcast(checkpoint_identity, sizeof(checkpoint_identity), MPI_BYTE, 0,
+              MPI_COMM_WORLD);
+#endif
+  }
   std::string fname;
   if (single_file_per_rank) {
     // Generate a directory and filename for each rank
@@ -199,6 +262,13 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
   pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
 
+  // Advertise the optional AMR metadata extension in the serialized ParameterInput.
+  // Old restart files lack this key and retain their original byte layout.
+  if (pm->adaptive) {
+    pin->SetInteger("mesh_refinement", "restart_cycle_counters_version",
+                    kAmrCycleCounterVersion);
+  }
+
   // create string holding input parameters (copy of input file)
   std::stringstream ost;
   pin->ParameterDump(ost);
@@ -212,6 +282,15 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   IOWrapper resfile;
   resfile.Open(fname.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
   if (global_variable::my_rank == 0 || single_file_per_rank) {
+    // The legacy header has one timestep slot.  Give it one unambiguous meaning for all
+    // checkpoint sites: the last completed step, which is the value needed to apply the
+    // growth limiter exactly once after restart.  Cycle-zero checkpoints use the same
+    // sentinel as a fresh Mesh and therefore impose no artificial initial growth cap.
+    const Real restart_dt =
+        (pm->ncycle > 0 && std::isfinite(pm->dt_last_completed) &&
+         pm->dt_last_completed > 0.0)
+        ? pm->dt_last_completed : std::numeric_limits<float>::max();
+
     // output the input parameters (input file)
     resfile.Write_any_type(sbuf.c_str(), sbuf.size(), "byte", single_file_per_rank);
 
@@ -228,8 +307,7 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                             single_file_per_rank);
     resfile.Write_any_type(&(pm->time), (sizeof(Real)), "byte",
                             single_file_per_rank);
-    resfile.Write_any_type(&(pm->dt), (sizeof(Real)), "byte",
-                            single_file_per_rank);
+    resfile.Write_any_type(&restart_dt, sizeof(Real), "byte", single_file_per_rank);
     resfile.Write_any_type(&(pm->ncycle), (sizeof(int)), "byte",
                             single_file_per_rank);
   }
@@ -241,6 +319,41 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                            "byte", single_file_per_rank);
     resfile.Write_any_type(&(pm->cost_eachmb[0]), (pm->nmb_total)*sizeof(float),
                            "byte", single_file_per_rank);
+    // A per-rank file stores only the field data owned by its writer.  Persist that
+    // exact partition so restart can reject a different MPI layout instead of silently
+    // attaching the local data stream to the wrong global MeshBlock IDs.
+    if (single_file_per_rank) {
+      const int writer_nranks = global_variable::nranks;
+      const int writer_rank = global_variable::my_rank;
+      const int writer_gid_start = pm->gids_eachrank[writer_rank];
+      const int writer_nmb = pm->nmb_eachrank[writer_rank];
+      resfile.Write_any_type(&kPerRankPartitionMagic, sizeof(kPerRankPartitionMagic),
+                             "byte", single_file_per_rank);
+      resfile.Write_any_type(&kPerRankPartitionVersion,
+                             sizeof(kPerRankPartitionVersion), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(&writer_nranks, sizeof(writer_nranks), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(&writer_rank, sizeof(writer_rank), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(&writer_gid_start, sizeof(writer_gid_start), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(&writer_nmb, sizeof(writer_nmb), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(checkpoint_identity, sizeof(checkpoint_identity), "byte",
+                             single_file_per_rank);
+    }
+    if (pm->adaptive) {
+      const int counter_count = pm->nmb_total;
+      resfile.Write_any_type(&kAmrCycleCounterMagic, sizeof(kAmrCycleCounterMagic),
+                             "byte", single_file_per_rank);
+      resfile.Write_any_type(&kAmrCycleCounterVersion, sizeof(kAmrCycleCounterVersion),
+                             "byte", single_file_per_rank);
+      resfile.Write_any_type(&counter_count, sizeof(counter_count), "byte",
+                             single_file_per_rank);
+      resfile.Write_any_type(pm->pmr->ncyc_since_ref.data(),
+                             counter_count*sizeof(int), "byte", single_file_per_rank);
+    }
   }
 
   //--- STEP 3.  Root process writes internal state of objects that require it
@@ -299,6 +412,14 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   IOWrapperSizeT step1size = sbuf.size()*sizeof(char) + 3*sizeof(int) + 2*sizeof(Real) +
                              sizeof(RegionSize) + 2*sizeof(RegionIndcs);
   IOWrapperSizeT step2size = (pm->nmb_total)*(sizeof(LogicalLocation) + sizeof(float));
+  if (single_file_per_rank) {
+    step2size += sizeof(kPerRankPartitionMagic) + 5*sizeof(int)
+               + kCheckpointIdentityWords*sizeof(std::uint64_t);
+  }
+  if (pm->adaptive) {
+    step2size += sizeof(kAmrCycleCounterMagic) + 2*sizeof(int)
+               + pm->nmb_total*sizeof(int);
+  }
 
   IOWrapperSizeT step3size = 3*nco*sizeof(Real);
   if (pz4c != nullptr) step3size += sizeof(Real);

@@ -91,26 +91,29 @@ def _assert_same_topology(reference, candidate):
 def _subcycling_rank_map(dump, num_ranks: int):
     """Reproduce weighted Mesh::LoadBalance for a strict-subcycling mesh."""
     levels = np.asarray(dump["mb_logical"])[:, 3].astype(int)
-    block_costs = np.ldexp(np.ones(dump["n_mbs"], dtype=np.float32), levels)
-    num_blocks = dump["n_mbs"]
-    rank_map = np.empty(num_blocks, dtype=int)
-    rank = num_ranks - 1
-    remaining_cost = np.float32(0.0)
-    for cost in block_costs:
-        remaining_cost = np.float32(remaining_cost + cost)
-    target_cost = np.float32(remaining_cost / np.float32(num_ranks))
-    rank_cost = np.float32(0.0)
+    levels -= int(np.min(levels))
+    block_costs = np.ldexp(np.ones(dump["n_mbs"], dtype=np.float64), levels)
+    rank_map = np.empty(dump["n_mbs"], dtype=int)
+    segment_end = dump["n_mbs"]
+    remaining_cost = float(np.sum(block_costs, dtype=np.float64))
+    for rank in range(num_ranks - 1, 0, -1):
+        segment_begin = segment_end - 1
+        segment_cost = float(block_costs[segment_begin])
+        target_cost = remaining_cost / (rank + 1)
+        while segment_begin > rank:
+            candidate_cost = segment_cost + float(block_costs[segment_begin - 1])
+            if abs(candidate_cost - target_cost) > abs(segment_cost - target_cost):
+                break
+            segment_begin -= 1
+            segment_cost = candidate_cost
+        rank_map[segment_begin:segment_end] = rank
+        segment_end = segment_begin
+        remaining_cost = max(0.0, remaining_cost - segment_cost)
+    rank_map[:segment_end] = 0
 
-    for gid in range(num_blocks - 1, -1, -1):
-        rank_cost = np.float32(rank_cost + block_costs[gid])
-        rank_map[gid] = rank
-        if rank_cost >= target_cost and rank > 0:
-            rank -= 1
-            remaining_cost = np.float32(remaining_cost - rank_cost)
-            rank_cost = np.float32(0.0)
-            target_cost = np.float32(remaining_cost / np.float32(rank + 1))
-
-    assert rank == 0
+    unique_ranks, counts = np.unique(rank_map, return_counts=True)
+    np.testing.assert_array_equal(unique_ranks, np.arange(num_ranks))
+    assert np.all(counts > 0)
     return rank_map
 
 
@@ -119,8 +122,8 @@ def _blocks_share_face(coarse_geometry, fine_geometry, atol=1.0e-12):
     touches = []
     overlaps = []
     for direction in range(3):
-        clo, chi = coarse_geometry[2 * direction : 2 * direction + 2]
-        flo, fhi = fine_geometry[2 * direction : 2 * direction + 2]
+        clo, chi = coarse_geometry[2 * direction:2 * direction + 2]
+        flo, fhi = fine_geometry[2 * direction:2 * direction + 2]
         touches.append(abs(chi - flo) <= atol or abs(fhi - clo) <= atol)
         overlaps.append(min(chi, fhi) - max(clo, flo) > atol)
 
@@ -176,12 +179,14 @@ def test_subcycling_is_mpi_decomposition_invariant(tmp_path):
     level_counts = dict(zip(levels.tolist(), counts.tolist()))
     assert level_counts == {0: 56, 1: 56, 2: 64}
     assert one_state["n_mbs"] == 176
-    theoretical_updates = sum(count * (1 << level) for level, count in level_counts.items())
+    theoretical_updates = sum(
+        count * (1 << level) for level, count in level_counts.items()
+    )
     assert theoretical_updates == EXPECTED_ROOT_CYCLE_UPDATES
     assert one_updates == EXPECTED_ROOT_CYCLE_UPDATES
     assert three_updates == EXPECTED_ROOT_CYCLE_UPDATES
 
-    expected_remote_faces = {0: 6, 1: 7}
+    expected_remote_faces = {0: 6, 1: 6}
     for coarse_level, expected_faces in expected_remote_faces.items():
         remote_faces = _count_remote_coarse_fine_faces(
             one_state, num_ranks=3, coarse_level=coarse_level
