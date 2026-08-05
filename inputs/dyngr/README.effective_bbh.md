@@ -190,7 +190,7 @@ The paper says density-averaged beta but does not publish its exact averaging fo
 not a claim that the private paper implementation is algebraically identical.  The
 meaning of `torus_mag_target` follows the selected normalization.  Values from different
 choices are not interchangeable, so record the choice, unnormalized ratio, target, and
-applied field scale printed at initialization in run metadata.
+applied field scale printed at full `Real` precision during initialization in run metadata.
 
 Initialization fails if the resolved density peak is below
 `torus_min_grid_peak_fraction*torus_rho_max`, or if fewer than

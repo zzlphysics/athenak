@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -1512,13 +1513,15 @@ void InitializeReferenceFMTorus(MeshBlockPack *pmbp) {
   });
 
   if (global_variable::my_rank == 0) {
-    std::cout << "Reference FM torus initialized: grid rho_max=" << grid_rho_max
+    std::cout << std::setprecision(std::numeric_limits<Real>::max_digits10)
+              << "Reference FM torus initialized: grid rho_max=" << grid_rho_max
               << ", minimum timelike margin=" << min_timelike_margin
               << ", magnetic cells=" << magnetic_cells
               << ", " << TorusMagNormName(torus.mag_norm)
               << " unnormalized ratio=" << unnormalized_ratio
               << ", magnetic scale=" << magnetic_normalization
-              << ", normalized target=" << torus.mag_target << std::endl;
+              << ", normalized target=" << torus.mag_target
+              << std::setprecision(6) << std::endl;
   }
 }
 
