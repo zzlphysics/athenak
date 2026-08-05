@@ -131,6 +131,45 @@ at late times the `h/2,h,2h` triplet can otherwise collapse onto the same float 
 produce a false finite-difference convergence result.  Always confirm the executable with
 `athena -c` before launching.
 
+## Two-A100 infrastructure qualification (2026-08-05)
+
+A compact infrastructure run, deliberately smaller than tier L, exercised four physical
+AMR levels, strict 2:1 level subcycling, the frozen v3 4PN table, reference FM-torus
+initialization, adaptive refinement, shared restart output, and MPI restart on two
+A100-SXM4-40GB GPUs.  The full fresh/restart run used commit `85d552d3`; commit
+`d03ac167` then fixed and requalified a restart-segment-only load-balance diagnostic.
+This does **not** qualify the L/M/H spatial convergence tiers or the H post-merger
+partition.
+
+The host OpenMPI 4.1.2 build was rejected after it reported no CUDA support and failed on
+the first device-buffer send.  An isolated OpenMPI 5.0.9 configured with CUDA reported
+`mpi_built_with_cuda_support=true`; an independent two-rank device-pointer `Sendrecv`
+passed before AthenaK was launched.  AthenaK was linked to that installation rather than
+the system MPI.
+
+The fresh hierarchy began with 1,296 MeshBlocks, split exactly 648/648 at weighted cost
+2,416/2,416.  After two root cycles it had created 1,232 blocks (2,528 total), with
+1,264 blocks and weighted cost 7,636 on each rank.  Fresh and cycle-2-to-4 restart both
+exited zero; the table content fingerprint was identical across segments.  The stable
+post-refinement hierarchy requires 15,272 MeshBlock updates per root cycle under level
+subcycling, versus 40,448 if every block were advanced at the L4 cadence: a 62.2% update
+reduction (2.65x fewer updates), not a claim of equal wall-clock speedup.  Across the two
+fresh topologies the measured count was 20,104 rather than 61,184 updates (67.1%
+reduction).
+
+Peak allocated memory was 27,429 MiB per GPU with `max_nmb_per_rank=2000`, consistent
+with and slightly below the matrix's conservative 14.33 MiB per configured MeshBlock
+slot.  A 2,528-block double-precision restart was 7,024,456,205 bytes, validating the
+restart-byte model to file-header accuracy.  The qualification directory occupied 38
+GiB; only 1.1 MiB of logs, inputs, build/MPI/GPU provenance, histories, and hashes was
+downloaded.  Large checkpoints remain on the retained cloud disk.
+
+The complete SHA-verified metadata is archived under
+`/home/zhangzelin/UGreenNAS/Projects/GRMHD_AthenaK/4pn_amr_campaign/cloud_636963/` in
+`20260805-a100x2-4level-subcycling-85d552d3-metadata-v2` and
+`20260805-a100x2-restart-d03ac167-diagnostic`.  The latter records why an initial wrapper
+marker was a decimal-format false negative and retains the subsequent strict verification.
+
 ## Qualification order
 
 1. Convert and validate the trajectory with
