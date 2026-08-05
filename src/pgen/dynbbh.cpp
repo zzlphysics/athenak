@@ -1499,7 +1499,7 @@ void InitializeReferenceFMTorus(MeshBlockPack *pmbp) {
     Fatal("reference_fm_torus magnetic loop has invalid normalization energy");
   }
 
-  par_for("dynbbh_torus_normalize_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je,
+  par_for("dynbbh_torus_normalize_face_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je,
           is, ie, KOKKOS_LAMBDA(int m, int k, int j, int i) {
     b0.x1f(m,k,j,i) *= magnetic_normalization;
     b0.x2f(m,k,j,i) *= magnetic_normalization;
@@ -1507,6 +1507,14 @@ void InitializeReferenceFMTorus(MeshBlockPack *pmbp) {
     if (i == ie) b0.x1f(m,k,j,i+1) *= magnetic_normalization;
     if (j == je) b0.x2f(m,k,j+1,i) *= magnetic_normalization;
     if (k == ke) b0.x3f(m,k+1,j,i) *= magnetic_normalization;
+  });
+
+  // Reconstruct only after every face has been normalized.  Combining these operations
+  // in one kernel creates a RAW race: a cell can read its upper face while the adjacent
+  // CUDA thread block is still scaling that face.  Besides making bcc nondeterministic,
+  // PrimToConInit() would then construct conserved variables from a stale magnetic field.
+  par_for("dynbbh_torus_normalized_cell_b", DevExeSpace(), 0, nmb-1, ks, ke, js, je,
+          is, ie, KOKKOS_LAMBDA(int m, int k, int j, int i) {
     bcc0(m,IBX,k,j,i) = 0.5*(b0.x1f(m,k,j,i)+b0.x1f(m,k,j,i+1));
     bcc0(m,IBY,k,j,i) = 0.5*(b0.x2f(m,k,j,i)+b0.x2f(m,k,j+1,i));
     bcc0(m,IBZ,k,j,i) = 0.5*(b0.x3f(m,k,j,i)+b0.x3f(m,k+1,j,i));
