@@ -515,6 +515,17 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
 
+  // coarse_b0 is also used as scratch storage while filling coarse/fine boundaries.
+  // For a face normal to such a boundary, that scratch region overlaps the valid
+  // restricted face later consumed by de-refinement.  Rebuild the face-centered coarse
+  // representation from the synchronized fine state before either the MPI or same-rank
+  // migration path reads it.  AMR is only entered at a root-level synchronization point,
+  // so every physical level is at the same simulation time here.
+  if (ndel > 0 && pm->pmb_pack->pmhd != nullptr) {
+    RestrictFC(pm->pmb_pack->pmhd->b0, pm->pmb_pack->pmhd->coarse_b0);
+    Kokkos::fence();
+  }
+
   // Step 4.
   // Allocate send/recv buffers for load balancing, post receives.
   // Pack send buffers for load blancing and send data

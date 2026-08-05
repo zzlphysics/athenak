@@ -22,6 +22,11 @@ MPI_TIMEOUT_SECONDS = 180
 NEGATIVE_MPI_TIMEOUT_SECONDS = 30
 EXPECTED_FULL_UPDATES = 104
 EXPECTED_HALF_UPDATES = 52
+# This bound is deliberately tight enough to catch stale coarse_b0 face data being
+# copied into a newly de-refined parent.  The broken path produces 4.7--4.9e-13 in this
+# problem, while a clean face-centered restriction stays below 9e-14 on both one and
+# three MPI ranks.
+MAX_DIVB = 2.0e-13
 
 
 def _timed_mpi_command(
@@ -331,11 +336,11 @@ def _assert_divb_close(reference, candidate, description):
         candidate_divb,
         reference_divb,
         rtol=0.0,
-        atol=2.0e-11,
+        atol=MAX_DIVB,
         err_msg=f"{description} changed div(B)",
     )
-    assert np.max(np.abs(reference_divb)) < 1.0e-10
-    assert np.max(np.abs(candidate_divb)) < 1.0e-10
+    assert np.max(np.abs(reference_divb)) < MAX_DIVB
+    assert np.max(np.abs(candidate_divb)) < MAX_DIVB
 
 
 def _assert_all_divb_bounded(*run_dirs):
@@ -345,7 +350,7 @@ def _assert_all_divb_bounded(*run_dirs):
             divb = _canonical_field(dump, "divb")
             assert np.isfinite(divb).all(), f"Non-finite div(B) in {path}"
             max_divb = float(np.max(np.abs(divb)))
-            assert max_divb < 1.0e-10, (
+            assert max_divb < MAX_DIVB, (
                 f"Magnetic constraint violation in {path}: "
                 f"max|div(B)|={max_divb:.16e}"
             )
@@ -578,6 +583,16 @@ def test_subcycling_survives_moving_amr_mpi_and_restart(tmp_path):
         rank_file_split_dir,
         rank_file_restart_dir,
     )
+
+    # Cycle 2 is the first simultaneous move: the old fine column is de-refined while
+    # a new column is refined.  This is the earliest point at which stale coarse_b0
+    # boundary scratch used to be copied onto the new parent's active faces.
+    three_divb_by_cycle = _latest_by_cycle(
+        _read_dumps(three_dir, DIVB_VARIABLE)
+    )
+    assert 2 in three_divb_by_cycle
+    cycle_two_divb = _canonical_field(three_divb_by_cycle[2], "divb")
+    assert np.max(np.abs(cycle_two_divb)) < MAX_DIVB
 
     amr_counts = re.findall(
         r"(\d+) MeshBlocks created, (\d+) deleted by AMR", three_log
