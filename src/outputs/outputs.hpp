@@ -144,6 +144,11 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  // Write context used to keep forced final dumps from consuming the next scheduled
+  // output phase.  advance_cadence is transient; last_write_cycle is checkpointed so a
+  // zero-step restart at an overdue endpoint cannot advance the cadence a second time.
+  bool advance_cadence=true;
+  int last_write_cycle=-1;
 };
 
 //----------------------------------------------------------------------------------------
@@ -240,6 +245,12 @@ class BaseTypeOutput {
   }
 
  protected:
+  // Every successful write consumes a file number when the output type has one.  Only
+  // cadence writes (initial or scheduled) advance last_time; forced final writes retain
+  // the existing schedule while still using a new file number.
+  void UpdateOutputParameters(Mesh *pm, ParameterInput *pin,
+                              bool increment_file_number);
+
   // CC output data on host with dims (n,m,k,j,i) except
   // for restarts, where dims are (m,n,k,j,i)
   HostArray5D<Real> outarray;

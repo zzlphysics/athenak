@@ -788,6 +788,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   //---- Step 3.  Cycle through output Types and load data / write files.
   if (!res_flag) { // only write outputs at the beginning of the run
     for (auto &out : pout->pout_list) {
+      out->out_params.advance_cadence = true;
       out->LoadOutputData(pmesh);
       out->WriteOutputFile(pmesh, pin);
     }
@@ -816,6 +817,24 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   }
 
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::OutputDueAtCurrentState()
+//! \brief Test an output cadence using the same float-precision comparison as Execute().
+
+bool Driver::OutputDueAtCurrentState(const BaseTypeOutput *out, const Mesh *pm,
+                                     bool enforce_time_limit) const {
+  // Compare at floating point (32-bit) precision to reduce the effect of round off.
+  const float time_32 = static_cast<float>(pm->time);
+  const float next_32 =
+      static_cast<float>(out->out_params.last_time + out->out_params.dt);
+  const float tlim_32 = static_cast<float>(tlim);
+  const bool time_due = out->out_params.dt > 0.0 && time_32 >= next_32 &&
+                        (!enforce_time_limit || time_32 < tlim_32);
+  const int dcycle = out->out_params.dcycle;
+  const bool cycle_due = dcycle > 0 && pm->ncycle % dcycle == 0;
+  return time_due || cycle_due;
 }
 
 
@@ -932,14 +951,8 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // used by the next root step.  In particular, writing a restart before regridding
       // would cause a resumed run to skip the refinement decision at this endpoint.
       for (auto &out : pout->pout_list) {
-        // compare at floating point (32-bit) precision to reduce effect of round off
-        float time_32 = static_cast<float>(pmesh->time);
-        float next_32 = static_cast<float>(out->out_params.last_time+out->out_params.dt);
-        float tlim_32 = static_cast<float>(tlim);
-        int &dcycle_ = out->out_params.dcycle;
-
-        if (((out->out_params.dt > 0.0) && ((time_32 >= next_32) && (time_32<tlim_32))) ||
-            ((dcycle_ > 0) && ((pmesh->ncycle)%(dcycle_) == 0)) ) {
+        if (OutputDueAtCurrentState(out, pmesh, true)) {
+          out->out_params.advance_cadence = true;
           out->LoadOutputData(pmesh);
           out->WriteOutputFile(pmesh, pin);
         }
@@ -970,6 +983,14 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
   // cycle through output Types and load data / write files
   //  This design allows for asynchronous outputs to implemented in the future.
   for (auto &out : pout->pout_list) {
+    // A final dump is normally an extra, off-cadence snapshot.  Keep its unique file
+    // number, but do not consume the next scheduled phase.  The time-output condition in
+    // Execute suppresses a write exactly at tlim; in that one case the final dump is the
+    // scheduled output and must advance last_time.  If Execute already wrote this endpoint,
+    // last_write_cycle prevents the duplicate final dump from advancing twice.
+    out->out_params.advance_cadence =
+        out->out_params.last_write_cycle != pmesh->ncycle &&
+        OutputDueAtCurrentState(out, pmesh, false);
     out->LoadOutputData(pmesh);
     out->WriteOutputFile(pmesh, pin);
   }

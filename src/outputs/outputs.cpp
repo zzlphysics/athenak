@@ -84,6 +84,8 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
 
       // set file number, basename, and format
       opar.file_number = pin->GetOrAddInteger(opar.block_name,"file_number",0);
+      opar.last_write_cycle =
+          pin->GetOrAddInteger(opar.block_name, "last_write_cycle", -1);
       opar.file_basename = pin->GetString("job","basename");
       opar.file_type = pin->GetString(opar.block_name,"file_type");
 

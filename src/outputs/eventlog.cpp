@@ -93,7 +93,6 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       std::fprintf(pfile,"#  cycle eos_dfloor eos_efloor eos_tfloor eos_vceil");
       std::fprintf(pfile," eos_fail c2p_it fofc");
       std::fprintf(pfile,"\n");  // terminate line
-      header_written = true;
     }
 
     // write event counters
@@ -110,6 +109,9 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     }
     std::fclose(pfile);
   }
+  // Keep control flow and persisted output-cadence state identical on every rank.  Only
+  // rank zero owns the file, but all ranks participated in this first header attempt.
+  header_written = true;
 
   // reset counters
   pm->ecounter.neos_dfloor = 0;
@@ -120,12 +122,6 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   pm->ecounter.maxit_c2p = 0;
   pm->ecounter.nfofc = 0;
 
-  // increment output time, clean up
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  UpdateOutputParameters(pm, pin, false);
   return;
 }

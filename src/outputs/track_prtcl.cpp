@@ -163,12 +163,6 @@ void TrackedParticleOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   partfile.Close();
   delete[] data;
 
-  // increment counters
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  UpdateOutputParameters(pm, pin, false);
   return;
 }

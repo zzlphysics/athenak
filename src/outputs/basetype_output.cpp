@@ -850,3 +850,30 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
     }
   }
 }
+
+//----------------------------------------------------------------------------------------
+//! \fn void BaseTypeOutput::UpdateOutputParameters()
+//! \brief Persist counters after a successful output write without necessarily advancing
+//! the scheduled output phase.
+
+void BaseTypeOutput::UpdateOutputParameters(Mesh *pm, ParameterInput *pin,
+                                            bool increment_file_number) {
+  if (increment_file_number) {
+    ++out_params.file_number;
+    pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
+  }
+
+  if (out_params.advance_cadence) {
+    if (out_params.last_time < 0.0) {
+      out_params.last_time = pm->time;
+    } else {
+      out_params.last_time += out_params.dt;
+    }
+  }
+  // Keep ParameterInput synchronized even for a forced final write.  Restart output is
+  // ordered last and serializes these exact values into its checkpoint header.
+  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  out_params.last_write_cycle = pm->ncycle;
+  pin->SetInteger(out_params.block_name, "last_write_cycle",
+                  out_params.last_write_cycle);
+}
