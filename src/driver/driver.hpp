@@ -84,6 +84,7 @@ class Driver {
   float lb_efficiency_;         // measure of how efficient was load balancing
   std::uint64_t lb_efficiency_samples_; // completed cycles sampled in this run segment
   int finest_occupied_level_ = -1; // cached global leaf-tree depth for current root step
+  Real root_dt_max_ = 0.0;      // optional synchronized root-step cap; zero disables it
   void OutputCycleDiagnostics(Mesh *pm);
   Real UpdateWallClock();
   void ValidateLevelSubcyclingConfiguration(ParameterInput *pin, Mesh *pmesh) const;

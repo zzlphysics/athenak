@@ -103,6 +103,25 @@ Driver::Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptim
       }
       std::exit(EXIT_FAILURE);
     }
+
+    // This cap is deliberately opt-in: leaving it absent preserves both the legacy
+    // parameter dump and timestep path.  Validate an explicit value even when level
+    // subcycling is disabled, but only arm it for the strict level scheduler.
+    if (pin->DoesParameterExist("time", "root_dt_max")) {
+      const Real configured_root_dt_max = pin->GetReal("time", "root_dt_max");
+      if (!std::isfinite(configured_root_dt_max) || !(configured_root_dt_max > 0.0)) {
+        if (global_variable::my_rank == 0) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl
+                    << "<time>/root_dt_max must be finite and greater than zero."
+                    << std::endl;
+        }
+        std::exit(EXIT_FAILURE);
+      }
+      if (subcycling_mode == SubcyclingMode::level) {
+        root_dt_max_ = configured_root_dt_max;
+      }
+    }
   }
 
   // read <time> parameters controlling driver if run requires time-evolution
@@ -516,6 +535,9 @@ void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
     if (previous_dt > 0.0 && std::isfinite(previous_dt)) {
       next_dt = std::min(next_dt, static_cast<Real>(2.0)*previous_dt);
     }
+  }
+  if (root_dt_max_ > 0.0) {
+    next_dt = std::min(next_dt, root_dt_max_);
   }
   if ((pmesh->time < tlim) && (pmesh->time + next_dt > tlim)) {
     next_dt = tlim - pmesh->time;

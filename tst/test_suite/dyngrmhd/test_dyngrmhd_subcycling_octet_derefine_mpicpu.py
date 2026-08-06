@@ -2,11 +2,13 @@
 
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import athena_read
 import bin_convert
 import test_suite.testutils as testutils
 
@@ -23,7 +25,14 @@ EXPECTED_RESTART_UPDATES = 38
 MAX_TEST_OUTPUT_BYTES = 64 * 1024 * 1024
 
 
-def _run_mpi(run_dir: Path, ranks: int, restart=None, nlim=4, overrides=()):
+def _run_mpi(
+    run_dir: Path,
+    ranks: int,
+    restart=None,
+    nlim=4,
+    overrides=(),
+    input_file=INPUT_FILE,
+):
     """Run Athena under a process-tree timeout and return this run's log."""
     timeout_executable = shutil.which("timeout")
     assert timeout_executable is not None, "GNU timeout is required by this MPI test"
@@ -39,7 +48,7 @@ def _run_mpi(run_dir: Path, ranks: int, restart=None, nlim=4, overrides=()):
         "./athena",
     ]
     if restart is None:
-        command += ["-i", INPUT_FILE]
+        command += ["-i", str(Path(input_file).resolve())]
     else:
         command += ["-r", str(Path(restart).resolve())]
     command += [
@@ -61,6 +70,75 @@ def _run_mpi(run_dir: Path, ranks: int, restart=None, nlim=4, overrides=()):
         f"{log_output[-8000:]}"
     )
     return log_output
+
+
+def _run_mpi_expect_failure(run_dir: Path, input_file: Path):
+    """Require invalid root-step parameters to fail promptly and diagnostically."""
+    timeout_executable = shutil.which("timeout")
+    assert timeout_executable is not None, "GNU timeout is required by this MPI test"
+    command = [
+        timeout_executable,
+        "--signal=TERM",
+        "--kill-after=10s",
+        "30s",
+        "mpirun",
+        "-np",
+        "1",
+        "./athena",
+        "-i",
+        str(input_file.resolve()),
+        "-d",
+        str(run_dir),
+        f"job/basename={BASENAME}",
+        "time/nlim=0",
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    assert result.returncode not in (0, 124, 137), (
+        "Invalid <time>/root_dt_max did not fail promptly:\n"
+        f"{result.stdout[-8000:]}"
+    )
+    assert re.search(
+        r"<time>/root_dt_max must be finite and greater than zero", result.stdout
+    ), result.stdout[-8000:]
+
+
+def _input_with_root_dt_max(
+    tmp_path: Path, name: str, value=None, subcycling="level"
+):
+    """Create a test-local input while keeping the checked-in default cap-free."""
+    source = Path(INPUT_FILE).resolve()
+    contents = source.read_text(encoding="utf-8")
+    replacement = f"subcycling = {subcycling}"
+    if value is not None:
+        replacement += f"\nroot_dt_max = {value}"
+    contents, count = re.subn(
+        r"(?m)^subcycling\s*=\s*\S+\s*$", replacement, contents, count=1
+    )
+    assert count == 1, f"Unable to locate <time>/subcycling in {source}"
+    output = tmp_path / f"{name}.athinput"
+    output.write_text(contents, encoding="utf-8")
+    return output
+
+
+def _history_time_and_dt(run_dir: Path):
+    history_path = run_dir / f"{BASENAME}.mhd.hst"
+    assert history_path.is_file(), f"Missing history file {history_path}"
+    history = athena_read.hst(str(history_path), raw=True)
+    return np.asarray(history["time"]), np.asarray(history["dt"])
+
+
+def _restart_parameter_text(path: Path):
+    contents = path.read_bytes()
+    marker = b"<par_end>\n"
+    marker_offset = contents.find(marker)
+    assert marker_offset >= 0, f"Missing ParameterInput terminator in {path}"
+    return contents[:marker_offset].decode("utf-8")
 
 
 def _read_dumps(run_dir: Path, variable: str):
@@ -208,6 +286,99 @@ def _communicated_blocks(log_output):
     matches = re.findall(r"(\d+) communicated for load balancing", log_output)
     assert matches, "Run log did not report load-balancing communication"
     return int(matches[-1])
+
+
+def test_subcycling_root_dt_max_is_opt_in_validated_and_restartable(tmp_path):
+    cap = 1.0e-4
+
+    for index, invalid in enumerate(("0", "-1", "nan", "inf")):
+        invalid_input = _input_with_root_dt_max(
+            tmp_path, f"invalid_{index}", invalid
+        )
+        _run_mpi_expect_failure(tmp_path / f"invalid_run_{index}", invalid_input)
+
+    # Omitting the parameter retains the historical level-subcycling CFL step.
+    default_dir = tmp_path / "level_default"
+    _run_mpi(default_dir, ranks=1, nlim=1)
+    default_times, default_dt = _history_time_and_dt(default_dir)
+    assert default_times[0] == pytest.approx(0.0, abs=0.0)
+    assert default_dt[0] > 10.0 * cap
+
+    # The cap applies to both the initial root step and the subsequent growth phase.
+    cap_input = _input_with_root_dt_max(tmp_path, "capped", f"{cap:.17e}")
+    continuous_dir = tmp_path / "capped_continuous"
+    _run_mpi(
+        continuous_dir,
+        ranks=1,
+        nlim=2,
+        input_file=cap_input,
+        overrides=("output4/dcycle=1",),
+    )
+    continuous_times, continuous_dt = _history_time_and_dt(continuous_dir)
+    np.testing.assert_allclose(
+        np.unique(continuous_times),
+        np.asarray((0.0, cap, 2.0 * cap)),
+        rtol=2.0e-14,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(continuous_dt, cap, rtol=2.0e-14, atol=0.0)
+
+    # An explicit value is accepted but has no timestep effect in legacy mode.
+    legacy_default_input = _input_with_root_dt_max(
+        tmp_path, "legacy_default", subcycling="none"
+    )
+    legacy_capped_input = _input_with_root_dt_max(
+        tmp_path, "legacy_with_ignored_cap", f"{cap:.17e}", subcycling="none"
+    )
+    legacy_default_dir = tmp_path / "legacy_default"
+    legacy_capped_dir = tmp_path / "legacy_with_ignored_cap"
+    _run_mpi(
+        legacy_default_dir, ranks=1, nlim=2, input_file=legacy_default_input
+    )
+    _run_mpi(
+        legacy_capped_dir, ranks=1, nlim=2, input_file=legacy_capped_input
+    )
+    legacy_default_time, legacy_default_dt = _history_time_and_dt(legacy_default_dir)
+    legacy_capped_time, legacy_capped_dt = _history_time_and_dt(legacy_capped_dir)
+    np.testing.assert_array_equal(legacy_capped_time, legacy_default_time)
+    np.testing.assert_array_equal(legacy_capped_dt, legacy_default_dt)
+    assert legacy_capped_dt[0] > 10.0 * cap
+
+    # ParameterInput is serialized in the checkpoint and must re-arm the same cap
+    # without a command-line override after restart.
+    split_dir = tmp_path / "capped_split"
+    _run_mpi(
+        split_dir,
+        ranks=1,
+        nlim=1,
+        input_file=cap_input,
+        overrides=("output4/dcycle=1",),
+    )
+    split_restarts = sorted((split_dir / "rst").glob(f"{BASENAME}.*.rst"))
+    assert split_restarts, "Expected capped split checkpoint"
+    split_restart = split_restarts[-1]
+    parameter_text = _restart_parameter_text(split_restart)
+    assert re.search(
+        rf"(?m)^\s*root_dt_max\s*=\s*{re.escape(f'{cap:.17e}')}\s*$",
+        parameter_text,
+    )
+
+    restart_dir = tmp_path / "capped_restart"
+    _run_mpi(
+        restart_dir,
+        ranks=1,
+        restart=split_restart,
+        nlim=2,
+        overrides=("output4/dcycle=1",),
+    )
+    restart_times, restart_dt = _history_time_and_dt(restart_dir)
+    np.testing.assert_allclose(restart_times, 2.0 * cap, rtol=2.0e-14, atol=0.0)
+    np.testing.assert_allclose(restart_dt, cap, rtol=2.0e-14, atol=0.0)
+    restart_restarts = sorted(
+        (restart_dir / "rst").glob(f"{BASENAME}.*.rst")
+    )
+    assert restart_restarts, "Expected checkpoint after capped restart"
+    assert "root_dt_max" in _restart_parameter_text(restart_restarts[-1])
 
 
 def test_subcycling_preserves_divb_on_anisotropic_2d_cells(tmp_path):
