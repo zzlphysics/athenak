@@ -92,6 +92,7 @@ struct BBHParameters {
   Real refinement_floor_center[3];
   int refinement_floor_level;
   Real run_end_time;
+  Real root_dt_max;
   binary_bh::MetricParameters metric;
 };
 
@@ -657,6 +658,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   bbh.refinement_floor_level =
       pin->GetOrAddInteger("problem", "refinement_floor_level", 0);
   bbh.run_end_time = pin->GetReal("time", "tlim");
+  bbh.root_dt_max = 0.0;
+  if (pin->DoesParameterExist("time", "subcycling") &&
+      pin->GetString("time", "subcycling") == "level" &&
+      pin->DoesParameterExist("time", "root_dt_max")) {
+    bbh.root_dt_max = pin->GetReal("time", "root_dt_max");
+  }
   bbh.metric.mass_scale1 = pin->GetOrAddReal("problem", "mass_scale1",
       pin->GetOrAddReal("problem", "adjust_mass1", 1.0));
   bbh.metric.mass_scale2 = pin->GetOrAddReal("problem", "mass_scale2",
@@ -1009,7 +1016,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       for (std::size_t level=1; level<refinement_shell_radii.size(); ++level) {
         std::cout << " L" << level << "=" << refinement_shell_radii[level];
       }
-      std::cout << ", horizon factor=" << bbh.refinement_horizon_factor << std::endl;
+      std::cout << ", horizon factor=" << bbh.refinement_horizon_factor;
+      if (bbh.root_dt_max > 0.0) {
+        std::cout << ", root-step lookahead cap=" << bbh.root_dt_max;
+      }
+      std::cout << std::endl;
       if (bbh.refinement_floor_level > 0) {
         std::cout << "BBH AMR resolution floor: radius="
                   << bbh.refinement_floor_radius << " through L"
@@ -2573,7 +2584,14 @@ void RefineTracker(MeshBlockPack *pmbp) {
   // covered by the same speed bound so a final checkpoint can safely extend its tlim.
   const Real last_dt = (std::isfinite(pmesh->dt) && pmesh->dt > 0.0) ? pmesh->dt : 0.0;
   const Real remaining_time = std::max(bbh.run_end_time-pmesh->time, Real(0.0));
-  const Real lookahead = 2.0*last_dt;
+  Real lookahead = 2.0*last_dt;
+  // The strict level scheduler may impose a tighter absolute root-step ceiling than
+  // its generic factor-two growth limiter.  Honor that same reachable-step bound here;
+  // otherwise moving-hole AMR creates and audits a halo for a timestep the Driver can
+  // never take, which can cause a one-level startup transient and needless memory use.
+  if (bbh.root_dt_max > 0.0) {
+    lookahead = std::min(lookahead, bbh.root_dt_max);
+  }
   const Real sample_horizon = std::min(lookahead, remaining_time);
   const Real sample_times[3] = {
     pmesh->time, pmesh->time+static_cast<Real>(0.5)*sample_horizon,
