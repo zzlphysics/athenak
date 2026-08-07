@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "campaign_id": "effective-bbh-4pn-amr-convergence-v1",
+  "schema_version": 2,
+  "campaign_id": "effective-bbh-4pn-amr-convergence-v2",
   "status": "qualification_candidate_not_publication_certification",
   "trajectory": {
     "declared_model": "4PN_to_single_remnant",
@@ -132,7 +132,20 @@
         "premerger_weighted_meshblock_cycles_per_root_cycle": 336872,
         "postmerger_2p5M_guard_meshblocks": 3480,
         "postmerger_2p5M_guard_weighted_meshblock_cycles_per_root_cycle": 711272,
-        "campaign_meshblock_gate": 8690,
+        "rootcap_runtime_observation": {
+          "classification": "L-tier-rootcap-runtime-and-full-trajectory-capacity-sweep",
+          "commit": "f8fa04191e435bab5e0bbee0ffd45fdac88742e9",
+          "evidence_sha256": "cc40081b1b6b2c499f596c4f685ee8e037e35327bff1c23b3222066476bf2132",
+          "root_dt_max_M": 4.8,
+          "executed_peak_cycle": 2,
+          "executed_peak_time_M": 9.6,
+          "executed_peak_meshblocks": 14372,
+          "peak_meshblocks": 14470,
+          "peak_meshblocks_source": "full-trajectory rootcap-aware capacity sweep",
+          "mpi_ranks": 4,
+          "peak_meshblocks_per_rank": 3899
+        },
+        "campaign_meshblock_gate": 18088,
         "rank_partition_qualification": {
           "topology_artifact": "frozen-v3 reference-offset initial preseed",
           "mesh_structure_sha256": "09f834aba0cc50616b6d912fae53a598eb624434db085110ca8957fef6497e9a",
@@ -144,11 +157,13 @@
         }
       },
       "resource_gate": {
-        "aggregate_memory_lower_bound_A100_40G_gpus": 4,
-        "qualified_launch_A100_40G_gpus": 4,
+        "aggregate_memory_lower_bound_A100_40G_gpus": 8,
+        "partition_qualified_launch_gpus": 4,
+        "minimum_gpu_memory_GiB_at_qualified_count": 80,
+        "runtime_qualification_status": "rootcap-runtime-qualified-through-10-cycles",
         "minimum_streaming_scratch_GiB": 128,
-        "projected_undrained_output_GiB_at_10000M": 749.4,
-        "minimum_undrained_scratch_GiB_at_10000M": 940
+        "projected_undrained_output_GiB_at_10000M": 1559.7,
+        "minimum_undrained_scratch_GiB_at_10000M": 1950
       }
     },
     "M": {
@@ -175,7 +190,20 @@
         "premerger_weighted_meshblock_cycles_per_root_cycle": 2978792,
         "postmerger_2p5M_guard_meshblocks": 8520,
         "postmerger_2p5M_guard_weighted_meshblock_cycles_per_root_cycle": 6240872,
-        "campaign_meshblock_gate": 12470,
+        "rootcap_runtime_observation": {
+          "classification": "M-tier-four-rank-cycle1-to-cycle2-capacity-probe",
+          "commit": "81fb52512818481b36d77152762adf54fa17406a",
+          "evidence_sha256": "120107164b8c4923f243fdc4b46648373cde9e0919e76343d5d4f806ba9ed973",
+          "root_dt_max_M": 4.8,
+          "executed_peak_cycle": 2,
+          "executed_peak_time_M": 9.6,
+          "executed_peak_meshblocks": 22604,
+          "peak_meshblocks": 22604,
+          "peak_meshblocks_source": "executed four-rank rootcap-aware cycle-2 probe",
+          "mpi_ranks": 4,
+          "peak_meshblocks_per_rank": 5651
+        },
+        "campaign_meshblock_gate": 28255,
         "rank_partition_qualification": {
           "topology_artifact": "frozen-v3 reference-offset initial preseed",
           "mesh_structure_sha256": "edf4c8723b5bcadb911a543dd5c0ab8e1f236fb271dad0045407b8730d0c2c34",
@@ -187,11 +215,13 @@
         }
       },
       "resource_gate": {
-        "aggregate_memory_lower_bound_A100_40G_gpus": 6,
-        "qualified_launch_A100_40G_gpus": 8,
+        "aggregate_memory_lower_bound_A100_40G_gpus": 13,
+        "partition_qualified_launch_gpus": 8,
+        "minimum_gpu_memory_GiB_at_qualified_count": 80,
+        "runtime_qualification_status": "candidate-pending-eight-rank-runtime-qualification",
         "minimum_streaming_scratch_GiB": 256,
-        "projected_undrained_output_GiB_at_10000M": 1075.3,
-        "minimum_undrained_scratch_GiB_at_10000M": 1350
+        "projected_undrained_output_GiB_at_10000M": 2436.4,
+        "minimum_undrained_scratch_GiB_at_10000M": 3050
       }
     },
     "H": {
@@ -232,7 +262,9 @@
       },
       "resource_gate": {
         "aggregate_memory_lower_bound_A100_40G_gpus": 25,
-        "qualified_launch_A100_40G_gpus": 32,
+        "partition_qualified_launch_gpus": 32,
+        "minimum_gpu_memory_GiB_at_qualified_count": 40,
+        "runtime_qualification_status": "topology-only-pending-runtime-qualification",
         "minimum_streaming_scratch_GiB": 512,
         "projected_undrained_output_GiB_at_10000M": 4775.4,
         "minimum_undrained_scratch_GiB_at_10000M": 6000

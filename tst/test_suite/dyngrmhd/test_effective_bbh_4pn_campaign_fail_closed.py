@@ -181,6 +181,35 @@ def _write_synthetic_campaign_artifacts(tmp_path: Path) -> tuple[Path, ...]:
     return trajectory, provenance_path, source_artifact, custom_matrix
 
 
+def test_lm_runtime_observations_set_fail_closed_resource_gates():
+    matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    GENERATOR.validate_matrix(matrix)
+    assert matrix["schema_version"] == 2
+    assert matrix["tiers"]["L"]["topology_estimate"][
+        "campaign_meshblock_gate"
+    ] == 18088
+    assert matrix["tiers"]["M"]["topology_estimate"][
+        "campaign_meshblock_gate"
+    ] == 28255
+    assert matrix["tiers"]["L"]["resource_gate"][
+        "minimum_gpu_memory_GiB_at_qualified_count"
+    ] == 80
+    assert matrix["tiers"]["M"]["resource_gate"][
+        "minimum_gpu_memory_GiB_at_qualified_count"
+    ] == 80
+
+
+def test_missing_l_runtime_observation_is_rejected():
+    matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    del matrix["tiers"]["L"]["topology_estimate"][
+        "rootcap_runtime_observation"
+    ]
+    with pytest.raises(
+        GENERATOR.CampaignError, match="rootcap runtime observation is required"
+    ):
+        GENERATOR.validate_matrix(matrix)
+
+
 def test_default_offset_covers_the_first_metric_fd_stencil(tmp_path):
     """The CLI default leaves a complete centered metric stencil at t=0."""
     trajectory, provenance, source_artifact, matrix_path = (
@@ -200,6 +229,8 @@ def test_default_offset_covers_the_first_metric_fd_stencil(tmp_path):
         str(matrix_path),
         "--gpus",
         "4",
+        "--gpu-memory-gib",
+        "80",
         "--scratch-gib",
         "10000",
         "--validate-only",
@@ -249,6 +280,8 @@ def test_generated_input_declares_cfl_scaled_root_dt_cap(
         str(matrix_path),
         "--gpus",
         "4",
+        "--gpu-memory-gib",
+        "80",
         "--scratch-gib",
         "10000",
         "--tlim",

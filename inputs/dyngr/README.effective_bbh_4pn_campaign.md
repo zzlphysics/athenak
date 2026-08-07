@@ -11,15 +11,16 @@ The three spatial tiers use the same `[-1024M,1024M]^3` domain, `128^3` root gri
 floor keeps `r<=80M` at least at physical L4 (`dx=M`); moving-hole shell radii are listed
 explicitly at every level.  Only the inner levels change between tiers.
 
-| tier | finest level | finest `dx` | MeshBlock gate | generated `max_nmb/rank` | A100-40G aggregate-memory lower bound / qualified launch | streaming scratch | undrained scratch for `10000M` |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| L | L9 | `M/32` | 8,690 | 2,176 | 4 / 4 | 128 GiB | 940 GiB |
-| M | L10 | `M/64` | 12,470 | 1,600 | 6 / 8 | 256 GiB | 1,350 GiB |
-| H | L11 | `M/128` | 55,380 | 2,048 | 25 / 32 | 512 GiB | 6,000 GiB |
+| tier | finest level | finest `dx` | MeshBlock gate | generated `max_nmb/rank` | A100-40G aggregate lower bound | accepted launch layout | streaming scratch | undrained scratch for `10000M` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| L | L9 | `M/32` | 18,088 | 4,544 | 8 | 4 x A100-80G | 128 GiB | 1,950 GiB |
+| M | L10 | `M/64` | 28,255 | 3,584 | 13 | candidate 8 x A100-80G | 256 GiB | 3,050 GiB |
+| H | L11 | `M/128` | 55,380 | 2,048 | 25 | topology-only 32 x A100-40G | 512 GiB | 6,000 GiB |
 
 The gate is 1.25 times the larger of (a) the actual initial hierarchy reported by
-AthenaK `-m`, (b) an alignment probe, and (c) the post-merger `2.5M` horizon-guard topology
-model.  For the frozen v3 table at its reference offset, initial preseeding is
+AthenaK `-m`, (b) an alignment probe, (c) the post-merger `2.5M` horizon-guard topology
+model, and (d) an archived root-step-capped runtime or capacity-sweep observation when
+one exists.  For the frozen v3 table at its reference offset, initial preseeding is
 6,952/9,976/37,024 MeshBlocks for L/M/H; a nearby H alignment probe reaches 40,440.  These
 are artifact-and-phase-qualified measurements, not universal counts for arbitrary q=1
 tables.  The central L4 cube is intentionally larger than the persistent spherical floor
@@ -27,10 +28,19 @@ so the torus is never initialized on the root grid.  The post-merger model still
 H (44,304 MeshBlocks before margin), and every newly generated input must be rechecked
 with AthenaK `-m` before allocation.
 
-The 4/6/25 values are arithmetic aggregate-memory lower bounds only; they are **not**
-approved launch layouts.  This frozen matrix accepts exactly L/4, M/8, or H/32 MPI
-ranks/GPUs.  Any other count fails closed until a real GID-ordered topology partition and
-peak-memory run at that count are archived and the matrix is revised.
+The L rootcap run reached 14,372 MeshBlocks at cycle 2; its trajectory-wide capacity
+sweep reached 14,470 total blocks and a 3,899-block rank peak.  The M four-rank probe
+reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 2
+archives the evidence hashes and uses 18,088/28,255 blocks after the 25% margin.  The M
+observation is a capacity input, not an eight-rank qualification result.
+
+The 8/13/25 values are arithmetic A100-40G aggregate-memory lower bounds only; they are
+**not** approved launch layouts.  The per-rank allocation rejects 40G for L and M.  This
+frozen matrix accepts exactly L/4 on 80G, M/8 on 80G, or H/32 on 40G MPI ranks/GPUs.  M/8
+remains a candidate layout until the real eight-rank runtime and partition evidence are
+archived; H remains topology-only.  Any other count fails closed until a real GID-ordered
+topology partition and peak-memory run at that count are archived and the matrix is
+revised.
 
 `max_nmb_per_rank` is not computed from `total/ranks` alone.  The generated value is the
 larger of the rounded global campaign gate per rank and an artifact-qualified contiguous-
@@ -42,6 +52,11 @@ peak and rounding to 64 gives hard floors 1,920/1,408/2,048 for L/M/H.  Therefor
 2,048 even though `55,380/32` rounded to 64 is only 1,792.  The matrix pins each
 `mesh_structure.dat` SHA-256; file-order replay is invalid because that file is grouped by
 physical level and must first be sorted by its `#MeshBlock GID`.
+
+For L/M the larger gate-derived allocations, 4,544 and 3,584 blocks/rank, now dominate
+those initial-partition floors.  L's separately archived full-sweep rank peak of 3,899 is
+also below the new allocation.  M/8 must still verify the actual weighted partition; a
+global total divided by eight is not treated as evidence of rank balance.
 
 The aggregate GPU lower bounds are not performance or launch recommendations.  H is a
 multi-node-size job on ordinary 8-GPU hosts; do not launch it over slow Ethernet merely
@@ -81,12 +96,13 @@ python3 inputs/dyngr/generate_effective_bbh_4pn_campaign.py L \
   --trajectory-provenance /data/trajectories/q1_4pn_to_remnant.dat.provenance.json \
   --source-artifact /data/trajectories/circular_orbit_PN_sep20.h5 \
   --expected-source-revision 2ce68e3d49e8758b32efc8841d239354d8d619d6 \
-  --gpus 4 --gpu-memory-gib 40 --scratch-gib 128 \
+  --gpus 4 --gpu-memory-gib 80 --scratch-gib 128 \
   --streaming-drain --drain-mib-s 8 \
   --output /data/athenak/run-L/effective_bbh_4pn_L.athinput
 ```
 
-Use `--gpus 8 --scratch-gib 256` for M and `--gpus 32 --scratch-gib 512` for H.
+Use `--gpus 8 --gpu-memory-gib 80 --scratch-gib 256` for the M qualification candidate
+and `--gpus 32 --gpu-memory-gib 40 --scratch-gib 512` for H topology qualification.
 `--validate-only` performs every trajectory/resource/storage check without writing an
 input.  `tlim` defaults to the table endpoint minus the metric finite-difference padding;
 use `--tlim` for a short qualification segment.  Unless explicitly supplied,

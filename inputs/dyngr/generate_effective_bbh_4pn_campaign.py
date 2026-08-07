@@ -163,7 +163,7 @@ def load_matrix(path: Path) -> dict[str, object]:
 
 
 def validate_matrix(matrix: dict[str, object]) -> None:
-    if matrix.get("schema_version") != 1:
+    if matrix.get("schema_version") != 2:
         raise CampaignError("unsupported campaign matrix schema")
     common = matrix["common"]
     mesh = common["mesh"]
@@ -226,14 +226,59 @@ def validate_matrix(matrix: dict[str, object]) -> None:
             raise CampaignError(f"tier {name}: finest_dx_M is inconsistent")
         topology = tier["topology_estimate"]
         margin = float(common["resource_model"]["topology_margin_fraction"])
-        required_gate = math.ceil(
-            max(
-                int(topology["initial_preseed_meshblocks_athena_m"]),
-                int(topology["initial_preseed_alignment_probe_max_meshblocks"]),
-                int(topology["postmerger_2p5M_guard_meshblocks"]),
+        gate_candidates = [
+            int(topology["initial_preseed_meshblocks_athena_m"]),
+            int(topology["initial_preseed_alignment_probe_max_meshblocks"]),
+            int(topology["postmerger_2p5M_guard_meshblocks"]),
+        ]
+        observation = topology.get("rootcap_runtime_observation")
+        if name in {"L", "M"} and not isinstance(observation, dict):
+            raise CampaignError(
+                f"tier {name}: a rootcap runtime observation is required"
             )
-            * (1.0 + margin)
-        )
+        if observation is not None:
+            if not isinstance(observation, dict):
+                raise CampaignError(
+                    f"tier {name}: rootcap runtime observation must be an object"
+                )
+            observation_sha = observation.get("evidence_sha256")
+            observation_commit = observation.get("commit")
+            if not isinstance(observation_sha, str) or re.fullmatch(
+                r"[0-9a-f]{64}", observation_sha
+            ) is None:
+                raise CampaignError(
+                    f"tier {name}: runtime-observation evidence SHA-256 is invalid"
+                )
+            if not isinstance(observation_commit, str) or re.fullmatch(
+                r"[0-9a-f]{40}", observation_commit
+            ) is None:
+                raise CampaignError(
+                    f"tier {name}: runtime-observation commit is invalid"
+                )
+            observed_root_dt = float(observation["root_dt_max_M"])
+            expected_root_dt = float(time["cfl_number"]) * root_dx
+            if not math.isclose(
+                observed_root_dt, expected_root_dt, rel_tol=0.0, abs_tol=1e-14
+            ):
+                raise CampaignError(
+                    f"tier {name}: runtime observation used a different root-step cap"
+                )
+            observed_peak = int(observation["peak_meshblocks"])
+            executed_peak = int(observation["executed_peak_meshblocks"])
+            observed_ranks = int(observation["mpi_ranks"])
+            observed_rank_peak = int(observation["peak_meshblocks_per_rank"])
+            if (
+                observed_peak <= 0
+                or executed_peak <= 0
+                or observed_peak < executed_peak
+                or observed_ranks <= 0
+                or observed_rank_peak < math.ceil(executed_peak / observed_ranks)
+            ):
+                raise CampaignError(
+                    f"tier {name}: invalid rootcap runtime topology observation"
+                )
+            gate_candidates.append(observed_peak)
+        required_gate = math.ceil(max(gate_candidates) * (1.0 + margin))
         if int(topology["campaign_meshblock_gate"]) != required_gate:
             raise CampaignError(
                 f"tier {name}: MeshBlock gate must equal the larger measured topology "
@@ -274,9 +319,9 @@ def validate_matrix(matrix: dict[str, object]) -> None:
                 f"{rank_margin:.0%}, rounded to {rounding}"
             )
         resource_gate = tier["resource_gate"]
-        if int(resource_gate["qualified_launch_A100_40G_gpus"]) != qualified_ranks:
+        if int(resource_gate["partition_qualified_launch_gpus"]) != qualified_ranks:
             raise CampaignError(
-                f"tier {name}: qualified launch count must match the partition audit"
+                f"tier {name}: partition-qualified launch count must match the audit"
             )
         per_block_mib = float(resource["empirical_peak_MiB_per_meshblock"])
         usable_mib = 40.0 * 1024.0 * float(resource["gpu_memory_usable_fraction"])
@@ -286,6 +331,54 @@ def validate_matrix(matrix: dict[str, object]) -> None:
         ):
             raise CampaignError(
                 f"tier {name}: aggregate A100-40G memory lower bound is inconsistent"
+            )
+        minimum_gpu_memory_gib = float(
+            resource_gate["minimum_gpu_memory_GiB_at_qualified_count"]
+        )
+        qualified_capacity = math.floor(
+            minimum_gpu_memory_gib
+            * 1024.0
+            * float(resource["gpu_memory_usable_fraction"])
+            / per_block_mib
+        )
+        qualified_gate_per_rank = (
+            math.ceil((required_gate / qualified_ranks) / rounding) * rounding
+        )
+        qualified_allocation = max(qualified_gate_per_rank, hard_floor)
+        if qualified_allocation > qualified_capacity:
+            raise CampaignError(
+                f"tier {name}: declared qualified GPU memory cannot hold the "
+                "campaign per-rank allocation"
+            )
+        outputs = common["outputs"]
+        reference_duration = float(resource["reference_duration_M"])
+        output_bytes = outputs["estimated_bytes_per_meshblock"]
+        projected_reference_gib = sum(
+            (math.floor(reference_duration / float(cadence)) + 2)
+            * required_gate
+            * int(output_bytes[key])
+            for cadence, key in (
+                (outputs["full_state_dt_M"], "full_state_mhd_w_bcc"),
+                (outputs["divb_dt_M"], "divb"),
+                (outputs["restart_dt_M"], "restart_double_precision_dynadm"),
+            )
+        ) / 2**30
+        reported_projection = float(
+            resource_gate["projected_undrained_output_GiB_at_10000M"]
+        )
+        if not (
+            projected_reference_gib <= reported_projection
+            < projected_reference_gib + 0.1
+        ):
+            raise CampaignError(
+                f"tier {name}: reference output projection is inconsistent"
+            )
+        minimum_undrained = int(
+            resource_gate["minimum_undrained_scratch_GiB_at_10000M"]
+        )
+        if minimum_undrained < math.ceil(1.25 * projected_reference_gib):
+            raise CampaignError(
+                f"tier {name}: undrained scratch does not include the 25% margin"
             )
 
 
@@ -869,6 +962,14 @@ def validate_resources(
             f"ranks/GPUs, not {args.gpus}; run a real GID-ordered topology and peak-memory "
             f"qualification, then update the campaign matrix before using another count"
         )
+    minimum_qualified_memory = float(
+        tier["resource_gate"]["minimum_gpu_memory_GiB_at_qualified_count"]
+    )
+    if args.gpu_memory_gib < minimum_qualified_memory:
+        raise CampaignError(
+            f"tier {args.tier} requires at least {minimum_qualified_memory:g} GiB/GPU "
+            "at its partition-qualified rank count"
+        )
     rounding = int(resource["max_nmb_rounding"])
     gate_based_max_nmb = math.ceil((gate_blocks / args.gpus) / rounding) * rounding
     partition_floor = int(
@@ -1331,11 +1432,18 @@ def main() -> int:
             "maximum_hermite_middle_control_speed": summary.maximum_middle_control_speed,
             "finest_dx_M": tier["finest_dx_M"],
             "campaign_meshblock_gate": tier["topology_estimate"]["campaign_meshblock_gate"],
+            "rootcap_runtime_observation": tier["topology_estimate"].get(
+                "rootcap_runtime_observation"
+            ),
             "aggregate_memory_lower_bound_gpus": minimum_gpus,
             "qualified_launch_gpus": tier["topology_estimate"][
                 "rank_partition_qualification"
             ]["mpi_ranks"],
             "declared_gpus": args.gpus,
+            "declared_gpu_memory_GiB": args.gpu_memory_gib,
+            "runtime_qualification_status": tier["resource_gate"][
+                "runtime_qualification_status"
+            ],
             "max_nmb_per_rank": max_nmb,
             "gate_based_max_nmb_per_rank": gate_based_max_nmb,
             "rank_partition_qualification": {
