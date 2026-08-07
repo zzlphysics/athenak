@@ -7,6 +7,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -219,4 +220,59 @@ def test_default_offset_covers_the_first_metric_fd_stencil(tmp_path):
     assert first_time <= actual_offset - fd_step
     assert report["trajectory_time_range"][1] >= (
         actual_offset + report["tlim_M"] + fd_step
+    )
+
+
+@pytest.mark.parametrize(
+    ("cfl_number", "expected_root_dt_max"),
+    [(None, 4.8), (0.15, 2.4)],
+)
+def test_generated_input_declares_cfl_scaled_root_dt_cap(
+    tmp_path, cfl_number, expected_root_dt_max
+):
+    """Production inputs must declare the cap before CLI override processing."""
+    trajectory, provenance, source_artifact, matrix_path = (
+        _write_synthetic_campaign_artifacts(tmp_path)
+    )
+    output = tmp_path / "generated-L.athinput"
+    command = [
+        sys.executable,
+        str(GENERATOR_PATH),
+        "L",
+        "--trajectory",
+        str(trajectory),
+        "--trajectory-provenance",
+        str(provenance),
+        "--source-artifact",
+        str(source_artifact),
+        "--matrix",
+        str(matrix_path),
+        "--gpus",
+        "4",
+        "--scratch-gib",
+        "10000",
+        "--tlim",
+        "1",
+        "--output",
+        str(output),
+    ]
+    if cfl_number is not None:
+        command.extend(("--cfl-number", str(cfl_number)))
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        pytest.fail(
+            "synthetic campaign generation failed:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    report = json.loads(result.stdout)
+    assert report["root_dt_max_M"] == pytest.approx(expected_root_dt_max)
+    time_block = re.search(
+        r"(?ms)^<time>\s*$\n(.*?)(?=^<[^>]+>\s*$)",
+        output.read_text(encoding="utf-8"),
+    )
+    assert time_block is not None
+    expected_text = format(expected_root_dt_max, ".17g")
+    assert re.search(
+        rf"(?m)^root_dt_max\s*=\s*{re.escape(expected_text)}\s*$",
+        time_block.group(1),
     )

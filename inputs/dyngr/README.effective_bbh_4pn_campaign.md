@@ -99,6 +99,10 @@ to the validated double-precision A100+MPI build (`Athena_SINGLE_PRECISION=OFF`)
 matrix records `2.5e-5`, `5e-5`, and `1e-4M` as the required finite-difference sensitivity
 triplet.  The restart storage estimate is also double precision (ordinary `bin` outputs
 remain float32 by file-format design).
+Every generated input explicitly sets `time/root_dt_max=cfl_number*root_dx` (`4.8M` at
+the baseline CFL).  This bounds moving-BBH AMR lookahead and makes the cap available for
+fail-closed command-line overrides; AthenaK cannot override a parameter that is absent
+from the input file.  The half-CFL variant therefore receives a `2.4M` root-step cap.
 Use `--cfl-number 0.15` to generate the half-CFL temporal-convergence variant; the
 generator permits decreasing, but never silently increasing, the audited baseline CFL.
 

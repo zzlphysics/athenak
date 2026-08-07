@@ -1009,6 +1009,7 @@ def render_input(
     tlim: float,
     metric_fd_step: float,
     cfl_number: float,
+    root_dt_max: float,
     max_nmb_per_rank: int,
     projected_gib: float,
     required_scratch: float,
@@ -1091,6 +1092,7 @@ method = user
 evolution = dynamic
 integrator = {time['integrator']}
 subcycling = level
+root_dt_max = {format_real(root_dt_max)}
 cfl_number = {format_real(cfl_number)}
 nlim = -1
 tlim = {format_real(tlim)}
@@ -1247,6 +1249,9 @@ def main() -> int:
         cfl_number = baseline_cfl if args.cfl_number is None else args.cfl_number
         if not math.isfinite(cfl_number) or not 0.0 < cfl_number <= baseline_cfl:
             raise CampaignError(f"CFL must lie in (0, {baseline_cfl:g}]")
+        root_dt_max = cfl_number * float(matrix["common"]["mesh"]["root_dx_M"])
+        if not math.isfinite(root_dt_max) or root_dt_max <= 0.0:
+            raise CampaignError("derived root_dt_max must be finite and positive")
         summary = inspect_trajectory(
             args.trajectory,
             args.trajectory_time_offset,
@@ -1319,6 +1324,7 @@ def main() -> int:
             "trajectory_time_offset_M": args.trajectory_time_offset,
             "tlim_M": tlim,
             "cfl_number": cfl_number,
+            "root_dt_max_M": root_dt_max,
             "real_precision": args.real_precision,
             "maximum_horizon_guard_radius_M": summary.maximum_guard_radius,
             "maximum_row_horizon_guard_radius_M": summary.maximum_row_guard_radius,
@@ -1374,6 +1380,7 @@ def main() -> int:
                 tlim,
                 metric_fd_step,
                 cfl_number,
+                root_dt_max,
                 max_nmb,
                 projected_gib,
                 required_scratch,
