@@ -50,6 +50,50 @@ def assert_writable_directory(destination: Path) -> None:
         raise SystemExit(f"destination is not writable: {destination}: {exc}") from exc
 
 
+def existing_ancestor(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise SystemExit(f"no existing ancestor for destination: {path}")
+        candidate = parent
+    return candidate
+
+
+def assert_expected_mount(
+    destination: Path,
+    expected_source: str,
+    expected_fstype: str | None,
+) -> dict[str, str]:
+    """Fail before mkdir when a nominal NAS path is not on the expected mount."""
+    probe = existing_ancestor(destination)
+    payload = json.loads(
+        run([
+            "findmnt", "--json", "--target", str(probe),
+            "--output", "TARGET,SOURCE,FSTYPE,OPTIONS",
+        ]).stdout
+    )
+    filesystems = payload.get("filesystems", [])
+    if len(filesystems) != 1:
+        raise SystemExit(f"could not resolve exactly one mount for {probe}: {filesystems}")
+    mount = filesystems[0]
+    required = {"target", "source", "fstype", "options"}
+    if not required.issubset(mount) or not all(isinstance(mount[key], str) for key in required):
+        raise SystemExit(f"malformed findmnt result for {probe}: {mount}")
+    if mount["source"] != expected_source:
+        raise SystemExit(
+            f"destination mount source is {mount['source']!r}, expected {expected_source!r}"
+        )
+    if expected_fstype is not None and mount["fstype"] != expected_fstype:
+        raise SystemExit(
+            f"destination filesystem is {mount['fstype']!r}, expected {expected_fstype!r}"
+        )
+    options = set(mount["options"].split(","))
+    if "rw" not in options or "ro" in options:
+        raise SystemExit(f"destination mount is not read-write: {mount['options']}")
+    return {key: mount[key] for key in sorted(required)}
+
+
 def remote_usage_percent(host: str, remote_root: str) -> int:
     output = remote(host, ["df", "-P", remote_root])
     lines = [line for line in output.splitlines() if line.strip()]
@@ -144,12 +188,25 @@ def main() -> int:
     parser.add_argument("--remote-root", required=True)
     parser.add_argument("--remote-manifest-dir", required=True)
     parser.add_argument("--destination", required=True, type=Path)
+    parser.add_argument(
+        "--expected-mount-source",
+        required=True,
+        help="exact findmnt SOURCE for the destination, preventing fallback to a local disk",
+    )
+    parser.add_argument(
+        "--expected-mount-fstype",
+        help="optional exact findmnt FSTYPE, for example nfs",
+    )
     parser.add_argument("--bwlimit-kib", type=int, default=9000)
     parser.add_argument("--poll-seconds", type=float, default=0.0,
                         help="0 performs one pass; positive values poll continuously")
     args = parser.parse_args()
     args.destination = args.destination.expanduser().resolve()
+    mount = assert_expected_mount(
+        args.destination, args.expected_mount_source, args.expected_mount_fstype
+    )
     assert_writable_directory(args.destination)
+    print(f"destination mount: {json.dumps(mount, sort_keys=True)}", file=sys.stderr)
 
     while True:
         usage = remote_usage_percent(args.host, args.remote_root)

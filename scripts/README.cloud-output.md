@@ -32,11 +32,15 @@ python3 scripts/pull_ready_outputs.py \
   --remote-root /data/athenak/run01 \
   --remote-manifest-dir /data/athenak/run01/manifests \
   --destination ~/UGreenNAS/Projects/GRMHD_AthenaK/run01 \
+  --expected-mount-source 192.168.99.198:/volume1/Projects \
+  --expected-mount-fstype nfs \
   --bwlimit-kib 9000 --poll-seconds 60
 ```
 
-The destination is probed with a real create/delete operation before transfer.  This is
-important for the current NAS, which must be remounted read-write before use.
+Before creating the destination, the puller uses `findmnt` to require the exact declared
+mount source and an `rw` mount; it then probes with a real create/delete operation.  This
+prevents a missing NAS mount from silently redirecting a large transfer onto the local
+filesystem.  The current NAS must be remounted read-write before use.
 
 Use the following remote disk policy for the segment launcher:
 
