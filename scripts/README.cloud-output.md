@@ -42,6 +42,18 @@ mount source and an `rw` mount; it then probes with a real create/delete operati
 prevents a missing NAS mount from silently redirecting a large transfer onto the local
 filesystem.  The current NAS must be remounted read-write before use.
 
+Zhixing Cloud instances default to 32 Mbps, which caps an SSH transfer at about
+3.8 MiB/s even when the NAS is faster.  Before a large pull, query `MaxBandwidth` from
+the instance list, call
+[`change_bandwidth_query_price`](https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-319535385),
+and then call
+[`change_bandwidth`](https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-242525904)
+on the running instance.  A 100 Mbps target is appropriate for a NAS path measured at
+about 10 MB/s.  On 2026-08-08, the quoted incremental price was 0.204 CNY/hour (68 paid
+Mbps above the free 32 Mbps), but always query the current price rather than hard-coding
+it.  Stop the transfer instance promptly after both ACKs are verified so GPU, disk, and
+bandwidth billing all end together.
+
 Use the following remote disk policy for the segment launcher:
 
 - below 65%: normal operation;
