@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / "vis" / "python"))
 from analyze_bbh_grmhd_campaign import (  # noqa: E402
     load_verified_files,
     merge_histories,
+    storage_projection,
+    subcycling_work_model,
     verify_file,
 )
 from compare_bbh_grmhd_convergence import analyze  # noqa: E402
@@ -101,3 +103,37 @@ def test_empirical_second_order_difference_ratio() -> None:
         series.append((label, {"time": time, "mass": mass}))
     _, summaries, _ = analyze(series, ["mass_rel"], 2.0)
     assert abs(float(summaries["mass_rel"]["empirical_order"]) - 2.0) < 1.0e-12
+
+
+def test_storage_budget_includes_forced_segment_restarts() -> None:
+    streams = {
+        "mhd_w_bcc": [
+            {
+                "time_M": 100.0,
+                "bytes": 1_000_000_000,
+                "configured_dt_M": 10.0,
+            }
+        ]
+    }
+    projection = storage_projection(
+        streams,
+        target_time=300.0,
+        restart_sizes=[24_000_000_000],
+        restart_dt=250.0,
+        segment_span=100.0,
+        root_dt=4.8,
+        root_step_seconds=500.0,
+        drain_mib_s=8.0,
+    )
+    assert projection["remaining_binary_bytes"] == 20_000_000_000
+    assert projection["restarts"]["effective_archive_cadence_M"] == 100.0
+    assert projection["restarts"]["remaining_restarts"] == 2
+    assert projection["remaining_archive_bytes"] == 68_000_000_000
+    assert projection["transfer_budget"]["average_drain_has_headroom"] is True
+
+
+def test_subcycling_work_model_uses_strict_two_to_one_levels() -> None:
+    work = subcycling_work_model({0: 8, 1: 4, 2: 2})
+    assert work["subcycled_meshblock_updates_per_root_step"] == 24
+    assert work["global_finest_dt_meshblock_updates_per_root_step"] == 56
+    assert work["global_to_subcycled_update_ratio"] == 56 / 24

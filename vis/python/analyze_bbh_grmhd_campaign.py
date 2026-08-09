@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import struct
 import sys
 import tempfile
 
@@ -180,19 +181,15 @@ def configured_output_dt(header, stream_name: str) -> float | None:
     return None
 
 
-def meshblock_count(path: Path, header) -> int:
+def meshblock_level_counts(path: Path, header) -> dict[int, int]:
     try:
         cells = math.prod(
             int(header.parameters["meshblock"][f"nx{axis}"]) for axis in (1, 2, 3)
         )
     except KeyError as exc:
         raise RuntimeError(f"{path}: binary header lacks MeshBlock dimensions") from exc
-    record_bytes = (
-        24
-        + 16
-        + 6 * header.location_size
-        + len(header.variables) * cells * header.variable_size
-    )
+    data_bytes = len(header.variables) * cells * header.variable_size
+    record_bytes = 24 + 16 + 6 * header.location_size + data_bytes
     payload_bytes = path.stat().st_size - header.data_offset
     count, remainder = divmod(payload_bytes, record_bytes)
     if remainder:
@@ -200,7 +197,37 @@ def meshblock_count(path: Path, header) -> int:
             f"{path}: {remainder} bytes remain after fixed MeshBlock records; "
             "file may be incomplete"
         )
-    return count
+    levels: dict[int, int] = {}
+    with path.open("rb") as stream:
+        stream.seek(header.data_offset)
+        for _ in range(count):
+            if len(stream.read(24)) != 24:
+                raise RuntimeError(f"{path}: truncated MeshBlock index record")
+            logical = stream.read(16)
+            if len(logical) != 16:
+                raise RuntimeError(f"{path}: truncated MeshBlock logical record")
+            level = struct.unpack("=4i", logical)[3]
+            levels[level] = levels.get(level, 0) + 1
+            stream.seek(6 * header.location_size + data_bytes, os.SEEK_CUR)
+        if stream.tell() != path.stat().st_size:
+            raise RuntimeError(f"{path}: MeshBlock scan did not reach end of file")
+    return levels
+
+
+def subcycling_work_model(level_counts: dict[int, int]) -> dict[str, object]:
+    if not level_counts:
+        raise RuntimeError("cannot model subcycling work for an empty hierarchy")
+    finest_level = max(level_counts)
+    subcycled = sum(count * 2**level for level, count in level_counts.items())
+    global_small_step = sum(level_counts.values()) * 2**finest_level
+    return {
+        "finest_physical_level": finest_level,
+        "subcycled_meshblock_updates_per_root_step": subcycled,
+        "global_finest_dt_meshblock_updates_per_root_step": global_small_step,
+        "meshblock_update_reduction_fraction": 1.0 - subcycled / global_small_step,
+        "global_to_subcycled_update_ratio": global_small_step / subcycled,
+        "scope": "MeshBlock-update count only; excludes communication and output I/O",
+    }
 
 
 def cadence_summary(frames: list[dict[str, object]]) -> dict[str, object]:
@@ -225,11 +252,36 @@ def cadence_summary(frames: list[dict[str, object]]) -> dict[str, object]:
     return result
 
 
+def configured_restart_dt(header) -> float | None:
+    for section in header.parameters.values():
+        if section.get("file_type") == "rst":
+            try:
+                value = float(section["dt"])
+            except (KeyError, ValueError):
+                return None
+            return value if value > 0.0 and math.isfinite(value) else None
+    return None
+
+
 def storage_projection(
-    streams: dict[str, list[dict[str, object]]], target_time: float
+    streams: dict[str, list[dict[str, object]]],
+    target_time: float,
+    restart_sizes: list[int],
+    restart_dt: float | None,
+    segment_span: float | None,
+    root_dt: float,
+    root_step_seconds: float | None,
+    drain_mib_s: float,
 ) -> dict[str, object]:
     projection: dict[str, object] = {"target_time_M": target_time, "streams": {}}
-    total = 0.0
+    binary_total = 0.0
+    bytes_per_simulation_M = 0.0
+    latest_time = max(
+        float(frame["time_M"])
+        for frames in streams.values()
+        for frame in frames
+    )
+    segment_binary_bytes = 0.0
     for name, frames in streams.items():
         if not frames:
             continue
@@ -267,10 +319,69 @@ def storage_projection(
                 "remaining_frames": remaining_frames,
                 "remaining_bytes": remaining_bytes,
             }
-            total += remaining_bytes
+            binary_total += remaining_bytes
+            median_size = float(np.median(sizes))
+            bytes_per_simulation_M += median_size / cadence
+            if segment_span is not None:
+                segment_binary_bytes += math.ceil(segment_span / cadence) * median_size
         projection["streams"][name] = stream_projection
-    projection["remaining_binary_bytes"] = total
-    projection["remaining_binary_TiB"] = total / 2**40
+    projection["remaining_binary_bytes"] = binary_total
+    projection["remaining_binary_TiB"] = binary_total / 2**40
+
+    restart_projection: dict[str, object]
+    restart_archive_bytes = 0.0
+    remote_restart_working_set = 0.0
+    if restart_sizes and (restart_dt is not None or segment_span is not None):
+        median_restart = float(np.median(restart_sizes))
+        effective_dt = (
+            min(value for value in (restart_dt, segment_span) if value is not None)
+        )
+        remaining_restarts = max(
+            0, math.ceil((target_time - latest_time) / effective_dt)
+        )
+        restart_archive_bytes = remaining_restarts * median_restart
+        remote_restart_working_set = 2.0 * median_restart
+        bytes_per_simulation_M += median_restart / effective_dt
+        restart_projection = {
+            "configured_dt_M": restart_dt,
+            "forced_segment_span_M": segment_span,
+            "effective_archive_cadence_M": effective_dt,
+            "median_restart_bytes": median_restart,
+            "remaining_restarts": remaining_restarts,
+            "remaining_archive_bytes": restart_archive_bytes,
+            "remote_retention_generations": 2,
+            "remote_retained_restart_bytes": remote_restart_working_set,
+        }
+    else:
+        restart_projection = {
+            "status": "needs_a_verified_restart_and_cadence",
+            "configured_dt_M": restart_dt,
+            "forced_segment_span_M": segment_span,
+        }
+    projection["restarts"] = restart_projection
+    archive_total = binary_total + restart_archive_bytes
+    projection["remaining_archive_bytes"] = archive_total
+    projection["remaining_archive_TiB"] = archive_total / 2**40
+    if segment_span is not None:
+        projection["remote_segment_working_set_bytes"] = (
+            segment_binary_bytes + remote_restart_working_set
+        )
+    if root_step_seconds is not None:
+        simulation_M_per_second = root_dt / root_step_seconds
+        generation_bytes_s = bytes_per_simulation_M * simulation_M_per_second
+        drain_bytes_s = drain_mib_s * 2**20
+        projection["transfer_budget"] = {
+            "root_dt_M": root_dt,
+            "root_step_seconds": root_step_seconds,
+            "average_generation_MiB_s": generation_bytes_s / 2**20,
+            "assumed_sustained_drain_MiB_s": drain_mib_s,
+            "drain_to_generation_ratio": (
+                drain_bytes_s / generation_bytes_s
+                if generation_bytes_s > 0.0
+                else None
+            ),
+            "average_drain_has_headroom": drain_bytes_s > generation_bytes_s,
+        }
     return projection
 
 
@@ -440,6 +551,19 @@ def parse_args() -> argparse.Namespace:
         help="render every Nth frame plus the last; 0 builds inventory/history only",
     )
     parser.add_argument("--target-time", type=float, default=3500.0)
+    parser.add_argument(
+        "--segment-span",
+        type=float,
+        default=100.0,
+        help="simulation time per cloud segment; 0 disables forced-restart budgeting",
+    )
+    parser.add_argument("--root-dt", type=float, default=4.8)
+    parser.add_argument(
+        "--root-step-seconds",
+        type=float,
+        help="measured wall seconds per root step, enabling network-rate budgeting",
+    )
+    parser.add_argument("--drain-mib-s", type=float, default=8.0)
     parser.add_argument("--plane", choices=("x", "y", "z"), default="z")
     parser.add_argument("--location", type=float, default=0.0)
     parser.add_argument("--extent", type=float, default=80.0)
@@ -454,6 +578,12 @@ def main() -> int:
         raise SystemExit("--render-every must be non-negative")
     if args.extent <= 0.0:
         raise SystemExit("--extent must be positive")
+    if args.segment_span < 0.0 or args.root_dt <= 0.0 or args.drain_mib_s <= 0.0:
+        raise SystemExit(
+            "segment span must be non-negative; root dt and drain rate must be positive"
+        )
+    if args.root_step_seconds is not None and args.root_step_seconds <= 0.0:
+        raise SystemExit("--root-step-seconds must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     all_records: list[VerifiedFile] = []
@@ -480,6 +610,7 @@ def main() -> int:
             continue
         header = read_binary_header(record.path)
         stream_name = classify_binary(record.path.name, header.variables)
+        level_counts = meshblock_level_counts(record.path, header)
         streams[stream_name].append(
             {
                 "path": str(record.path),
@@ -490,7 +621,11 @@ def main() -> int:
                 "time_M": header.time,
                 "cycle": header.cycle,
                 "variables": list(header.variables),
-                "meshblocks": meshblock_count(record.path, header),
+                "meshblocks": sum(level_counts.values()),
+                "meshblocks_by_physical_level": {
+                    str(level): count for level, count in sorted(level_counts.items())
+                },
+                "subcycling_work_model": subcycling_work_model(level_counts),
                 "configured_dt_M": configured_output_dt(header, stream_name),
             }
         )
@@ -501,6 +636,9 @@ def main() -> int:
     history_records = [
         record for record in science_records if record.path.suffix == ".hst"
     ]
+    restart_records = [record for record in all_records if record.path.suffix == ".rst"]
+    for record in restart_records:
+        verify_file(record, False)
     # Preserve command-line segment order so later restart segments replace overlap.
     history_paths = [record.path for record in history_records]
     history_summary = None
@@ -533,15 +671,35 @@ def main() -> int:
         "segments": [str(path.expanduser().resolve()) for path in args.segments],
         "input_policy": {
             "local_ack_required": True,
-            "size_verified": True,
-            "sha256_verified": not args.no_sha256,
+            "science_file_size_verified": True,
+            "science_file_sha256_verified": not args.no_sha256,
+            "restart_size_verified_for_budget": True,
+            "restart_sha256_trusted_from_transfer_ack": True,
             "active_or_partial_files_accepted": False,
         },
         "streams": streams,
         "cadence": {
             name: cadence_summary(frames) for name, frames in streams.items()
         },
-        "storage_projection": storage_projection(streams, args.target_time),
+        "storage_projection": storage_projection(
+            streams,
+            args.target_time,
+            [record.size for record in restart_records],
+            configured_restart_dt(
+                max(
+                    (
+                        read_binary_header(Path(str(frame["path"])))
+                        for frames in streams.values()
+                        for frame in frames
+                    ),
+                    key=lambda header: header.time,
+                )
+            ),
+            args.segment_span if args.segment_span > 0.0 else None,
+            args.root_dt,
+            args.root_step_seconds,
+            args.drain_mib_s,
+        ),
         "history": history_summary,
         "timeline": str(timeline_path),
         "rendered_frames": rendered,

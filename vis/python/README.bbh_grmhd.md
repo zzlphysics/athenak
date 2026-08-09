@@ -36,15 +36,24 @@ unverified transfer directory directly to the plotter.  Every segment must have 
 `.acks/*.ack` written by `scripts/pull_ready_outputs.py`.  By default the workflow
 rechecks both size and SHA256 before reading any `.bin` or `.hst` file, merges overlapping
 restart histories in command-line order, inventories binary times/cycles/MeshBlock
-counts, measures output cadence, projects storage to the requested target time, and
-renders every verified frame plus the final frame:
+counts by physical AMR level, measures the strict-subcycling MeshBlock-update reduction,
+measures output cadence, projects storage to the requested target time, and renders every
+verified frame plus the final frame:
 
 ```bash
 python3 vis/python/analyze_bbh_grmhd_campaign.py \
   /nas/campaign/L-segment-000 /nas/campaign/L-segment-001 \
   --output-dir output/L-full --target-time 3500 \
+  --segment-span 100 --root-step-seconds 522 --drain-mib-s 8 \
   --trajectory /path/to/q1_4pn_to_remnant.dat
 ```
+
+`--segment-span` includes the synchronized checkpoint forced at every cloud-segment end,
+even when the configured restart cadence is longer.  With a measured root-step wall time,
+the report converts primitive/divB/checkpoint production into average MiB/s and compares
+it with the conservative sustained NAS drain rate.  It separately reports total NAS
+archive growth and the remote working set obtained by retaining only the two newest
+restart generations.
 
 Use `--render-every 5` for a lower-cadence preview, or `--render-every 0` to produce only
 the verified inventory, merged history, cadence plot, and JSON report.  `--no-sha256`
