@@ -1,6 +1,6 @@
 {
-  "schema_version": 3,
-  "campaign_id": "effective-bbh-4pn-amr-convergence-v3",
+  "schema_version": 4,
+  "campaign_id": "effective-bbh-4pn-amr-convergence-v4",
   "status": "qualification_candidate_not_publication_certification",
   "trajectory": {
     "declared_model": "4PN_to_single_remnant",
@@ -83,14 +83,20 @@
     },
     "outputs": {
       "history_root_dcycle": 1,
-      "full_state_dt_M": 10.0,
-      "gr_diagnostics_dt_M": 10.0,
+      "full_state_dt_M": 50.0,
+      "gr_diagnostics_dt_M": 50.0,
       "divb_dt_M": 25.0,
       "restart_dt_M": 250.0,
+      "local_slice_root_dcycle": 1,
+      "local_slice_center": "bbh_com",
+      "local_slice_half_width_M": 40.0,
+      "local_slice_axis": 3,
       "estimated_bytes_per_meshblock": {
         "full_state_mhd_w_bcc": 147456,
         "gr_diagnostics": 65536,
         "divb": 16384,
+        "local_slice_mhd_w_bcc": 9216,
+        "local_slice_gr_diagnostics": 4096,
         "restart_double_precision_dynadm": 2778624
       }
     },
@@ -167,7 +173,7 @@
         "minimum_gpu_memory_GiB_at_qualified_count": 80,
         "runtime_qualification_status": "rootcap-runtime-qualified-through-10-cycles",
         "minimum_streaming_scratch_GiB": 192,
-        "projected_undrained_output_GiB_at_10000M": 8480.6,
+        "projected_undrained_output_GiB_at_10000M": 6077.8,
         "minimum_undrained_scratch_GiB_at_10000M": 10700
       }
     },
@@ -225,7 +231,7 @@
         "minimum_gpu_memory_GiB_at_qualified_count": 80,
         "runtime_qualification_status": "candidate-pending-eight-rank-runtime-qualification",
         "minimum_streaming_scratch_GiB": 320,
-        "projected_undrained_output_GiB_at_10000M": 13247.4,
+        "projected_undrained_output_GiB_at_10000M": 9494.0,
         "minimum_undrained_scratch_GiB_at_10000M": 16600
       }
     },
@@ -271,7 +277,7 @@
         "minimum_gpu_memory_GiB_at_qualified_count": 40,
         "runtime_qualification_status": "topology-only-pending-runtime-qualification",
         "minimum_streaming_scratch_GiB": 640,
-        "projected_undrained_output_GiB_at_10000M": 25965.0,
+        "projected_undrained_output_GiB_at_10000M": 18608.2,
         "minimum_undrained_scratch_GiB_at_10000M": 32500
       }
     }

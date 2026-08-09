@@ -204,6 +204,7 @@ void AugmentBBHExcisionMasks(MeshBlockPack *pmbp);
 void RefineAlphaMin(MeshBlockPack *pmbp);
 void RefineTracker(MeshBlockPack *pmbp);
 void BBHHistory(HistoryData *pdata, Mesh *pm);
+bool BBHOutputRegionCenter(const std::string &name, Real time, Real center[3]);
 void InitializeReferenceFMTorus(MeshBlockPack *pmbp);
 
 KOKKOS_INLINE_FUNCTION
@@ -583,6 +584,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   pmbp->padm->SetADMVariables = &SetADMVariablesToBBH;
   pmbp->pcoord->AugmentExcisionMasks = &AugmentBBHExcisionMasks;
   user_hist_func = BBHHistory;
+  user_output_region_func = BBHOutputRegionCenter;
 
   const std::string trajectory_mode =
       pin->GetOrAddString("problem", "trajectory_mode", "circular");
@@ -2560,6 +2562,36 @@ int BuildTrackingTargets(const Real state[NTRAJ], TrackingTarget targets[2]) {
         0.5*(targets[0].spin[direction]+targets[1].spin[direction]);
   }
   return 1;
+}
+
+//----------------------------------------------------------------------------------------
+//! Resolve moving centers for filtered BBH binary output.
+
+bool BBHOutputRegionCenter(const std::string &name, const Real time, Real center[3]) {
+  Real state[NTRAJ];
+  FindTrajectory(time, state);
+  TrackingTarget holes[2];
+  LoadTrackingTarget(state, 0, holes[0]);
+  LoadTrackingTarget(state, 1, holes[1]);
+
+  if (name == "bh1") {
+    for (int axis=0; axis<3; ++axis) center[axis] = holes[0].position[axis];
+    return true;
+  }
+  if (name == "bh2") {
+    for (int axis=0; axis<3; ++axis) center[axis] = holes[1].position[axis];
+    return true;
+  }
+  if (name == "bbh_com") {
+    const Real total_mass = holes[0].mass+holes[1].mass;
+    if (!(total_mass > 0.0)) return false;
+    for (int axis=0; axis<3; ++axis) {
+      center[axis] = (holes[0].mass*holes[0].position[axis]
+                     +holes[1].mass*holes[1].position[axis])/total_mass;
+    }
+    return true;
+  }
+  return false;
 }
 
 //----------------------------------------------------------------------------------------

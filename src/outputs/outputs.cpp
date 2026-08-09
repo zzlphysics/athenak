@@ -39,6 +39,7 @@
 //! comment text: 'NEW_OUTPUT_TYPES'.
 //========================================================================================
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>    // strcmp
@@ -161,6 +162,71 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         }
       } else {
         opar.slice3 = false;
+      }
+
+      // Optional moving, problem-defined output region.  Region filtering is currently
+      // restricted to binary mesh output because that format records the logical and
+      // physical extent of every selected AMR MeshBlock.  The scalar half width is a
+      // convenient default; per-axis values may override it.
+      if (pin->DoesParameterExist(opar.block_name, "region_center")) {
+        if (opar.file_type != "bin") {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Moving region requested in output block '"
+                    << opar.block_name << "', but file_type is not bin" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        if (pm->pgen->user_output_region_func == nullptr) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Moving region requested in output block '"
+                    << opar.block_name << "', but the problem generator did not enroll "
+                    << "a region resolver" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        opar.region_enabled = true;
+        opar.region_center = pin->GetString(opar.block_name, "region_center");
+        const Real default_half_width =
+            pin->GetOrAddReal(opar.block_name, "region_half_width", 0.0);
+        opar.region_half_width1 = pin->GetOrAddReal(
+            opar.block_name, "region_half_width1", default_half_width);
+        opar.region_half_width2 = pin->GetOrAddReal(
+            opar.block_name, "region_half_width2", default_half_width);
+        opar.region_half_width3 = pin->GetOrAddReal(
+            opar.block_name, "region_half_width3", default_half_width);
+        if (!(opar.region_half_width1 > 0.0) ||
+            !(opar.region_half_width2 > 0.0) ||
+            !(opar.region_half_width3 > 0.0) ||
+            !std::isfinite(opar.region_half_width1) ||
+            !std::isfinite(opar.region_half_width2) ||
+            !std::isfinite(opar.region_half_width3)) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Moving region half widths in output block '"
+                    << opar.block_name << "' must all be positive" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        opar.region_slice_axis =
+            pin->GetOrAddInteger(opar.block_name, "region_slice_axis", 0);
+        opar.region_slice_offset =
+            pin->GetOrAddReal(opar.block_name, "region_slice_offset", 0.0);
+        if (opar.region_slice_axis < 0 || opar.region_slice_axis > 3) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "region_slice_axis in output block '"
+                    << opar.block_name << "' must be 0, 1, 2, or 3" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        if (!std::isfinite(opar.region_slice_offset)) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "region_slice_offset in output block '"
+                    << opar.block_name << "' must be finite" << std::endl;
+          exit(EXIT_FAILURE);
+        }
+        if (opar.region_slice_axis != 0 &&
+            (opar.slice1 || opar.slice2 || opar.slice3)) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Output block '" << opar.block_name
+                    << "' cannot combine region_slice_axis with fixed slice_x* options"
+                    << std::endl;
+          exit(EXIT_FAILURE);
+        }
       }
 
       // read ghost cell option

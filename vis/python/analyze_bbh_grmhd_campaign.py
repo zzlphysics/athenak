@@ -161,6 +161,10 @@ def verify_file(record: VerifiedFile, verify_sha256: bool) -> None:
 
 
 def classify_binary(name: str, variables: tuple[str, ...]) -> str:
+    if ".bbh_local_w." in name:
+        return "bbh_local_w"
+    if ".bbh_local_gr." in name:
+        return "bbh_local_gr"
     if ".mhd_w_bcc." in name:
         return "mhd_w_bcc"
     if ".mhd_gr_diagnostics." in name or variables == (
@@ -190,47 +194,99 @@ def is_event_log(path: Path) -> bool:
 
 
 def configured_output_dt(header, stream_name: str) -> float | None:
+    # Prefer the explicit id because local and global streams may contain the same
+    # variable group at different cadences.
+    sections = [
+        section
+        for section in header.parameters.values()
+        if section.get("file_type") == "bin"
+    ]
+    matches = [section for section in sections if section.get("id") == stream_name]
+    if not matches:
+        matches = [
+            section for section in sections if section.get("variable") == stream_name
+        ]
+    if len(matches) != 1:
+        return None
+    try:
+        value = float(matches[0]["dt"])
+    except (KeyError, ValueError):
+        return None
+    return value if value > 0.0 and math.isfinite(value) else None
+
+
+def configured_output_dcycle(header, stream_name: str) -> int | None:
+    sections = [
+        section
+        for section in header.parameters.values()
+        if section.get("file_type") == "bin"
+    ]
+    matches = [section for section in sections if section.get("id") == stream_name]
+    if not matches:
+        matches = [
+            section for section in sections if section.get("variable") == stream_name
+        ]
+    if len(matches) != 1:
+        return None
+    try:
+        value = int(matches[0]["dcycle"])
+    except (KeyError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def configured_output_region(header, stream_name: str) -> dict[str, object] | None:
     for section in header.parameters.values():
         if section.get("file_type") != "bin":
             continue
-        if section.get("variable") == stream_name or section.get("id") == stream_name:
-            try:
-                value = float(section["dt"])
-            except (KeyError, ValueError):
-                return None
-            return value if value > 0.0 and math.isfinite(value) else None
+        if section.get("id") != stream_name or "region_center" not in section:
+            continue
+        try:
+            default_width = float(section.get("region_half_width", "0"))
+            widths = [
+                float(section.get(f"region_half_width{axis}", default_width))
+                for axis in (1, 2, 3)
+            ]
+            slice_axis = int(section.get("region_slice_axis", "0"))
+            slice_offset = float(section.get("region_slice_offset", "0"))
+        except ValueError:
+            return None
+        return {
+            "center": section["region_center"],
+            "half_width_M": widths,
+            "slice_axis": slice_axis,
+            "slice_offset_M": slice_offset,
+        }
     return None
 
 
 def meshblock_level_counts(path: Path, header) -> dict[int, int]:
-    try:
-        cells = math.prod(
-            int(header.parameters["meshblock"][f"nx{axis}"]) for axis in (1, 2, 3)
-        )
-    except KeyError as exc:
-        raise RuntimeError(f"{path}: binary header lacks MeshBlock dimensions") from exc
-    data_bytes = len(header.variables) * cells * header.variable_size
-    record_bytes = 24 + 16 + 6 * header.location_size + data_bytes
-    payload_bytes = path.stat().st_size - header.data_offset
-    count, remainder = divmod(payload_bytes, record_bytes)
-    if remainder:
-        raise RuntimeError(
-            f"{path}: {remainder} bytes remain after fixed MeshBlock records; "
-            "file may be incomplete"
-        )
     levels: dict[int, int] = {}
     with path.open("rb") as stream:
         stream.seek(header.data_offset)
-        for _ in range(count):
-            if len(stream.read(24)) != 24:
+        file_size = path.stat().st_size
+        while stream.tell() < file_size:
+            indices_buffer = stream.read(24)
+            if len(indices_buffer) != 24:
                 raise RuntimeError(f"{path}: truncated MeshBlock index record")
+            indices = struct.unpack("=6i", indices_buffer)
+            shape = (
+                indices[1]-indices[0]+1,
+                indices[3]-indices[2]+1,
+                indices[5]-indices[4]+1,
+            )
+            if any(cells <= 0 for cells in shape):
+                raise RuntimeError(f"{path}: invalid MeshBlock output shape {shape}")
             logical = stream.read(16)
             if len(logical) != 16:
                 raise RuntimeError(f"{path}: truncated MeshBlock logical record")
             level = struct.unpack("=4i", logical)[3]
             levels[level] = levels.get(level, 0) + 1
+            data_bytes = (
+                len(header.variables) * math.prod(shape) * header.variable_size
+            )
             stream.seek(6 * header.location_size + data_bytes, os.SEEK_CUR)
-        if stream.tell() != path.stat().st_size:
+        if stream.tell() != file_size:
             raise RuntimeError(f"{path}: MeshBlock scan did not reach end of file")
     return levels
 
@@ -316,6 +372,13 @@ def storage_projection(
             for frame in ordered
             if frame.get("configured_dt_M") is not None
         ]
+        configured_cycles = [
+            int(frame["configured_root_dcycle"])
+            for frame in ordered
+            if frame.get("configured_root_dcycle") is not None
+        ]
+        if not configured and configured_cycles:
+            configured = [float(np.median(configured_cycles)) * root_dt]
         if not positive_gaps.size and not configured:
             stream_projection = {
                 "status": "needs_at_least_two_frames",
@@ -576,11 +639,33 @@ def render_dashboards(
             "level",
         ],
         "mhd_divb": ["divb", "level"],
+        "bbh_local_w": [
+            "dens",
+            "press",
+            "temperature",
+            "bmag",
+            "beta_inv_proxy",
+            "level",
+        ],
+        "bbh_local_gr": [
+            "gr_bsq",
+            "gr_lorentz",
+            "gr_sigma",
+            "gr_beta_inv",
+            "level",
+        ],
     }
     for stream_name, panel_names in choices.items():
         for frame in selected_frames(streams.get(stream_name, []), every):
             input_path = Path(str(frame["path"]))
-            slice_data = read_slice(input_path, panel_names, plane, location, extent)
+            local_region = frame.get("region") is not None
+            slice_data = read_slice(
+                input_path,
+                panel_names,
+                plane,
+                location,
+                None if local_region else extent,
+            )
             trajectory = None
             if trajectory_path is not None:
                 offset = float(
@@ -600,7 +685,7 @@ def render_dashboards(
                 slice_data,
                 panel_names,
                 figure_path,
-                extent,
+                None if local_region else extent,
                 dpi,
                 False,
                 trajectory,
@@ -791,6 +876,8 @@ def main() -> int:
         "mhd_w_bcc": [],
         "mhd_gr_diagnostics": [],
         "mhd_divb": [],
+        "bbh_local_w": [],
+        "bbh_local_gr": [],
         "other": [],
     }
     for record in science_records:
@@ -815,6 +902,10 @@ def main() -> int:
                 },
                 "subcycling_work_model": subcycling_work_model(level_counts),
                 "configured_dt_M": configured_output_dt(header, stream_name),
+                "configured_root_dcycle": configured_output_dcycle(
+                    header, stream_name
+                ),
+                "region": configured_output_region(header, stream_name),
             }
         )
     for frames in streams.values():
@@ -860,7 +951,9 @@ def main() -> int:
         args.dpi,
         args.trajectory.expanduser().resolve(strict=True) if args.trajectory else None,
     )
-    native_gr_diagnostics = bool(streams.get("mhd_gr_diagnostics"))
+    native_gr_diagnostics = bool(
+        streams.get("mhd_gr_diagnostics") or streams.get("bbh_local_gr")
+    )
     native_bbh_history = "user" in history_summary
     exact_outputs = [
         "density",

@@ -184,7 +184,7 @@ def _write_synthetic_campaign_artifacts(tmp_path: Path) -> tuple[Path, ...]:
 def test_lm_runtime_observations_set_fail_closed_resource_gates():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     GENERATOR.validate_matrix(matrix)
-    assert matrix["schema_version"] == 3
+    assert matrix["schema_version"] == 4
     assert matrix["tiers"]["L"]["topology_estimate"][
         "campaign_meshblock_gate"
     ] == 18088
@@ -199,15 +199,20 @@ def test_lm_runtime_observations_set_fail_closed_resource_gates():
     ] == 80
 
 
-def test_dense_output_cadence_and_streaming_working_set_are_budgeted():
+def test_hierarchical_output_cadence_and_streaming_working_set_are_budgeted():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     outputs = matrix["common"]["outputs"]
     assert outputs["history_root_dcycle"] == 1
-    assert outputs["full_state_dt_M"] == 10.0
-    assert outputs["gr_diagnostics_dt_M"] == 10.0
+    assert outputs["full_state_dt_M"] == 50.0
+    assert outputs["gr_diagnostics_dt_M"] == 50.0
     assert outputs["divb_dt_M"] == 25.0
     assert outputs["restart_dt_M"] == 250.0
+    assert outputs["local_slice_root_dcycle"] == 1
+    assert outputs["local_slice_center"] == "bbh_com"
+    assert outputs["local_slice_half_width_M"] == 40.0
+    assert outputs["local_slice_axis"] == 3
     assert outputs["estimated_bytes_per_meshblock"]["gr_diagnostics"] == 65536
+    assert outputs["estimated_bytes_per_meshblock"]["local_slice_mhd_w_bcc"] == 9216
     GENERATOR.validate_matrix(matrix)
 
     matrix["tiers"]["L"]["resource_gate"]["minimum_streaming_scratch_GiB"] = 128
@@ -318,11 +323,15 @@ def test_generated_input_declares_cfl_scaled_root_dt_cap(
     generated = output.read_text(encoding="utf-8")
     assert "<output5>" in generated
     assert "variable = mhd_gr_diagnostics" in generated
-    assert "dt = 10" in generated
+    assert "dt = 50" in generated
     assert "user_hist = true" in generated
     assert "history_inner_radius = 80" in generated
     assert re.search(r"(?ms)^<output1>.*?^dcycle\s*=\s*1\s*$", generated)
     assert re.search(r"(?ms)^<output6>.*?^file_type\s*=\s*log\s*$", generated)
+    assert re.search(r"(?ms)^<output7>.*?^id\s*=\s*bbh_local_w\s*$", generated)
+    assert re.search(r"(?ms)^<output8>.*?^id\s*=\s*bbh_local_gr\s*$", generated)
+    assert generated.count("region_center = bbh_com") == 2
+    assert generated.count("region_slice_axis = 3") == 2
     time_block = re.search(
         r"(?ms)^<time>\s*$\n(.*?)(?=^<[^>]+>\s*$)",
         generated,

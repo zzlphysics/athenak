@@ -51,7 +51,8 @@ MeshBinaryOutput::MeshBinaryOutput(ParameterInput *pin, Mesh *pm, OutputParamete
 
 void MeshBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   // check if slicing
-  bool bin_slice = (out_params.slice1 || out_params.slice2 || out_params.slice3);
+  bool bin_slice = (out_params.slice1 || out_params.slice2 || out_params.slice3 ||
+                    out_params.region_enabled || out_params.region_slice_axis != 0);
 
   // create filename: "bin/file_basename" + "." + "file_id" + "." + XXXXX + ".bin"
   // where XXXXX = 5-digit file_number

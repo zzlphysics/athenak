@@ -207,5 +207,7 @@ def test_bbh_torus_general_reference_frame_initializes(tmp_path):
     _assert_finite(state)
     _assert_finite(divb)
     assert "M_ref=0.5 (trajectory total=0.5)" in log_output
-    assert "center=(5,-3,2), velocity=(0.01,0.005,0)" in log_output
+    # Full-Real diagnostics may print the exact binary representation of 0.005.
+    assert "center=(5,-3,2), velocity=(0.01,0.005" in log_output
+    assert ",0), r_edge=9" in log_output
     assert np.max(np.abs(_canonical_field(divb, "divb"))) < 1.0e-10

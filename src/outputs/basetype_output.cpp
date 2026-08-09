@@ -6,11 +6,13 @@
 //  \brief implements BaseTypeOutput constructor, and LoadOutputData functions
 //
 
+#include <algorithm> // min_element
+#include <cmath>
+#include <cstdio> // snprintf
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <string>   // std::string, to_string()
-#include <cstdio> // snprintf
-#include <algorithm> // min_element
 #include <utility> // pair<>
 #include <vector>
 
@@ -744,6 +746,45 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   // So start with clean vector of output MeshBlock info, and re-compute
   outmbs.clear();
 
+  // Resolve the moving center at the exact synchronized output time.  All ranks have the
+  // same problem trajectory and therefore make an identical selection without an extra
+  // collective.  Fixed slice coordinates remain unchanged for ordinary output blocks.
+  Real region_center[3] = {0.0, 0.0, 0.0};
+  bool slice1 = out_params.slice1;
+  bool slice2 = out_params.slice2;
+  bool slice3 = out_params.slice3;
+  Real slice_x1 = slice1 ? out_params.slice_x1 : 0.0;
+  Real slice_x2 = slice2 ? out_params.slice_x2 : 0.0;
+  Real slice_x3 = slice3 ? out_params.slice_x3 : 0.0;
+  if (out_params.region_enabled) {
+    if (!(pm->pgen->user_output_region_func)(
+            out_params.region_center, pm->time, region_center)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "Problem generator rejected moving output region '"
+                << out_params.region_center << "' in block '"
+                << out_params.block_name << "'" << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    for (int axis=0; axis<3; ++axis) {
+      if (!std::isfinite(region_center[axis])) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Moving output region '" << out_params.region_center
+                  << "' returned a non-finite center" << std::endl;
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (out_params.region_slice_axis == 1) {
+      slice1 = true;
+      slice_x1 = region_center[0] + out_params.region_slice_offset;
+    } else if (out_params.region_slice_axis == 2) {
+      slice2 = true;
+      slice_x2 = region_center[1] + out_params.region_slice_offset;
+    } else if (out_params.region_slice_axis == 3) {
+      slice3 = true;
+      slice_x3 = region_center[2] + out_params.region_slice_offset;
+    }
+  }
+
   // loop over all MeshBlocks
   // set size & starting indices of output arrays, adjusted accordingly if gz included
   auto &indcs = pm->mb_indcs;
@@ -752,6 +793,22 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   for (int m=0; m<(pm->pmb_pack->nmb_thispack); ++m) {
     // skip if MeshBlock ID is specified and not equal to this ID
     if (out_params.gid >= 0 && (m+gids) != out_params.gid) { continue; }
+
+    // Region filtering selects whole AMR MeshBlocks.  This intentionally pads the
+    // requested box by at most one block in each direction and keeps every emitted
+    // binary record the same shape.
+    if (out_params.region_enabled) {
+      const bool overlap1 =
+          size.h_view(m).x1max > region_center[0]-out_params.region_half_width1 &&
+          size.h_view(m).x1min < region_center[0]+out_params.region_half_width1;
+      const bool overlap2 =
+          size.h_view(m).x2max > region_center[1]-out_params.region_half_width2 &&
+          size.h_view(m).x2min < region_center[1]+out_params.region_half_width2;
+      const bool overlap3 =
+          size.h_view(m).x3max > region_center[2]-out_params.region_half_width3 &&
+          size.h_view(m).x3min < region_center[2]+out_params.region_half_width3;
+      if (!(overlap1 && overlap2 && overlap3)) { continue; }
+    }
 
     int ois,oie,ojs,oje,oks,oke;
 
@@ -769,34 +826,34 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
     }
 
     // check for slicing in each dimension, adjust start/end indices accordingly
-    if (out_params.slice1) {
+    if (slice1) {
       // skip this MB if slice is out of range
-      if (out_params.slice_x1 <  size.h_view(m).x1min ||
-          out_params.slice_x1 >= size.h_view(m).x1max) { continue; }
+      if (slice_x1 <  size.h_view(m).x1min ||
+          slice_x1 >= size.h_view(m).x1max) { continue; }
       // set index of slice
-      ois = CellCenterIndex(out_params.slice_x1, indcs.nx1,
+      ois = CellCenterIndex(slice_x1, indcs.nx1,
                             size.h_view(m).x1min, size.h_view(m).x1max);
       ois += indcs.is;
       oie = ois;
     }
 
-    if (out_params.slice2) {
+    if (slice2) {
       // skip this MB if slice is out of range
-      if (out_params.slice_x2 <  size.h_view(m).x2min ||
-          out_params.slice_x2 >= size.h_view(m).x2max) { continue; }
+      if (slice_x2 <  size.h_view(m).x2min ||
+          slice_x2 >= size.h_view(m).x2max) { continue; }
       // set index of slice
-      ojs = CellCenterIndex(out_params.slice_x2, indcs.nx2,
+      ojs = CellCenterIndex(slice_x2, indcs.nx2,
                             size.h_view(m).x2min, size.h_view(m).x2max);
       ojs += indcs.js;
       oje = ojs;
     }
 
-    if (out_params.slice3) {
+    if (slice3) {
       // skip this MB if slice is out of range
-      if (out_params.slice_x3 <  size.h_view(m).x3min ||
-          out_params.slice_x3 >= size.h_view(m).x3max) { continue; }
+      if (slice_x3 <  size.h_view(m).x3min ||
+          slice_x3 >= size.h_view(m).x3max) { continue; }
       // set index of slice
-      oks = CellCenterIndex(out_params.slice_x3, indcs.nx3,
+      oks = CellCenterIndex(slice_x3, indcs.nx3,
                             size.h_view(m).x3min, size.h_view(m).x3max);
       oks += indcs.ks;
       oke = oks;
@@ -820,6 +877,14 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   MPI_Allreduce(MPI_IN_PLACE, noutmbs.data(), global_variable::nranks,
                 MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 #endif
+  if (out_params.region_enabled &&
+      std::accumulate(noutmbs.begin(), noutmbs.end(), 0) == 0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "Moving output region '" << out_params.region_center
+              << "' selected no MeshBlocks in block '" << out_params.block_name << "'"
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
   noutmbs_min = *std::min_element(noutmbs.begin(), noutmbs.end());
   noutmbs_max = *std::max_element(noutmbs.begin(), noutmbs.end());
 

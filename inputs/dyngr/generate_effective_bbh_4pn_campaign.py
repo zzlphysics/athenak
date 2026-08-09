@@ -163,7 +163,7 @@ def load_matrix(path: Path) -> dict[str, object]:
 
 
 def validate_matrix(matrix: dict[str, object]) -> None:
-    if matrix.get("schema_version") != 3:
+    if matrix.get("schema_version") != 4:
         raise CampaignError("unsupported campaign matrix schema")
     common = matrix["common"]
     mesh = common["mesh"]
@@ -205,6 +205,22 @@ def validate_matrix(matrix: dict[str, object]) -> None:
     )
     if outputs.get("history_root_dcycle") != 1:
         raise CampaignError("history must be written at every synchronized root cycle")
+    if outputs.get("local_slice_root_dcycle") != 1:
+        raise CampaignError("local BBH slices must be written at every root cycle")
+    if outputs.get("local_slice_center") != "bbh_com":
+        raise CampaignError("publication campaign local slices must track bbh_com")
+    if int(outputs.get("local_slice_axis", 0)) != 3:
+        raise CampaignError("publication campaign local slices must use the orbital x1-x2 plane")
+    local_half_width = float(outputs.get("local_slice_half_width_M", 0.0))
+    minimum_local_half_width = (
+        0.5*float(matrix["trajectory"]["baseline"]["initial_separation_M"])
+        + float(matrix["trajectory"]["maximum_horizon_guard_radius_M"])
+    )
+    if not math.isfinite(local_half_width) or local_half_width < minimum_local_half_width:
+        raise CampaignError("local BBH slice does not cover both initial horizon guards")
+    for bytes_key in ("local_slice_mhd_w_bcc", "local_slice_gr_diagnostics"):
+        if int(output_bytes.get(bytes_key, 0)) <= 0:
+            raise CampaignError(f"invalid local-slice per-MeshBlock size for {bytes_key}")
     for cadence_key, bytes_key in output_specs:
         if (
             not math.isfinite(float(outputs[cadence_key]))
@@ -220,6 +236,7 @@ def validate_matrix(matrix: dict[str, object]) -> None:
     )
     if not math.isclose(root_dx, float(mesh["root_dx_M"]), rel_tol=0.0, abs_tol=1e-14):
         raise CampaignError("matrix root_dx_M is inconsistent with its domain and root mesh")
+    root_dt_max = float(time["cfl_number"])*root_dx
 
     common_outer: tuple[float, ...] | None = None
     for name, tier in matrix["tiers"].items():
@@ -386,6 +403,10 @@ def validate_matrix(matrix: dict[str, object]) -> None:
                 (outputs["full_state_dt_M"], "full_state_mhd_w_bcc"),
                 (outputs["gr_diagnostics_dt_M"], "gr_diagnostics"),
                 (outputs["divb_dt_M"], "divb"),
+                (root_dt_max*outputs["local_slice_root_dcycle"],
+                 "local_slice_mhd_w_bcc"),
+                (root_dt_max*outputs["local_slice_root_dcycle"],
+                 "local_slice_gr_diagnostics"),
                 (effective_restart_cadence, "restart_double_precision_dynadm"),
             )
         ) / 2**30
@@ -414,6 +435,10 @@ def validate_matrix(matrix: dict[str, object]) -> None:
                 (outputs["full_state_dt_M"], "full_state_mhd_w_bcc"),
                 (outputs["gr_diagnostics_dt_M"], "gr_diagnostics"),
                 (outputs["divb_dt_M"], "divb"),
+                (root_dt_max*outputs["local_slice_root_dcycle"],
+                 "local_slice_mhd_w_bcc"),
+                (root_dt_max*outputs["local_slice_root_dcycle"],
+                 "local_slice_gr_diagnostics"),
             )
         )
         segment_bytes += (
@@ -970,10 +995,22 @@ def projected_output_gib(matrix: dict[str, object], tier: dict[str, object], tli
         float(outputs["restart_dt_M"]),
         float(matrix["common"]["resource_model"]["streaming_segment_span_M"]),
     )
+    root_dt_max = (
+        float(matrix["common"]["time"]["cfl_number"])
+        * float(matrix["common"]["mesh"]["root_dx_M"])
+    )
     dump_specs = (
         (float(outputs["full_state_dt_M"]), int(sizes["full_state_mhd_w_bcc"])),
         (float(outputs["gr_diagnostics_dt_M"]), int(sizes["gr_diagnostics"])),
         (float(outputs["divb_dt_M"]), int(sizes["divb"])),
+        (
+            root_dt_max*int(outputs["local_slice_root_dcycle"]),
+            int(sizes["local_slice_mhd_w_bcc"]),
+        ),
+        (
+            root_dt_max*int(outputs["local_slice_root_dcycle"]),
+            int(sizes["local_slice_gr_diagnostics"]),
+        ),
         (restart_cadence, int(sizes["restart_double_precision_dynadm"])),
     )
     total = 0
@@ -1368,6 +1405,32 @@ ghost_zones = false
 <output6>
 file_type = log
 dcycle = 1
+
+# Dense equatorial diagnostics around the mass-weighted binary center.  Whole AMR
+# MeshBlocks intersecting the 80M-wide moving window are selected, then reduced to the
+# cell plane through the instantaneous COM.  These streams are independent of the
+# low-cadence global 3D dumps above.
+<output7>
+file_type = bin
+variable = mhd_w_bcc
+id = bbh_local_w
+dcycle = {int(outputs['local_slice_root_dcycle'])}
+region_center = {outputs['local_slice_center']}
+region_half_width = {format_real(float(outputs['local_slice_half_width_M']))}
+region_slice_axis = {int(outputs['local_slice_axis'])}
+region_slice_offset = 0.0
+ghost_zones = false
+
+<output8>
+file_type = bin
+variable = mhd_gr_diagnostics
+id = bbh_local_gr
+dcycle = {int(outputs['local_slice_root_dcycle'])}
+region_center = {outputs['local_slice_center']}
+region_half_width = {format_real(float(outputs['local_slice_half_width_M']))}
+region_slice_axis = {int(outputs['local_slice_axis'])}
+region_slice_offset = 0.0
+ghost_zones = false
 """
 
 

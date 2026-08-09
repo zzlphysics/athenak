@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "geodesic-grid/spherical_grid.hpp"
@@ -20,6 +21,8 @@ using UserBoundaryFnPtr = void (*)(Mesh* pm);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
+using UserOutputRegionFnPtr = bool (*)(const std::string &name, Real time,
+                                       Real center[3]);
 
 //----------------------------------------------------------------------------------------
 //! \class ProblemGenerator
@@ -53,6 +56,9 @@ class ProblemGenerator {
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;
+  // Resolve a problem-defined, time-dependent center used by filtered mesh output.
+  // Returning false rejects an unknown region name before any partial file is written.
+  UserOutputRegionFnPtr user_output_region_func=nullptr;
 
   // predefined problem generator functions (default test suite)
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);

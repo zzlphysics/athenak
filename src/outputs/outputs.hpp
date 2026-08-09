@@ -128,6 +128,15 @@ struct OutputParameters {
   int gid;
   bool slice1, slice2, slice3;
   Real slice_x1, slice_x2, slice_x3;
+  // Optional problem-defined moving region.  Whole MeshBlocks intersecting the box are
+  // retained, which preserves the fixed record shape required by binary MPI-IO.  A
+  // nonzero region_slice_axis additionally reduces every retained block to the cell plane
+  // passing through the resolved center (plus region_slice_offset).
+  bool region_enabled=false;
+  std::string region_center;
+  Real region_half_width1=0.0, region_half_width2=0.0, region_half_width3=0.0;
+  int region_slice_axis=0;
+  Real region_slice_offset=0.0;
   bool user_hist_only;
   std::string data_format;
   bool contains_derived=false;

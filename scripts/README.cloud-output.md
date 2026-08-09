@@ -56,7 +56,9 @@ python3 scripts/pull_ready_outputs.py \
 Before creating the destination, the puller uses `findmnt` to require the exact declared
 mount source and an `rw` mount; it then probes with a real create/delete operation.  This
 prevents a missing NAS mount from silently redirecting a large transfer onto the local
-filesystem.  The current NAS must be remounted read-write before use.
+filesystem.  A managed sandbox may expose the same target as `ro`; perform the pull and
+its write probe in the host mount namespace.  On 2026-08-10 the host view of this NAS was
+verified `rw` by create, `fsync`, readback, SHA-256, and cleanup.
 
 Zhixing Cloud instances default to 32 Mbps, which caps an SSH transfer at about
 3.8 MiB/s even when the NAS is faster.  Before a large pull, query `MaxBandwidth` from

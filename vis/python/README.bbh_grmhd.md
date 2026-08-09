@@ -57,6 +57,13 @@ archive growth and the remote working set obtained by retaining only the two new
 restart generations.  Both a machine-readable `campaign-analysis.json` and a concise
 human-readable `campaign-analysis.md` are written.
 
+The analyzer distinguishes low-cadence global `mhd_w_bcc`/
+`mhd_gr_diagnostics` files from high-cadence `bbh_local_w`/`bbh_local_gr` files even
+though they contain the same variable groups.  It reads already-sliced variable-size
+MeshBlock records directly, derives root-cycle cadence from `dcycle` when only one frame
+is present, and plots a local stream using its stored moving-window extent rather than a
+fixed origin-centered crop.
+
 The generic history remains `merged-history.{csv,hst,png}`.  Native BBH diagnostics are
 written as `merged-user-history.{csv,hst,png}` and include the two 3D positions,
 separation, orbital angular frequency, trajectory mass terms, outside-excision baryon

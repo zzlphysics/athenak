@@ -30,7 +30,7 @@ with AthenaK `-m` before allocation.
 
 The L rootcap run reached 14,372 MeshBlocks at cycle 2; its trajectory-wide capacity
 sweep reached 14,470 total blocks and a 3,899-block rank peak.  The M four-rank probe
-reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 3
+reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 4
 archives the evidence hashes and uses 18,088/28,255 blocks after the 25% margin.  The M
 observation is a capacity input, not an eight-rank qualification result.
 
@@ -115,16 +115,25 @@ to the validated double-precision A100+MPI build (`Athena_SINGLE_PRECISION=OFF`)
 matrix records `2.5e-5`, `5e-5`, and `1e-4M` as the required finite-difference sensitivity
 triplet.  The restart storage estimate is also double precision (ordinary `bin` outputs
 remain float32 by file-format design).
-The default closed-file cadence is both generic and BBH-specific history at every
-synchronized root cycle, primitive state every `10M`, native metric-aware GRMHD
-diagnostics every `10M`, `divB` every `25M`, and restart every `250M`.  With the baseline
-root-step cap this means a history spacing of at most `4.8M`, not `1M`: ordinary AthenaK
-history output cannot observe intermediate level substeps.  The generated event log also
-checks and resets EOS floors, velocity ceilings, C2P failures/iteration maxima, and FOFC
-events every root cycle.
+The default closed-file layout is hierarchical.  Generic and BBH-specific history are
+written at every synchronized root cycle.  Global three-dimensional primitive state and
+native metric-aware diagnostics are written every `50M`, global `divB` every `25M`, and
+restart every `250M`.  Two additional `80M`-wide equatorial streams follow the
+mass-weighted `bbh_com`: `bbh_local_w` stores primitive/MHD state and `bbh_local_gr`
+stores covariant GRMHD diagnostics every root cycle.  With the baseline root-step cap the
+local-frame and history spacing is at most `4.8M`, not `1M`: synchronized AthenaK output
+cannot observe intermediate fine-level substeps.  The event log also checks and resets
+EOS floors, velocity ceilings, C2P failures/iteration maxima, and FOFC events every root
+cycle.
+
+Local output selects complete AMR MeshBlocks intersecting the moving cube and then writes
+only one cell plane through its instantaneous center.  Thus it preserves MPI-IO record
+shape and AMR provenance while reducing each selected `16^3` block to `16^2` cells.  The
+storage gate pessimistically assumes every gated MeshBlock intersects the local window;
+the measured campaign analyzer uses actual closed-file sizes instead.
 The streaming scratch gate budgets a conservative `100M` cloud segment, two retained
 restart generations, forced end-of-segment outputs, and 25% headroom.  The corresponding
-undrained `10000M` archive projections are 8.28/12.94/25.36 TiB for L/M/H, including
+undrained `10000M` archive projections are 5.94/9.27/18.17 TiB for L/M/H, including
 the restart forced at every `100M` segment boundary.  Full campaigns must therefore
 stream checksum-verified closed files instead of accumulating them on an instance disk.
 Every generated input explicitly sets `time/root_dt_max=cfl_number*root_dx` (`4.8M` at

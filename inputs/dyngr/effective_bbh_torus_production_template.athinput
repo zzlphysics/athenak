@@ -157,19 +157,47 @@ dcycle      = 1
 <output2>
 file_type   = bin
 variable    = mhd_w_bcc
-dt          = 100.0
+dt          = 50.0
 ghost_zones = false
 
 <output3>
 file_type   = bin
 variable    = mhd_divb
-dt          = 100.0
+dt          = 25.0
 ghost_zones = false
 
 <output4>
 file_type = rst
-dt        = 500.0
+dt        = 250.0
 
 <output5>
 file_type = log
 dcycle    = 1
+
+<output6>
+file_type   = bin
+variable    = mhd_gr_diagnostics
+dt          = 50.0
+ghost_zones = false
+
+<output7>
+file_type            = bin
+variable             = mhd_w_bcc
+id                   = bbh_local_w
+dcycle               = 1
+region_center         = bbh_com
+region_half_width     = 40.0
+region_slice_axis     = 3
+region_slice_offset   = 0.0
+ghost_zones           = false
+
+<output8>
+file_type            = bin
+variable             = mhd_gr_diagnostics
+id                   = bbh_local_gr
+dcycle               = 1
+region_center         = bbh_com
+region_half_width     = 40.0
+region_slice_axis     = 3
+region_slice_offset   = 0.0
+ghost_zones           = false

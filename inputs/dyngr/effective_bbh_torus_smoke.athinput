@@ -164,3 +164,14 @@ dcycle    = 2
 <output5>
 file_type = log
 dcycle    = 1
+
+<output6>
+file_type            = bin
+variable             = mhd_w_bcc
+id                   = bbh_local_w
+dcycle               = 1
+region_center         = bbh_com
+region_half_width     = 40.0
+region_slice_axis     = 3
+region_slice_offset   = 0.0
+ghost_zones           = false

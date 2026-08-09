@@ -254,6 +254,34 @@ the complete initial hierarchy, and refuses GPU-memory or scratch-storage declar
 below the audited gate.  Generated files remain qualification candidates until their
 short-run topology, memory, restart, and diagnostic gates pass.
 
+## Moving local binary output
+
+Binary mesh output can follow problem-defined BBH centers while global three-dimensional
+dumps remain sparse.  `dynbbh` provides `bh1`, `bh2`, and the instantaneous mass-weighted
+`bbh_com`.  For example, this writes an equatorial `80M`-wide COM window at every
+synchronized root cycle:
+
+```text
+<output7>
+file_type = bin
+variable = mhd_w_bcc
+id = bbh_local_w
+dcycle = 1
+region_center = bbh_com
+region_half_width = 40
+region_slice_axis = 3
+region_slice_offset = 0
+ghost_zones = false
+```
+
+`region_half_width{1,2,3}` can override the scalar width.  `region_slice_axis=1,2,3`
+writes the cell plane through the moving center plus `region_slice_offset`; zero retains
+the three-dimensional local cube.  A moving region cannot be combined with fixed
+`slice_x*` parameters.  Selection is at whole-MeshBlock granularity, so the physical box
+is padded by at most one block per side.  The binary header retains the static selection
+contract, while each record contains its actual AMR logical location and coordinates;
+pair it with `.user.hst` or the certified trajectory for the exact center at each time.
+
 Moving-hole shells can be specified independently with
 `refinement_radius_level_1` through the configured finest physical level.  If any one is
 present, every level must be listed, values must be positive and non-increasing, and

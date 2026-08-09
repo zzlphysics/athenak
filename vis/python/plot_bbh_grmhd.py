@@ -340,6 +340,7 @@ def read_slice(
     level_counts: Counter = Counter()
     selected_level_counts: Counter = Counter()
     blocks: list[SliceBlock] = []
+    file_presliced: bool | None = None
 
     with path.open("rb") as stream:
         stream.seek(header.data_offset)
@@ -360,28 +361,47 @@ def read_slice(
                 int(indices[3] - indices[2] + 1),
                 int(indices[5] - indices[4] + 1),
             )
+            presliced = (
+                block_cells[axis] == 1 and block_cells_config[axis] > 1
+            )
             if first_record:
-                if block_cells != block_cells_config:
+                shape_is_supported = all(
+                    actual == configured or
+                    (dimension == axis and actual == 1 and configured > 1)
+                    for dimension, (actual, configured) in enumerate(
+                        zip(block_cells, block_cells_config)
+                    )
+                )
+                if not shape_is_supported:
                     raise RuntimeError(
                         f"{path}: output block shape {block_cells} differs from "
-                        f"configured shape {block_cells_config}"
+                        f"configured shape {block_cells_config}; the file may be sliced "
+                        f"along a different axis"
                     )
+                file_presliced = presliced
                 first_record = False
+            elif presliced != file_presliced:
+                raise RuntimeError(f"{path}: inconsistent MeshBlock slice shapes")
             number_cells = math.prod(block_cells)
             variable_bytes = number_cells * header.variable_size
             record_data_bytes = len(header.variables) * variable_bytes
-            target_block, slice_index = _target_block_and_index(
-                location,
-                domain_min,
-                domain_max,
-                root_blocks,
-                block_cells[axis],
-                level,
-            )
-            block_location = (block_i, block_j, block_k)[axis]
-            if block_location != target_block:
-                stream.seek(6 * header.location_size + record_data_bytes, os.SEEK_CUR)
-                continue
+            if presliced:
+                slice_index = 0
+            else:
+                target_block, slice_index = _target_block_and_index(
+                    location,
+                    domain_min,
+                    domain_max,
+                    root_blocks,
+                    block_cells[axis],
+                    level,
+                )
+                block_location = (block_i, block_j, block_k)[axis]
+                if block_location != target_block:
+                    stream.seek(
+                        6 * header.location_size + record_data_bytes, os.SEEK_CUR
+                    )
+                    continue
 
             limits_buffer = stream.read(6 * header.location_size)
             limits = np.frombuffer(limits_buffer, dtype=location_dtype)

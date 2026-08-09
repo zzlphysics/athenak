@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import struct
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -16,8 +18,12 @@ sys.path.insert(0, str(ROOT / "vis" / "python"))
 from analyze_bbh_grmhd_campaign import (  # noqa: E402
     classify_binary,
     classify_history,
+    configured_output_dcycle,
+    configured_output_dt,
+    configured_output_region,
     load_verified_files,
     merge_histories,
+    meshblock_level_counts,
     storage_projection,
     subcycling_work_model,
     summarize_event_logs,
@@ -159,6 +165,33 @@ def test_storage_budget_includes_forced_segment_restarts() -> None:
     assert projection["transfer_budget"]["average_drain_has_headroom"] is True
 
 
+def test_storage_budget_uses_root_cycle_cadence_for_local_slices() -> None:
+    streams = {
+        "bbh_local_w": [
+            {
+                "time_M": 0.0,
+                "bytes": 10_000_000,
+                "configured_dt_M": None,
+                "configured_root_dcycle": 1,
+            }
+        ]
+    }
+    projection = storage_projection(
+        streams,
+        target_time=9.6,
+        restart_sizes=[],
+        restart_dt=None,
+        segment_span=None,
+        root_dt=4.8,
+        root_step_seconds=None,
+        drain_mib_s=8.0,
+    )
+    local = projection["streams"]["bbh_local_w"]
+    assert local["cadence_M"] == 4.8
+    assert local["remaining_frames"] == 2
+    assert local["remaining_bytes"] == 20_000_000
+
+
 def test_subcycling_work_model_uses_strict_two_to_one_levels() -> None:
     work = subcycling_work_model({0: 8, 1: 4, 2: 2})
     assert work["subcycled_meshblock_updates_per_root_step"] == 24
@@ -172,6 +205,62 @@ def test_native_grmhd_diagnostic_stream_is_classified() -> None:
         "mhd_gr_diagnostics"
     )
     assert classify_binary("renamed-output.bin", variables) == "mhd_gr_diagnostics"
+    assert classify_binary("run.bbh_local_gr.00001.bin", variables) == "bbh_local_gr"
+    assert classify_binary(
+        "run.bbh_local_w.00001.bin", ("dens", "velx", "bcc1")
+    ) == "bbh_local_w"
+
+
+def test_local_and_global_duplicate_variables_use_ids_for_cadence() -> None:
+    header = SimpleNamespace(
+        parameters={
+            "output2": {
+                "file_type": "bin",
+                "variable": "mhd_w_bcc",
+                "id": "mhd_w_bcc",
+                "dt": "50",
+            },
+            "output7": {
+                "file_type": "bin",
+                "variable": "mhd_w_bcc",
+                "id": "bbh_local_w",
+                "dcycle": "1",
+                "region_center": "bbh_com",
+                "region_half_width": "40",
+                "region_slice_axis": "3",
+            },
+        }
+    )
+    assert configured_output_dt(header, "mhd_w_bcc") == 50.0
+    assert configured_output_dt(header, "bbh_local_w") is None
+    assert configured_output_dcycle(header, "bbh_local_w") == 1
+    assert configured_output_region(header, "bbh_local_w") == {
+        "center": "bbh_com",
+        "half_width_M": [40.0, 40.0, 40.0],
+        "slice_axis": 3,
+        "slice_offset_M": 0.0,
+    }
+
+
+def test_meshblock_scan_accepts_full_and_sliced_record_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "mixed-shape-records.bin"
+
+    def record(shape: tuple[int, int, int], level: int) -> bytes:
+        nx1, nx2, nx3 = shape
+        indices = struct.pack("=6i", 0, nx1 - 1, 0, nx2 - 1, 0, nx3 - 1)
+        logical = struct.pack("=4i", 0, 0, 0, level)
+        geometry = struct.pack("=6d", 0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+        data = bytes(2 * nx1 * nx2 * nx3 * 4)
+        return indices + logical + geometry + data
+
+    path.write_bytes(record((2, 2, 2), 0) + record((2, 2, 1), 1))
+    header = SimpleNamespace(
+        data_offset=0,
+        variables=("a", "b"),
+        variable_size=4,
+        location_size=8,
+    )
+    assert meshblock_level_counts(path, header) == {0: 1, 1: 1}
 
 
 def test_generic_and_bbh_histories_are_kept_separate() -> None:
