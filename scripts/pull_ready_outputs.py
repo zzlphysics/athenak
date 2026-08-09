@@ -14,9 +14,17 @@ import sys
 import time
 
 
-def run(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, input=input_text, text=True, check=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(
+    command: list[str], *, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        input=input_text,
+        text=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
 
 def remote(host: str, command: list[str], *, input_text: str | None = None) -> str:
@@ -34,7 +42,9 @@ def sha256(path: Path) -> str:
 
 def safe_relative(value: str) -> PurePosixPath:
     path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or any(part in ("", ".", "..") for part in path.parts):
+    if path.is_absolute() or not path.parts or any(
+        part in ("", ".", "..") for part in path.parts
+    ):
         raise ValueError(f"unsafe manifest path: {value!r}")
     return path
 
@@ -47,7 +57,9 @@ def assert_writable_directory(destination: Path) -> None:
             stream.write("ok\n")
         probe.unlink()
     except OSError as exc:
-        raise SystemExit(f"destination is not writable: {destination}: {exc}") from exc
+        raise SystemExit(
+            f"destination is not writable: {destination}: {exc}"
+        ) from exc
 
 
 def existing_ancestor(path: Path) -> Path:
@@ -68,21 +80,32 @@ def assert_expected_mount(
     """Fail before mkdir when a nominal NAS path is not on the expected mount."""
     probe = existing_ancestor(destination)
     payload = json.loads(
-        run([
-            "findmnt", "--json", "--target", str(probe),
-            "--output", "TARGET,SOURCE,FSTYPE,OPTIONS",
-        ]).stdout
+        run(
+            [
+                "findmnt",
+                "--json",
+                "--target",
+                str(probe),
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ]
+        ).stdout
     )
     filesystems = payload.get("filesystems", [])
     if len(filesystems) != 1:
-        raise SystemExit(f"could not resolve exactly one mount for {probe}: {filesystems}")
+        raise SystemExit(
+            f"could not resolve exactly one mount for {probe}: {filesystems}"
+        )
     mount = filesystems[0]
     required = {"target", "source", "fstype", "options"}
-    if not required.issubset(mount) or not all(isinstance(mount[key], str) for key in required):
+    if not required.issubset(mount) or not all(
+        isinstance(mount[key], str) for key in required
+    ):
         raise SystemExit(f"malformed findmnt result for {probe}: {mount}")
     if mount["source"] != expected_source:
         raise SystemExit(
-            f"destination mount source is {mount['source']!r}, expected {expected_source!r}"
+            f"destination mount source is {mount['source']!r}, "
+            f"expected {expected_source!r}"
         )
     if expected_fstype is not None and mount["fstype"] != expected_fstype:
         raise SystemExit(
@@ -103,19 +126,42 @@ def remote_usage_percent(host: str, remote_root: str) -> int:
 
 
 def list_manifests(host: str, manifest_dir: str) -> list[str]:
-    output = remote(host, ["find", manifest_dir, "-maxdepth", "1", "-type", "f",
-                            "-name", "*.manifest.ready", "-printf", "%f\\n"])
+    output = remote(
+        host,
+        [
+            "find",
+            manifest_dir,
+            "-maxdepth",
+            "1",
+            "-type",
+            "f",
+            "-name",
+            "*.manifest.ready",
+            "-printf",
+            "%f\\n",
+        ],
+    )
     return sorted(line for line in output.splitlines() if line)
 
 
-def load_manifest(host: str, manifest_dir: str, name: str) -> dict:
+def load_manifest(host: str, manifest_dir: str, name: str) -> tuple[dict, str]:
     if PurePosixPath(name).name != name or not name.endswith(".manifest.ready"):
         raise ValueError(f"unsafe manifest name: {name!r}")
     payload = remote(host, ["cat", f"{manifest_dir.rstrip('/')}/{name}"])
     manifest = json.loads(payload)
     if manifest.get("schema") != 1 or not isinstance(manifest.get("files"), list):
         raise ValueError(f"unsupported manifest schema in {name}")
-    return manifest
+    return manifest, payload
+
+
+def atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("x", encoding="utf-8") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def already_verified(path: Path, size: int, digest: str) -> bool:
@@ -123,13 +169,19 @@ def already_verified(path: Path, size: int, digest: str) -> bool:
 
 
 def transfer_manifest(args: argparse.Namespace, name: str) -> None:
-    manifest = load_manifest(args.host, args.remote_manifest_dir, name)
+    manifest, manifest_text = load_manifest(args.host, args.remote_manifest_dir, name)
     segment = manifest.get("segment")
     if not isinstance(segment, str) or not segment:
         raise ValueError(f"manifest {name} has no segment")
 
     incoming_root = args.destination / ".incoming" / segment
     ack_root = args.destination / ".acks"
+    local_manifest = args.destination / ".manifests" / name
+    if local_manifest.exists():
+        if local_manifest.read_text(encoding="utf-8") != manifest_text:
+            raise RuntimeError(f"refusing changed ready manifest: {local_manifest}")
+    else:
+        atomic_write_text(local_manifest, manifest_text)
     transferred = []
     for record in manifest["files"]:
         relative = safe_relative(record["path"])
@@ -144,13 +196,24 @@ def transfer_manifest(args: argparse.Namespace, name: str) -> None:
             continue
         if final_path.exists():
             raise RuntimeError(
-                f"refusing to overwrite existing file with different content: {final_path}")
+                "refusing to overwrite existing file with different content: "
+                f"{final_path}"
+            )
 
-        partial_path = incoming_root.joinpath(*relative.parts).with_name(relative.name + ".part")
+        partial_path = incoming_root.joinpath(*relative.parts).with_name(
+            relative.name + ".part"
+        )
         partial_path.parent.mkdir(parents=True, exist_ok=True)
         source = f"{args.host}:{args.remote_root.rstrip('/')}/{relative.as_posix()}"
-        command = ["rsync", "--partial", "--append-verify", "--protect-args",
-                   f"--bwlimit={args.bwlimit_kib}", source, str(partial_path)]
+        command = [
+            "rsync",
+            "--partial",
+            "--append-verify",
+            "--protect-args",
+            f"--bwlimit={args.bwlimit_kib}",
+            source,
+            str(partial_path),
+        ]
         run(command)
         if partial_path.stat().st_size != size:
             raise RuntimeError(f"size mismatch for {relative}")
@@ -164,53 +227,79 @@ def transfer_manifest(args: argparse.Namespace, name: str) -> None:
     ack = {
         "schema": 1,
         "manifest": name,
+        "manifest_sha256": hashlib.sha256(manifest_text.encode("utf-8")).hexdigest(),
         "segment": segment,
         "verified_unix": time.time(),
         "destination": str(args.destination),
+        "total_bytes": sum(int(record["size"]) for record in transferred),
         "files": transferred,
     }
     ack_text = json.dumps(ack, indent=2, sort_keys=True) + "\n"
     local_ack = ack_root / f"{name}.ack"
-    temporary = ack_root / f".{name}.{os.getpid()}.tmp"
-    temporary.write_text(ack_text, encoding="utf-8")
-    os.replace(temporary, local_ack)
+    atomic_write_text(local_ack, ack_text)
 
     remote_ack_dir = f"{args.remote_manifest_dir.rstrip('/')}/acks"
     remote(args.host, ["mkdir", "-p", remote_ack_dir])
-    remote(args.host, ["sh", "-c", f"cat > {shlex.quote(remote_ack_dir + '/' + name + '.ack')}"] ,
-           input_text=ack_text)
+    remote(
+        args.host,
+        [
+            "sh",
+            "-c",
+            f"cat > {shlex.quote(remote_ack_dir + '/' + name + '.ack')}",
+        ],
+        input_text=ack_text,
+    )
     print(f"verified {name}: {len(transferred)} files")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", required=True, help="SSH destination, e.g. root@gpu-host")
+    parser.add_argument(
+        "--host", required=True, help="SSH destination, e.g. root@gpu-host"
+    )
     parser.add_argument("--remote-root", required=True)
     parser.add_argument("--remote-manifest-dir", required=True)
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument(
         "--expected-mount-source",
         required=True,
-        help="exact findmnt SOURCE for the destination, preventing fallback to a local disk",
+        help=(
+            "exact findmnt SOURCE for the destination, preventing fallback to a "
+            "local disk"
+        ),
     )
     parser.add_argument(
         "--expected-mount-fstype",
         help="optional exact findmnt FSTYPE, for example nfs",
     )
     parser.add_argument("--bwlimit-kib", type=int, default=9000)
-    parser.add_argument("--poll-seconds", type=float, default=0.0,
-                        help="0 performs one pass; positive values poll continuously")
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=0.0,
+        help="0 performs one pass; positive values poll continuously",
+    )
     args = parser.parse_args()
     args.destination = args.destination.expanduser().resolve()
     mount = assert_expected_mount(
         args.destination, args.expected_mount_source, args.expected_mount_fstype
     )
     assert_writable_directory(args.destination)
-    print(f"destination mount: {json.dumps(mount, sort_keys=True)}", file=sys.stderr)
+    print(
+        f"destination mount: {json.dumps(mount, sort_keys=True)}", file=sys.stderr
+    )
 
     while True:
         usage = remote_usage_percent(args.host, args.remote_root)
-        level = "ok" if usage < 65 else "warning" if usage < 75 else "hold" if usage < 80 else "stop"
+        level = (
+            "ok"
+            if usage < 65
+            else "warning"
+            if usage < 75
+            else "hold"
+            if usage < 80
+            else "stop"
+        )
         print(f"remote disk: {usage}% ({level})", file=sys.stderr)
         for name in list_manifests(args.host, args.remote_manifest_dir):
             ack = args.destination / ".acks" / f"{name}.ack"

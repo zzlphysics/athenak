@@ -29,6 +29,48 @@ python3 vis/python/plot_bbh_grmhd.py "state/bin/*.bin" \
 Every PNG has a neighboring JSON summary, and the output directory receives a
 `postprocess-manifest.json` describing all processed frames.
 
+## Closed-file campaign workflow
+
+For cloud campaign data, use `analyze_bbh_grmhd_campaign.py` instead of passing an
+unverified transfer directory directly to the plotter.  Every segment must have a local
+`.acks/*.ack` written by `scripts/pull_ready_outputs.py`.  By default the workflow
+rechecks both size and SHA256 before reading any `.bin` or `.hst` file, merges overlapping
+restart histories in command-line order, inventories binary times/cycles/MeshBlock
+counts, measures output cadence, projects storage to the requested target time, and
+renders every verified frame plus the final frame:
+
+```bash
+python3 vis/python/analyze_bbh_grmhd_campaign.py \
+  /nas/campaign/L-segment-000 /nas/campaign/L-segment-001 \
+  --output-dir output/L-full --target-time 3500 \
+  --trajectory /path/to/q1_4pn_to_remnant.dat
+```
+
+Use `--render-every 5` for a lower-cadence preview, or `--render-every 0` to produce only
+the verified inventory, merged history, cadence plot, and JSON report.  `--no-sha256`
+exists only for a quick local debugging pass; its report is explicitly marked unverified
+and it must not be used for a paper artifact.
+
+The workflow never discovers arbitrary files with a glob.  A science file absent from a
+local ACK is ignored, and a missing, size-changed, or hash-changed ACK record aborts the
+whole analysis.  This is the downstream half of the closed-file protocol documented in
+`scripts/README.cloud-output.md`.
+
+After separate L/M/H workflows exist, build the time-aligned history comparison with:
+
+```bash
+python3 vis/python/compare_bbh_grmhd_convergence.py \
+  L=output/L-full/merged-history.csv \
+  M=output/M-full/merged-history.csv \
+  H=output/H-full/merged-history.csv \
+  --output-dir output/LMH-convergence
+```
+
+It writes aligned CSV, a comparison figure, pairwise L2 differences, and an empirical
+2:1 tier-difference order.  This order only probes diagnostics affected by the moving-hole
+inner hierarchy: the campaign deliberately keeps the bulk disk at physical L4, so it is
+not a claim of MRI or small-scale magnetic-turbulence convergence.
+
 Proxy panels mask cells below `1e-8` of the maximum slice density by default so
 that atmosphere floors do not dominate their color scale.  Change this with
 `--rho-mask-fraction`, or pass `--rho-mask-fraction 0` to disable the mask.

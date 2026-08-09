@@ -5,14 +5,24 @@ run.  The intended protocol is:
 
 1. Run AthenaK for a 2--4 hour segment and stop at a synchronized restart point.
 2. On the compute host, publish every closed file in that segment with
-   `mark_output_ready.py`.  The script checks that files are stable, computes SHA256, and
-   atomically creates `SEGMENT.manifest.ready`.
+   `mark_output_ready.py`.  The script refuses files younger than 120 seconds, scans
+   `/proc/*/fd` before and after hashing to prove that no process has the file open,
+   verifies size/mtime stability while computing SHA256, and atomically creates
+   an immutable `SEGMENT.manifest.ready`.  A segment identifier can never replace an
+   existing ready manifest, so receivers cannot ACK one payload and later observe another.
 3. On the workstation, run `pull_ready_outputs.py`.  It resumes partial `rsync` transfers,
    verifies size and SHA256 in a hidden incoming directory, atomically installs each
    verified file, and writes matching local and remote ACK records.
 4. Delete cloud files only after their ACK exists.  Keep at least the two newest restart
    files on the compute host.  Remote deletion is intentionally not implemented by the
    puller, so a transfer failure cannot destroy the only copy.
+
+Never publish the newest in-progress output merely because its size has stopped changing.
+For mid-segment streaming, publish a binary dump only after the following numbered dump
+exists and the closure checks pass.  History files are append-only and remain unpublished
+until the AthenaK segment exits.  Restart files are published only after synchronized
+shutdown; retain two newer verified restart generations before considering an ACK-gated
+cleanup.
 
 Example on the compute host after a segment has closed:
 
