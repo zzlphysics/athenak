@@ -607,6 +607,8 @@ def write_markdown_report(report: dict[str, object], path: Path) -> None:
     lines.extend(["## Publication gates still open", ""])
     for item in readiness["not_available_from_current_dump"]:
         lines.append(f"- {item}")
+    for item in readiness["campaign_systematics_still_required"]:
+        lines.append(f"- {item}")
     lines.extend(
         [
             "",
@@ -801,6 +803,12 @@ def main() -> int:
                 "MRI quality factors Q_theta and Q_phi",
                 "moving-horizon mass and magnetic fluxes",
                 "covariant Bernoulli parameter and Lorentz factor",
+            ],
+            "campaign_systematics_still_required": [
+                "bulk-disk resolution sequence beyond the fixed physical-L4 floor",
+                "horizon-following magnetic leakage/forcing validation",
+                "half-CFL and metric finite-difference-step sensitivity",
+                "floor, excision, and outer-boundary sensitivity",
             ],
         },
     }
