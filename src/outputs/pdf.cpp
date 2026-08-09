@@ -165,6 +165,7 @@ void PDFOutput::LoadOutputData(Mesh *pm) {
   // although maybe not optimal -- should probably have a way to
   // know beforehand which needs to be computed
   if (out_params.contains_derived) {
+    out_params.i_derived = 0;
     ComputeDerivedVariable(out_params.variable, pm);
     ComputeDerivedVariable(out_params.variable_2, pm);
   }
