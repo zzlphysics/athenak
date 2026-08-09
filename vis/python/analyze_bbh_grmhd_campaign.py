@@ -535,6 +535,89 @@ def render_dashboards(
     return rendered
 
 
+def write_markdown_report(report: dict[str, object], path: Path) -> None:
+    lines = [
+        "# Verified BBH GRMHD campaign analysis",
+        "",
+        "## Integrity",
+        "",
+        "Only files chained through an immutable ready manifest and local ACK are "
+        "included. Science-file size and SHA256 checks are recorded in "
+        "`campaign-analysis.json`.",
+        "",
+        "## Output streams",
+        "",
+        "| stream | frames | time range (M) | median gap (M) | latest blocks | "
+        "subcycling update reduction |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    streams = report["streams"]
+    cadence = report["cadence"]
+    for name in sorted(streams):
+        frames = streams[name]
+        summary = cadence[name]
+        latest = max(frames, key=lambda frame: float(frame["time_M"]))
+        work = latest["subcycling_work_model"]
+        lines.append(
+            f"| {name} | {summary['frames']} | "
+            f"{summary['time_min_M']:.6g}–{summary['time_max_M']:.6g} | "
+            f"{summary.get('gap_median_M', 'n/a')} | {latest['meshblocks']} | "
+            f"{100.0 * work['meshblock_update_reduction_fraction']:.2f}% |"
+        )
+
+    storage = report["storage_projection"]
+    lines.extend(
+        [
+            "",
+            "## Storage and drain budget",
+            "",
+            f"- Target time: {storage['target_time_M']:.6g}M",
+            f"- Remaining binary output: {storage['remaining_binary_TiB']:.3f} TiB",
+            f"- Remaining total archive: {storage['remaining_archive_TiB']:.3f} TiB",
+            f"- Remote segment working set: "
+            f"{storage.get('remote_segment_working_set_bytes', 0) / 2**30:.1f} GiB",
+        ]
+    )
+    transfer = storage.get("transfer_budget")
+    if transfer is not None:
+        lines.extend(
+            [
+                f"- Average generation: {transfer['average_generation_MiB_s']:.3f} "
+                "MiB/s",
+                f"- Assumed sustained drain: "
+                f"{transfer['assumed_sustained_drain_MiB_s']:.3f} MiB/s",
+                f"- Drain/generation headroom: "
+                f"{transfer['drain_to_generation_ratio']:.2f}x",
+            ]
+        )
+
+    history = report.get("history")
+    lines.extend(["", "## History diagnostics", ""])
+    if history is None:
+        lines.append("No verified history file was available.")
+    else:
+        for name, value in sorted(history["diagnostics"].items()):
+            lines.append(f"- `{name}`: {value:.8g}")
+        lines.append("")
+        for note in history.get("interpretation_notes", []):
+            lines.append(f"> {note}")
+            lines.append("")
+
+    readiness = report["publication_readiness"]
+    lines.extend(["## Publication gates still open", ""])
+    for item in readiness["not_available_from_current_dump"]:
+        lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "Coordinate-component magnetic and velocity panels remain explicitly "
+            "labelled as proxies until synchronized metric data are present.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("segments", nargs="+", type=Path)
@@ -725,6 +808,9 @@ def main() -> int:
     report_path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    markdown_path = args.output_dir / "campaign-analysis.md"
+    write_markdown_report(report, markdown_path)
+    print(markdown_path)
     print(report_path)
     return 0
 

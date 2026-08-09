@@ -53,7 +53,8 @@ even when the configured restart cadence is longer.  With a measured root-step w
 the report converts primitive/divB/checkpoint production into average MiB/s and compares
 it with the conservative sustained NAS drain rate.  It separately reports total NAS
 archive growth and the remote working set obtained by retaining only the two newest
-restart generations.
+restart generations.  Both a machine-readable `campaign-analysis.json` and a concise
+human-readable `campaign-analysis.md` are written.
 
 Use `--render-every 5` for a lower-cadence preview, or `--render-every 0` to produce only
 the verified inventory, merged history, cadence plot, and JSON report.  `--no-sha256`
