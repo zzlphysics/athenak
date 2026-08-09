@@ -190,6 +190,23 @@ The complete SHA-verified metadata is archived under
 `20260805-a100x2-restart-d03ac167-diagnostic`.  The latter records why an initial wrapper
 marker was a decimal-format false negative and retains the subsequent strict verification.
 
+## Four-A100 controlled subcycling comparison (2026-08-08)
+
+A same-binary, same-restart, same-hardware comparison advanced the L hierarchy from
+`t=48M` to `52.8M` on four A100-80G GPUs.  Strict level subcycling took `513.286s`; the
+historical uniform-finest-step path took `697.485s`, a measured `1.3589x` wall-clock
+speedup and `26.4%` time reduction.  At the common starting topology, the analytical
+MeshBlock-update counts are 1,796,672 versus 4,448,256, a `59.6%` reduction (`2.4758x`
+fewer updates).  The observed uniform run regridded after every fine step and deleted
+2,772 blocks, so its realized update reduction was only `41.5%`.  Subcycling achieved
+`79.5%` of the uniform path's updates/s because recursive synchronization and smaller
+level-local batches reduce GPU occupancy; therefore the update-count ratio must not be
+reported as the wall-clock speedup.
+
+The 68 KiB evidence bundle is archived below `cloud_638770` as
+`uniform-cycle10-to52p8`.  Its `comparison-summary.json` SHA-256 is
+`09d69c0a0a48bdb1d62a019476df6c6cc204ffe3fe47f5f7eb7333676c171f82`.
+
 ## Qualification order
 
 1. Convert and validate the trajectory with
