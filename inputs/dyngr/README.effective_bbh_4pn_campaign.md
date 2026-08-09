@@ -13,9 +13,9 @@ explicitly at every level.  Only the inner levels change between tiers.
 
 | tier | finest level | finest `dx` | MeshBlock gate | generated `max_nmb/rank` | A100-40G aggregate lower bound | accepted launch layout | streaming scratch | undrained scratch for `10000M` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| L | L9 | `M/32` | 18,088 | 4,544 | 8 | 4 x A100-80G | 128 GiB | 1,950 GiB |
-| M | L10 | `M/64` | 28,255 | 3,584 | 13 | candidate 8 x A100-80G | 256 GiB | 3,050 GiB |
-| H | L11 | `M/128` | 55,380 | 2,048 | 25 | topology-only 32 x A100-40G | 512 GiB | 6,000 GiB |
+| L | L9 | `M/32` | 18,088 | 4,544 | 8 | 4 x A100-80G | 192 GiB | 10,700 GiB |
+| M | L10 | `M/64` | 28,255 | 3,584 | 13 | candidate 8 x A100-80G | 320 GiB | 16,600 GiB |
+| H | L11 | `M/128` | 55,380 | 2,048 | 25 | topology-only 32 x A100-40G | 640 GiB | 32,500 GiB |
 
 The gate is 1.25 times the larger of (a) the actual initial hierarchy reported by
 AthenaK `-m`, (b) an alignment probe, (c) the post-merger `2.5M` horizon-guard topology
@@ -96,13 +96,13 @@ python3 inputs/dyngr/generate_effective_bbh_4pn_campaign.py L \
   --trajectory-provenance /data/trajectories/q1_4pn_to_remnant.dat.provenance.json \
   --source-artifact /data/trajectories/circular_orbit_PN_sep20.h5 \
   --expected-source-revision 2ce68e3d49e8758b32efc8841d239354d8d619d6 \
-  --gpus 4 --gpu-memory-gib 80 --scratch-gib 128 \
+  --gpus 4 --gpu-memory-gib 80 --scratch-gib 192 \
   --streaming-drain --drain-mib-s 8 \
   --output /data/athenak/run-L/effective_bbh_4pn_L.athinput
 ```
 
-Use `--gpus 8 --gpu-memory-gib 80 --scratch-gib 256` for the M qualification candidate
-and `--gpus 32 --gpu-memory-gib 40 --scratch-gib 512` for H topology qualification.
+Use `--gpus 8 --gpu-memory-gib 80 --scratch-gib 320` for the M qualification candidate
+and `--gpus 32 --gpu-memory-gib 40 --scratch-gib 640` for H topology qualification.
 `--validate-only` performs every trajectory/resource/storage check without writing an
 input.  `tlim` defaults to the table endpoint minus the metric finite-difference padding;
 use `--tlim` for a short qualification segment.  Unless explicitly supplied,
@@ -115,6 +115,13 @@ to the validated double-precision A100+MPI build (`Athena_SINGLE_PRECISION=OFF`)
 matrix records `2.5e-5`, `5e-5`, and `1e-4M` as the required finite-difference sensitivity
 triplet.  The restart storage estimate is also double precision (ordinary `bin` outputs
 remain float32 by file-format design).
+The default closed-file cadence is history every `1M`, primitive state every `10M`, native
+metric-aware GRMHD diagnostics every `10M`, `divB` every `25M`, and restart every `250M`.
+The streaming scratch gate budgets a conservative `100M` cloud segment, two retained
+restart generations, forced end-of-segment outputs, and 25% headroom.  The corresponding
+undrained `10000M` archive projections are 8.28/12.94/25.36 TiB for L/M/H, including
+the restart forced at every `100M` segment boundary.  Full campaigns must therefore
+stream checksum-verified closed files instead of accumulating them on an instance disk.
 Every generated input explicitly sets `time/root_dt_max=cfl_number*root_dx` (`4.8M` at
 the baseline CFL).  This bounds moving-BBH AMR lookahead and makes the cap available for
 fail-closed command-line overrides; AthenaK cannot override a parameter that is absent

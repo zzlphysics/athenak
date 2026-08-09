@@ -16,9 +16,9 @@ python3 vis/python/plot_bbh_grmhd.py \
   --history /path/to/state/effective_bbh_4pn_L_q8.mhd.hst
 ```
 
-The default dashboard contains density, gas pressure, temperature, coordinate
-magnetic-field magnitude, an inverse-beta proxy, and AMR level.  Available panels
-can be listed with `--help`; for example:
+The default dashboard contains density, gas pressure, temperature, the magnitude of
+the stored densitized `bcc` components, an inverse-beta proxy, and AMR level.  Available
+panels can be listed with `--help`; for example:
 
 ```bash
 python3 vis/python/plot_bbh_grmhd.py "state/bin/*.bin" \
@@ -92,20 +92,31 @@ python3 vis/python/plot_bbh_grmhd.py state/bin/run.mhd_divb.00005.bin \
   --output-dir output/divb --panels divb,level --plane z --extent 80
 ```
 
+Fresh DynGRMHD builds also provide a compact native diagnostic stream.  It evaluates
+the contractions against the synchronized ADM spatial metric inside AthenaK, including
+the required `bcc/sqrt(det(gamma))` conversion:
+
+```bash
+python3 vis/python/plot_bbh_grmhd.py \
+  state/bin/run.mhd_gr_diagnostics.00005.bin \
+  --output-dir output/gr-diagnostics \
+  --panels gr_bsq,gr_lorentz,gr_sigma,gr_beta_inv,level \
+  --plane z --extent 80
+```
+
 ## Dynamic-spacetime limitation
 
-The current `mhd_w_bcc` output stores primitive fluid variables and coordinate
-magnetic components, but not the dynamical ADM metric.  Therefore density,
-`press`, `temperature`, `vel*`, and `bcc*` are exact output values, while `bmag`,
-`beta_inv_proxy`, `sigma_proxy`, and `velmag_proxy` are explicitly labelled
-coordinate-component proxies.  They are useful for morphology and debugging but
-must not be quoted as covariant GR diagnostics.
+The `mhd_w_bcc` output stores primitive fluid variables and densitized magnetic
+components, `bcc=sqrt(det(gamma_ij)) B^i`, but not the dynamical ADM metric.  Therefore
+density, `press`, `temperature`, `vel*`, and `bcc*` are exact stored values, while
+`bmag`, `beta_inv_proxy`, `sigma_proxy`, and `velmag_proxy` are explicitly labelled
+stored-component proxies.  They are useful for morphology and debugging but must not
+be quoted as covariant GR diagnostics.
 
-Publication analysis of relativistic magnetization, Lorentz factor, Bernoulli
-parameter, and horizon flux should add synchronized lapse, shift, spatial-metric,
-and preferably determinant data to the science output.  The post-processor can
-then be extended to perform metric contractions without reconstructing the
-effective BBH metric independently.
+Use `mhd_gr_diagnostics` for publication measurements of `b^2`, Lorentz factor,
+`b^2/rho`, and `b^2/(2p)`.  Bernoulli parameters, MRI quality factors, and moving-horizon
+fluxes still require additional native diagnostics; they must not be reconstructed from
+the proxy panels.
 
 The history plot is likewise a global coordinate-volume diagnostic, not a closed-system
 conservation proof.  The prescribed time-dependent metric exchanges coordinate energy

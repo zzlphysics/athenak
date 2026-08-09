@@ -168,6 +168,15 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((ivar==153) && (pm->pmb_pack->pmhd == nullptr ||
+                      pm->pmb_pack->pdyngr == nullptr ||
+                      pm->pmb_pack->padm == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+       << std::endl << "Native GRMHD diagnostics requested in <output> block '"
+       << out_params.block_name << "' but MHD, DynGRMHD, or ADM is missing."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
 
   // Now load STL vector of output variables
   outvars.clear();
@@ -473,6 +482,19 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         ((variable.compare("mhd_w") == 0 ||
           variable.compare("mhd_w_bcc") == 0) && pm->pmb_pack->pdyngr !=nullptr)) {
       outvars.emplace_back("temperature",0,&(pm->pmb_pack->pdyngr->temperature));
+    }
+
+    // Native 3+1 diagnostics.  DynGRMHD stores densitized cell-centered magnetic
+    // components, so these must be calculated with the synchronized spatial metric
+    // rather than reconstructed from an ordinary mhd_w_bcc output.
+    if (variable.compare("mhd_gr_diagnostics") == 0) {
+      out_params.contains_derived = true;
+      int i_derived = out_params.n_derived;
+      out_params.n_derived += 4;
+      outvars.emplace_back("gr_bsq", i_derived, &(derived_var));
+      outvars.emplace_back("gr_lorentz", i_derived + 1, &(derived_var));
+      outvars.emplace_back("gr_sigma", i_derived + 2, &(derived_var));
+      outvars.emplace_back("gr_beta_inv", i_derived + 3, &(derived_var));
     }
 
     // hydro/mhd z-component of vorticity (useful in 2D)

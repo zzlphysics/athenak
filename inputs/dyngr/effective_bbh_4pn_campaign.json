@@ -83,11 +83,13 @@
     },
     "outputs": {
       "history_dt_M": 1.0,
-      "full_state_dt_M": 50.0,
-      "divb_dt_M": 100.0,
-      "restart_dt_M": 500.0,
+      "full_state_dt_M": 10.0,
+      "gr_diagnostics_dt_M": 10.0,
+      "divb_dt_M": 25.0,
+      "restart_dt_M": 250.0,
       "estimated_bytes_per_meshblock": {
         "full_state_mhd_w_bcc": 147456,
+        "gr_diagnostics": 65536,
         "divb": 16384,
         "restart_double_precision_dynadm": 2778624
       }
@@ -104,6 +106,9 @@
       "load_balance_partition_ordering": "contiguous MeshBlock GIDs (Z-order)",
       "max_nmb_rounding": 64,
       "streaming_minimum_drain_MiB_per_second": 8.0,
+      "streaming_segment_span_M": 100.0,
+      "streaming_restart_generations": 2,
+      "streaming_safety_fraction": 0.25,
       "remote_disk_stop_threshold_percent": 80,
       "remote_disk_emergency_threshold_percent": 85
     }
@@ -161,9 +166,9 @@
         "partition_qualified_launch_gpus": 4,
         "minimum_gpu_memory_GiB_at_qualified_count": 80,
         "runtime_qualification_status": "rootcap-runtime-qualified-through-10-cycles",
-        "minimum_streaming_scratch_GiB": 128,
-        "projected_undrained_output_GiB_at_10000M": 1559.7,
-        "minimum_undrained_scratch_GiB_at_10000M": 1950
+        "minimum_streaming_scratch_GiB": 192,
+        "projected_undrained_output_GiB_at_10000M": 8480.6,
+        "minimum_undrained_scratch_GiB_at_10000M": 10700
       }
     },
     "M": {
@@ -219,9 +224,9 @@
         "partition_qualified_launch_gpus": 8,
         "minimum_gpu_memory_GiB_at_qualified_count": 80,
         "runtime_qualification_status": "candidate-pending-eight-rank-runtime-qualification",
-        "minimum_streaming_scratch_GiB": 256,
-        "projected_undrained_output_GiB_at_10000M": 2436.4,
-        "minimum_undrained_scratch_GiB_at_10000M": 3050
+        "minimum_streaming_scratch_GiB": 320,
+        "projected_undrained_output_GiB_at_10000M": 13247.4,
+        "minimum_undrained_scratch_GiB_at_10000M": 16600
       }
     },
     "H": {
@@ -265,9 +270,9 @@
         "partition_qualified_launch_gpus": 32,
         "minimum_gpu_memory_GiB_at_qualified_count": 40,
         "runtime_qualification_status": "topology-only-pending-runtime-qualification",
-        "minimum_streaming_scratch_GiB": 512,
-        "projected_undrained_output_GiB_at_10000M": 4775.4,
-        "minimum_undrained_scratch_GiB_at_10000M": 6000
+        "minimum_streaming_scratch_GiB": 640,
+        "projected_undrained_output_GiB_at_10000M": 25965.0,
+        "minimum_undrained_scratch_GiB_at_10000M": 32500
       }
     }
   }

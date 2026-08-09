@@ -11,6 +11,7 @@
 //!   - magnitude of vorticity Curl(v)^2  [non-relativistic]
 //!   - z-component of current density Jz  [non-relativistic]
 //!   - magnitude of current density J^2  [non-relativistic]
+//!   - native metric-aware b^2, Lorentz factor, magnetization, and inverse magnetic beta
 
 #include <iostream>
 #include <sstream>
@@ -18,6 +19,7 @@
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
+#include "coordinates/adm.hpp"
 #include "coordinates/cartesian_ks.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
@@ -115,6 +117,59 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       dv(m,i_dv,k,j,i) = (w0_(m,IEN,k,j,i+1) / w0_(m,IDN,k,j,i-1));
     });
     i_dv += 1; // increment derived variable index
+  }
+
+  // Native covariant diagnostics for dynamical GRMHD.  This follows the exact 3+1
+  // primitive definitions used by PrimitiveSolver::PrimToCon.  In particular, bcc is
+  // densitized by sqrt(det(gamma_ij)) in DynGRMHD and must be undensitized first.
+  if (name.compare("mhd_gr_diagnostics") == 0) {
+    if (DerivedVariableShapeChanged(derived_var, nmb, n_dv, n3, n2, n1)) {
+      Kokkos::realloc(derived_var, nmb, n_dv, n3, n2, n1);
+    }
+    auto dv = derived_var;
+    auto &w0 = pm->pmb_pack->pmhd->w0;
+    auto &bcc = pm->pmb_pack->pmhd->bcc0;
+    auto &adm = pm->pmb_pack->padm->adm;
+    par_for("mhd_gr_diagnostics", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real gxx = adm.g_dd(m, 0, 0, k, j, i);
+      const Real gxy = adm.g_dd(m, 0, 1, k, j, i);
+      const Real gxz = adm.g_dd(m, 0, 2, k, j, i);
+      const Real gyy = adm.g_dd(m, 1, 1, k, j, i);
+      const Real gyz = adm.g_dd(m, 1, 2, k, j, i);
+      const Real gzz = adm.g_dd(m, 2, 2, k, j, i);
+      const Real detg = gxx*(gyy*gzz - gyz*gyz)
+                      - gxy*(gxy*gzz - gxz*gyz)
+                      + gxz*(gxy*gyz - gxz*gyy);
+      const Real isdetg = 1.0/sqrt(detg);
+
+      const Real wx = w0(m, IVX, k, j, i);
+      const Real wy = w0(m, IVY, k, j, i);
+      const Real wz = w0(m, IVZ, k, j, i);
+      const Real wx_d = gxx*wx + gxy*wy + gxz*wz;
+      const Real wy_d = gxy*wx + gyy*wy + gyz*wz;
+      const Real wz_d = gxz*wx + gyz*wy + gzz*wz;
+      const Real Wsq = 1.0 + wx*wx_d + wy*wy_d + wz*wz_d;
+      const Real W = sqrt(Wsq);
+
+      const Real bx = bcc(m, IBX, k, j, i)*isdetg;
+      const Real by = bcc(m, IBY, k, j, i)*isdetg;
+      const Real bz = bcc(m, IBZ, k, j, i)*isdetg;
+      const Real bx_d = gxx*bx + gxy*by + gxz*bz;
+      const Real by_d = gxy*bx + gyy*by + gyz*bz;
+      const Real bz_d = gxz*bx + gyz*by + gzz*bz;
+      const Real Bsq = bx*bx_d + by*by_d + bz*bz_d;
+      const Real Bv = (bx*wx_d + by*wy_d + bz*wz_d)/W;
+      const Real bsq = Bv*Bv + Bsq/Wsq;
+      const Real rho = w0(m, IDN, k, j, i);
+      const Real pgas = w0(m, IPR, k, j, i);
+
+      dv(m, i_dv,     k, j, i) = bsq;
+      dv(m, i_dv + 1, k, j, i) = W;
+      dv(m, i_dv + 2, k, j, i) = bsq/rho;
+      dv(m, i_dv + 3, k, j, i) = 0.5*bsq/pgas;
+    });
+    i_dv += 4;
   }
 
   // z-component of vorticity.

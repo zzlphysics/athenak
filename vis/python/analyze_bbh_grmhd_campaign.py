@@ -163,6 +163,13 @@ def verify_file(record: VerifiedFile, verify_sha256: bool) -> None:
 def classify_binary(name: str, variables: tuple[str, ...]) -> str:
     if ".mhd_w_bcc." in name:
         return "mhd_w_bcc"
+    if ".mhd_gr_diagnostics." in name or variables == (
+        "gr_bsq",
+        "gr_lorentz",
+        "gr_sigma",
+        "gr_beta_inv",
+    ):
+        return "mhd_gr_diagnostics"
     if ".mhd_divb." in name or variables == ("divb",):
         return "mhd_divb"
     return "other"
@@ -486,7 +493,21 @@ def render_dashboards(
 ) -> list[dict[str, object]]:
     rendered: list[dict[str, object]] = []
     choices = {
-        "mhd_w_bcc": ["dens", "press", "temperature", "bmag", "beta_inv_proxy", "level"],
+        "mhd_w_bcc": [
+            "dens",
+            "press",
+            "temperature",
+            "bmag",
+            "beta_inv_proxy",
+            "level",
+        ],
+        "mhd_gr_diagnostics": [
+            "gr_bsq",
+            "gr_lorentz",
+            "gr_sigma",
+            "gr_beta_inv",
+            "level",
+        ],
         "mhd_divb": ["divb", "level"],
     }
     for stream_name, panel_names in choices.items():
@@ -687,6 +708,7 @@ def main() -> int:
 
     streams: dict[str, list[dict[str, object]]] = {
         "mhd_w_bcc": [],
+        "mhd_gr_diagnostics": [],
         "mhd_divb": [],
         "other": [],
     }
@@ -750,6 +772,32 @@ def main() -> int:
         args.dpi,
         args.trajectory.expanduser().resolve(strict=True) if args.trajectory else None,
     )
+    native_gr_diagnostics = bool(streams.get("mhd_gr_diagnostics"))
+    exact_outputs = [
+        "density",
+        "pressure",
+        "temperature",
+        "stored bcc components (densitized in DynGRMHD)",
+        "primitive velocity",
+        "divB",
+    ]
+    unavailable = [
+        "MRI quality factors Q_theta and Q_phi",
+        "moving-horizon mass and magnetic fluxes",
+        "covariant Bernoulli parameter",
+    ]
+    if native_gr_diagnostics:
+        exact_outputs.extend(
+            [
+                "comoving magnetic invariant b^2",
+                "Lorentz factor W",
+                "magnetization b^2/rho",
+                "inverse magnetic beta b^2/(2p)",
+            ]
+        )
+    else:
+        unavailable.insert(0, "covariant magnetization, plasma beta, and Lorentz factor")
+
     report = {
         "schema": 1,
         "classification": "athenak-bbh-grmhd-verified-campaign-analysis",
@@ -789,21 +837,10 @@ def main() -> int:
         "timeline": str(timeline_path),
         "rendered_frames": rendered,
         "publication_readiness": {
-            "exact_outputs": [
-                "density",
-                "pressure",
-                "temperature",
-                "coordinate B",
-                "primitive velocity",
-                "divB",
-            ],
+            "native_gr_diagnostics_available": native_gr_diagnostics,
+            "exact_outputs": exact_outputs,
             "proxy_warning": PROXY_WARNING,
-            "not_available_from_current_dump": [
-                "covariant magnetization and plasma beta",
-                "MRI quality factors Q_theta and Q_phi",
-                "moving-horizon mass and magnetic fluxes",
-                "covariant Bernoulli parameter and Lorentz factor",
-            ],
+            "not_available_from_current_dump": unavailable,
             "campaign_systematics_still_required": [
                 "bulk-disk resolution sequence beyond the fixed physical-L4 floor",
                 "horizon-following magnetic leakage/forcing validation",

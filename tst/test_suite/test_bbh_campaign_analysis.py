@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "vis" / "python"))
 
 from analyze_bbh_grmhd_campaign import (  # noqa: E402
+    classify_binary,
     load_verified_files,
     merge_histories,
     storage_projection,
@@ -137,3 +138,11 @@ def test_subcycling_work_model_uses_strict_two_to_one_levels() -> None:
     assert work["subcycled_meshblock_updates_per_root_step"] == 24
     assert work["global_finest_dt_meshblock_updates_per_root_step"] == 56
     assert work["global_to_subcycled_update_ratio"] == 56 / 24
+
+
+def test_native_grmhd_diagnostic_stream_is_classified() -> None:
+    variables = ("gr_bsq", "gr_lorentz", "gr_sigma", "gr_beta_inv")
+    assert classify_binary("run.mhd_gr_diagnostics.00001.bin", variables) == (
+        "mhd_gr_diagnostics"
+    )
+    assert classify_binary("renamed-output.bin", variables) == "mhd_gr_diagnostics"

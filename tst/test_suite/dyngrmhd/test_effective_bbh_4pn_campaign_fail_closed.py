@@ -199,6 +199,22 @@ def test_lm_runtime_observations_set_fail_closed_resource_gates():
     ] == 80
 
 
+def test_dense_output_cadence_and_streaming_working_set_are_budgeted():
+    matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    outputs = matrix["common"]["outputs"]
+    assert outputs["history_dt_M"] == 1.0
+    assert outputs["full_state_dt_M"] == 10.0
+    assert outputs["gr_diagnostics_dt_M"] == 10.0
+    assert outputs["divb_dt_M"] == 25.0
+    assert outputs["restart_dt_M"] == 250.0
+    assert outputs["estimated_bytes_per_meshblock"]["gr_diagnostics"] == 65536
+    GENERATOR.validate_matrix(matrix)
+
+    matrix["tiers"]["L"]["resource_gate"]["minimum_streaming_scratch_GiB"] = 128
+    with pytest.raises(GENERATOR.CampaignError, match="streaming scratch cannot retain"):
+        GENERATOR.validate_matrix(matrix)
+
+
 def test_missing_l_runtime_observation_is_rejected():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     del matrix["tiers"]["L"]["topology_estimate"][
@@ -299,9 +315,13 @@ def test_generated_input_declares_cfl_scaled_root_dt_cap(
         )
     report = json.loads(result.stdout)
     assert report["root_dt_max_M"] == pytest.approx(expected_root_dt_max)
+    generated = output.read_text(encoding="utf-8")
+    assert "<output5>" in generated
+    assert "variable = mhd_gr_diagnostics" in generated
+    assert "dt = 10" in generated
     time_block = re.search(
         r"(?ms)^<time>\s*$\n(.*?)(?=^<[^>]+>\s*$)",
-        output.read_text(encoding="utf-8"),
+        generated,
     )
     assert time_block is not None
     expected_text = format(expected_root_dt_max, ".17g")

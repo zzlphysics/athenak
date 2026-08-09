@@ -5,11 +5,12 @@ The stock ``plot_slice.py`` remains the general single-panel plotting tool.  Thi
 script follows its binary-slice selection logic, but reads every requested field in
 one pass so that multi-panel figures remain practical for gigabyte-scale AMR dumps.
 
-The current ``mhd_w_bcc`` output does not contain the dynamical ADM metric.  Density,
-pressure, temperature, magnetic components, and primitive velocity components are
-therefore plotted exactly as stored.  Quantities involving contractions of magnetic
-or velocity components are explicitly labelled ``proxy`` and must not be interpreted
-as covariant GR diagnostics.
+The ordinary ``mhd_w_bcc`` output does not contain the dynamical ADM metric.  Density,
+pressure, temperature, densitized magnetic components, and primitive velocity
+components are therefore plotted exactly as stored.  Quantities involving contractions
+of those components are explicitly labelled ``proxy`` and must not be interpreted as
+covariant GR diagnostics.  The separate ``mhd_gr_diagnostics`` output contains native
+metric-aware magnetic invariants and the Lorentz factor.
 """
 
 from __future__ import annotations
@@ -31,8 +32,8 @@ import numpy as np
 
 
 PROXY_WARNING = (
-    "Coordinate-component proxy: the mhd_w_bcc dump does not contain the "
-    "dynamical ADM metric needed for a covariant GR contraction."
+    "Stored-component proxy: DynGRMHD bcc is sqrt(det(gamma_ij))*B^i, and the "
+    "mhd_w_bcc dump does not contain the metric needed for a covariant contraction."
 )
 
 
@@ -100,7 +101,7 @@ PANELS = {
     ),
     "bmag": Panel(
         "bmag",
-        r"$\sqrt{(B^x)^2+(B^y)^2+(B^z)^2}$ (proxy)",
+        r"$\sqrt{(\tilde B^x)^2+(\tilde B^y)^2+(\tilde B^z)^2}$ (stored-bcc proxy)",
         ("dens", "bcc1", "bcc2", "bcc3"),
         lambda fields, level: np.sqrt(_b2(fields)),
         "viridis",
@@ -109,7 +110,7 @@ PANELS = {
     ),
     "beta_inv_proxy": Panel(
         "beta_inv_proxy",
-        r"$[(B^x)^2+(B^y)^2+(B^z)^2]/(2p)$ (proxy)",
+        r"$[(\tilde B^x)^2+(\tilde B^y)^2+(\tilde B^z)^2]/(2p)$ (proxy)",
         ("dens", "press", "bcc1", "bcc2", "bcc3"),
         lambda fields, level: np.divide(
             0.5 * _b2(fields),
@@ -123,7 +124,7 @@ PANELS = {
     ),
     "sigma_proxy": Panel(
         "sigma_proxy",
-        r"$[(B^x)^2+(B^y)^2+(B^z)^2]/\rho$ (proxy)",
+        r"$[(\tilde B^x)^2+(\tilde B^y)^2+(\tilde B^z)^2]/\rho$ (proxy)",
         ("dens", "bcc1", "bcc2", "bcc3"),
         lambda fields, level: np.divide(
             _b2(fields),
@@ -145,6 +146,38 @@ PANELS = {
         "magma",
         "linear",
         True,
+    ),
+    "gr_bsq": Panel(
+        "gr_bsq",
+        r"$b^2=b^\mu b_\mu$",
+        ("gr_bsq",),
+        _identity("gr_bsq"),
+        "viridis",
+        "log",
+    ),
+    "gr_lorentz": Panel(
+        "gr_lorentz",
+        r"$W=\alpha u^0$",
+        ("gr_lorentz",),
+        _identity("gr_lorentz"),
+        "magma",
+        "linear",
+    ),
+    "gr_sigma": Panel(
+        "gr_sigma",
+        r"$\sigma=b^2/\rho$",
+        ("gr_sigma",),
+        _identity("gr_sigma"),
+        "cubehelix",
+        "log",
+    ),
+    "gr_beta_inv": Panel(
+        "gr_beta_inv",
+        r"$\beta_\mathrm{mag}^{-1}=b^2/(2p)$",
+        ("gr_beta_inv",),
+        _identity("gr_beta_inv"),
+        "cividis",
+        "log",
     ),
     "divb": Panel(
         "divb",
@@ -649,8 +682,9 @@ def create_dashboard(
         figure.text(
             0.5,
             0.012,
-            "Panels marked proxy use coordinate components; covariant ADM contractions "
-            "require metric output. Low-density atmosphere is masked.",
+            "Panels marked proxy use stored components; DynGRMHD bcc is densitized by "
+            "sqrt(det gamma). Covariant contractions require mhd_gr_diagnostics. "
+            "Low-density atmosphere is masked.",
             ha="center",
             va="bottom",
             fontsize=8,

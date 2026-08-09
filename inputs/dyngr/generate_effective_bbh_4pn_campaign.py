@@ -195,6 +195,27 @@ def validate_matrix(matrix: dict[str, object]) -> None:
         "contiguous MeshBlock GIDs (Z-order)"
     ):
         raise CampaignError("campaign partition audit must use contiguous MeshBlock GIDs")
+    outputs = common["outputs"]
+    output_bytes = outputs["estimated_bytes_per_meshblock"]
+    output_specs = (
+        ("full_state_dt_M", "full_state_mhd_w_bcc"),
+        ("gr_diagnostics_dt_M", "gr_diagnostics"),
+        ("divb_dt_M", "divb"),
+        ("restart_dt_M", "restart_double_precision_dynadm"),
+    )
+    if not math.isfinite(float(outputs["history_dt_M"])) or float(
+        outputs["history_dt_M"]
+    ) <= 0.0:
+        raise CampaignError("history output cadence must be finite and positive")
+    for cadence_key, bytes_key in output_specs:
+        if (
+            not math.isfinite(float(outputs[cadence_key]))
+            or float(outputs[cadence_key]) <= 0.0
+            or int(output_bytes[bytes_key]) <= 0
+        ):
+            raise CampaignError(
+                f"invalid output cadence or per-MeshBlock size for {cadence_key}"
+            )
     root_dx = (
         2.0 * float(mesh["domain_half_extent_M"])
         / int(mesh["root_cells_per_dimension"])
@@ -350,17 +371,24 @@ def validate_matrix(matrix: dict[str, object]) -> None:
                 f"tier {name}: declared qualified GPU memory cannot hold the "
                 "campaign per-rank allocation"
             )
-        outputs = common["outputs"]
         reference_duration = float(resource["reference_duration_M"])
-        output_bytes = outputs["estimated_bytes_per_meshblock"]
+        segment_span = float(resource["streaming_segment_span_M"])
+        restart_generations = int(resource["streaming_restart_generations"])
+        streaming_margin = float(resource["streaming_safety_fraction"])
+        if segment_span <= 0.0 or restart_generations < 2 or streaming_margin < 0.0:
+            raise CampaignError("streaming storage policy is invalid")
+        effective_restart_cadence = min(
+            float(outputs["restart_dt_M"]), segment_span
+        )
         projected_reference_gib = sum(
             (math.floor(reference_duration / float(cadence)) + 2)
             * required_gate
             * int(output_bytes[key])
             for cadence, key in (
                 (outputs["full_state_dt_M"], "full_state_mhd_w_bcc"),
+                (outputs["gr_diagnostics_dt_M"], "gr_diagnostics"),
                 (outputs["divb_dt_M"], "divb"),
-                (outputs["restart_dt_M"], "restart_double_precision_dynadm"),
+                (effective_restart_cadence, "restart_double_precision_dynadm"),
             )
         ) / 2**30
         reported_projection = float(
@@ -379,6 +407,28 @@ def validate_matrix(matrix: dict[str, object]) -> None:
         if minimum_undrained < math.ceil(1.25 * projected_reference_gib):
             raise CampaignError(
                 f"tier {name}: undrained scratch does not include the 25% margin"
+            )
+        segment_bytes = sum(
+            (math.floor(segment_span / float(cadence)) + 2)
+            * required_gate
+            * int(output_bytes[key])
+            for cadence, key in (
+                (outputs["full_state_dt_M"], "full_state_mhd_w_bcc"),
+                (outputs["gr_diagnostics_dt_M"], "gr_diagnostics"),
+                (outputs["divb_dt_M"], "divb"),
+            )
+        )
+        segment_bytes += (
+            restart_generations
+            * required_gate
+            * int(output_bytes["restart_double_precision_dynadm"])
+        )
+        minimum_streaming = int(resource_gate["minimum_streaming_scratch_GiB"])
+        required_streaming = math.ceil((1.0 + streaming_margin) * segment_bytes / 2**30)
+        if minimum_streaming < required_streaming:
+            raise CampaignError(
+                f"tier {name}: streaming scratch cannot retain a guarded segment "
+                "and the configured restart generations"
             )
 
 
@@ -918,10 +968,15 @@ def projected_output_gib(matrix: dict[str, object], tier: dict[str, object], tli
     outputs = matrix["common"]["outputs"]
     blocks = int(tier["topology_estimate"]["campaign_meshblock_gate"])
     sizes = outputs["estimated_bytes_per_meshblock"]
+    restart_cadence = min(
+        float(outputs["restart_dt_M"]),
+        float(matrix["common"]["resource_model"]["streaming_segment_span_M"]),
+    )
     dump_specs = (
         (float(outputs["full_state_dt_M"]), int(sizes["full_state_mhd_w_bcc"])),
+        (float(outputs["gr_diagnostics_dt_M"]), int(sizes["gr_diagnostics"])),
         (float(outputs["divb_dt_M"]), int(sizes["divb"])),
-        (float(outputs["restart_dt_M"]), int(sizes["restart_double_precision_dynadm"])),
+        (restart_cadence, int(sizes["restart_double_precision_dynadm"])),
     )
     total = 0
     for cadence, bytes_per_block in dump_specs:
@@ -1303,6 +1358,12 @@ ghost_zones = false
 <output4>
 file_type = rst
 dt = {format_real(float(outputs['restart_dt_M']))}
+
+<output5>
+file_type = bin
+variable = mhd_gr_diagnostics
+dt = {format_real(float(outputs['gr_diagnostics_dt_M']))}
+ghost_zones = false
 """
 
 
