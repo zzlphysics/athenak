@@ -157,7 +157,7 @@ dcycle      = 1
 <output2>
 file_type   = bin
 variable    = mhd_w_bcc
-dt          = 50.0
+dt          = 10.0
 ghost_zones = false
 
 <output3>
@@ -177,7 +177,7 @@ dcycle    = 1
 <output6>
 file_type   = bin
 variable    = mhd_gr_diagnostics
-dt          = 50.0
+dt          = 10.0
 ghost_zones = false
 
 <output7>

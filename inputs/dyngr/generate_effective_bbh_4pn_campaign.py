@@ -163,7 +163,7 @@ def load_matrix(path: Path) -> dict[str, object]:
 
 
 def validate_matrix(matrix: dict[str, object]) -> None:
-    if matrix.get("schema_version") != 4:
+    if matrix.get("schema_version") != 5:
         raise CampaignError("unsupported campaign matrix schema")
     common = matrix["common"]
     mesh = common["mesh"]

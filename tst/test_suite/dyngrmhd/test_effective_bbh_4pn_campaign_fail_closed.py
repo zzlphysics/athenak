@@ -184,7 +184,7 @@ def _write_synthetic_campaign_artifacts(tmp_path: Path) -> tuple[Path, ...]:
 def test_lm_runtime_observations_set_fail_closed_resource_gates():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     GENERATOR.validate_matrix(matrix)
-    assert matrix["schema_version"] == 4
+    assert matrix["schema_version"] == 5
     assert matrix["tiers"]["L"]["topology_estimate"][
         "campaign_meshblock_gate"
     ] == 18088
@@ -203,8 +203,8 @@ def test_hierarchical_output_cadence_and_streaming_working_set_are_budgeted():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     outputs = matrix["common"]["outputs"]
     assert outputs["history_root_dcycle"] == 1
-    assert outputs["full_state_dt_M"] == 50.0
-    assert outputs["gr_diagnostics_dt_M"] == 50.0
+    assert outputs["full_state_dt_M"] == 10.0
+    assert outputs["gr_diagnostics_dt_M"] == 10.0
     assert outputs["divb_dt_M"] == 25.0
     assert outputs["restart_dt_M"] == 250.0
     assert outputs["local_slice_root_dcycle"] == 1
@@ -323,7 +323,7 @@ def test_generated_input_declares_cfl_scaled_root_dt_cap(
     generated = output.read_text(encoding="utf-8")
     assert "<output5>" in generated
     assert "variable = mhd_gr_diagnostics" in generated
-    assert "dt = 50" in generated
+    assert generated.count("dt = 10") >= 2
     assert "user_hist = true" in generated
     assert "history_inner_radius = 80" in generated
     assert re.search(r"(?ms)^<output1>.*?^dcycle\s*=\s*1\s*$", generated)

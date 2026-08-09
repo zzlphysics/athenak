@@ -13,9 +13,9 @@ explicitly at every level.  Only the inner levels change between tiers.
 
 | tier | finest level | finest `dx` | MeshBlock gate | generated `max_nmb/rank` | A100-40G aggregate lower bound | accepted launch layout | streaming scratch | undrained scratch for `10000M` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| L | L9 | `M/32` | 18,088 | 4,544 | 8 | 4 x A100-80G | 192 GiB | 10,700 GiB |
-| M | L10 | `M/64` | 28,255 | 3,584 | 13 | candidate 8 x A100-80G | 320 GiB | 16,600 GiB |
-| H | L11 | `M/128` | 55,380 | 2,048 | 25 | topology-only 32 x A100-40G | 640 GiB | 32,500 GiB |
+| L | L9 | `M/32` | 18,088 | 4,544 | 8 | 4 x A100-80G | 192 GiB | 11,200 GiB |
+| M | L10 | `M/64` | 28,255 | 3,584 | 13 | candidate 8 x A100-80G | 320 GiB | 17,500 GiB |
+| H | L11 | `M/128` | 55,380 | 2,048 | 25 | topology-only 32 x A100-40G | 640 GiB | 34,300 GiB |
 
 The gate is 1.25 times the larger of (a) the actual initial hierarchy reported by
 AthenaK `-m`, (b) an alignment probe, (c) the post-merger `2.5M` horizon-guard topology
@@ -30,8 +30,9 @@ with AthenaK `-m` before allocation.
 
 The L rootcap run reached 14,372 MeshBlocks at cycle 2; its trajectory-wide capacity
 sweep reached 14,470 total blocks and a 3,899-block rank peak.  The M four-rank probe
-reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 4
-archives the evidence hashes and uses 18,088/28,255 blocks after the 25% margin.  The M
+reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 5
+archives the evidence hashes, the `10M` global-output policy, and uses 18,088/28,255
+blocks after the 25% margin.  The M
 observation is a capacity input, not an eight-rank qualification result.
 
 The 8/13/25 values are arithmetic A100-40G aggregate-memory lower bounds only; they are
@@ -117,7 +118,7 @@ triplet.  The restart storage estimate is also double precision (ordinary `bin` 
 remain float32 by file-format design).
 The default closed-file layout is hierarchical.  Generic and BBH-specific history are
 written at every synchronized root cycle.  Global three-dimensional primitive state and
-native metric-aware diagnostics are written every `50M`, global `divB` every `25M`, and
+native metric-aware diagnostics are written every `10M`, global `divB` every `25M`, and
 restart every `250M`.  Two additional `80M`-wide equatorial streams follow the
 mass-weighted `bbh_com`: `bbh_local_w` stores primitive/MHD state and `bbh_local_gr`
 stores covariant GRMHD diagnostics every root cycle.  With the baseline root-step cap the
@@ -133,7 +134,7 @@ storage gate pessimistically assumes every gated MeshBlock intersects the local 
 the measured campaign analyzer uses actual closed-file sizes instead.
 The streaming scratch gate budgets a conservative `100M` cloud segment, two retained
 restart generations, forced end-of-segment outputs, and 25% headroom.  The corresponding
-undrained `10000M` archive projections are 5.94/9.27/18.17 TiB for L/M/H, including
+undrained `10000M` archive projections are 8.74/13.65/26.75 TiB for L/M/H, including
 the restart forced at every `100M` segment boundary.  Full campaigns must therefore
 stream checksum-verified closed files instead of accumulating them on an instance disk.
 Every generated input explicitly sets `time/root_dt_max=cfl_number*root_dx` (`4.8M` at
@@ -142,6 +143,16 @@ fail-closed command-line overrides; AthenaK cannot override a parameter that is 
 from the input file.  The half-CFL variant therefore receives a `2.4M` root-step cap.
 Use `--cfl-number 0.15` to generate the half-CFL temporal-convergence variant; the
 generator permits decreasing, but never silently increasing, the audited baseline CFL.
+
+AMR topology is intentionally immutable inside one root step.  All finer levels complete
+their recursive 2:1 substeps and reflux to the root endpoint before regridding, output,
+or restart is legal.  The BBH spacetime itself is not frozen: ADM variables are evaluated
+at each local RK stage time.  To keep the moving holes resolved between root-sync
+regrids, the tracker samples each trajectory at the beginning, midpoint, and end of the
+reachable next root interval and pads those shells by a subluminal light-speed bound.
+With `ncycle_check=1`, `refinement_interval=1`, and the `4.8M` root cap, every root
+endpoint therefore installs a path-covering hierarchy for the next at-most-`4.8M` step;
+regridding independently inside fine substeps is neither required nor supported.
 
 The generator verifies syntax-independent campaign invariants, the complete 21-column
 table, monotonic times, finite and subluminal states, time coverage, trajectory SHA-256,
