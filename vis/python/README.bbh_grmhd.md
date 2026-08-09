@@ -105,3 +105,9 @@ parameter, and horizon flux should add synchronized lapse, shift, spatial-metric
 and preferably determinant data to the science output.  The post-processor can
 then be extended to perform metric contractions without reconstructing the
 effective BBH metric independently.
+
+The history plot is likewise a global coordinate-volume diagnostic, not a closed-system
+conservation proof.  The prescribed time-dependent metric exchanges coordinate energy
+and momentum with the gas; excision, atmosphere recovery, accretion, and boundary flux
+can change domain mass.  Quote moving-surface fluxes and controlled systematics rather
+than interpreting `tot-E` drift alone as a numerical error norm.

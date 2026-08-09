@@ -745,6 +745,13 @@ def create_history_plot(
         "time_max": float(time.max()),
         "columns": sorted(data),
         "diagnostics": diagnostics,
+        "interpretation_notes": [
+            "A prescribed time-dependent BBH metric can exchange coordinate energy "
+            "and momentum with the fluid, so tot-E and domain momentum are not "
+            "strict conservation invariants.",
+            "Domain mass can change through excision, atmosphere recovery, accretion, "
+            "and boundary flux. Publication analysis requires moving-surface fluxes."
+        ],
     }
 
 
