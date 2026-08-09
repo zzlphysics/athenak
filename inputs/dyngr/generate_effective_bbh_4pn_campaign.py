@@ -163,7 +163,7 @@ def load_matrix(path: Path) -> dict[str, object]:
 
 
 def validate_matrix(matrix: dict[str, object]) -> None:
-    if matrix.get("schema_version") != 2:
+    if matrix.get("schema_version") != 3:
         raise CampaignError("unsupported campaign matrix schema")
     common = matrix["common"]
     mesh = common["mesh"]
@@ -203,10 +203,8 @@ def validate_matrix(matrix: dict[str, object]) -> None:
         ("divb_dt_M", "divb"),
         ("restart_dt_M", "restart_double_precision_dynadm"),
     )
-    if not math.isfinite(float(outputs["history_dt_M"])) or float(
-        outputs["history_dt_M"]
-    ) <= 0.0:
-        raise CampaignError("history output cadence must be finite and positive")
+    if outputs.get("history_root_dcycle") != 1:
+        raise CampaignError("history must be written at every synchronized root cycle")
     for cadence_key, bytes_key in output_specs:
         if (
             not math.isfinite(float(outputs[cadence_key]))
@@ -1310,6 +1308,8 @@ refinement_floor_level = {int(amr['disk_floor_physical_level'])}
 refinement_floor_center1 = {format_real(float(amr['disk_floor_center_M'][0]))}
 refinement_floor_center2 = {format_real(float(amr['disk_floor_center_M'][1]))}
 refinement_floor_center3 = {format_real(float(amr['disk_floor_center_M'][2]))}
+history_inner_radius = {format_real(float(amr['disk_floor_radius_M']))}
+user_hist = true
 
 initial_data = reference_fm_torus
 torus_reference_mass = 1.0
@@ -1341,7 +1341,7 @@ torus_require_full_domain = true
 <output1>
 file_type = hst
 data_format = %.17e
-dt = {format_real(float(outputs['history_dt_M']))}
+dcycle = {int(outputs['history_root_dcycle'])}
 
 <output2>
 file_type = bin
@@ -1364,6 +1364,10 @@ file_type = bin
 variable = mhd_gr_diagnostics
 dt = {format_real(float(outputs['gr_diagnostics_dt_M']))}
 ghost_zones = false
+
+<output6>
+file_type = log
+dcycle = 1
 """
 
 

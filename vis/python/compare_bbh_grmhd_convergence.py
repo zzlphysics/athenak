@@ -36,6 +36,34 @@ def read_csv(path: Path) -> dict[str, np.ndarray]:
 
 def derive(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     diagnostics: dict[str, np.ndarray] = {}
+    if "baryon_m" in data:
+        diagnostics["baryon_mass_rel"] = (
+            data["baryon_m"] / data["baryon_m"][0] - 1.0
+        )
+    if "inner_D" in data:
+        diagnostics["inner_mass_rel"] = data["inner_D"] / data["inner_D"][0] - 1.0
+        diagnostics["inner_mass_fraction"] = data["inner_D"] / data["baryon_m"]
+    if "emag_prp" in data:
+        diagnostics["magnetic_energy_rel"] = (
+            data["emag_prp"] / data["emag_prp"][0] - 1.0
+        )
+    if "pgas_prp" in data:
+        diagnostics["gas_pressure_integral_rel"] = (
+            data["pgas_prp"] / data["pgas_prp"][0] - 1.0
+        )
+    if "lor_D" in data:
+        diagnostics["D_weighted_lorentz"] = data["lor_D"] / data["baryon_m"]
+    if "sigma_D" in data:
+        diagnostics["D_weighted_sigma"] = data["sigma_D"] / data["baryon_m"]
+    for source, name in (
+        ("bh_sep", "separation"),
+        ("orb_omega", "orbital_omega"),
+        ("angmom_z", "angular_momentum_z"),
+        ("rho_max", "rho_max"),
+        ("sigma_max", "sigma_max"),
+    ):
+        if source in data:
+            diagnostics[name] = data[source]
     if "mass" in data:
         diagnostics["mass_rel"] = data["mass"] / data["mass"][0] - 1.0
     if "tot-E" in data:
@@ -51,6 +79,25 @@ def derive(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     if "dt" in data:
         diagnostics["root_dt"] = data["dt"]
     return diagnostics
+
+
+def automatic_diagnostics(
+    series: list[tuple[str, dict[str, np.ndarray]]]
+) -> list[str]:
+    available = set.intersection(*(set(derive(data)) for _, data in series))
+    priorities = (
+        "baryon_mass_rel",
+        "inner_mass_rel",
+        "magnetic_energy_rel",
+        "D_weighted_sigma",
+        "mass_rel",
+        "total_energy_rel",
+        "kinetic_energy_rel",
+    )
+    selected = [name for name in priorities if name in available]
+    if not selected:
+        raise RuntimeError("history series have no common derived diagnostics")
+    return selected[:4]
 
 
 def parse_series(values: list[str]) -> list[tuple[str, Path]]:
@@ -178,7 +225,8 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--diagnostics",
-        default="mass_rel,total_energy_rel,magnetic_energy_rel",
+        default="auto",
+        help="comma-separated derived diagnostics, or 'auto' for the history type",
     )
     parser.add_argument("--refinement-ratio", type=float, default=2.0)
     parser.add_argument("--dpi", type=int, default=180)
@@ -187,7 +235,11 @@ def main() -> int:
         raise SystemExit("--refinement-ratio must exceed 1")
     parsed = parse_series(args.series)
     loaded = [(label, read_csv(path)) for label, path in parsed]
-    diagnostics = [name.strip() for name in args.diagnostics.split(",") if name.strip()]
+    diagnostics = (
+        automatic_diagnostics(loaded)
+        if args.diagnostics == "auto"
+        else [name.strip() for name in args.diagnostics.split(",") if name.strip()]
+    )
     if not diagnostics:
         raise SystemExit("at least one diagnostic is required")
     common_time, summaries, aligned = analyze(

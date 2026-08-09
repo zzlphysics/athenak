@@ -31,8 +31,14 @@ python3 scripts/mark_output_ready.py \
   --root /data/athenak/run01 \
   --manifest-dir /data/athenak/run01/manifests \
   --segment segment-0001 \
-  bin/effective_bbh.mhd_w.00001.bin rst/effective_bbh.00001.rst
+  bin/effective_bbh.mhd_w.00001.bin \
+  effective_bbh.mhd.hst effective_bbh.user.hst effective_bbh.log \
+  rst/effective_bbh.00001.rst
 ```
+
+The generic and user history files and the event log are append-only and must be
+published only after the segment process exits.  Keep all three in the same immutable
+segment manifest so post-processing can align physics diagnostics with numerical events.
 
 Example on the workstation:
 

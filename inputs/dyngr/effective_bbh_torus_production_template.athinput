@@ -91,6 +91,8 @@ enforce_maximum = false
 
 <problem>
 pgen_name              = dynbbh
+user_hist              = true
+history_inner_radius   = 80.0
 # This placeholder is intentional and must fail at startup until replaced by a verified,
 # normalized PN-to-remnant table whose coverage includes both metric finite differences.
 trajectory_mode        = table
@@ -145,12 +147,12 @@ torus_min_grid_peak_fraction = 0.9
 torus_min_magnetic_cells  = 64
 torus_require_full_domain = true
 
-# These cadences are placeholders.  Derive them from the science diagnostics and a
-# measured bytes-per-dump budget before enabling the production hierarchy.
+# Binary and restart cadences are placeholders.  History and event counters are sampled
+# at every synchronized root endpoint.
 <output1>
 file_type   = hst
 data_format = %.17e
-dt          = 10.0
+dcycle      = 1
 
 <output2>
 file_type   = bin
@@ -167,3 +169,7 @@ ghost_zones = false
 <output4>
 file_type = rst
 dt        = 500.0
+
+<output5>
+file_type = log
+dcycle    = 1

@@ -34,8 +34,9 @@ Every PNG has a neighboring JSON summary, and the output directory receives a
 For cloud campaign data, use `analyze_bbh_grmhd_campaign.py` instead of passing an
 unverified transfer directory directly to the plotter.  Every segment must have a local
 `.acks/*.ack` written by `scripts/pull_ready_outputs.py`.  By default the workflow
-rechecks both size and SHA256 before reading any `.bin` or `.hst` file, merges overlapping
-restart histories in command-line order, inventories binary times/cycles/MeshBlock
+rechecks both size and SHA256 before reading any `.bin`, `.hst`, or event-log file, merges
+overlapping restart histories in command-line order, keeps generic `.mhd.hst` and BBH
+`.user.hst` columns in separate products, inventories binary times/cycles/MeshBlock
 counts by physical AMR level, measures the strict-subcycling MeshBlock-update reduction,
 measures output cadence, projects storage to the requested target time, and renders every
 verified frame plus the final frame:
@@ -56,6 +57,14 @@ archive growth and the remote working set obtained by retaining only the two new
 restart generations.  Both a machine-readable `campaign-analysis.json` and a concise
 human-readable `campaign-analysis.md` are written.
 
+The generic history remains `merged-history.{csv,hst,png}`.  Native BBH diagnostics are
+written as `merged-user-history.{csv,hst,png}` and include the two 3D positions,
+separation, orbital angular frequency, trajectory mass terms, outside-excision baryon
+mass, proper-volume gas/magnetic integrals, mass-weighted Lorentz factor and
+magnetization, coordinate `J_z`, inner-region mass, and outside-excision density and
+magnetization maxima.  The analyzer also merges the root-cycle Athena event log and
+reports total floor/ceiling/C2P/FOFC events plus the maximum C2P iteration count.
+
 Use `--render-every 5` for a lower-cadence preview, or `--render-every 0` to produce only
 the verified inventory, merged history, cadence plot, and JSON report.  `--no-sha256`
 exists only for a quick local debugging pass; its report is explicitly marked unverified
@@ -70,9 +79,9 @@ After separate L/M/H workflows exist, build the time-aligned history comparison 
 
 ```bash
 python3 vis/python/compare_bbh_grmhd_convergence.py \
-  L=output/L-full/merged-history.csv \
-  M=output/M-full/merged-history.csv \
-  H=output/H-full/merged-history.csv \
+  L=output/L-full/merged-user-history.csv \
+  M=output/M-full/merged-user-history.csv \
+  H=output/H-full/merged-user-history.csv \
   --output-dir output/LMH-convergence
 ```
 
@@ -118,8 +127,10 @@ Use `mhd_gr_diagnostics` for publication measurements of `b^2`, Lorentz factor,
 fluxes still require additional native diagnostics; they must not be reconstructed from
 the proxy panels.
 
-The history plot is likewise a global coordinate-volume diagnostic, not a closed-system
-conservation proof.  The prescribed time-dependent metric exchanges coordinate energy
-and momentum with the gas; excision, atmosphere recovery, accretion, and boundary flux
-can change domain mass.  Quote moving-surface fluxes and controlled systematics rather
-than interpreting `tot-E` drift alone as a numerical error norm.
+The generic history plot is likewise a global coordinate-volume diagnostic, not a
+closed-system conservation proof.  The BBH user history improves the definitions and
+excludes atmosphere values inside the excision-floor mask, but its integration domain
+still moves with that mask.  The prescribed time-dependent metric exchanges coordinate
+energy and momentum with the gas; atmosphere recovery, accretion, and boundary flux can
+change domain mass.  Quote moving-surface fluxes and controlled systematics rather than
+interpreting `tot-E` or `baryon_m` drift alone as a numerical error norm.

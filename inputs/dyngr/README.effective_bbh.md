@@ -278,6 +278,25 @@ trajectory, test `metric_fd_step`, add validated moving-hole accretion and magne
 diagnostics, address horizon-following fluid/magnetic forcing, and demonstrate spatial,
 temporal, floor/excision, trajectory, and initial-transient convergence.
 
+### BBH history diagnostics
+
+Set `<problem> user_hist=true` to write a separate `.user.hst` at every enabled history
+output.  `history_inner_radius` defines a coordinate sphere about the instantaneous
+mass-weighted binary center.  The 20 columns are the two three-dimensional positions,
+separation, orbital angular-frequency magnitude, the two trajectory mass terms,
+outside-excision `baryon_m`, proper-volume `rho_prp`, `pgas_prp`, and `emag_prp`, the
+numerators `lor_D` and `sigma_D` for conserved-rest-mass-weighted means, coordinate
+`angmom_z`, `inner_D`, and the outside-excision maxima `rho_max` and `sigma_max`.
+The magnetic invariant uses the ADM spatial metric and undensitizes AthenaK's stored
+`bcc=sqrt(det(gamma)) B^i` before contraction.
+
+All of these are evaluated only at synchronized root endpoints.  With strict level
+subcycling, a history block configured by physical `dt` cannot write during a fine-level
+half step.  Production inputs therefore use `dcycle=1` explicitly.  The campaign also
+writes `file_type=log` every root cycle; this is the authoritative interval record for
+density/energy/temperature floors, velocity ceilings, C2P failures and iteration maxima,
+and FOFC events.
+
 ### Strict 2:1 level subcycling
 
 Set `<time> subcycling=level` to advance every physical refinement level with exactly

@@ -30,7 +30,7 @@ with AthenaK `-m` before allocation.
 
 The L rootcap run reached 14,372 MeshBlocks at cycle 2; its trajectory-wide capacity
 sweep reached 14,470 total blocks and a 3,899-block rank peak.  The M four-rank probe
-reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 2
+reached 22,604 MeshBlocks at cycle 2.  Both exceeded the old static gates, so schema 3
 archives the evidence hashes and uses 18,088/28,255 blocks after the 25% margin.  The M
 observation is a capacity input, not an eight-rank qualification result.
 
@@ -115,8 +115,13 @@ to the validated double-precision A100+MPI build (`Athena_SINGLE_PRECISION=OFF`)
 matrix records `2.5e-5`, `5e-5`, and `1e-4M` as the required finite-difference sensitivity
 triplet.  The restart storage estimate is also double precision (ordinary `bin` outputs
 remain float32 by file-format design).
-The default closed-file cadence is history every `1M`, primitive state every `10M`, native
-metric-aware GRMHD diagnostics every `10M`, `divB` every `25M`, and restart every `250M`.
+The default closed-file cadence is both generic and BBH-specific history at every
+synchronized root cycle, primitive state every `10M`, native metric-aware GRMHD
+diagnostics every `10M`, `divB` every `25M`, and restart every `250M`.  With the baseline
+root-step cap this means a history spacing of at most `4.8M`, not `1M`: ordinary AthenaK
+history output cannot observe intermediate level substeps.  The generated event log also
+checks and resets EOS floors, velocity ceilings, C2P failures/iteration maxima, and FOFC
+events every root cycle.
 The streaming scratch gate budgets a conservative `100M` cloud segment, two retained
 restart generations, forced end-of-segment outputs, and 25% headroom.  The corresponding
 undrained `10000M` archive projections are 8.28/12.94/25.36 TiB for L/M/H, including

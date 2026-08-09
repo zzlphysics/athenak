@@ -175,6 +175,20 @@ def classify_binary(name: str, variables: tuple[str, ...]) -> str:
     return "other"
 
 
+def classify_history(name: str) -> str:
+    """Return the AthenaK physics suffix of a history filename."""
+
+    for physics in ("user", "mhd", "hydro", "z4c"):
+        if name.endswith(f".{physics}.hst"):
+            return physics
+    return "other"
+
+
+def is_event_log(path: Path) -> bool:
+    with path.open("r", encoding="utf-8") as stream:
+        return stream.readline() == "# Athena event counter data\n"
+
+
 def configured_output_dt(header, stream_name: str) -> float | None:
     for section in header.parameters.values():
         if section.get("file_type") != "bin":
@@ -423,16 +437,69 @@ def merge_histories(paths: list[Path]) -> tuple[list[str], dict[str, np.ndarray]
     return columns, merged
 
 
+def summarize_event_logs(paths: list[Path]) -> dict[str, object]:
+    """Merge overlapping restart event logs and summarize interval counters."""
+
+    rows: dict[int, tuple[int, ...]] = {}
+    expected_columns = (
+        "cycle",
+        "eos_dfloor",
+        "eos_efloor",
+        "eos_tfloor",
+        "eos_vceil",
+        "eos_fail",
+        "c2p_it",
+        "fofc",
+    )
+    for path in paths:
+        header: tuple[str, ...] | None = None
+        with path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                fields = line.split()
+                if not fields:
+                    continue
+                if fields[0] == "#" and len(fields) > 1 and fields[1] == "cycle":
+                    header = tuple(fields[1:])
+                    continue
+                if fields[0].startswith("#"):
+                    continue
+                if header != expected_columns or len(fields) != len(expected_columns):
+                    raise RuntimeError(f"{path}:{line_number}: malformed event log")
+                values = tuple(int(value) for value in fields)
+                rows[values[0]] = values
+        if header != expected_columns:
+            raise RuntimeError(f"{path}: event-log header is missing or unsupported")
+
+    ordered = [rows[cycle] for cycle in sorted(rows)]
+    result: dict[str, object] = {
+        "verified_sources": [str(path) for path in paths],
+        "records_with_events": len(ordered),
+        "totals": {
+            name: sum(row[index] for row in ordered)
+            for index, name in enumerate(expected_columns[1:], start=1)
+            if name != "c2p_it"
+        },
+        "c2p_iteration_max": max((row[6] for row in ordered), default=0),
+    }
+    if ordered:
+        result["cycle_min"] = ordered[0][0]
+        result["cycle_max"] = ordered[-1][0]
+    return result
+
+
 def write_history_products(
-    output_dir: Path, columns: list[str], data: dict[str, np.ndarray]
+    output_dir: Path,
+    columns: list[str],
+    data: dict[str, np.ndarray],
+    stem: str = "merged-history",
 ) -> tuple[Path, Path]:
-    csv_path = output_dir / "merged-history.csv"
+    csv_path = output_dir / f"{stem}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(columns)
         writer.writerows(zip(*(data[column] for column in columns)))
 
-    hst_path = output_dir / "merged-history.hst"
+    hst_path = output_dir / f"{stem}.hst"
     with hst_path.open("w", encoding="utf-8") as stream:
         stream.write("# Athena++ history data\n")
         stream.write("# " + " ".join(
@@ -614,15 +681,29 @@ def write_markdown_report(report: dict[str, object], path: Path) -> None:
 
     history = report.get("history")
     lines.extend(["", "## History diagnostics", ""])
-    if history is None:
+    if not history:
         lines.append("No verified history file was available.")
     else:
-        for name, value in sorted(history["diagnostics"].items()):
-            lines.append(f"- `{name}`: {value:.8g}")
-        lines.append("")
-        for note in history.get("interpretation_notes", []):
-            lines.append(f"> {note}")
+        for physics, summary in sorted(history.items()):
+            lines.append(f"### {physics} history")
             lines.append("")
+            for name, value in sorted(summary["diagnostics"].items()):
+                lines.append(f"- `{name}`: {value:.8g}")
+            lines.append("")
+            for note in summary.get("interpretation_notes", []):
+                lines.append(f"> {note}")
+                lines.append("")
+
+    events = report.get("event_counters")
+    lines.extend(["## Numerical event counters", ""])
+    if events is None:
+        lines.append("No verified Athena event log was available.")
+    else:
+        lines.append(f"- Records containing events: {events['records_with_events']}")
+        lines.append(f"- Maximum C2P iterations: {events['c2p_iteration_max']}")
+        for name, value in sorted(events["totals"].items()):
+            lines.append(f"- `{name}` total: {value}")
+        lines.append("")
 
     readiness = report["publication_readiness"]
     lines.extend(["## Publication gates still open", ""])
@@ -698,10 +779,10 @@ def main() -> int:
     science_records = [
         record
         for record in all_records
-        if record.path.suffix == ".bin" or record.path.suffix == ".hst"
+        if record.path.suffix in (".bin", ".hst", ".log")
     ]
     if not science_records:
-        raise RuntimeError("ACKs contain no binary or history science output")
+        raise RuntimeError("ACKs contain no binary, history, or event-log science output")
     for record in science_records:
         verify_file(record, not args.no_sha256)
         print(f"verified {record.relative} ({record.size} bytes)", file=sys.stderr)
@@ -740,25 +821,32 @@ def main() -> int:
         frames.sort(key=lambda frame: (float(frame["time_M"]), str(frame["path"])))
     streams = {name: frames for name, frames in streams.items() if frames}
 
-    history_records = [
-        record for record in science_records if record.path.suffix == ".hst"
+    history_records = [record for record in science_records if record.path.suffix == ".hst"]
+    event_records = [
+        record
+        for record in science_records
+        if record.path.suffix == ".log" and is_event_log(record.path)
     ]
     restart_records = [record for record in all_records if record.path.suffix == ".rst"]
     for record in restart_records:
         verify_file(record, False)
     # Preserve command-line segment order so later restart segments replace overlap.
-    history_paths = [record.path for record in history_records]
-    history_summary = None
-    if history_paths:
+    history_groups: dict[str, list[Path]] = {}
+    for record in history_records:
+        history_groups.setdefault(classify_history(record.path.name), []).append(record.path)
+    history_summary: dict[str, dict[str, object]] = {}
+    for physics, history_paths in sorted(history_groups.items()):
         columns, history_data = merge_histories(history_paths)
+        stem = "merged-history" if physics == "mhd" else f"merged-{physics}-history"
         csv_path, hst_path = write_history_products(
-            args.output_dir, columns, history_data
+            args.output_dir, columns, history_data, stem=stem
         )
-        history_summary = create_history_plot(
-            hst_path, args.output_dir / "merged-history.png", args.dpi
+        summary = create_history_plot(
+            hst_path, args.output_dir / f"{stem}.png", args.dpi
         )
-        history_summary["csv"] = str(csv_path)
-        history_summary["verified_sources"] = [str(path) for path in history_paths]
+        summary["csv"] = str(csv_path)
+        summary["verified_sources"] = [str(path) for path in history_paths]
+        history_summary[physics] = summary
 
     timeline_path = args.output_dir / "verified-output-timeline.png"
     render_timeline(streams, timeline_path, args.dpi)
@@ -773,6 +861,7 @@ def main() -> int:
         args.trajectory.expanduser().resolve(strict=True) if args.trajectory else None,
     )
     native_gr_diagnostics = bool(streams.get("mhd_gr_diagnostics"))
+    native_bbh_history = "user" in history_summary
     exact_outputs = [
         "density",
         "pressure",
@@ -797,9 +886,17 @@ def main() -> int:
         )
     else:
         unavailable.insert(0, "covariant magnetization, plasma beta, and Lorentz factor")
+    if native_bbh_history:
+        exact_outputs.extend(
+            [
+                "outside-excision global baryon mass and GRMHD proper-volume integrals",
+                "BBH positions, separation, orbital angular frequency, and term masses",
+                "outside-excision rho and magnetization maxima",
+            ]
+        )
 
     report = {
-        "schema": 1,
+        "schema": 2,
         "classification": "athenak-bbh-grmhd-verified-campaign-analysis",
         "segments": [str(path.expanduser().resolve()) for path in args.segments],
         "input_policy": {
@@ -834,10 +931,16 @@ def main() -> int:
             args.drain_mib_s,
         ),
         "history": history_summary,
+        "event_counters": (
+            summarize_event_logs([record.path for record in event_records])
+            if event_records
+            else None
+        ),
         "timeline": str(timeline_path),
         "rendered_frames": rendered,
         "publication_readiness": {
             "native_gr_diagnostics_available": native_gr_diagnostics,
+            "native_bbh_history_available": native_bbh_history,
             "exact_outputs": exact_outputs,
             "proxy_warning": PROXY_WARNING,
             "not_available_from_current_dump": unavailable,

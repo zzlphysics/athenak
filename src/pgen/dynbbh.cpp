@@ -35,6 +35,7 @@
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "mhd/mhd.hpp"
+#include "outputs/outputs.hpp"
 #include "parameter_input.hpp"
 
 namespace {
@@ -91,6 +92,7 @@ struct BBHParameters {
   Real refinement_floor_radius;
   Real refinement_floor_center[3];
   int refinement_floor_level;
+  Real history_inner_radius;
   Real run_end_time;
   Real root_dt_max;
   binary_bh::MetricParameters metric;
@@ -201,6 +203,7 @@ void SetADMVariablesToBBH(MeshBlockPack *pmbp);
 void AugmentBBHExcisionMasks(MeshBlockPack *pmbp);
 void RefineAlphaMin(MeshBlockPack *pmbp);
 void RefineTracker(MeshBlockPack *pmbp);
+void BBHHistory(HistoryData *pdata, Mesh *pm);
 void InitializeReferenceFMTorus(MeshBlockPack *pmbp);
 
 KOKKOS_INLINE_FUNCTION
@@ -579,6 +582,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   pmbp->padm->SetADMVariables = &SetADMVariablesToBBH;
   pmbp->pcoord->AugmentExcisionMasks = &AugmentBBHExcisionMasks;
+  user_hist_func = BBHHistory;
 
   const std::string trajectory_mode =
       pin->GetOrAddString("problem", "trajectory_mode", "circular");
@@ -657,6 +661,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddReal("problem", "refinement_floor_center3", 0.0);
   bbh.refinement_floor_level =
       pin->GetOrAddInteger("problem", "refinement_floor_level", 0);
+  bbh.history_inner_radius = pin->GetOrAddReal(
+      "problem", "history_inner_radius", 4.0*bbh.separation);
   bbh.run_end_time = pin->GetReal("time", "tlim");
   bbh.root_dt_max = 0.0;
   if (pin->DoesParameterExist("time", "subcycling") &&
@@ -804,6 +810,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     bbh.refinement_hysteresis, bbh.refinement_horizon_factor, bbh.run_end_time,
     bbh.refinement_floor_radius, bbh.refinement_floor_center[0],
     bbh.refinement_floor_center[1], bbh.refinement_floor_center[2],
+    bbh.history_inner_radius,
     bbh.metric.mass_scale1,
     bbh.metric.mass_scale2, bbh.metric.spin_buffer1, bbh.metric.spin_buffer2,
     bbh.metric.singularity_floor
@@ -819,7 +826,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       || !(bbh.metric.singularity_floor > 0.0) || !(bbh.refinement_radius > 0.0)
       || !(bbh.refinement_radius_ratio >= 1.0)
       || !(bbh.refinement_hysteresis > 1.0)
-      || !(bbh.refinement_horizon_factor > 0.0)) {
+      || !(bbh.refinement_horizon_factor > 0.0)
+      || !(bbh.history_inner_radius > 0.0)) {
     Fatal("invalid non-positive dynbbh parameter");
   }
   if (!(bbh.refinement_floor_radius >= 0.0)
@@ -1028,6 +1036,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                   << bbh.refinement_floor_center[0] << ","
                   << bbh.refinement_floor_center[1] << ","
                   << bbh.refinement_floor_center[2] << ")" << std::endl;
+      }
+      if (user_hist) {
+        std::cout << "BBH history: outside-excision global diagnostics, inner radius="
+                  << bbh.history_inner_radius << std::endl;
       }
     }
     if (bbh.initial_data == 1) {
@@ -2548,6 +2560,184 @@ int BuildTrackingTargets(const Real state[NTRAJ], TrackingTarget targets[2]) {
         0.5*(targets[0].spin[direction]+targets[1].spin[direction]);
   }
   return 1;
+}
+
+//----------------------------------------------------------------------------------------
+//! Global, metric-aware BBH diagnostics at synchronized root-level endpoints.
+//!
+//! The first ten entries are trajectory metadata.  HistoryOutput combines rank-local
+//! buffers with MPI_SUM, so only rank zero contributes those replicated values.  The
+//! remaining entries include coordinate-volume integrals of densitized conserved
+//! variables, proper-volume integrals using sqrt(det(gamma_ij)), and two maxima.  Cells
+//! in the excision-floor mask are deliberately omitted: their atmosphere state is
+//! numerical regularization, not physical disk material.
+
+void BBHHistory(HistoryData *pdata, Mesh *pm) {
+  constexpr int ntrajectory = 10;
+  pdata->nhist = 20;
+  const char *labels[20] = {
+    "bh1_x", "bh1_y", "bh1_z", "bh2_x", "bh2_y", "bh2_z",
+    "bh_sep", "orb_omega", "bh1_mass", "bh2_mass",
+    "baryon_m", "rho_prp", "pgas_prp", "emag_prp", "lor_D",
+    "sigma_D", "angmom_z", "inner_D", "rho_max", "sigma_max"
+  };
+  for (int n=0; n<pdata->nhist; ++n) pdata->label[n] = labels[n];
+
+  Real state[NTRAJ];
+  FindTrajectory(pm->time, state);
+  TrackingTarget holes[2];
+  LoadTrackingTarget(state, 0, holes[0]);
+  LoadTrackingTarget(state, 1, holes[1]);
+
+  const Real rx = holes[0].position[0]-holes[1].position[0];
+  const Real ry = holes[0].position[1]-holes[1].position[1];
+  const Real rz = holes[0].position[2]-holes[1].position[2];
+  const Real vx = holes[0].velocity[0]-holes[1].velocity[0];
+  const Real vy = holes[0].velocity[1]-holes[1].velocity[1];
+  const Real vz = holes[0].velocity[2]-holes[1].velocity[2];
+  const Real separation2 = SQR(rx)+SQR(ry)+SQR(rz);
+  const Real separation = sqrt(separation2);
+  const Real omega_x = ry*vz-rz*vy;
+  const Real omega_y = rz*vx-rx*vz;
+  const Real omega_z = rx*vy-ry*vx;
+  const Real orbital_omega = (separation2 > 0.0)
+      ? sqrt(SQR(omega_x)+SQR(omega_y)+SQR(omega_z))/separation2 : 0.0;
+  const Real trajectory_values[ntrajectory] = {
+    holes[0].position[0], holes[0].position[1], holes[0].position[2],
+    holes[1].position[0], holes[1].position[1], holes[1].position[2],
+    separation, orbital_omega, holes[0].mass, holes[1].mass
+  };
+  for (int n=0; n<ntrajectory; ++n) {
+    pdata->hdata[n] = (global_variable::my_rank == 0) ? trajectory_values[n] : 0.0;
+  }
+
+  const Real total_mass = holes[0].mass+holes[1].mass;
+  Real center_x = 0.0;
+  Real center_y = 0.0;
+  Real center_z = 0.0;
+  if (total_mass > 0.0) {
+    center_x = (holes[0].mass*holes[0].position[0]
+               +holes[1].mass*holes[1].position[0])/total_mass;
+    center_y = (holes[0].mass*holes[0].position[1]
+               +holes[1].mass*holes[1].position[1])/total_mass;
+    center_z = (holes[0].mass*holes[0].position[2]
+               +holes[1].mass*holes[1].position[2])/total_mass;
+  }
+
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  auto &u0 = pmbp->pmhd->u0;
+  auto &w0 = pmbp->pmhd->w0;
+  auto &bcc = pmbp->pmhd->bcc0;
+  auto &adm = pmbp->padm->adm;
+  auto &excision_floor = pmbp->pcoord->excision_floor;
+  auto &size = pmbp->pmb->mb_size;
+  auto &indcs = pm->mb_indcs;
+  const int is = indcs.is;
+  const int js = indcs.js;
+  const int ks = indcs.ks;
+  const int nx1 = indcs.nx1;
+  const int nx2 = indcs.nx2;
+  const int nx3 = indcs.nx3;
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  const int nmkji = pmbp->nmb_thispack*nkji;
+  const Real inner_radius2 = SQR(bbh.history_inner_radius);
+
+  array_sum::GlobalSum integral;
+  Real rho_max = 0.0;
+  Real sigma_max = 0.0;
+  Kokkos::parallel_reduce(
+    "dynbbh_history", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+    KOKKOS_LAMBDA(const int idx, array_sum::GlobalSum &sum, Real &max_rho,
+                  Real &max_sigma) {
+      const int m = idx/nkji;
+      const int k0 = (idx-m*nkji)/nji;
+      const int j0 = (idx-m*nkji-k0*nji)/nx1;
+      const int i0 = idx-m*nkji-k0*nji-j0*nx1;
+      const int i = i0+is;
+      const int j = j0+js;
+      const int k = k0+ks;
+      if (excision_floor(m,k,j,i)) return;
+
+      const Real gxx = adm.g_dd(m,0,0,k,j,i);
+      const Real gxy = adm.g_dd(m,0,1,k,j,i);
+      const Real gxz = adm.g_dd(m,0,2,k,j,i);
+      const Real gyy = adm.g_dd(m,1,1,k,j,i);
+      const Real gyz = adm.g_dd(m,1,2,k,j,i);
+      const Real gzz = adm.g_dd(m,2,2,k,j,i);
+      const Real detg = adm::SpatialDet(gxx, gxy, gxz, gyy, gyz, gzz);
+      const Real sqrt_detg = sqrt(detg);
+      const Real inv_sqrt_detg = 1.0/sqrt_detg;
+
+      const Real wx = w0(m,IVX,k,j,i);
+      const Real wy = w0(m,IVY,k,j,i);
+      const Real wz = w0(m,IVZ,k,j,i);
+      const Real wx_d = gxx*wx+gxy*wy+gxz*wz;
+      const Real wy_d = gxy*wx+gyy*wy+gyz*wz;
+      const Real wz_d = gxz*wx+gyz*wy+gzz*wz;
+      const Real lorentz2 = 1.0+wx*wx_d+wy*wy_d+wz*wz_d;
+      const Real lorentz = sqrt(lorentz2);
+
+      const Real bx = bcc(m,IBX,k,j,i)*inv_sqrt_detg;
+      const Real by = bcc(m,IBY,k,j,i)*inv_sqrt_detg;
+      const Real bz = bcc(m,IBZ,k,j,i)*inv_sqrt_detg;
+      const Real bx_d = gxx*bx+gxy*by+gxz*bz;
+      const Real by_d = gxy*bx+gyy*by+gyz*bz;
+      const Real bz_d = gxz*bx+gyz*by+gzz*bz;
+      const Real magnetic2 = bx*bx_d+by*by_d+bz*bz_d;
+      const Real magnetic_velocity = (bx*wx_d+by*wy_d+bz*wz_d)/lorentz;
+      const Real bsq = SQR(magnetic_velocity)+magnetic2/lorentz2;
+      const Real rho = w0(m,IDN,k,j,i);
+      const Real pgas = w0(m,IPR,k,j,i);
+      const Real sigma = (rho > 0.0) ? bsq/rho : 0.0;
+      const Real coordinate_volume = size.d_view(m).dx1*size.d_view(m).dx2
+                                   *size.d_view(m).dx3;
+      const Real proper_volume = coordinate_volume*sqrt_detg;
+      const Real densitized_mass = u0(m,IDN,k,j,i);
+      const Real x = CellCenterX(i0, nx1, size.d_view(m).x1min,
+                                size.d_view(m).x1max);
+      const Real y = CellCenterX(j0, nx2, size.d_view(m).x2min,
+                                size.d_view(m).x2max);
+      const Real z = CellCenterX(k0, nx3, size.d_view(m).x3min,
+                                size.d_view(m).x3max);
+
+      array_sum::GlobalSum cell;
+      cell.the_array[10] = coordinate_volume*densitized_mass;
+      cell.the_array[11] = proper_volume*rho;
+      cell.the_array[12] = proper_volume*pgas;
+      cell.the_array[13] = proper_volume*0.5*bsq;
+      cell.the_array[14] = coordinate_volume*densitized_mass*lorentz;
+      cell.the_array[15] = coordinate_volume*densitized_mass*sigma;
+      cell.the_array[16] = coordinate_volume*((x-center_x)*u0(m,IM2,k,j,i)
+                                             -(y-center_y)*u0(m,IM1,k,j,i));
+      cell.the_array[17] =
+          (SQR(x-center_x)+SQR(y-center_y)+SQR(z-center_z) <= inner_radius2)
+          ? coordinate_volume*densitized_mass : 0.0;
+      sum += cell;
+      max_rho = fmax(max_rho, rho);
+      max_sigma = fmax(max_sigma, sigma);
+    }, Kokkos::Sum<array_sum::GlobalSum>(integral), Kokkos::Max<Real>(rho_max),
+    Kokkos::Max<Real>(sigma_max));
+
+  for (int n=10; n<=17; ++n) pdata->hdata[n] = integral.the_array[n];
+#if MPI_PARALLEL_ENABLED
+  if (global_variable::my_rank == 0) {
+    MPI_Reduce(MPI_IN_PLACE, &rho_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(MPI_IN_PLACE, &sigma_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+  } else {
+    Real unused_max = 0.0;
+    MPI_Reduce(&rho_max, &unused_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    MPI_Reduce(&sigma_max, &unused_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0,
+               MPI_COMM_WORLD);
+    rho_max = 0.0;
+    sigma_max = 0.0;
+  }
+#endif
+  pdata->hdata[18] = rho_max;
+  pdata->hdata[19] = sigma_max;
 }
 
 Real HorizonEnclosingRadius(const TrackingTarget &target) {

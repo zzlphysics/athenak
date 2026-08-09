@@ -147,6 +147,8 @@ enforce_maximum = false
 
 <problem>
 pgen_name              = dynbbh
+user_hist              = true
+history_inner_radius   = 80.0
 trajectory_mode        = circular
 trajectory_file        = none
 trajectory_time_offset = 0.0
@@ -220,3 +222,7 @@ ghost_zones = false
 <output4>
 file_type = rst
 dcycle    = 9999
+
+<output5>
+file_type = log
+dcycle    = 1

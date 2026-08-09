@@ -719,30 +719,63 @@ def create_history_plot(
     time = data["time"]
     figure, axes = plt.subplots(2, 2, figsize=(11, 7.5))
     axes = axes.ravel()
-    if "mass" in data:
-        mass_reference = data["mass"][0]
-        axes[0].plot(time, data["mass"] / mass_reference - 1.0)
-        axes[0].set_ylabel(r"$M/M_0-1$")
-    momentum_names = [name for name in ("1-mom", "2-mom", "3-mom") if name in data]
-    for name in momentum_names:
-        axes[1].plot(time, data[name], label=name)
-    if momentum_names:
-        axes[1].legend(fontsize=8)
-    axes[1].set_ylabel("domain momentum")
-    kinetic_names = [name for name in ("1-KE", "2-KE", "3-KE") if name in data]
-    magnetic_names = [name for name in ("1-ME", "2-ME", "3-ME") if name in data]
-    if kinetic_names:
-        kinetic = sum(data[name] for name in kinetic_names)
-        axes[2].plot(time, kinetic, label="kinetic")
-    if magnetic_names:
-        magnetic = sum(data[name] for name in magnetic_names)
-        axes[2].plot(time, magnetic, label="magnetic")
-    if kinetic_names or magnetic_names:
-        axes[2].legend(fontsize=8)
+    bbh_history = "baryon_m" in data
+    momentum_names: list[str] = []
+    kinetic_names: list[str] = []
+    magnetic_names: list[str] = []
+    if bbh_history:
+        baryon_reference = data["baryon_m"][0]
+        axes[0].plot(time, data["baryon_m"] / baryon_reference - 1.0)
+        axes[0].set_ylabel(r"$M_b/M_{b,0}-1$")
+        axes[1].plot(time, data["bh_sep"], label="separation")
+        axes[1].set_ylabel(r"$d/M$")
+        omega_axis = axes[1].twinx()
+        omega_axis.plot(time, data["orb_omega"], color="tab:orange", label="omega")
+        omega_axis.set_ylabel(r"$M\Omega$")
+        for name, label in (
+            ("pgas_prp", r"$\int p\sqrt{\gamma}\,d^3x$"),
+            ("emag_prp", r"$\int b^2\sqrt{\gamma}\,d^3x/2$"),
+        ):
+            axes[2].plot(time, data[name], label=label)
         axes[2].set_yscale("log")
-    axes[2].set_ylabel("integrated energy")
-    axes[3].plot(time, data["dt"])
-    axes[3].set_ylabel(r"$\Delta t_\mathrm{root}$")
+        axes[2].set_ylabel("proper-volume integrals")
+        axes[2].legend(fontsize=8)
+        axes[3].plot(time, data["rho_max"], label=r"$\rho_\mathrm{max}$")
+        axes[3].plot(time, data["sigma_max"], label=r"$\sigma_\mathrm{max}$")
+        axes[3].set_yscale("log")
+        axes[3].set_ylabel("outside-excision maxima")
+        axes[3].legend(fontsize=8)
+    else:
+        if "mass" in data:
+            mass_reference = data["mass"][0]
+            axes[0].plot(time, data["mass"] / mass_reference - 1.0)
+            axes[0].set_ylabel(r"$M/M_0-1$")
+        momentum_names = [
+            name for name in ("1-mom", "2-mom", "3-mom") if name in data
+        ]
+        for name in momentum_names:
+            axes[1].plot(time, data[name], label=name)
+        if momentum_names:
+            axes[1].legend(fontsize=8)
+        axes[1].set_ylabel("domain momentum")
+        kinetic_names = [
+            name for name in ("1-KE", "2-KE", "3-KE") if name in data
+        ]
+        magnetic_names = [
+            name for name in ("1-ME", "2-ME", "3-ME") if name in data
+        ]
+        if kinetic_names:
+            kinetic = sum(data[name] for name in kinetic_names)
+            axes[2].plot(time, kinetic, label="kinetic")
+        if magnetic_names:
+            magnetic = sum(data[name] for name in magnetic_names)
+            axes[2].plot(time, magnetic, label="magnetic")
+        if kinetic_names or magnetic_names:
+            axes[2].legend(fontsize=8)
+            axes[2].set_yscale("log")
+        axes[2].set_ylabel("integrated energy")
+        axes[3].plot(time, data["dt"])
+        axes[3].set_ylabel(r"$\Delta t_\mathrm{root}$")
     for axis in axes:
         axis.set_xlabel(r"$t/M$")
         axis.grid(alpha=0.25)
@@ -752,6 +785,33 @@ def create_history_plot(
     figure.savefig(output_path, dpi=dpi)
     plt.close(figure)
     diagnostics: dict[str, float] = {}
+    if bbh_history:
+        diagnostics.update(
+            {
+                "baryon_mass_relative_change": float(
+                    data["baryon_m"][-1] / data["baryon_m"][0] - 1.0
+                ),
+                "inner_mass_fraction_initial": float(
+                    data["inner_D"][0] / data["baryon_m"][0]
+                ),
+                "inner_mass_fraction_final": float(
+                    data["inner_D"][-1] / data["baryon_m"][-1]
+                ),
+                "separation_final": float(data["bh_sep"][-1]),
+                "orbital_omega_final": float(data["orb_omega"][-1]),
+                "D_weighted_lorentz_final": float(
+                    data["lor_D"][-1] / data["baryon_m"][-1]
+                ),
+                "D_weighted_sigma_final": float(
+                    data["sigma_D"][-1] / data["baryon_m"][-1]
+                ),
+                "integrated_beta_inverse_final": float(
+                    data["emag_prp"][-1] / data["pgas_prp"][-1]
+                ),
+                "rho_max_final": float(data["rho_max"][-1]),
+                "sigma_max_final": float(data["sigma_max"][-1]),
+            }
+        )
     if "mass" in data:
         diagnostics["mass_relative_change"] = float(
             data["mass"][-1] / data["mass"][0] - 1.0
@@ -779,13 +839,24 @@ def create_history_plot(
         "time_max": float(time.max()),
         "columns": sorted(data),
         "diagnostics": diagnostics,
-        "interpretation_notes": [
-            "A prescribed time-dependent BBH metric can exchange coordinate energy "
-            "and momentum with the fluid, so tot-E and domain momentum are not "
-            "strict conservation invariants.",
-            "Domain mass can change through excision, atmosphere recovery, accretion, "
-            "and boundary flux. Publication analysis requires moving-surface fluxes."
-        ],
+        "interpretation_notes": (
+            [
+                "BBH user integrals omit the excision-floor mask. baryon_m and inner_D "
+                "use the densitized conserved rest mass; rho_prp, pgas_prp, and "
+                "emag_prp use proper spatial volume.",
+                "angmom_z is a coordinate angular-momentum proxy about the instantaneous "
+                "binary mass center. Publication accretion claims still require "
+                "moving-surface mass and magnetic-flux diagnostics.",
+            ]
+            if bbh_history
+            else [
+                "A prescribed time-dependent BBH metric can exchange coordinate energy "
+                "and momentum with the fluid, so tot-E and domain momentum are not "
+                "strict conservation invariants.",
+                "Domain mass can change through excision, atmosphere recovery, accretion, "
+                "and boundary flux. Publication analysis requires moving-surface fluxes.",
+            ]
+        ),
     }
 
 

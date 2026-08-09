@@ -15,13 +15,15 @@ sys.path.insert(0, str(ROOT / "vis" / "python"))
 
 from analyze_bbh_grmhd_campaign import (  # noqa: E402
     classify_binary,
+    classify_history,
     load_verified_files,
     merge_histories,
     storage_projection,
     subcycling_work_model,
+    summarize_event_logs,
     verify_file,
 )
-from compare_bbh_grmhd_convergence import analyze  # noqa: E402
+from compare_bbh_grmhd_convergence import analyze, automatic_diagnostics  # noqa: E402
 
 
 def digest(payload: bytes) -> str:
@@ -106,6 +108,30 @@ def test_empirical_second_order_difference_ratio() -> None:
     assert abs(float(summaries["mass_rel"]["empirical_order"]) - 2.0) < 1.0e-12
 
 
+def test_bbh_user_history_selects_native_convergence_diagnostics() -> None:
+    time = np.asarray([0.0, 1.0])
+    series = []
+    for label in ("L", "M"):
+        series.append(
+            (
+                label,
+                {
+                    "time": time,
+                    "baryon_m": np.asarray([10.0, 9.9]),
+                    "inner_D": np.asarray([1.0, 1.1]),
+                    "emag_prp": np.asarray([0.1, 0.2]),
+                    "sigma_D": np.asarray([0.01, 0.02]),
+                },
+            )
+        )
+    assert automatic_diagnostics(series) == [
+        "baryon_mass_rel",
+        "inner_mass_rel",
+        "magnetic_energy_rel",
+        "D_weighted_sigma",
+    ]
+
+
 def test_storage_budget_includes_forced_segment_restarts() -> None:
     streams = {
         "mhd_w_bcc": [
@@ -146,3 +172,41 @@ def test_native_grmhd_diagnostic_stream_is_classified() -> None:
         "mhd_gr_diagnostics"
     )
     assert classify_binary("renamed-output.bin", variables) == "mhd_gr_diagnostics"
+
+
+def test_generic_and_bbh_histories_are_kept_separate() -> None:
+    assert classify_history("run.mhd.hst") == "mhd"
+    assert classify_history("run.user.hst") == "user"
+    assert classify_history("legacy.hst") == "other"
+
+
+def test_event_log_merge_prefers_later_restart_segment(tmp_path: Path) -> None:
+    header = (
+        "# Athena event counter data\n"
+        "#  cycle eos_dfloor eos_efloor eos_tfloor eos_vceil eos_fail c2p_it fofc\n"
+    )
+    first = tmp_path / "first.log"
+    second = tmp_path / "second.log"
+    first.write_text(
+        header + "       5        1        2        3        4        5      6        7\n"
+        "      10       10       20       30       40       50     60       70\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        header + "      10        2        3        4        5        6      7        8\n"
+        "      20        3        4        5        6        7      8        9\n",
+        encoding="utf-8",
+    )
+    summary = summarize_event_logs([first, second])
+    assert summary["records_with_events"] == 3
+    assert summary["cycle_min"] == 5
+    assert summary["cycle_max"] == 20
+    assert summary["c2p_iteration_max"] == 8
+    assert summary["totals"] == {
+        "eos_dfloor": 6,
+        "eos_efloor": 9,
+        "eos_tfloor": 12,
+        "eos_vceil": 15,
+        "eos_fail": 18,
+        "fofc": 24,
+    }

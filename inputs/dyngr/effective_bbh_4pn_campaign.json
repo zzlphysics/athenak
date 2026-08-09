@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "campaign_id": "effective-bbh-4pn-amr-convergence-v2",
+  "schema_version": 3,
+  "campaign_id": "effective-bbh-4pn-amr-convergence-v3",
   "status": "qualification_candidate_not_publication_certification",
   "trajectory": {
     "declared_model": "4PN_to_single_remnant",
@@ -82,7 +82,7 @@
       "disk_floor_center_M": [0.0, 0.0, 0.0]
     },
     "outputs": {
-      "history_dt_M": 1.0,
+      "history_root_dcycle": 1,
       "full_state_dt_M": 10.0,
       "gr_diagnostics_dt_M": 10.0,
       "divb_dt_M": 25.0,

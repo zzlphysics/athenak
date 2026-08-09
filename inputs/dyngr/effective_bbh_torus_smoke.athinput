@@ -110,6 +110,8 @@ singularity_floor      = 1.0e-3
 amr_condition          = track
 alpha_threshold        = 0.6
 refinement_radius      = 6.0
+history_inner_radius   = 80.0
+user_hist              = true
 
 initial_data              = reference_fm_torus
 torus_reference_mass      = 1.0
@@ -158,3 +160,7 @@ ghost_zones = false
 <output4>
 file_type = rst
 dcycle    = 2
+
+<output5>
+file_type = log
+dcycle    = 1
