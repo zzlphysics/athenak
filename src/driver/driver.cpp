@@ -525,7 +525,9 @@ int Driver::FinestOccupiedLevel(const Mesh *pmesh) const {
 //! \brief Apply growth and end-time caps to the synchronized root-level CFL limit.
 
 void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
-  const Real previous_dt = pmesh->dt;
+  const Real previous_dt =
+      (std::isfinite(pmesh->dt_restart_growth) && pmesh->dt_restart_growth > 0.0)
+      ? pmesh->dt_restart_growth : pmesh->dt;
   Real next_dt = ComputeLevelSubcyclingTimeStep(pmesh);
 
   if (previous_dt == std::numeric_limits<float>::max()) {
@@ -539,6 +541,10 @@ void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
   if (root_dt_max_ > 0.0) {
     next_dt = std::min(next_dt, root_dt_max_);
   }
+  // A tlim clip is an output-boundary artifact rather than a new CFL constraint.
+  // Retain the pre-clip value so a checkpoint at the endpoint can resume without a
+  // long 2x growth staircase from a roundoff-sized tail step.
+  pmesh->dt_restart_growth = next_dt;
   if ((pmesh->time < tlim) && (pmesh->time + next_dt > tlim)) {
     next_dt = tlim - pmesh->time;
   }

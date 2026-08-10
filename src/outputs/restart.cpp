@@ -263,6 +263,14 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                     kAmrCycleCounterVersion);
   }
 
+  // The binary header retains the actual last completed step for time-derived output.
+  // Store the independent growth-limiter reference in ParameterInput so a timestep
+  // clipped only to hit tlim does not force a roundoff-scale restart staircase.
+  const Real restart_growth =
+      (std::isfinite(pm->dt_restart_growth) && pm->dt_restart_growth > 0.0)
+      ? pm->dt_restart_growth : std::numeric_limits<float>::max();
+  pin->SetReal("time", "restart_dt_growth", restart_growth);
+
   // create string holding input parameters (copy of input file)
   std::stringstream ost;
   pin->ParameterDump(ost);
@@ -276,10 +284,10 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   IOWrapper resfile;
   resfile.Open(fname.c_str(), IOWrapper::FileMode::write, single_file_per_rank);
   if (global_variable::my_rank == 0 || single_file_per_rank) {
-    // The legacy header has one timestep slot.  Give it one unambiguous meaning for all
-    // checkpoint sites: the last completed step, which is the value needed to apply the
-    // growth limiter exactly once after restart.  Cycle-zero checkpoints use the same
-    // sentinel as a fresh Mesh and therefore impose no artificial initial growth cap.
+    // The legacy header has one timestep slot.  Keep its unambiguous physical meaning:
+    // the actual last completed step used by time-derived diagnostics.  The separate
+    // restart_dt_growth ParameterInput value controls the post-restart growth limiter.
+    // Cycle-zero checkpoints use the fresh-Mesh sentinel in this legacy slot.
     const Real restart_dt =
         (pm->ncycle > 0 && std::isfinite(pm->dt_last_completed) &&
          pm->dt_last_completed > 0.0)

@@ -144,6 +144,14 @@ from the input file.  The half-CFL variant therefore receives a `2.4M` root-step
 Use `--cfl-number 0.15` to generate the half-CFL temporal-convergence variant; the
 generator permits decreasing, but never silently increasing, the audited baseline CFL.
 
+Restart files preserve the actual last completed timestep for time-derived diagnostics
+and separately serialize `time/restart_dt_growth`, the CFL/growth-limited value before a
+final `tlim` clip.  Thus a roundoff-sized step taken only to land exactly on a segment
+endpoint does not force a long 2x timestep staircase after restart.  Old checkpoints
+without this internal parameter treat only a machine-roundoff-scale header timestep as
+an endpoint artifact; the newly evaluated CFL and `root_dt_max` still bound the resumed
+step.
+
 AMR topology is intentionally immutable inside one root step.  All finer levels complete
 their recursive 2:1 substeps and reflux to the root endpoint before regridding, output,
 or restart is legal.  The BBH spacetime itself is not frozen: ADM variables are evaluated

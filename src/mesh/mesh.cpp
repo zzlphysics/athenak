@@ -53,7 +53,8 @@ Mesh::Mesh(ParameterInput *pin) :
   nprtcl_thisrank(0),
   nprtcl_total(0),
   dtold(0.),
-  dt_last_completed(0.) {
+  dt_last_completed(0.),
+  dt_restart_growth(0.) {
   // Set physical size and number of cells in mesh (root level)
   mesh_size.x1min = pin->GetReal("mesh", "x1min");
   mesh_size.x1max = pin->GetReal("mesh", "x1max");
@@ -568,16 +569,20 @@ std::string Mesh::GetBoundaryString(BoundaryFlag input_flag) {
 // \fn Mesh::NewTimeStep()
 
 void Mesh::NewTimeStep(const Real tlim) {
-  // save old timestep
-  dtold = dt;
-  if (dt == std::numeric_limits<float>::max()) {
+  // Use the pre-tlim reference for the growth limiter.  It equals the actual previous
+  // step normally, but remains at the CFL-limited value after an endpoint tail.
+  const Real previous_dt =
+      (std::isfinite(dt_restart_growth) && dt_restart_growth > 0.0)
+      ? dt_restart_growth : dt;
+  dtold = previous_dt;
+  if (previous_dt == std::numeric_limits<float>::max()) {
     dtold = 0.;
   }
 
   // cycle over all MeshBlocks on this rank and find minimum dt
   // Requires at least ONE of the physics modules to be defined.
   // limit increase in timestep to 2x old value
-  dt = 2.0*dt;
+  dt = 2.0*previous_dt;
 
   // Hydro timestep
   if (pmb_pack->phydro != nullptr) {
@@ -632,6 +637,11 @@ void Mesh::NewTimeStep(const Real tlim) {
   // get minimum dt over all MPI ranks
   MPI_Allreduce(MPI_IN_PLACE, &dt, 1, MPI_ATHENA_REAL, MPI_MIN, MPI_COMM_WORLD);
 #endif
+
+  // Preserve the CFL/growth-limited value separately from an artificial final-step
+  // truncation.  Restart uses this reference to avoid growing from a roundoff-sized
+  // tail that was taken only to land on tlim exactly.
+  dt_restart_growth = dt;
 
   // limit last time step to stop at tlim *exactly*
   if ( (time < tlim) && ((time + dt) > tlim) ) {dt = tlim - time;}

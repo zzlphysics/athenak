@@ -421,9 +421,35 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   hdos += sizeof(Real);
   std::memcpy(&ncycle, &(headerdata[hdos]), sizeof(int));
   delete [] headerdata;
+  const Real checkpoint_dt = dt;
   dt_last_completed =
-      (ncycle > 0 && std::isfinite(dt) && dt > 0.0 &&
-       dt != std::numeric_limits<float>::max()) ? dt : 0.0;
+      (ncycle > 0 && std::isfinite(checkpoint_dt) && checkpoint_dt > 0.0 &&
+       checkpoint_dt != std::numeric_limits<float>::max()) ? checkpoint_dt : 0.0;
+
+  // New checkpoints serialize the pre-tlim CFL/growth reference independently from
+  // the actual last completed step above.  This keeps dt_last_completed physically
+  // correct for time-derived diagnostics while preventing an endpoint roundoff tail
+  // from throttling the resumed run.  For an old checkpoint, discard only a timestep
+  // at floating-point roundoff scale; the freshly recomputed CFL limit still bounds the
+  // next step, so this compatibility path cannot hide a genuinely restrictive CFL.
+  const Real fresh_dt = std::numeric_limits<float>::max();
+  dt_restart_growth = fresh_dt;
+  if (ncycle > 0) {
+    if (pin->DoesParameterExist("time", "restart_dt_growth")) {
+      dt_restart_growth = pin->GetReal("time", "restart_dt_growth");
+      if (!std::isfinite(dt_restart_growth) || !(dt_restart_growth > 0.0)) {
+        BuildTreeError("Restart contains an invalid <time>/restart_dt_growth");
+      }
+    } else if (dt_last_completed > 0.0) {
+      const Real scale = std::max(static_cast<Real>(1.0), std::abs(time));
+      const Real roundoff_tail =
+          static_cast<Real>(64.0)*std::numeric_limits<Real>::epsilon()*scale;
+      if (dt_last_completed > roundoff_tail) {
+        dt_restart_growth = dt_last_completed;
+      }
+    }
+  }
+  dt = dt_restart_growth;
 
   // calculate the number of MeshBlocks at root level in each dir
   nmb_rootx1 = mesh_indcs.nx1/mb_indcs.nx1;

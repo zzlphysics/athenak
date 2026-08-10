@@ -2,6 +2,7 @@
 
 import re
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -139,6 +140,32 @@ def _restart_parameter_text(path: Path):
     marker_offset = contents.find(marker)
     assert marker_offset >= 0, f"Missing ParameterInput terminator in {path}"
     return contents[:marker_offset].decode("utf-8")
+
+
+def _restart_time_dt_cycle(path: Path):
+    contents = path.read_bytes()
+    marker = b"<par_end>\n"
+    marker_offset = contents.find(marker)
+    assert marker_offset >= 0, f"Missing ParameterInput terminator in {path}"
+    offset = marker_offset + len(marker)
+    mesh_prefix = struct.calcsize("=ii9d19i19i")
+    return struct.unpack_from("=ddi", contents, offset + mesh_prefix)
+
+
+def _without_restart_growth_parameter(source: Path, destination: Path):
+    """Create a byte-valid legacy checkpoint lacking the new optional parameter."""
+    contents = source.read_bytes()
+    marker = b"<par_end>\n"
+    marker_offset = contents.find(marker)
+    assert marker_offset >= 0, f"Missing ParameterInput terminator in {source}"
+    parameter_text = contents[:marker_offset].decode("utf-8")
+    parameter_text, count = re.subn(
+        r"(?m)^restart_dt_growth\s*=.*\n", "", parameter_text, count=1
+    )
+    assert count == 1, "Checkpoint did not contain restart_dt_growth"
+    destination.write_bytes(
+        parameter_text.encode("utf-8") + contents[marker_offset:]
+    )
 
 
 def _read_dumps(run_dir: Path, variable: str):
@@ -379,6 +406,94 @@ def test_subcycling_root_dt_max_is_opt_in_validated_and_restartable(tmp_path):
     )
     assert restart_restarts, "Expected checkpoint after capped restart"
     assert "root_dt_max" in _restart_parameter_text(restart_restarts[-1])
+
+
+def test_tlim_roundoff_tail_does_not_throttle_restart(tmp_path):
+    cap = 1.0e-6
+    endpoint = np.nextafter(cap, np.inf)
+    tail = endpoint - cap
+    assert 0.0 < tail < 64.0 * np.finfo(float).eps
+
+    cap_input = _input_with_root_dt_max(
+        tmp_path, "tail_capped", f"{cap:.17e}"
+    )
+    # linear_wave interprets tlim in wave periods and rescales it during initial-data
+    # setup. Measure that deterministic factor so the evolved endpoint is exactly the
+    # adjacent representable value above one root cap.
+    probe_dir = tmp_path / "tail_scale_probe"
+    _run_mpi(
+        probe_dir,
+        ranks=1,
+        nlim=0,
+        input_file=cap_input,
+        overrides=("time/tlim=1.0", "output4/dcycle=1"),
+    )
+    probe_restarts = sorted(
+        (probe_dir / "rst").glob(f"{BASENAME}.*.rst")
+    )
+    assert probe_restarts, "Expected a cycle-zero scale-probe checkpoint"
+    probe_text = _restart_parameter_text(probe_restarts[-1])
+    scale_match = re.search(r"(?m)^tlim\s*=\s*(\S+)", probe_text)
+    assert scale_match, "Scale-probe checkpoint did not contain tlim"
+    tlim_scale = float(scale_match.group(1))
+    assert tlim_scale > 0.0
+
+    tail_dir = tmp_path / "tail_endpoint"
+    _run_mpi(
+        tail_dir,
+        ranks=1,
+        nlim=-1,
+        input_file=cap_input,
+        overrides=(
+            f"time/tlim={endpoint/tlim_scale:.17e}",
+            "output4/dcycle=1",
+        ),
+    )
+    tail_restarts = sorted(
+        (tail_dir / "rst").glob(f"{BASENAME}.*.rst")
+    )
+    assert tail_restarts, "Expected a checkpoint after the roundoff tail"
+    checkpoint = tail_restarts[-1]
+    checkpoint_time, checkpoint_dt, checkpoint_cycle = _restart_time_dt_cycle(
+        checkpoint
+    )
+    assert checkpoint_cycle == 2
+    assert checkpoint_time == pytest.approx(endpoint, rel=0.0, abs=0.0)
+    assert checkpoint_dt == pytest.approx(tail, rel=0.0, abs=0.0)
+
+    parameter_text = _restart_parameter_text(checkpoint)
+    match = re.search(r"(?m)^restart_dt_growth\s*=\s*(\S+)", parameter_text)
+    assert match, "Checkpoint did not serialize restart_dt_growth"
+    assert float(match.group(1)) == pytest.approx(cap, rel=2.0e-14, abs=0.0)
+
+    # A new checkpoint resumes at the normal root cap, not 2*tail.
+    resumed_dir = tmp_path / "tail_resumed"
+    _run_mpi(
+        resumed_dir,
+        ranks=1,
+        restart=checkpoint,
+        nlim=3,
+        overrides=("time/tlim=1.0", "output4/dcycle=1"),
+    )
+    resumed_time, resumed_dt = _history_time_and_dt(resumed_dir)
+    np.testing.assert_allclose(resumed_time, endpoint + cap, rtol=2.0e-14, atol=0.0)
+    np.testing.assert_allclose(resumed_dt, cap, rtol=2.0e-14, atol=0.0)
+
+    # Existing checkpoints have no optional parameter.  A roundoff-scale legacy header
+    # must remove only the growth constraint; the freshly evaluated CFL/root cap remains.
+    legacy_checkpoint = tmp_path / "tail_legacy.rst"
+    _without_restart_growth_parameter(checkpoint, legacy_checkpoint)
+    legacy_dir = tmp_path / "tail_legacy_resumed"
+    _run_mpi(
+        legacy_dir,
+        ranks=1,
+        restart=legacy_checkpoint,
+        nlim=3,
+        overrides=("time/tlim=1.0", "output4/dcycle=1"),
+    )
+    legacy_time, legacy_dt = _history_time_and_dt(legacy_dir)
+    np.testing.assert_allclose(legacy_time, endpoint + cap, rtol=2.0e-14, atol=0.0)
+    np.testing.assert_allclose(legacy_dt, cap, rtol=2.0e-14, atol=0.0)
 
 
 def test_subcycling_preserves_divb_on_anisotropic_2d_cells(tmp_path):
