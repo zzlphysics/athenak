@@ -921,16 +921,32 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
     Kokkos::realloc(outarray, nout_vars, nout_mbs, nout3, nout2, nout1);
   }
 
-  // Calculate derived variables, if required
-  if (out_params.contains_derived) {
+  // Native GRMHD diagnostics are four independent scalars.  On large AMR packs a
+  // simultaneous four-component device allocation can exceed otherwise sufficient GPU
+  // memory.  Stage one component at a time into the already allocated host output array;
+  // the binary file still contains the same four variables in the same order.
+  const bool stream_gr_diagnostics =
+      (out_params.variable.compare("mhd_gr_diagnostics") == 0);
+  if (stream_gr_diagnostics && nout_vars != 4) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "mhd_gr_diagnostics must contain exactly four variables, got "
+              << nout_vars << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
+  // Calculate derived variables, if required.  The streamed GR diagnostics are computed
+  // below immediately before each component is copied.
+  if (out_params.contains_derived && !stream_gr_diagnostics) {
     // ComputeDerivedVariable advances this cursor while filling a composite derived
     // output.  Every output load starts a fresh fill, including after AMR or restart.
     out_params.i_derived = 0;
     ComputeDerivedVariable(out_params.variable, pm);
   }
 
-  // Now copy data to host (outarray) over all variables and MeshBlocks
-  for (int n=0; n<nout_vars; ++n) {
+  // Copy one output variable to host.  source_index can differ from the persistent
+  // outvars index when a composite derived field is streamed through a one-component
+  // scratch View.
+  auto copy_variable_to_host = [&](int n, int source_index) {
     for (int m=0; m<nout_mbs; ++m) {
       int mbi = pm->FindMeshBlockIndex(outmbs[m].mb_gid);
       std::pair<int,int> irange = std::make_pair(outmbs[m].ois, outmbs[m].oie+1);
@@ -942,7 +958,7 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
 
       // copy output variable to new device View
       DvceArray3D<Real> d_output_var("d_out_var",nout3,nout2,nout1);
-      auto d_slice = Kokkos::subview(*(outvars[n].data_ptr), mbi, outvars[n].data_index,
+      auto d_slice = Kokkos::subview(*(outvars[n].data_ptr), mbi, source_index,
                                      krange,jrange,irange);
       Kokkos::deep_copy(d_output_var,d_slice);
 
@@ -953,6 +969,24 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
       // copy host mirror to 5D host View containing all output variables
       auto h_slice = Kokkos::subview(outarray,n,m,Kokkos::ALL,Kokkos::ALL,Kokkos::ALL);
       Kokkos::deep_copy(h_slice,h_output_var);
+    }
+  };
+
+  if (stream_gr_diagnostics) {
+    static const char *component_names[4] = {
+      "mhd_gr_bsq", "mhd_gr_lorentz", "mhd_gr_sigma", "mhd_gr_beta_inv"
+    };
+    for (int n=0; n<nout_vars; ++n) {
+      out_params.i_derived = 0;
+      ComputeDerivedVariable(component_names[n], pm);
+      copy_variable_to_host(n, 0);
+      Kokkos::fence();
+      derived_var = DvceArray5D<Real>("derived-var", 1, 1, 1, 1, 1);
+    }
+  } else {
+    // Now copy data to host (outarray) over all variables and MeshBlocks.
+    for (int n=0; n<nout_vars; ++n) {
+      copy_variable_to_host(n, outvars[n].data_index);
     }
   }
 }

@@ -122,9 +122,17 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
   // Native covariant diagnostics for dynamical GRMHD.  This follows the exact 3+1
   // primitive definitions used by PrimitiveSolver::PrimToCon.  In particular, bcc is
   // densitized by sqrt(det(gamma_ij)) in DynGRMHD and must be undensitized first.
-  if (name.compare("mhd_gr_diagnostics") == 0) {
-    if (DerivedVariableShapeChanged(derived_var, nmb, n_dv, n3, n2, n1)) {
-      Kokkos::realloc(derived_var, nmb, n_dv, n3, n2, n1);
+  const bool all_gr_diagnostics = (name.compare("mhd_gr_diagnostics") == 0);
+  int gr_diagnostic_component = -1;
+  if (name.compare("mhd_gr_bsq") == 0) gr_diagnostic_component = 0;
+  if (name.compare("mhd_gr_lorentz") == 0) gr_diagnostic_component = 1;
+  if (name.compare("mhd_gr_sigma") == 0) gr_diagnostic_component = 2;
+  if (name.compare("mhd_gr_beta_inv") == 0) gr_diagnostic_component = 3;
+  if (all_gr_diagnostics || gr_diagnostic_component >= 0) {
+    const int output_components = all_gr_diagnostics ? 4 : 1;
+    if (DerivedVariableShapeChanged(
+            derived_var, nmb, output_components, n3, n2, n1)) {
+      Kokkos::realloc(derived_var, nmb, output_components, n3, n2, n1);
     }
     auto dv = derived_var;
     auto &w0 = pm->pmb_pack->pmhd->w0;
@@ -164,12 +172,22 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       const Real rho = w0(m, IDN, k, j, i);
       const Real pgas = w0(m, IPR, k, j, i);
 
-      dv(m, i_dv,     k, j, i) = bsq;
-      dv(m, i_dv + 1, k, j, i) = W;
-      dv(m, i_dv + 2, k, j, i) = bsq/rho;
-      dv(m, i_dv + 3, k, j, i) = 0.5*bsq/pgas;
+      if (all_gr_diagnostics) {
+        dv(m, i_dv,     k, j, i) = bsq;
+        dv(m, i_dv + 1, k, j, i) = W;
+        dv(m, i_dv + 2, k, j, i) = bsq/rho;
+        dv(m, i_dv + 3, k, j, i) = 0.5*bsq/pgas;
+      } else if (gr_diagnostic_component == 0) {
+        dv(m, i_dv, k, j, i) = bsq;
+      } else if (gr_diagnostic_component == 1) {
+        dv(m, i_dv, k, j, i) = W;
+      } else if (gr_diagnostic_component == 2) {
+        dv(m, i_dv, k, j, i) = bsq/rho;
+      } else {
+        dv(m, i_dv, k, j, i) = 0.5*bsq/pgas;
+      }
     });
-    i_dv += 4;
+    i_dv += output_components;
   }
 
   // z-component of vorticity.
