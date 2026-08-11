@@ -131,6 +131,21 @@ def _run_timed_mpi_expect_failure(
     return output
 
 
+def test_subcycling_moving_amr_honors_block_capacity(tmp_path):
+    """Repeated AMR repartitioning must stay within fixed MeshBlockPack capacity."""
+    run_dir = tmp_path / "capacity_constrained"
+    run_dir.mkdir()
+    log_output = _run_timed_mpi(
+        run_dir,
+        ranks=3,
+        overrides=("mesh_refinement/max_nmb_per_rank=5",),
+    )
+
+    assert "Current number of MeshBlocks = 14" in log_output
+    assert "30 MeshBlocks created, 24 deleted by AMR" in log_output
+    assert "exceeds <mesh_refinement>/max_nmb_per_rank" not in log_output
+
+
 def _read_dumps(run_dir: Path, variable: str):
     pattern = f"{BASENAME}.{variable}.*.bin"
     paths = sorted((run_dir / "bin").glob(pattern))

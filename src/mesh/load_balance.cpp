@@ -45,17 +45,20 @@ namespace {
 }  // namespace
 
 //----------------------------------------------------------------------------------------
-//! \fn void Mesh::LoadBalance(double *clist, int *rlist, int *slist, int *nlist, int nb)
+//! \fn void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb,
+//!                            int max_blocks_per_rank)
 //! \brief Calculate distribution of MeshBlocks across ranks based on input cost list
 //! input: clist = cost of each MB (array of length nmbtotal)
 //!        nb = number of MeshBlocks
 //! output: rlist = rank to which each MB is assigned (array of length nmbtotal)
 //!         slist = starting grid ID (gid) for MB on each rank (array of length nrank)
 //!         nlist = number of MBs on each rank (array of length nrank)
+//!        max_blocks_per_rank = hard partition capacity, or zero for no explicit cap
 //! With multiple ranks in MPI, this function is needed even on a uniform mesh and not
 //! just for SMR/AMR, which is why it is part of the Mesh and not MeshRefinement class.
 
-void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb) {
+void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb,
+                       int max_blocks_per_rank) {
   const int nranks = global_variable::nranks;
   if (nranks < 1) {
     LoadBalanceError("Cannot load balance over fewer than one MPI rank");
@@ -64,6 +67,16 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
     LoadBalanceError("Cannot load balance " + std::to_string(nb) +
                      " MeshBlocks over " + std::to_string(nranks) +
                      " ranks while keeping at least one MeshBlock per rank");
+  }
+  if (max_blocks_per_rank < 0) {
+    LoadBalanceError("Maximum MeshBlocks per rank cannot be negative");
+  }
+  if (max_blocks_per_rank > 0 &&
+      static_cast<long long>(nb) >
+          static_cast<long long>(nranks)*max_blocks_per_rank) {
+    LoadBalanceError("Cannot fit " + std::to_string(nb) + " MeshBlocks on " +
+                     std::to_string(nranks) + " ranks with max_blocks_per_rank=" +
+                     std::to_string(max_blocks_per_rank));
   }
 
   float min_cost = std::numeric_limits<float>::max();
@@ -88,20 +101,36 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
 
   // Preserve contiguous Z-order ranges while balancing their weighted costs.  Work from
   // the final rank towards rank zero so ties leave the master rank no more work.  For
-  // each rank, choose the segment boundary closest to the mean remaining cost, but never
-  // consume the one-block minimum reserved for every lower rank.  The reservation is the
-  // essential invariant missing from the previous threshold-only greedy algorithm.
+  // each rank, choose the segment boundary closest to the mean remaining cost.  Bounds on
+  // that boundary reserve both the one-block minimum and enough capacity for every lower
+  // rank, while limiting the current rank to max_blocks_per_rank.  This matters for strict
+  // subcycling: a long run of inexpensive coarse blocks can otherwise produce a perfectly
+  // cost-balanced partition that cannot fit in the fixed-capacity MeshBlockPack.
+  const int block_cap =
+      (max_blocks_per_rank > 0) ? max_blocks_per_rank : nb;
   int segment_end = nb;
   double remaining_cost = total_cost;
   for (int rank=nranks-1; rank>0; --rank) {
-    int segment_begin = segment_end - 1;
-    double segment_cost = static_cast<double>(clist[segment_begin]);
+    const int minimum_begin = std::max(rank, segment_end-block_cap);
+    const int maximum_begin = static_cast<int>(std::min(
+        static_cast<long long>(segment_end-1),
+        static_cast<long long>(rank)*static_cast<long long>(block_cap)));
+    if (minimum_begin > maximum_begin) {
+      LoadBalanceError("No feasible capacity-constrained boundary for rank " +
+                       std::to_string(rank));
+    }
+
+    int segment_begin = maximum_begin;
+    double segment_cost = 0.0;
+    for (int i=segment_begin; i<segment_end; ++i) {
+      segment_cost += static_cast<double>(clist[i]);
+    }
     const double target_cost = remaining_cost/static_cast<double>(rank + 1);
 
-    // segment_begin == rank leaves exactly one block for each lower rank.  Positive
-    // costs make distance from target unimodal as preceding blocks are added, so the
-    // first worsening candidate is also the globally best boundary for this segment.
-    while (segment_begin > rank) {
+    // Positive costs make distance from target unimodal as preceding blocks are added,
+    // so the first worsening candidate is also the best feasible boundary for this
+    // segment.
+    while (segment_begin > minimum_begin) {
       const double candidate_cost =
           segment_cost + static_cast<double>(clist[segment_begin-1]);
       if (std::abs(candidate_cost-target_cost) >
@@ -132,11 +161,12 @@ void Mesh::LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb)
   // zero-sized pack or discovering inconsistent GID metadata in later communication.
   int next_gid = 0;
   for (int rank=0; rank<nranks; ++rank) {
-    if (nlist[rank] < 1 || slist[rank] != next_gid) {
+    if (nlist[rank] < 1 || nlist[rank] > block_cap || slist[rank] != next_gid) {
       LoadBalanceError("Internal weighted-partition error for rank " +
                        std::to_string(rank) + ": start=" +
                        std::to_string(slist[rank]) + ", count=" +
-                       std::to_string(nlist[rank]) + ", expected start=" +
+                       std::to_string(nlist[rank]) + ", cap=" +
+                       std::to_string(block_cap) + ", expected start=" +
                        std::to_string(next_gid));
     }
     for (int i=slist[rank]; i<slist[rank]+nlist[rank]; ++i) {

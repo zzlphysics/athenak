@@ -58,17 +58,23 @@ float LevelSubcyclingBlockCost(const LogicalLocation &lloc, int root_level) {
   std::exit(EXIT_FAILURE);
 }
 
-int ValidatedMaxBlocksPerRank(ParameterInput *pin, bool adaptive,
+int ConfiguredMaxBlocksPerRank(ParameterInput *pin, bool adaptive) {
+  if (!adaptive) return 0;
+  if (!pin->DoesParameterExist("mesh_refinement", "max_nmb_per_rank")) {
+    BuildTreeError("With AMR, <mesh_refinement>/max_nmb_per_rank must be specified");
+  }
+  const int max_blocks = pin->GetInteger("mesh_refinement", "max_nmb_per_rank");
+  if (max_blocks < 1) {
+    BuildTreeError("<mesh_refinement>/max_nmb_per_rank must be a positive integer");
+  }
+  return max_blocks;
+}
+
+int ValidatedMaxBlocksPerRank(bool adaptive, int configured_max_blocks,
                               const int *nmb_eachrank) {
   int max_blocks = nmb_eachrank[global_variable::my_rank];
   if (adaptive) {
-    if (!pin->DoesParameterExist("mesh_refinement", "max_nmb_per_rank")) {
-      BuildTreeError("With AMR, <mesh_refinement>/max_nmb_per_rank must be specified");
-    }
-    max_blocks = pin->GetInteger("mesh_refinement", "max_nmb_per_rank");
-    if (max_blocks < 1) {
-      BuildTreeError("<mesh_refinement>/max_nmb_per_rank must be a positive integer");
-    }
+    max_blocks = configured_max_blocks;
     for (int rank=0; rank<global_variable::nranks; ++rank) {
       if (nmb_eachrank[rank] > max_blocks) {
         BuildTreeError("Initial weighted partition assigns " +
@@ -330,8 +336,11 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
     cost_eachmb[i] = level_subcycling
         ? LevelSubcyclingBlockCost(lloc_eachmb[i], root_level) : 1.0f;
   }
-  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
-  nmb_maxperrank = ValidatedMaxBlocksPerRank(pin, adaptive, nmb_eachrank);
+  const int max_blocks_per_rank = ConfiguredMaxBlocksPerRank(pin, adaptive);
+  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total,
+              max_blocks_per_rank);
+  nmb_maxperrank =
+      ValidatedMaxBlocksPerRank(adaptive, max_blocks_per_rank, nmb_eachrank);
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];
@@ -686,7 +695,9 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
   }
 #endif
 
-  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total);
+  const int max_blocks_per_rank = ConfiguredMaxBlocksPerRank(pin, adaptive);
+  LoadBalance(cost_eachmb, rank_eachmb, gids_eachrank, nmb_eachrank, nmb_total,
+              max_blocks_per_rank);
   if (single_file_per_rank) {
     int partition_matches =
         (gids_eachrank[global_variable::my_rank] == writer_gid_start &&
@@ -700,7 +711,8 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
                      "load-balanced partition");
     }
   }
-  nmb_maxperrank = ValidatedMaxBlocksPerRank(pin, adaptive, nmb_eachrank);
+  nmb_maxperrank =
+      ValidatedMaxBlocksPerRank(adaptive, max_blocks_per_rank, nmb_eachrank);
 
   // create MeshBlockPack for this rank
   int mbp_gids = gids_eachrank[global_variable::my_rank];

@@ -238,6 +238,7 @@ class Mesh {
 
  private:
   std::unique_ptr<MeshBlockTree> ptree;  // pointer to root node in binary/quad/oct-tree
-  void LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb);
+  void LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb,
+                   int max_blocks_per_rank = 0);
 };
 #endif  // MESH_MESH_HPP_

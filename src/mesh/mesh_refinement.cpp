@@ -468,7 +468,7 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
         ? LevelSubcyclingBlockCost(new_lloc_eachmb[i], pm->root_level) : 1.0f;
   }
   pm->LoadBalance(new_cost_eachmb, new_rank_eachmb, new_gids_eachrank, new_nmb_eachrank,
-                  new_nmb_total);
+                  new_nmb_total, pm->nmb_maxperrank);
   // Every rank has the replicated partition metadata, so detect capacity violations
   // globally before any rank posts migration receives into fixed-capacity arrays.  A
   // local std::exit here can strand peers in AMR communication; fail collectively.

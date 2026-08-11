@@ -1,0 +1,58 @@
+# Capacity-constrained weighted load-balance regression.
+#
+# The Z-ordered level costs are [1, 1, 1, 1, 1, 1, 1, 2, 4, 8, 8].  Pure cost
+# balancing gives rank counts [9, 2], which exceeds the AMR allocation capacity of six
+# blocks per rank.  The capacity-constrained partition must instead produce [6, 5].
+
+<job>
+basename = load_balance_capacity
+
+<mesh>
+nghost = 2
+nx1    = 64
+x1min  = 0.0
+x1max  = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 1
+x2min  = 0.0
+x2max  = 1.0
+
+nx3    = 1
+x3min  = 0.0
+x3max  = 1.0
+
+<meshblock>
+nx1 = 8
+nx2 = 1
+nx3 = 1
+
+<mesh_refinement>
+refinement       = adaptive
+num_levels       = 4
+max_nmb_per_rank = 6
+
+<refined_region1>
+level = 1
+x1min = 0.875
+x1max = 1.0
+
+<refined_region2>
+level = 2
+x1min = 0.9375
+x1max = 1.0
+
+<refined_region3>
+level = 3
+x1min = 0.96875
+x1max = 1.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = level
+cfl_number = 0.4
+nlim       = 0
+tlim       = 1.0
+ndiag      = 1
