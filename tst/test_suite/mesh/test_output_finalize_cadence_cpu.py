@@ -304,7 +304,7 @@ def test_finalize_at_due_tlim_consumes_exactly_one_phase(tmp_path):
     )
 
 
-def test_finalize_does_not_double_advance_an_overdue_scheduled_output(tmp_path):
+def test_finalize_skips_an_output_already_written_at_the_terminal_cycle(tmp_path):
     input_path = tmp_path / "overdue_output_cadence.athinput"
     short_output_dt = 1.0e-4
     _write_input(input_path, short_output_dt)
@@ -313,18 +313,18 @@ def test_finalize_does_not_double_advance_an_overdue_scheduled_output(tmp_path):
     _run(run_dir, input_path, None, nlim=1, tlim=1.0)
     binaries = _numbered_paths(run_dir, "bin", "hydro_w")
     restarts = _numbered_paths(run_dir, "rst", "rst")
-    # Initialize, the cycle-1 scheduled write, and the duplicate final snapshot each keep
-    # a unique file.  Only the scheduled write is allowed to advance the cadence.
-    assert _numbers(binaries) == [0, 1, 2]
-    assert _numbers(restarts) == [0, 1, 2]
+    # Initialize and the cycle-1 scheduled write are sufficient.  Finalize must not emit
+    # a byte-for-byte duplicate at the same cycle, including for the trailing restart.
+    assert _numbers(binaries) == [0, 1]
+    assert _numbers(restarts) == [0, 1]
     times = [_binary_time(path) for path in binaries]
     assert times[0] == 0.0
-    assert times[1] == times[2] and times[1] > short_output_dt
+    assert times[1] > short_output_dt
     _assert_times(_history_times(run_dir), times)
     _assert_checkpoint_contract(
         restarts[-1],
         last_time=short_output_dt,
-        next_file_number=3,
+        next_file_number=2,
         last_write_cycle=1,
     )
 
@@ -335,14 +335,14 @@ def test_finalize_does_not_double_advance_an_overdue_scheduled_output(tmp_path):
     _run(zero_step, None, restarts[-1], nlim=1, tlim=1.0)
     zero_step_bins = _numbered_paths(zero_step, "bin", "hydro_w")
     zero_step_restarts = _numbered_paths(zero_step, "rst", "rst")
-    assert _numbers(zero_step_bins) == [3]
-    assert _numbers(zero_step_restarts) == [3]
+    assert _numbers(zero_step_bins) == [2]
+    assert _numbers(zero_step_restarts) == [2]
     _assert_times([_binary_time(path) for path in zero_step_bins], [times[-1]])
     _assert_times(_history_times(zero_step), [times[-1]])
     _assert_checkpoint_contract(
         zero_step_restarts[-1],
         last_time=short_output_dt,
-        next_file_number=4,
+        next_file_number=3,
         last_write_cycle=1,
     )
 

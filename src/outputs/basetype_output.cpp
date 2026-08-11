@@ -733,6 +733,25 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn void BaseTypeOutput::LoadAndWriteOutput()
+//! \brief Complete one output and release device-only derived-variable scratch.
+
+void BaseTypeOutput::LoadAndWriteOutput(Mesh *pm, ParameterInput *pin) {
+  LoadOutputData(pm);
+  WriteOutputFile(pm, pin);
+
+  if (out_params.contains_derived) {
+    // LoadOutputData implementations either copy derived fields into host output arrays
+    // or reduce/interpolate them into backend-owned storage.  Fence before rebinding the
+    // member View so no asynchronous kernel can retain the old allocation.  outvars holds
+    // a pointer to the member View (not its allocation), and therefore remains valid when
+    // the scratch is grown again on the next output.
+    Kokkos::fence();
+    derived_var = DvceArray5D<Real>("derived-var", 1, 1, 1, 1, 1);
+  }
+}
+
+//----------------------------------------------------------------------------------------
 // BaseTypeOutput::LoadOutputData()
 // create std::vector of HostArray3Ds containing data specified in <output> block for
 // this output type
@@ -961,6 +980,7 @@ void BaseTypeOutput::UpdateOutputParameters(Mesh *pm, ParameterInput *pin,
   // ordered last and serializes these exact values into its checkpoint header.
   pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
   out_params.last_write_cycle = pm->ncycle;
+  out_params.wrote_this_run = true;
   pin->SetInteger(out_params.block_name, "last_write_cycle",
                   out_params.last_write_cycle);
 }

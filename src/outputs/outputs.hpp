@@ -161,6 +161,10 @@ struct OutputParameters {
   // zero-step restart at an overdue endpoint cannot advance the cadence a second time.
   bool advance_cadence=true;
   int last_write_cycle=-1;
+  // Process-local marker: unlike last_write_cycle this is deliberately not checkpointed.
+  // It distinguishes an output written by this invocation from one restored at the same
+  // cycle, so Finalize can suppress only genuine in-process duplicates.
+  bool wrote_this_run=false;
 };
 
 //----------------------------------------------------------------------------------------
@@ -242,6 +246,11 @@ class BaseTypeOutput {
   // virtual functions may be over-ridden in derived classes
   virtual void LoadOutputData(Mesh *pm);
   virtual void WriteOutputFile(Mesh *pm, ParameterInput *pin) = 0;
+
+  // Execute one complete output transaction.  Derived device data is scratch: every
+  // backend has staged or reduced it before WriteOutputFile returns, so release it here
+  // rather than retaining one full-mesh allocation per output object until shutdown.
+  void LoadAndWriteOutput(Mesh *pm, ParameterInput *pin);
 
   // Functions to detect big endian machine, and to byte-swap 32-bit words.  The vtk
   // legacy format requires data to be stored as big-endian.

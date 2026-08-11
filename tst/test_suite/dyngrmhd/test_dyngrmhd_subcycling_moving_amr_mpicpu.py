@@ -409,7 +409,7 @@ def test_subcycling_survives_moving_amr_mpi_and_restart(tmp_path):
     split_log = _run_timed_mpi(split_dir, ranks=3, nlim=3)
 
     split_restarts = sorted((split_dir / "rst").glob(f"{BASENAME}.*.rst"))
-    assert len(split_restarts) >= 3, "Expected initial, scheduled, and final checkpoints"
+    assert len(split_restarts) >= 2, "Expected initial and cycle-3 checkpoints"
     restart_log = _run_timed_mpi(
         restart_dir, ranks=2, restart=split_restarts[-1], nlim=6
     )
@@ -447,8 +447,8 @@ def test_subcycling_survives_moving_amr_mpi_and_restart(tmp_path):
             f"{BASENAME}.*.rst"
         )
     )
-    assert len(rank_file_restarts) >= 5, (
-        "Expected cycle 0--3 and final per-rank split checkpoints"
+    assert len(rank_file_restarts) >= 4, (
+        "Expected one per-rank split checkpoint for each cycle from 0 through 3"
     )
     rank_file_restart_log = _run_timed_mpi(
         rank_file_restart_dir,

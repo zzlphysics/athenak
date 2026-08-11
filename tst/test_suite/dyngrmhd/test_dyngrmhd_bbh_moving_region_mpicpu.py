@@ -155,6 +155,55 @@ def test_bbh_region_contract_and_selection_survive_restart(tmp_path):
         )
 
 
+def test_multiple_derived_outputs_release_scratch_and_finalize_once(tmp_path):
+    """Global and moving derived outputs must coexist without terminal duplicates."""
+    run_dir = tmp_path / "derived_lifecycle"
+    basename = "moving_region_derived_lifecycle"
+    flags = [
+        "-d",
+        str(run_dir),
+        f"job/basename={basename}",
+        "mesh/nx1=8",
+        "mesh/nx2=8",
+        "mesh/nx3=8",
+        "meshblock/nx1=4",
+        "meshblock/nx2=8",
+        "meshblock/nx3=8",
+        "time/nlim=1",
+        "time/tlim=1",
+        "problem/initial_data=uniform",
+        "problem/history_inner_radius=20",
+        "output2/dcycle=0",
+        "output3/variable=mhd_gr_diagnostics",
+        "output3/dcycle=1",
+        "output4/dcycle=0",
+        "output6/variable=mhd_gr_diagnostics",
+        "output6/id=bbh_local_gr",
+        "output6/region_center=bbh_com",
+        f"output6/region_half_width={HALF_WIDTH:.17g}",
+        "output6/dcycle=1",
+    ]
+    assert testutils.mpi_run(INPUT_FILE, flags, threads=1)
+
+    global_paths = sorted(
+        (run_dir / "bin").glob(f"{basename}.mhd_gr_diagnostics.*.bin")
+    )
+    local_paths = sorted(
+        (run_dir / "bin").glob(f"{basename}.bbh_local_gr.*.bin")
+    )
+    assert len(global_paths) == len(local_paths) == 2
+    assert [bin_convert.read_binary(str(path))["cycle"] for path in global_paths] == [0, 1]
+    assert [bin_convert.read_binary(str(path))["cycle"] for path in local_paths] == [0, 1]
+
+    history_path = run_dir / f"{basename}.user.hst"
+    rows = [
+        line
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert len(rows) == 2
+
+
 def test_unknown_bbh_region_fails_before_creating_binary_file(tmp_path):
     run_dir = tmp_path / "unknown"
     basename = "moving_region_unknown"

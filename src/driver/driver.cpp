@@ -795,8 +795,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   if (!res_flag) { // only write outputs at the beginning of the run
     for (auto &out : pout->pout_list) {
       out->out_params.advance_cadence = true;
-      out->LoadOutputData(pmesh);
-      out->WriteOutputFile(pmesh, pin);
+      out->LoadAndWriteOutput(pmesh, pin);
     }
   }
 
@@ -959,8 +958,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       for (auto &out : pout->pout_list) {
         if (OutputDueAtCurrentState(out, pmesh, true)) {
           out->out_params.advance_cadence = true;
-          out->LoadOutputData(pmesh);
-          out->WriteOutputFile(pmesh, pin);
+          out->LoadAndWriteOutput(pmesh, pin);
         }
       }
 
@@ -988,17 +986,33 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
 void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
   // cycle through output Types and load data / write files
   //  This design allows for asynchronous outputs to implemented in the future.
+  bool final_parameter_state_changed = false;
   for (auto &out : pout->pout_list) {
+    const bool is_restart = out->out_params.file_type == "rst";
+    const bool wrote_current_cycle =
+        out->out_params.wrote_this_run &&
+        out->out_params.last_write_cycle == pmesh->ncycle;
+
+    // Do not emit a second copy of an output already completed after this cycle.  A
+    // last_write_cycle restored from a checkpoint is not enough to skip: zero-step
+    // restarts still require a final output in their new directory, hence the separate
+    // process-local wrote_this_run marker.  Restart is ordered last; rewrite it only when
+    // an earlier forced final output changed counters that the checkpoint must serialize.
+    if (wrote_current_cycle && (!is_restart || !final_parameter_state_changed)) {
+      continue;
+    }
+
     // A final dump is normally an extra, off-cadence snapshot.  Keep its unique file
     // number, but do not consume the next scheduled phase.  The time-output condition in
     // Execute suppresses a write exactly at tlim; in that one case the final dump is the
-    // scheduled output and must advance last_time.  If Execute already wrote this endpoint,
-    // last_write_cycle prevents the duplicate final dump from advancing twice.
+    // scheduled output and must advance last_time.
     out->out_params.advance_cadence =
         out->out_params.last_write_cycle != pmesh->ncycle &&
         OutputDueAtCurrentState(out, pmesh, false);
-    out->LoadOutputData(pmesh);
-    out->WriteOutputFile(pmesh, pin);
+    out->LoadAndWriteOutput(pmesh, pin);
+    if (!is_restart) {
+      final_parameter_state_changed = true;
+    }
   }
 
   // call any problem specific functions to do work after main loop
