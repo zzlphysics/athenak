@@ -408,7 +408,7 @@ def test_subcycling_root_dt_max_is_opt_in_validated_and_restartable(tmp_path):
     assert "root_dt_max" in _restart_parameter_text(restart_restarts[-1])
 
 
-def test_tlim_roundoff_tail_does_not_throttle_restart(tmp_path):
+def test_tlim_roundoff_tail_is_skipped_and_restart_stays_at_cap(tmp_path):
     cap = 1.0e-6
     endpoint = np.nextafter(cap, np.inf)
     tail = endpoint - cap
@@ -452,14 +452,16 @@ def test_tlim_roundoff_tail_does_not_throttle_restart(tmp_path):
     tail_restarts = sorted(
         (tail_dir / "rst").glob(f"{BASENAME}.*.rst")
     )
-    assert tail_restarts, "Expected a checkpoint after the roundoff tail"
+    assert tail_restarts, "Expected a checkpoint at the snapped endpoint"
     checkpoint = tail_restarts[-1]
     checkpoint_time, checkpoint_dt, checkpoint_cycle = _restart_time_dt_cycle(
         checkpoint
     )
-    assert checkpoint_cycle == 2
+    # The root-cap step lands one representable value below the requested endpoint.  The
+    # driver snaps that roundoff residue instead of executing a second, tail-sized cycle.
+    assert checkpoint_cycle == 1
     assert checkpoint_time == pytest.approx(endpoint, rel=0.0, abs=0.0)
-    assert checkpoint_dt == pytest.approx(tail, rel=0.0, abs=0.0)
+    assert checkpoint_dt == pytest.approx(cap, rel=2.0e-14, abs=0.0)
 
     parameter_text = _restart_parameter_text(checkpoint)
     match = re.search(r"(?m)^restart_dt_growth\s*=\s*(\S+)", parameter_text)
@@ -472,15 +474,15 @@ def test_tlim_roundoff_tail_does_not_throttle_restart(tmp_path):
         resumed_dir,
         ranks=1,
         restart=checkpoint,
-        nlim=3,
+        nlim=2,
         overrides=("time/tlim=1.0", "output4/dcycle=1"),
     )
     resumed_time, resumed_dt = _history_time_and_dt(resumed_dir)
     np.testing.assert_allclose(resumed_time, endpoint + cap, rtol=2.0e-14, atol=0.0)
     np.testing.assert_allclose(resumed_dt, cap, rtol=2.0e-14, atol=0.0)
 
-    # Existing checkpoints have no optional parameter.  A roundoff-scale legacy header
-    # must remove only the growth constraint; the freshly evaluated CFL/root cap remains.
+    # Existing checkpoints have no optional parameter.  The completed cap remains a
+    # valid growth reference and the freshly evaluated CFL/root cap still bounds resume.
     legacy_checkpoint = tmp_path / "tail_legacy.rst"
     _without_restart_growth_parameter(checkpoint, legacy_checkpoint)
     legacy_dir = tmp_path / "tail_legacy_resumed"
@@ -488,7 +490,7 @@ def test_tlim_roundoff_tail_does_not_throttle_restart(tmp_path):
         legacy_dir,
         ranks=1,
         restart=legacy_checkpoint,
-        nlim=3,
+        nlim=2,
         overrides=("time/tlim=1.0", "output4/dcycle=1"),
     )
     legacy_time, legacy_dt = _history_time_and_dt(legacy_dir)

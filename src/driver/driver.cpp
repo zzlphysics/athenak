@@ -32,6 +32,24 @@
 #include <mpi.h>
 #endif
 
+namespace {
+
+// Snap a time that differs from tlim only by accumulated floating-point roundoff.  A
+// full root step can land one or two representable values below an analytically aligned
+// endpoint (for example 100.8 + 2*4.8 versus 110.4).  Treating that residue as a physical
+// timestep is both meaningless and, with deep level subcycling, very expensive.
+bool SnapToTimeLimit(Real &time, const Real tlim) {
+  if (!std::isfinite(time) || !std::isfinite(tlim)) return false;
+  const Real scale = std::max({static_cast<Real>(1.0), std::abs(time), std::abs(tlim)});
+  const Real tolerance =
+      static_cast<Real>(64.0)*std::numeric_limits<Real>::epsilon()*scale;
+  if (std::abs(time - tlim) > tolerance) return false;
+  time = tlim;
+  return true;
+}
+
+} // namespace
+
 //----------------------------------------------------------------------------------------
 // constructor, initializes data structures and parameters
 //
@@ -762,6 +780,12 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 //  outputting ICs, and computing initial time step
 
 void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool res_flag) {
+  // A checkpoint from an older executable may be a few ulps below its endpoint.  Snap
+  // before computing the first timestep so a zero-length continuation cannot be armed.
+  if (time_evolution != TimeEvolution::tstatic) {
+    (void)SnapToTimeLimit(pmesh->time, tlim);
+  }
+
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
@@ -887,6 +911,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
+      (void)SnapToTimeLimit(pmesh->time, tlim);
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
       if (LevelSubcyclingRequested()) {
