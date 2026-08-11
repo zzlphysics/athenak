@@ -14,6 +14,8 @@ import test_suite.testutils as testutils
 ROOT = Path(__file__).resolve().parents[3]
 INPUT_FILE = ROOT / "inputs" / "dyngr" / "effective_bbh_amr_subcycle_smoke.athinput"
 ROOT_DT_MAX = 1.0e-3
+TRANSVERSE_MIN = -4.9996
+TRANSVERSE_MAX = 3.0004
 TIMEOUT_SECONDS = 60
 
 
@@ -25,6 +27,37 @@ def _write_capped_input(path: Path) -> None:
         text.replace(anchor, f"{anchor}root_dt_max = {ROOT_DT_MAX:.17g}\n"),
         encoding="utf-8",
     )
+
+
+def _write_stationary_table(path: Path) -> None:
+    """Write immutable coverage well beyond either segment boundary."""
+    state = (
+        10.0,
+        0.0,
+        0.0,
+        -10.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.5,
+    )
+    rows = [
+        " ".join(f"{value:.17e}" for value in (time, *state))
+        for time in (-0.5, 0.0, 0.5)
+    ]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 def _mpi_launcher() -> str:
@@ -43,7 +76,14 @@ def _mpi_launcher() -> str:
     raise AssertionError("an MPI launcher matching the test binary is required")
 
 
-def _run(input_path: Path, run_dir: Path, *, ranks: int) -> str:
+def _run(
+    input_path: Path,
+    run_dir: Path,
+    *,
+    ranks: int,
+    tlim: float = ROOT_DT_MAX,
+    overrides: tuple[str, ...] = (),
+) -> str:
     timeout = shutil.which("timeout")
     assert timeout is not None, "GNU timeout is required by this MPI regression"
     command = [
@@ -60,21 +100,22 @@ def _run(input_path: Path, run_dir: Path, *, ranks: int) -> str:
         "-d",
         str(run_dir),
         "time/nlim=1",
-        "time/tlim=1.0e-3",
+        f"time/tlim={tlim:.17g}",
         "output1/dcycle=0",
         "output2/dcycle=0",
         "output3/dcycle=0",
         "mesh/x1min=-12.0",
         "mesh/x1max=12.0",
-        "mesh/x2min=-4.9985",
-        "mesh/x2max=3.0015",
-        "mesh/x3min=-4.9985",
-        "mesh/x3max=3.0015",
+        f"mesh/x2min={TRANSVERSE_MIN:.17g}",
+        f"mesh/x2max={TRANSVERSE_MAX:.17g}",
+        f"mesh/x3min={TRANSVERSE_MIN:.17g}",
+        f"mesh/x3max={TRANSVERSE_MAX:.17g}",
         "mesh_refinement/num_levels=2",
         "problem/omega=0.0",
         "problem/refinement_radius=1.0",
         "problem/refinement_radius_level_1=1.0",
         "problem/refinement_horizon_factor=1.0",
+        *overrides,
     ]
     result = subprocess.run(
         command,
@@ -131,10 +172,11 @@ def test_track_amr_lookahead_honors_enforced_root_dt_max(tmp_path):
     capped_time, capped_nmb, capped_created, _ = _terminal_contract(capped_log)
     assert math.isclose(capped_time, uncapped_time, rel_tol=0.0, abs_tol=1.0e-12)
 
-    # Both runs take the same physical root step to tlim.  At that endpoint the uncapped
-    # factor-two growth bound gives a 0.002M padding, whereas the reachable capped step
-    # gives 0.001M.  The deliberately offset root-block faces make this distinguish four
-    # parent blocks without relying on roundoff or evolved state.
+    # Both runs take the same physical root step.  Looking one reachable step through
+    # the checkpoint, the uncapped factor-two growth bound gives a 0.0005M half-sample
+    # padding, whereas the capped bound gives 0.00025M.  Deliberately offset root-block
+    # faces make this distinguish four parent blocks without relying on roundoff or
+    # evolved state.
     assert (uncapped_nmb, uncapped_created) == (134, 70)
     assert (capped_nmb, capped_created) == (106, 42)
     capped_mpi_time, capped_mpi_nmb, capped_mpi_created, _ = _terminal_contract(
@@ -148,3 +190,47 @@ def test_track_amr_lookahead_honors_enforced_root_dt_max(tmp_path):
     assert "root-step lookahead cap=0.001" in capped_log
     assert "root-step lookahead cap=0.001" in capped_mpi_log
     assert "Number of parallel ranks = 2" in capped_mpi_log
+
+
+def test_track_amr_checkpoint_tlim_does_not_change_future_topology(tmp_path):
+    """A segment boundary must not masquerade as the end of the trajectory."""
+    capped_input = tmp_path / "effective_bbh_amr_cap_smoke.athinput"
+    _write_capped_input(capped_input)
+    trajectory = tmp_path / "stationary_trajectory.dat"
+    _write_stationary_table(trajectory)
+    modes = {
+        "circular": (),
+        "table": (
+            "problem/trajectory_mode=table",
+            f"problem/trajectory_file={trajectory.resolve()}",
+            "problem/trajectory_time_offset=0.0",
+        ),
+    }
+
+    for label, overrides in modes.items():
+        endpoint_log = _run(
+            capped_input,
+            tmp_path / f"{label}_checkpoint_endpoint",
+            ranks=1,
+            tlim=ROOT_DT_MAX,
+            overrides=overrides,
+        )
+        continuing_log = _run(
+            capped_input,
+            tmp_path / f"{label}_continuing_segment",
+            ranks=1,
+            tlim=0.1,
+            overrides=overrides,
+        )
+        endpoint = _terminal_contract(endpoint_log)
+        continuing = _terminal_contract(continuing_log)
+
+        # Both executions complete exactly one capped root step from identical data.
+        # The first stops at tlim while the second can continue.  Their post-AMR
+        # topology must be identical so the checkpoint is already safe for the next
+        # segment.  The former implementation added the entire unsampled lookahead at
+        # tlim and created 28 extra children here.
+        assert math.isclose(
+            endpoint[0], continuing[0], rel_tol=0.0, abs_tol=1.0e-12
+        )
+        assert endpoint[1:] == continuing[1:] == (106, 42, 0)

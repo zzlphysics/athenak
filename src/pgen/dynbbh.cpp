@@ -93,7 +93,7 @@ struct BBHParameters {
   Real refinement_floor_center[3];
   int refinement_floor_level;
   Real history_inner_radius;
-  Real run_end_time;
+  Real trajectory_center_end_time;
   Real root_dt_max;
   binary_bh::MetricParameters metric;
 };
@@ -665,7 +665,6 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddInteger("problem", "refinement_floor_level", 0);
   bbh.history_inner_radius = pin->GetOrAddReal(
       "problem", "history_inner_radius", 4.0*bbh.separation);
-  bbh.run_end_time = pin->GetReal("time", "tlim");
   bbh.root_dt_max = 0.0;
   if (pin->DoesParameterExist("time", "subcycling") &&
       pin->GetString("time", "subcycling") == "level" &&
@@ -809,7 +808,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     bbh.theta1, bbh.theta2, bbh.phi1, bbh.phi2, bbh.time_offset, bbh.fd_step,
     bbh.rho0, bbh.pgas0, bbh.u10, bbh.u20, bbh.u30, bbh.b10, bbh.b20, bbh.b30,
     bbh.alpha_threshold, bbh.refinement_radius, bbh.refinement_radius_ratio,
-    bbh.refinement_hysteresis, bbh.refinement_horizon_factor, bbh.run_end_time,
+    bbh.refinement_hysteresis, bbh.refinement_horizon_factor,
     bbh.refinement_floor_radius, bbh.refinement_floor_center[0],
     bbh.refinement_floor_center[1], bbh.refinement_floor_center[2],
     bbh.history_inner_radius,
@@ -882,9 +881,23 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << required_start << ", " << required_end << "]";
       Fatal(message.str());
     }
+    // A segment tlim is only an execution/checkpoint boundary.  Moving-hole AMR
+    // must look through that boundary when the immutable trajectory table has more
+    // coverage, otherwise an ordinary segmented restart receives a light-speed
+    // padding sphere instead of the actual future hole positions.  Reserve the
+    // final finite-difference half stencil so every sampled endpoint is also a
+    // valid metric-update time after restart.
+    const Real center_end =
+        trajectory_table.back().time-bbh.time_offset-bbh.fd_step;
+    if (!std::isfinite(center_end)) {
+      Fatal("trajectory table and time offset do not give a finite metric-time bound");
+    }
+    bbh.trajectory_center_end_time = std::nextafter(
+        center_end, -std::numeric_limits<Real>::infinity());
   } else {
     trajectory_table.clear();
     trajectory_content_fingerprint = "analytic-circular";
+    bbh.trajectory_center_end_time = std::numeric_limits<Real>::max();
   }
   ValidateOrStoreTrajectoryRestartContract(pin, restart);
   ValidateTrajectorySignature(required_start, required_end);
@@ -2801,11 +2814,11 @@ void RefineTracker(MeshBlockPack *pmbp) {
   // known.  Its growth limiter allows that next root step to be at most twice the last
   // completed step.  Sample the complete look-ahead interval and enlarge each sample
   // sphere by a light-speed half-sample bound, so a subluminal hole cannot leave the
-  // refined region before the next synchronized regrid.  Near the configured tlim the
-  // trajectory may not be available for the full interval; the unsampled remainder is
-  // covered by the same speed bound so a final checkpoint can safely extend its tlim.
+  // refined region before the next synchronized regrid.  The execution tlim is a
+  // checkpoint boundary, not a physical trajectory boundary: sample through it when
+  // the immutable trajectory has coverage.  If the actual trajectory ends sooner,
+  // truncate there; a restart cannot evolve beyond that point with the same table.
   const Real last_dt = (std::isfinite(pmesh->dt) && pmesh->dt > 0.0) ? pmesh->dt : 0.0;
-  const Real remaining_time = std::max(bbh.run_end_time-pmesh->time, Real(0.0));
   Real lookahead = 2.0*last_dt;
   // The strict level scheduler may impose a tighter absolute root-step ceiling than
   // its generic factor-two growth limiter.  Honor that same reachable-step bound here;
@@ -2814,7 +2827,9 @@ void RefineTracker(MeshBlockPack *pmbp) {
   if (bbh.root_dt_max > 0.0) {
     lookahead = std::min(lookahead, bbh.root_dt_max);
   }
-  const Real sample_horizon = std::min(lookahead, remaining_time);
+  const Real trajectory_horizon = std::max(
+      bbh.trajectory_center_end_time-pmesh->time, Real(0.0));
+  const Real sample_horizon = std::min(lookahead, trajectory_horizon);
   const Real sample_times[3] = {
     pmesh->time, pmesh->time+static_cast<Real>(0.5)*sample_horizon,
     pmesh->time+sample_horizon
@@ -2823,8 +2838,7 @@ void RefineTracker(MeshBlockPack *pmbp) {
   for (int sample=0; sample<3; ++sample) {
     FindTrajectory(sample_times[sample], states[sample].data());
   }
-  const Real padding =
-      std::max(static_cast<Real>(0.25)*sample_horizon, lookahead-sample_horizon);
+  const Real padding = static_cast<Real>(0.25)*sample_horizon;
   for (int m = 0; m < nmb; ++m) {
     const RegionSize &block = size.h_view(m);
     const int level = pmbp->pmb->mb_lev.h_view(m);
