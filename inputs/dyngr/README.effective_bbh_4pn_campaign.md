@@ -64,6 +64,76 @@ multi-node-size job on ordinary 8-GPU hosts; do not launch it over slow Ethernet
 because aggregate memory is sufficient.  Benchmark the actual MPI fabric and complete M
 first; unqualified rank counts are rejected by the generator.
 
+## Non-publication 8xV100 long-run qualification
+
+`effective_bbh_4pn_v100_qualification.athinput` is a deliberately reduced, standalone
+software-qualification input for periods when the accepted A100/A800 L/M/H layouts are
+unavailable.  It is not generated from, and does not modify, the frozen L/M/H matrix.
+It must not be used as another spatial convergence tier or as evidence for resolved disk
+or magnetic turbulence.
+
+The input retains the full `[-1024M,1024M]^3` domain, the frozen v3 4PN-to-remnant table,
+reference FM torus and magnetic loop, dynamic ADM spacetime, ten physical AMR levels,
+moving-hole tracking, and strict level 2:1 subcycling.  It reduces the root grid from
+`128^3` to `64^3`, giving `dx0=32M` and `dx9=M/16`; the persistent disk floor is `64M`
+through L4 and the moving shells are `12,12,12,12,12,8,4,2,1M`.  The `4.8M` root-step
+cap is intentionally retained even though the coarser root grid has a `9.6M` CFL limit,
+so root synchronization, output scheduling, and AMR lookahead use the production cadence.
+
+With the pinned trajectory at its reference offset and the current hierarchy builder, a
+double-precision `athena -m` reports exactly 1,184 initial MeshBlocks, with physical-level
+counts `48,112,112,112,112,112,104,168,176,128`.  Their strict-subcycling cost is
+145,744 MeshBlock updates per root step, 84.2% below the L initial topology.  At eight
+ranks an actual MPI `-m` run with the configured 1,024-block cap assigns exactly 148
+blocks and weighted cost 18,218 to every rank.  These are initial-topology facts, not a
+trajectory-wide capacity certificate: abort rather than increasing the cap if a later
+partition exceeds 1,024 blocks/rank.  Do not infer the MPI partition by reading
+`mesh_structure.dat` in file order: it is grouped by physical level and must be sorted by
+the `#MeshBlock GID` before any independent replay.
+
+The deployed table path is
+`/data/athenak-l4/assets/bbh-dense-single-r7-d12-v3.dat`.  Verify its SHA-256 against the
+input header before launch.  A local parse may override only the path.  A serial `-m`
+check additionally needs a topology-only capacity override because its one process must
+temporarily hold all 1,184 initial blocks; this override must never be used for evolution:
+
+```bash
+build_bbh_cpu/src/athena -n \
+  -i inputs/dyngr/effective_bbh_4pn_v100_qualification.athinput \
+  problem/trajectory_file=/absolute/path/to/bbh-dense-single-r7-d12-v3.dat
+
+mkdir -p /tmp/athenak-v100q-mesh
+cd /tmp/athenak-v100q-mesh
+/absolute/path/to/athenak/build_bbh_cpu/src/athena -m \
+  -i /absolute/path/to/athenak/inputs/dyngr/effective_bbh_4pn_v100_qualification.athinput \
+  problem/trajectory_file=/absolute/path/to/bbh-dense-single-r7-d12-v3.dat \
+  mesh_refinement/max_nmb_per_rank=1184
+```
+
+The production eight-rank command must not contain that serial-only override: it uses the
+input's fail-closed `max_nmb_per_rank=1024` on every GPU.
+
+The authoritative partition check uses eight MPI processes and no capacity override:
+
+```bash
+mpirun --bind-to none -np 8 /absolute/path/to/athenak/build_bbh_mpi/src/athena -m \
+  -i /absolute/path/to/athenak/inputs/dyngr/effective_bbh_4pn_v100_qualification.athinput \
+  problem/trajectory_file=/absolute/path/to/bbh-dense-single-r7-d12-v3.dat
+```
+
+Before GPU evolution, require a double-precision Volta70 build, ECC enabled, one MPI rank
+per V100, a CUDA-aware MPI device-pointer `Sendrecv`, the exact 1,184-block topology, and
+an observed partition no larger than 1,024 blocks/rank.  The first runtime gates are
+`0--9.6M`, split-versus-continuous restart equivalence through `19.2M`, and then the
+`96--115.2M` checkpoint-boundary test of moving-AMR lookahead.  Only after those pass
+should restart-safe segments advance toward `604.8M`; a completed orbit is established
+from an unwrapped BBH phase of at least `2*pi`, not from final time alone.
+
+The qualification output policy is history and event log plus both COM-following local
+slices every root endpoint, global primitive and native-GR state every `48M`, global
+`divB` every `96M`, and restart every `19.2M`.  Transfer only checksum-verified closed
+files and retain at least the latest three restart generations until NAS acknowledgement.
+
 ## The horizon lower bound matters
 
 At physical level `l`, the tracker uses
