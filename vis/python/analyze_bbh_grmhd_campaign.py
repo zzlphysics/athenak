@@ -503,8 +503,7 @@ def merge_histories(paths: list[Path]) -> tuple[list[str], dict[str, np.ndarray]
 def summarize_event_logs(paths: list[Path]) -> dict[str, object]:
     """Merge overlapping restart event logs and summarize interval counters."""
 
-    rows: dict[int, tuple[int, ...]] = {}
-    expected_columns = (
+    base_columns = (
         "cycle",
         "eos_dfloor",
         "eos_efloor",
@@ -514,6 +513,15 @@ def summarize_event_logs(paths: list[Path]) -> dict[str, object]:
         "c2p_it",
         "fofc",
     )
+    appended_columns = (
+        "cons_adjust",
+        "mag_adjust",
+        "c2p_calls",
+        "fofc_tests",
+    )
+    all_columns = base_columns + appended_columns
+    supported_schemas = {frozenset(base_columns), frozenset(all_columns)}
+    rows: dict[int, dict[str, int]] = {}
     for path in paths:
         header: tuple[str, ...] | None = None
         with path.open("r", encoding="utf-8") as stream:
@@ -523,30 +531,56 @@ def summarize_event_logs(paths: list[Path]) -> dict[str, object]:
                     continue
                 if fields[0] == "#" and len(fields) > 1 and fields[1] == "cycle":
                     header = tuple(fields[1:])
+                    if (
+                        len(header) != len(set(header))
+                        or frozenset(header) not in supported_schemas
+                    ):
+                        raise RuntimeError(
+                            f"{path}:{line_number}: unsupported event-log header"
+                        )
                     continue
                 if fields[0].startswith("#"):
                     continue
-                if header != expected_columns or len(fields) != len(expected_columns):
+                if header is None or len(fields) != len(header):
                     raise RuntimeError(f"{path}:{line_number}: malformed event log")
-                values = tuple(int(value) for value in fields)
-                rows[values[0]] = values
-        if header != expected_columns:
+                try:
+                    row = {
+                        name: int(value) for name, value in zip(header, fields)
+                    }
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"{path}:{line_number}: malformed event log"
+                    ) from error
+                for name in appended_columns:
+                    row.setdefault(name, 0)
+                rows[row["cycle"]] = row
+        if header is None:
             raise RuntimeError(f"{path}: event-log header is missing or unsupported")
 
     ordered = [rows[cycle] for cycle in sorted(rows)]
+    corrective_columns = tuple(
+        name
+        for name in all_columns[1:]
+        if name not in ("c2p_it", "c2p_calls", "fofc_tests")
+    )
+    records_with_events = sum(
+        any(row[name] != 0 for name in corrective_columns) for row in ordered
+    )
     result: dict[str, object] = {
         "verified_sources": [str(path) for path in paths],
-        "records_with_events": len(ordered),
+        "records": len(ordered),
+        "records_with_events": records_with_events,
+        "records_without_corrective_events": len(ordered) - records_with_events,
         "totals": {
-            name: sum(row[index] for row in ordered)
-            for index, name in enumerate(expected_columns[1:], start=1)
+            name: sum(row[name] for row in ordered)
+            for name in all_columns[1:]
             if name != "c2p_it"
         },
-        "c2p_iteration_max": max((row[6] for row in ordered), default=0),
+        "c2p_iteration_max": max((row["c2p_it"] for row in ordered), default=0),
     }
     if ordered:
-        result["cycle_min"] = ordered[0][0]
-        result["cycle_max"] = ordered[-1][0]
+        result["cycle_min"] = ordered[0]["cycle"]
+        result["cycle_max"] = ordered[-1]["cycle"]
     return result
 
 
@@ -784,7 +818,11 @@ def write_markdown_report(report: dict[str, object], path: Path) -> None:
     if events is None:
         lines.append("No verified Athena event log was available.")
     else:
-        lines.append(f"- Records containing events: {events['records_with_events']}")
+        lines.append(f"- Logged root endpoints: {events.get('records', 0)}")
+        lines.append(
+            "- Endpoints containing corrective/failure events: "
+            f"{events['records_with_events']}"
+        )
         lines.append(f"- Maximum C2P iterations: {events['c2p_iteration_max']}")
         for name, value in sorted(events["totals"].items()):
             lines.append(f"- `{name}` total: {value}")

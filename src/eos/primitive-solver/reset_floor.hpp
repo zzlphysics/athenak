@@ -78,9 +78,11 @@ class ResetFloor : public ErrorPolicyInterface {
       Real factor = sqrt(max_bsq/bsq);
       bsq = max_bsq;
 
-      b_u[0] /= factor;
-      b_u[1] /= factor;
-      b_u[2] /= factor;
+      // b_u = B/sqrt(D).  Raising D until B^2/D reaches max_bsq must reduce
+      // every normalized magnetic component by the same factor.
+      b_u[0] *= factor;
+      b_u[1] *= factor;
+      b_u[2] *= factor;
 
       return Error::CONS_ADJUSTED;
     }

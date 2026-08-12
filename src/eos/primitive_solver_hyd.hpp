@@ -14,6 +14,8 @@
 #include <math.h>
 
 // C++ headers
+#include <cstdint>
+#include <cmath>
 #include <string>
 #include <type_traits>
 #include <iostream>
@@ -127,26 +129,52 @@ class PrimitiveSolverHydro {
   MeshBlockPack* pmy_pack;
   unsigned int nerrs;
   unsigned int errcap;
+  DvceArray1D<std::uint64_t> error_print_ticket;
 
   PrimitiveSolverHydro(std::string block, MeshBlockPack *pp, ParameterInput *pin) :
 //        pmy_pack(pp), ps{&eos} {
-        pmy_pack(pp), nerrs(0) {
+        pmy_pack(pp), nerrs(0), error_print_ticket("c2p_error_print_ticket", 1) {
     SetPolicyParams(block, pin);
     Real mb = ps.GetEOS().GetBaryonMass();
     ps.GetEOSMutable().SetDensityFloor(pin->GetOrAddReal(block, "dfloor", (FLT_MIN))/mb);
     ps.GetEOSMutable().SetTemperatureFloor(pin->GetOrAddReal(block, "tfloor", (FLT_MIN)));
     ps.GetEOSMutable().SetThreshold(pin->GetOrAddReal(block, "dthreshold", 1.0));
     ps.tol = pin->GetOrAddReal(block, "c2p_tol", 1e-15);
-    ps.GetRootSolverMutable().iterations = pin->GetOrAddInteger(block, "c2p_iter", 50);
-    errcap = pin->GetOrAddInteger(block, "c2perrs", 1000);
+    const int c2p_iterations = pin->GetOrAddInteger(block, "c2p_iter", 50);
+    if (c2p_iterations < 1) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << block << "/c2p_iter must be at least 1, got "
+                << c2p_iterations << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ps.GetRootSolverMutable().iterations = c2p_iterations;
+    const int errcap_input = pin->GetOrAddInteger(block, "c2perrs", 1000);
+    if (errcap_input < 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << block << "/c2perrs must be nonnegative, got "
+                << errcap_input << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    errcap = static_cast<unsigned int>(errcap_input);
+    Kokkos::deep_copy(error_print_ticket, std::uint64_t{0});
 
     // Calculate maximum allowed velocity
     Real Wmax = pin->GetOrAddReal(block, "gamma_max", 50.0);
     Real vmax = sqrt(1.0 - 1.0/(Wmax*Wmax));
     ps.GetEOSMutable().SetMaxVelocity(vmax);
 
-    // Set maximum B^2/D
-    ps.GetEOSMutable().SetMaximumMagnetization(pin->GetOrAddReal(block, "max_bsq", 1e6));
+    // Set maximum B^2/D.  A zero limit would make the ResetFloor response set B^2/D
+    // to zero and the subsequent density reconstruction divide by zero.  Reject all
+    // non-finite and non-positive limits at the input boundary instead of silently
+    // converting a configuration error into NaNs during evolution.
+    const Real max_bsq = pin->GetOrAddReal(block, "max_bsq", 1e6);
+    if (!(max_bsq > 0.0) || !std::isfinite(max_bsq)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << block << "/max_bsq must be finite and > 0, got "
+                << max_bsq << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    ps.GetEOSMutable().SetMaximumMagnetization(max_bsq);
 
     for (int n = 0; n < ps.GetEOS().GetNSpecies(); n++) {
       std::stringstream spec_name;
@@ -344,8 +372,9 @@ class PrimitiveSolverHydro {
     const int nmkji = nmb_active*nkji;
 
     const int rank = global_variable::my_rank;
-    const int nerrs_ = nerrs;
     const int errcap_ = errcap;
+    const std::uint64_t print_cap = static_cast<std::uint64_t>(errcap_);
+    auto error_print_ticket_ = error_print_ticket;
 
     Real mb = eos_.GetBaryonMass();
 
@@ -360,9 +389,16 @@ class PrimitiveSolverHydro {
 
     // FIXME(JMF): We can short-circuit the primitive solve if FOFC is already enabled
     // due to a maximum principle violation.
-    int count_errs=0;
+    std::uint64_t count_dfloor=0, count_efloor=0, count_tfloor=0, count_fail=0;
+    std::uint64_t count_cons_adjust=0, count_mag_adjust=0, count_c2p_calls=0;
+    std::uint64_t count_fofc_tests=0, count_printed=0;
+    int max_iterations=0;
     Kokkos::parallel_reduce("pshyd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
-    KOKKOS_LAMBDA(const int &idx, int &sumerrs) {
+    KOKKOS_LAMBDA(const int &idx, std::uint64_t &sumd, std::uint64_t &sume,
+                  std::uint64_t &sumt, std::uint64_t &sumfail,
+                  std::uint64_t &sumconsadjust, std::uint64_t &summagadjust,
+                  std::uint64_t &sumcalls, std::uint64_t &sumfofctests,
+                  std::uint64_t &sumprinted, int &max_iterations_used) {
       const int a = idx/nkji;
       const int m = active_lids(active_offset + a);
       int k = (idx - a*nkji)/nji;
@@ -425,6 +461,7 @@ class PrimitiveSolverHydro {
 
       // If we're in an excised region, set the primitives to some default value.
       Primitive::SolverResult result;
+      bool solver_called = false;
       if (excise) {
         if (excision_floor_(m,k,j,i)) {
           prim_pt[PRH] = dexcise_/mb;
@@ -444,33 +481,74 @@ class PrimitiveSolverHydro {
           result.cons_floor = false;
           result.prim_floor = false;
           result.cons_adjusted = true;
+          result.events = 0;
           ps_.PrimToCon(prim_pt, cons_pt, b3u, g3d);
         } else {
+          solver_called = true;
           result = ps_.ConToPrim(prim_pt, cons_pt, b3u, g3d, g3u);
         }
       } else {
+        solver_called = true;
         result = ps_.ConToPrim(prim_pt, cons_pt, b3u, g3d, g3u);
       }
 
-      if (result.error != Primitive::Error::SUCCESS && floors_only) {
-        fofc_(m,k,j,i) = true;
-      } else if (!floors_only) {
-        if (result.error != Primitive::Error::SUCCESS && (nerrs_ + sumerrs < errcap_)) {
-          sumerrs++;
-          // Find out where the point went bad and report a bunch of information about it.
-          Real &x1min = size.d_view(m).x1min;
-          Real &x1max = size.d_view(m).x1max;
-          Real x1v = CellCenterX(i-is, indcs.nx1, x1min, x1max);
+      if (floors_only) {
+        if (solver_called) {
+          sumfofctests++;
+          if (result.error != Primitive::Error::SUCCESS) {
+            fofc_(m,k,j,i) = true;
+          }
+        }
+      } else {
+        if (solver_called) {
+          sumcalls++;
+          const std::uint32_t events = result.events;
+          if ((events & (Primitive::CONS_DENSITY_FLOOR |
+                         Primitive::PRIM_DENSITY_FLOOR)) != 0U) {
+            sumd++;
+          }
+          if ((events & Primitive::CONS_ENERGY_FLOOR) != 0U) {
+            sume++;
+          }
+          if ((events & Primitive::PRIM_TEMPERATURE_FLOOR) != 0U) {
+            sumt++;
+          }
+          if (result.error != Primitive::Error::SUCCESS) {
+            sumfail++;
+          }
+          if (result.cons_adjusted) {
+            sumconsadjust++;
+          }
+          if ((events & Primitive::MAGNETIZATION_ADJUSTED) != 0U) {
+            summagadjust++;
+          }
+          max_iterations_used = (result.iterations > max_iterations_used) ?
+                                result.iterations : max_iterations_used;
+        }
 
-          Real &x2min = size.d_view(m).x2min;
-          Real &x2max = size.d_view(m).x2max;
-          Real x2v = CellCenterX(j-js, indcs.nx2, x2min, x2max);
+        if (solver_called && result.error != Primitive::Error::SUCCESS &&
+            print_cap > 0) {
+          // Once the sample budget is exhausted, avoid serializing every subsequent
+          // failure on an unnecessary read-modify-write.
+          if (Kokkos::atomic_load(&error_print_ticket_(0)) < print_cap) {
+            const std::uint64_t ticket =
+                Kokkos::atomic_fetch_add(&error_print_ticket_(0), std::uint64_t{1});
+            if (ticket < print_cap) {
+              sumprinted++;
+              // Find out where the point went bad and report a bunch of information.
+              Real &x1min = size.d_view(m).x1min;
+              Real &x1max = size.d_view(m).x1max;
+              Real x1v = CellCenterX(i-is, indcs.nx1, x1min, x1max);
 
-          Real &x3min = size.d_view(m).x3min;
-          Real &x3max = size.d_view(m).x3max;
-          Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
+              Real &x2min = size.d_view(m).x2min;
+              Real &x2max = size.d_view(m).x2max;
+              Real x2v = CellCenterX(j-js, indcs.nx2, x2min, x2max);
 
-          Kokkos::printf("An error occurred during the primitive solve: %s\n"
+              Real &x3min = size.d_view(m).x3min;
+              Real &x3max = size.d_view(m).x3max;
+              Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
+
+              Kokkos::printf("An error occurred during the primitive solve: %s\n"
                  "  Location: (%d, %d, %d, %d)\n"
                  "            (%.17g, %.17g, %.17g)\n"
                  "  Conserved vars: \n"
@@ -494,7 +572,8 @@ class PrimitiveSolverHydro {
                  m, k, j, i,
                  x1v, x2v, x3v,
                  cons_pt_old[CDN], cons_pt_old[CSX], cons_pt_old[CSY], cons_pt_old[CSZ],
-                 cons_pt_old[CTA], cons_pt_old[CYD], b3u[IBX], b3u[IBY], b3u[IBZ], detg,
+                 cons_pt_old[CTA], (nscal > 0) ? cons_pt_old[CYD] : 0.0,
+                 b3u[IBX], b3u[IBY], b3u[IBZ], detg,
                  g3d[S11], g3d[S12], g3d[S13], g3d[S22], g3d[S23], g3d[S33],
                  adm.alpha(m, k, j, i),
                  adm.beta_u(m, 0, k, j, i),
@@ -504,11 +583,13 @@ class PrimitiveSolverHydro {
                  adm.vK_dd(m, 0, 2, k, j, i),
                  adm.vK_dd(m, 1, 1, k, j, i), adm.vK_dd(m, 1, 2, k, j, i),
                  adm.vK_dd(m, 2, 2, k, j, i));
-          if (nerrs_ + sumerrs == errcap_) {
-            Kokkos::printf("%d C2P errors have been detected on rank %d."
-                   "All future C2P errors\n"
-                   "on this rank will be suppressed. Fix your code!\n",
-                   nerrs_ + sumerrs,rank);
+              if (ticket + 1 == print_cap) {
+                Kokkos::printf("%u C2P errors have been reported on rank %d. "
+                       "All future C2P errors\n"
+                       "on this rank will be suppressed. Fix your code!\n",
+                       static_cast<unsigned int>(ticket) + 1U, rank);
+              }
+            }
           }
         }
         // Regardless of failure, we need to copy the primitives.
@@ -562,13 +643,35 @@ class PrimitiveSolverHydro {
           }
         }
       }
-    }, Kokkos::Sum<int>(count_errs));
+    }, Kokkos::Sum<std::uint64_t>(count_dfloor),
+       Kokkos::Sum<std::uint64_t>(count_efloor),
+       Kokkos::Sum<std::uint64_t>(count_tfloor),
+       Kokkos::Sum<std::uint64_t>(count_fail),
+       Kokkos::Sum<std::uint64_t>(count_cons_adjust),
+       Kokkos::Sum<std::uint64_t>(count_mag_adjust),
+       Kokkos::Sum<std::uint64_t>(count_c2p_calls),
+       Kokkos::Sum<std::uint64_t>(count_fofc_tests),
+       Kokkos::Sum<std::uint64_t>(count_printed),
+       Kokkos::Max<int>(max_iterations));
 
     if (floors_only) {
       ps.GetEOSMutable().SetPrimitiveFloorFailure(prim_failure);
       ps.GetEOSMutable().SetConservedFloorFailure(cons_failure);
+      pmy_pack->pmesh->ecounter.nfofc_tests += count_fofc_tests;
     } else {
-      nerrs += count_errs;
+      auto &ecounter = pmy_pack->pmesh->ecounter;
+      ecounter.neos_dfloor += count_dfloor;
+      ecounter.neos_efloor += count_efloor;
+      ecounter.neos_tfloor += count_tfloor;
+      ecounter.neos_fail += count_fail;
+      ecounter.ncons_adjust += count_cons_adjust;
+      ecounter.nmag_adjust += count_mag_adjust;
+      ecounter.nc2p_calls += count_c2p_calls;
+      ecounter.maxit_c2p = std::max(ecounter.maxit_c2p, max_iterations);
+
+      // nerrs tracks detailed reports, not failures.  The latter remains exact in
+      // neos_fail even after stdout sampling reaches its configured cap.
+      nerrs += static_cast<unsigned int>(count_printed);
     }
   }
 

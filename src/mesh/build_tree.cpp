@@ -32,6 +32,9 @@ namespace {
 
 constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
 constexpr int kAmrCycleCounterVersion = 1;
+constexpr std::uint64_t kEventCounterMagic = UINT64_C(0x41544b4556543031);
+constexpr int kEventCounterVersion = 1;
+constexpr int kEventSumCounterCount = 10;
 constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
 constexpr int kPerRankPartitionVersion = 2;
 constexpr int kCheckpointIdentityWords = 2;
@@ -646,6 +649,100 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
       MPI_Bcast(restart_cycle_counters.data(), nmb_total, MPI_INT, 0, MPI_COMM_WORLD);
     }
 #endif
+  }
+
+  // Event counters accumulated since the previous log output are restart state, not
+  // disposable diagnostics: a checkpoint can be more frequent than the event log.  A
+  // shared file stores global sums, which are restored on rank zero only so a later
+  // MPI_Allreduce counts the carried state exactly once.  Per-rank files preserve local
+  // values and already require the same MPI rank/GID partition as their writer.
+  int event_extension_present = 0;
+  if (global_variable::my_rank == 0 || single_file_per_rank) {
+    const IOWrapperSizeT extension_offset =
+        resfile.GetPosition(single_file_per_rank);
+    std::uint64_t event_magic = 0;
+    const std::size_t magic_bytes =
+        resfile.Read_bytes(&event_magic, 1, sizeof(event_magic),
+                           single_file_per_rank);
+    if (magic_bytes == sizeof(event_magic) && event_magic == kEventCounterMagic) {
+      event_extension_present = 1;
+    } else if (resfile.Seek(extension_offset, single_file_per_rank) != 0) {
+      BuildTreeError("Could not restore the pre-event-counter restart position");
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  if (single_file_per_rank) {
+    int extension_min = 0;
+    int extension_max = 0;
+    MPI_Allreduce(&event_extension_present, &extension_min, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&event_extension_present, &extension_max, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (extension_min != extension_max) {
+      BuildTreeError("Per-rank restart files disagree on event-counter metadata");
+    }
+  } else {
+    MPI_Bcast(&event_extension_present, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  }
+#endif
+
+  if (event_extension_present != 0) {
+    int stored_version = 0;
+    int stored_sum_count = 0;
+    int stored_maxit = 0;
+    int metadata_read_ok = 1;
+    std::uint64_t stored_sums[kEventSumCounterCount] = {};
+    if (global_variable::my_rank == 0 || single_file_per_rank) {
+      metadata_read_ok =
+          (resfile.Read_bytes(&stored_version, 1, sizeof(stored_version),
+                              single_file_per_rank, true) == sizeof(stored_version)) &&
+          (resfile.Read_bytes(&stored_sum_count, 1, sizeof(stored_sum_count),
+                              single_file_per_rank, true) ==
+           sizeof(stored_sum_count));
+      metadata_read_ok = metadata_read_ok &&
+                         stored_version == kEventCounterVersion &&
+                         stored_sum_count == kEventSumCounterCount;
+      if (metadata_read_ok) {
+        metadata_read_ok =
+            (resfile.Read_bytes(stored_sums, 1, sizeof(stored_sums),
+                                single_file_per_rank, true) == sizeof(stored_sums)) &&
+            (resfile.Read_bytes(&stored_maxit, 1, sizeof(stored_maxit),
+                                single_file_per_rank, true) == sizeof(stored_maxit)) &&
+            stored_maxit >= 0;
+      }
+    }
+#if MPI_PARALLEL_ENABLED
+    if (single_file_per_rank) {
+      MPI_Allreduce(MPI_IN_PLACE, &metadata_read_ok, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD);
+    } else {
+      MPI_Bcast(&stored_version, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      MPI_Bcast(&stored_sum_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      MPI_Bcast(&metadata_read_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      if (metadata_read_ok != 0) {
+        MPI_Bcast(stored_sums, kEventSumCounterCount, MPI_UINT64_T, 0,
+                  MPI_COMM_WORLD);
+        MPI_Bcast(&stored_maxit, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      }
+    }
+#endif
+    if (!metadata_read_ok || stored_version != kEventCounterVersion ||
+        stored_sum_count != kEventSumCounterCount) {
+      BuildTreeError("Event-counter metadata in restart is invalid");
+    }
+    if (single_file_per_rank || global_variable::my_rank == 0) {
+      ecounter.neos_dfloor = stored_sums[0];
+      ecounter.neos_efloor = stored_sums[1];
+      ecounter.neos_tfloor = stored_sums[2];
+      ecounter.neos_vceil = stored_sums[3];
+      ecounter.neos_fail = stored_sums[4];
+      ecounter.nfofc = stored_sums[5];
+      ecounter.ncons_adjust = stored_sums[6];
+      ecounter.nmag_adjust = stored_sums[7];
+      ecounter.nc2p_calls = stored_sums[8];
+      ecounter.nfofc_tests = stored_sums[9];
+      ecounter.maxit_c2p = stored_maxit;
+    }
   }
   if (!adaptive) max_level = current_level;
 

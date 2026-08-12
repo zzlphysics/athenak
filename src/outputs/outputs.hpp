@@ -475,6 +475,7 @@ class EventLogOutput : public BaseTypeOutput {
   // various flags to denote output status
   bool header_written=false;
   bool no_output=true;
+  bool write_zeros=false;
 
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;

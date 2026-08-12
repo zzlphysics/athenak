@@ -287,7 +287,9 @@ def test_event_log_merge_prefers_later_restart_segment(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     summary = summarize_event_logs([first, second])
+    assert summary["records"] == 3
     assert summary["records_with_events"] == 3
+    assert summary["records_without_corrective_events"] == 0
     assert summary["cycle_min"] == 5
     assert summary["cycle_max"] == 20
     assert summary["c2p_iteration_max"] == 8
@@ -298,4 +300,72 @@ def test_event_log_merge_prefers_later_restart_segment(tmp_path: Path) -> None:
         "eos_vceil": 15,
         "eos_fail": 18,
         "fofc": 24,
+        "cons_adjust": 0,
+        "mag_adjust": 0,
+        "c2p_calls": 0,
+        "fofc_tests": 0,
     }
+
+
+def test_extended_event_log_uses_header_names_and_merges_with_legacy(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "legacy.log"
+    extended = tmp_path / "extended.log"
+    legacy.write_text(
+        "# Athena event counter data\n"
+        "# cycle eos_dfloor eos_efloor eos_tfloor eos_vceil eos_fail c2p_it fofc\n"
+        "10 1 2 3 4 5 6 7\n",
+        encoding="utf-8",
+    )
+    # Deliberately reorder both legacy and appended fields to make sure values
+    # are associated through the header rather than fixed column positions.
+    extended.write_text(
+        "# Athena event counter data\n"
+        "# cycle c2p_calls eos_fail eos_dfloor mag_adjust c2p_it fofc_tests "
+        "eos_tfloor cons_adjust fofc eos_vceil eos_efloor\n"
+        "10 100 50 10 90 80 110 30 70 60 40 20\n"
+        "20 101 51 11 91 81 111 31 71 61 41 21\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_event_logs([legacy, extended])
+
+    assert summary["records"] == 2
+    assert summary["records_with_events"] == 2
+    assert summary["records_without_corrective_events"] == 0
+    assert summary["cycle_min"] == 10
+    assert summary["cycle_max"] == 20
+    assert summary["c2p_iteration_max"] == 81
+    assert summary["totals"] == {
+        "eos_dfloor": 21,
+        "eos_efloor": 41,
+        "eos_tfloor": 61,
+        "eos_vceil": 81,
+        "eos_fail": 101,
+        "fofc": 121,
+        "cons_adjust": 141,
+        "mag_adjust": 181,
+        "c2p_calls": 201,
+        "fofc_tests": 221,
+    }
+
+
+def test_dense_event_log_distinguishes_observation_from_correction(
+    tmp_path: Path,
+) -> None:
+    event_log = tmp_path / "dense.log"
+    event_log.write_text(
+        "# Athena event counter data\n"
+        "# cycle eos_dfloor eos_efloor eos_tfloor eos_vceil eos_fail c2p_it "
+        "fofc cons_adjust mag_adjust c2p_calls fofc_tests\n"
+        "1 0 0 0 0 0 3 0 0 0 100 80\n"
+        "2 1 0 0 0 0 3 0 1 0 100 80\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_event_logs([event_log])
+
+    assert summary["records"] == 2
+    assert summary["records_with_events"] == 1
+    assert summary["records_without_corrective_events"] == 1

@@ -40,6 +40,9 @@ namespace {
 
 constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
 constexpr int kAmrCycleCounterVersion = 1;
+constexpr std::uint64_t kEventCounterMagic = UINT64_C(0x41544b4556543031);
+constexpr int kEventCounterVersion = 1;
+constexpr int kEventSumCounterCount = 10;
 constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
 constexpr int kPerRankPartitionVersion = 2;
 constexpr int kCheckpointIdentityWords = 2;
@@ -217,6 +220,40 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     nadm = padm->nadm;
   }
   bool single_file_per_rank = out_params.single_file_per_rank;
+  // FOFC counting is deferred on the device to avoid a fence at every subcycled RK
+  // stage.  A checkpoint is a diagnostic boundary too: move pending increments into
+  // the host interval before serializing it.  Draining clears only the device scalar;
+  // the host accumulator remains live until an event-log output consumes it.
+  pm->DrainDeviceEventCounters();
+  // A shared restart must contain one global diagnostic accumulator.  Restore that
+  // value on rank zero only (see BuildTreeFromRestart), so the next event-log
+  // MPI_Allreduce adds it exactly once.  Per-rank restarts retain local accumulators;
+  // their writer/current rank layout is already required to match exactly.
+  const std::uint64_t local_event_sums[kEventSumCounterCount] = {
+    pm->ecounter.neos_dfloor, pm->ecounter.neos_efloor,
+    pm->ecounter.neos_tfloor, pm->ecounter.neos_vceil,
+    pm->ecounter.neos_fail, pm->ecounter.nfofc,
+    pm->ecounter.ncons_adjust, pm->ecounter.nmag_adjust,
+    pm->ecounter.nc2p_calls, pm->ecounter.nfofc_tests
+  };
+  std::uint64_t restart_event_sums[kEventSumCounterCount] = {};
+  int restart_event_maxit = 0;
+  if (single_file_per_rank) {
+    std::copy(local_event_sums, local_event_sums + kEventSumCounterCount,
+              restart_event_sums);
+    restart_event_maxit = pm->ecounter.maxit_c2p;
+  } else {
+#if MPI_PARALLEL_ENABLED
+    MPI_Reduce(local_event_sums, restart_event_sums, kEventSumCounterCount,
+               MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&(pm->ecounter.maxit_c2p), &restart_event_maxit, 1, MPI_INT,
+               MPI_MAX, 0, MPI_COMM_WORLD);
+#else
+    std::copy(local_event_sums, local_event_sums + kEventSumCounterCount,
+              restart_event_sums);
+    restart_event_maxit = pm->ecounter.maxit_c2p;
+#endif
+  }
   std::uint64_t checkpoint_identity[kCheckpointIdentityWords] = {0, 0};
   if (single_file_per_rank) {
     if (global_variable::my_rank == 0) {
@@ -356,6 +393,19 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       resfile.Write_any_type(pm->pmr->ncyc_since_ref.data(),
                              counter_count*sizeof(int), "byte", single_file_per_rank);
     }
+    // Persist event counters even when every value is zero.  Presence is selected by
+    // the serialized marker, so new readers remain compatible with legacy restarts and
+    // parameter overrides cannot accidentally change the binary layout.
+    resfile.Write_any_type(&kEventCounterMagic, sizeof(kEventCounterMagic),
+                           "byte", single_file_per_rank);
+    resfile.Write_any_type(&kEventCounterVersion, sizeof(kEventCounterVersion),
+                           "byte", single_file_per_rank);
+    resfile.Write_any_type(&kEventSumCounterCount, sizeof(kEventSumCounterCount),
+                           "byte", single_file_per_rank);
+    resfile.Write_any_type(restart_event_sums, sizeof(restart_event_sums),
+                           "byte", single_file_per_rank);
+    resfile.Write_any_type(&restart_event_maxit, sizeof(restart_event_maxit),
+                           "byte", single_file_per_rank);
   }
 
   //--- STEP 3.  Root process writes internal state of objects that require it
@@ -422,6 +472,8 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     step2size += sizeof(kAmrCycleCounterMagic) + 2*sizeof(int)
                + pm->nmb_total*sizeof(int);
   }
+  step2size += sizeof(kEventCounterMagic) + 2*sizeof(int)
+             + kEventSumCounterCount*sizeof(std::uint64_t) + sizeof(int);
 
   IOWrapperSizeT step3size = 3*nco*sizeof(Real);
   if (pz4c != nullptr) step3size += sizeof(Real);

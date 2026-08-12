@@ -6,12 +6,17 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import test_suite.testutils as testutils
 
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "scripts"))
+import read_athenak_restart_metadata as restart_metadata  # noqa: E402
+
+
 INPUT_FILE = ROOT / "inputs" / "dyngr" / "effective_bbh_amr_subcycle_smoke.athinput"
 ROOT_DT_MAX = 1.0e-3
 TRANSVERSE_MIN = -4.9996
@@ -132,6 +137,40 @@ def _run(
     return result.stdout
 
 
+def _run_restart(restart: Path, run_dir: Path) -> str:
+    timeout = shutil.which("timeout")
+    assert timeout is not None, "GNU timeout is required by this MPI regression"
+    command = [
+        timeout,
+        "--signal=TERM",
+        "--kill-after=5s",
+        f"{TIMEOUT_SECONDS}s",
+        _mpi_launcher(),
+        "-np",
+        "1",
+        "./athena",
+        "-r",
+        str(restart),
+        "-d",
+        str(run_dir),
+        "time/nlim=2",
+        "time/tlim=0.1",
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=TIMEOUT_SECONDS + 10,
+    )
+    with Path(testutils.LOG_FILE_PATH).open("a", encoding="utf-8") as log_file:
+        log_file.write(f"\nBBH AMR clipped-restart command: {' '.join(command)}\n")
+        log_file.write(result.stdout)
+    assert result.returncode == 0, result.stdout[-8000:]
+    return result.stdout
+
+
 def _initial_dt(log: str) -> float:
     match = re.search(
         r"(?m)^elapsed=\S+ cycle=0 time=0\.000000e\+00 dt=(\S+)\s*$", log
@@ -234,3 +273,113 @@ def test_track_amr_checkpoint_tlim_does_not_change_future_topology(tmp_path):
             endpoint[0], continuing[0], rel_tol=0.0, abs_tol=1.0e-12
         )
         assert endpoint[1:] == continuing[1:] == (106, 42, 0)
+
+
+def test_short_tlim_clip_preserves_restart_growth_lookahead(tmp_path):
+    """A clipped endpoint must already cover the full step restored on restart."""
+    capped_input = tmp_path / "effective_bbh_amr_cap_smoke.athinput"
+    _write_capped_input(capped_input)
+    stationary = ("problem/omega=0.0",)
+
+    clipped_log = _run(
+        capped_input,
+        tmp_path / "short_clipped_endpoint",
+        ranks=1,
+        tlim=ROOT_DT_MAX / 4.0,
+        overrides=stationary,
+    )
+    continuing_log = _run(
+        capped_input,
+        tmp_path / "full_reachable_step",
+        ranks=1,
+        tlim=0.1,
+        overrides=stationary,
+    )
+    clipped = _terminal_contract(clipped_log)
+    continuing = _terminal_contract(continuing_log)
+
+    assert math.isclose(
+        clipped[0], ROOT_DT_MAX / 4.0, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    assert math.isclose(
+        continuing[0], ROOT_DT_MAX, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    # The targets are stationary.  Although tlim clips the first evolution step, the
+    # checkpoint retains ROOT_DT_MAX as its restart growth reference.  Its post-AMR
+    # hierarchy must therefore cover the same reachable next step as the continuing
+    # execution.  The old pmesh->dt-based lookahead covered only half this interval.
+    assert clipped[1:] == continuing[1:] == (106, 42, 0)
+
+
+def test_short_tlim_checkpoint_restores_full_step_and_tree(tmp_path):
+    """Exercise serialization, BuildTreeFromRestart, and restored growth together."""
+    capped_input = tmp_path / "effective_bbh_amr_cap_smoke.athinput"
+    _write_capped_input(capped_input)
+    clipped_dir = tmp_path / "clipped_checkpoint"
+    _run(
+        capped_input,
+        clipped_dir,
+        ranks=1,
+        tlim=ROOT_DT_MAX / 4.0,
+        overrides=("problem/omega=0.0", "output3/dcycle=1"),
+    )
+    clipped_restarts = sorted((clipped_dir / "rst").glob("*.rst"))
+    assert [path.name.split(".")[-2] for path in clipped_restarts] == [
+        "00000",
+        "00001",
+    ]
+    checkpoint = clipped_restarts[-1]
+    source = restart_metadata.read_restart_metadata(checkpoint)
+    assert source.cycle == 1
+    assert math.isclose(
+        source.time, ROOT_DT_MAX / 4.0, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    assert math.isclose(
+        source.last_dt, ROOT_DT_MAX / 4.0, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    assert math.isclose(
+        float(source.parameters["time"]["restart_dt_growth"]),
+        ROOT_DT_MAX,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    )
+    assert source.nmb_total == 106
+    assert source.amr_cycle_counters is not None
+
+    resumed_dir = tmp_path / "resumed_full_step"
+    restart_log = _run_restart(checkpoint, resumed_dir)
+    first = re.search(
+        r"(?m)^elapsed=\S+ cycle=(\d+) time=(\S+) dt=(\S+)\s*$",
+        restart_log,
+    )
+    assert first is not None, restart_log[-4000:]
+    assert int(first.group(1)) == 1
+    assert math.isclose(
+        float(first.group(2)), ROOT_DT_MAX / 4.0, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    assert math.isclose(
+        float(first.group(3)), ROOT_DT_MAX, rel_tol=0.0, abs_tol=1.0e-12
+    )
+
+    resumed_restarts = sorted((resumed_dir / "rst").glob("*.rst"))
+    assert [path.name.split(".")[-2] for path in resumed_restarts] == ["00002"]
+    resumed = restart_metadata.read_restart_metadata(resumed_restarts[0])
+    assert resumed.cycle == 2
+    assert math.isclose(
+        resumed.time,
+        ROOT_DT_MAX / 4.0 + ROOT_DT_MAX,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    )
+    assert math.isclose(
+        resumed.last_dt, ROOT_DT_MAX, rel_tol=0.0, abs_tol=1.0e-12
+    )
+    assert source.locations == resumed.locations
+    assert source.costs == resumed.costs
+    assert resumed.amr_cycle_counters is not None
+    assert all(
+        resumed_counter == source_counter + 1
+        for source_counter, resumed_counter in zip(
+            source.amr_cycle_counters, resumed.amr_cycle_counters
+        )
+    )

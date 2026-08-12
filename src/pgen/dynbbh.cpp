@@ -2818,8 +2818,20 @@ void RefineTracker(MeshBlockPack *pmbp) {
   // checkpoint boundary, not a physical trajectory boundary: sample through it when
   // the immutable trajectory has coverage.  If the actual trajectory ends sooner,
   // truncate there; a restart cannot evolve beyond that point with the same table.
-  const Real last_dt = (std::isfinite(pmesh->dt) && pmesh->dt > 0.0) ? pmesh->dt : 0.0;
-  Real lookahead = 2.0*last_dt;
+  // A segment tlim can shorten the completed step without changing the CFL/growth
+  // step that a restart may take next.  Driver preserves that pre-clip reference in
+  // dt_restart_growth.  Using the clipped pmesh->dt here would checkpoint a hierarchy
+  // that is too small for an immediate full-size continuation.
+  const Real fresh_dt = std::numeric_limits<float>::max();
+  const bool growth_reference_valid =
+      std::isfinite(pmesh->dt_restart_growth) &&
+      pmesh->dt_restart_growth > 0.0 && pmesh->dt_restart_growth < fresh_dt;
+  const bool completed_dt_valid =
+      std::isfinite(pmesh->dt) && pmesh->dt > 0.0 && pmesh->dt < fresh_dt;
+  const Real growth_reference = growth_reference_valid
+      ? pmesh->dt_restart_growth
+      : (completed_dt_valid ? pmesh->dt : 0.0);
+  Real lookahead = 2.0*growth_reference;
   // The strict level scheduler may impose a tighter absolute root-step ceiling than
   // its generic factor-two growth limiter.  Honor that same reachable-step bound here;
   // otherwise moving-hole AMR creates and audits a halo for a timestep the Driver can

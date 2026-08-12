@@ -19,8 +19,8 @@
 # Resource contract (not yet a runtime qualification):
 #   8 MPI ranks, one V100-32G per rank, double precision, CUDA-aware MPI
 #   max_nmb_per_rank=1024 (conservative model: 14.33 MiB/slot = 14673.9 MiB/GPU)
-#   initial topology expected at the reference offset: exactly 1184 MeshBlocks
-#   initial 8-rank partition expected: 148 MeshBlocks and weighted cost 18218 per rank
+#   cold-start topology expected at the reference offset: exactly 4320 MeshBlocks
+#   8-rank GID partition replay: 351--724 blocks/rank, cost 75683--75792/rank
 # A topology mismatch, a rank needing more than 1024 blocks, or a non-double executable
 # invalidates the launch.  Do not raise max_nmb_per_rank to evade a capacity failure.
 
@@ -94,6 +94,141 @@ x2max = 1.2142671546310384
 x3min = -1.2568796583708526
 x3max = 1.2568796583708526
 
+# The first runtime regrid occurs only after the first 4.8M root step.  Pre-apply its
+# four direct L7->L8 refinements for the t=4.8,7.2,9.6M tracker samples.  MeshBlockTree's
+# strict 2:1 neighbor propagation supplies every required coarser shell.
+<refined_region4>
+level = 8
+x1min = -10
+x1max = -10
+x2min = -6
+x2max = -6
+x3min = -2
+x3max = 2
+
+<refined_region5>
+level = 8
+x1min = 10
+x1max = 10
+x2min = 6
+x2max = 6
+x3min = -2
+x3max = 2
+
+# Pre-apply the same regrid's 56 direct L8->L9 refinements.  The ten disjoint boxes are
+# an exact cuboid cover of those parent MeshBlocks, not a Cartesian bounding box around
+# each spherical shell; the latter would overallocate 4,992 blocks at startup.
+<refined_region6>
+level = 9
+x1min = -13
+x1max = -7
+x2min = -3
+x2max = -3
+x3min = -1
+x3max = 1
+
+<refined_region7>
+level = 9
+x1min = 7
+x1max = 13
+x2min = 3
+x2max = 3
+x3min = -1
+x3max = 1
+
+<refined_region8>
+level = 9
+x1min = -11
+x1max = -9
+x2min = -3
+x2max = 1
+x3min = -3
+x3max = -3
+
+<refined_region9>
+level = 9
+x1min = -11
+x1max = -9
+x2min = -3
+x2max = 1
+x3min = 3
+x3max = 3
+
+<refined_region10>
+level = 9
+x1min = 9
+x1max = 11
+x2min = -1
+x2max = 3
+x3min = -3
+x3max = -3
+
+<refined_region11>
+level = 9
+x1min = 9
+x1max = 11
+x2min = -1
+x2max = 3
+x3min = 3
+x3max = 3
+
+<refined_region12>
+level = 9
+x1min = -13
+x1max = -13
+x2min = -1
+x2max = 1
+x3min = -1
+x3max = 1
+
+<refined_region13>
+level = 9
+x1min = -7
+x1max = -7
+x2min = -1
+x2max = 1
+x3min = -1
+x3max = 1
+
+<refined_region14>
+level = 9
+x1min = 7
+x1max = 7
+x2min = -1
+x2max = 1
+x3min = -1
+x3max = 1
+
+<refined_region15>
+level = 9
+x1min = 13
+x1max = 13
+x2min = -1
+x2max = 1
+x3min = -1
+x3max = 1
+
+# Complete the t=0,2.4,4.8M startup lookahead at L9.  These two trailing slabs are not
+# selected by the first post-step t=4.8,7.2,9.6M window, but are required before that
+# first step is taken; retaining both windows avoids a resolution hole at cold start.
+<refined_region16>
+level = 9
+x1min = -11
+x1max = -9
+x2min = 3
+x2max = 3
+x3min = -1
+x3max = 1
+
+<refined_region17>
+level = 9
+x1min = 9
+x1max = 11
+x2min = -3
+x2max = -3
+x3min = -1
+x3max = 1
+
 <time>
 evolution = dynamic
 integrator = rk2
@@ -130,6 +265,11 @@ dthreshold = 1.01
 dyn_scratch = 1
 fofc = true
 enforce_maximum = false
+# Qualification telemetry is intentionally fail-visible: cap detailed per-cell reports
+# while retaining exact aggregate counts, and make the magnetization response threshold
+# explicit rather than relying on a constructor default.
+c2perrs = 8
+max_bsq = 1.0e6
 
 <problem>
 pgen_name = dynbbh
@@ -217,7 +357,7 @@ ghost_zones = false
 <output3>
 file_type = bin
 variable = mhd_divb
-dt = 96.0
+dt = 19.2
 ghost_zones = false
 
 # Four root steps: intentionally dense while debugging long-run/restart failures.
@@ -235,6 +375,7 @@ ghost_zones = false
 <output6>
 file_type = log
 dcycle = 1
+write_zeros = true
 
 # Dense 80M-wide equatorial planes following the binary center of mass.
 <output7>

@@ -80,14 +80,25 @@ through L4 and the moving shells are `12,12,12,12,12,8,4,2,1M`.  The `4.8M` root
 cap is intentionally retained even though the coarser root grid has a `9.6M` CFL limit,
 so root synchronization, output scheduling, and AMR lookahead use the production cadence.
 
+The cold-start hierarchy deliberately pre-applies the two reachable tracker windows
+`(0,2.4,4.8)M` and `(4.8,7.2,9.6)M`, including the tracker's `1.2M` light-speed padding.
+The old finest-only seed began with 1,184 MeshBlocks and then created 2,744 blocks at the
+first regrid; it did not provide the complete moving-shell lookahead before the first
+`4.8M` step.  The replacement encodes only the directly selected L7 and L8 parents as
+disjoint cuboids and lets `MeshBlockTree` supply the strict 2:1 propagation.  A single
+bounding box per shell is forbidden: that alternative was measured at 4,992 blocks and
+828,544 weighted updates.
+
 With the pinned trajectory at its reference offset and the current hierarchy builder, a
-double-precision `athena -m` reports exactly 1,184 initial MeshBlocks, with physical-level
-counts `48,112,112,112,112,112,104,168,176,128`.  Their strict-subcycling cost is
-145,744 MeshBlock updates per root step, 84.2% below the L initial topology.  At eight
-ranks an actual MPI `-m` run with the configured 1,024-block cap assigns exactly 148
-blocks and weighted cost 18,218 to every rank.  These are initial-topology facts, not a
-trajectory-wide capacity certificate: abort rather than increasing the cap if a later
-partition exceeds 1,024 blocks/rank.  Do not infer the MPI partition by reading
+double-precision `athena -m` now reports exactly 4,320 initial MeshBlocks, with physical-
+level counts `4,420,420,420,420,420,396,588,592,640`.  Their strict-subcycling cost is
+605,884 MeshBlock updates per root step: 34.4% below the L initial topology and 72.6%
+below advancing every block at the finest cadence.  A GID-sorted replay of the production
+load balancer at eight ranks assigns `351--724` blocks and weighted cost `75,683--75,792`
+per rank, leaving at least 300 slots below the configured 1,024-block cap.  Confirm that
+replay with an actual eight-rank `-m` before evolution.  These are initial-topology facts,
+not a trajectory-wide capacity certificate: abort rather than increasing the cap if a
+later partition exceeds 1,024 blocks/rank.  Do not infer the MPI partition by reading
 `mesh_structure.dat` in file order: it is grouped by physical level and must be sorted by
 the `#MeshBlock GID` before any independent replay.
 
@@ -95,7 +106,7 @@ The deployed table path is
 `/data/athenak-l4/assets/bbh-dense-single-r7-d12-v3.dat`.  Verify its SHA-256 against the
 input header before launch.  A local parse may override only the path.  A serial `-m`
 check additionally needs a topology-only capacity override because its one process must
-temporarily hold all 1,184 initial blocks; this override must never be used for evolution:
+temporarily hold all 4,320 initial blocks; this override must never be used for evolution:
 
 ```bash
 build_bbh_cpu/src/athena -n \
@@ -107,7 +118,7 @@ cd /tmp/athenak-v100q-mesh
 /absolute/path/to/athenak/build_bbh_cpu/src/athena -m \
   -i /absolute/path/to/athenak/inputs/dyngr/effective_bbh_4pn_v100_qualification.athinput \
   problem/trajectory_file=/absolute/path/to/bbh-dense-single-r7-d12-v3.dat \
-  mesh_refinement/max_nmb_per_rank=1184
+  mesh_refinement/max_nmb_per_rank=4320
 ```
 
 The production eight-rank command must not contain that serial-only override: it uses the
@@ -122,7 +133,7 @@ mpirun --bind-to none -np 8 /absolute/path/to/athenak/build_bbh_mpi/src/athena -
 ```
 
 Before GPU evolution, require a double-precision Volta70 build, ECC enabled, one MPI rank
-per V100, a CUDA-aware MPI device-pointer `Sendrecv`, the exact 1,184-block topology, and
+per V100, a CUDA-aware MPI device-pointer `Sendrecv`, the exact 4,320-block topology, and
 an observed partition no larger than 1,024 blocks/rank.  The first runtime gates are
 `0--9.6M`, split-versus-continuous restart equivalence through `19.2M`, and then the
 `96--115.2M` checkpoint-boundary test of moving-AMR lookahead.  Only after those pass
@@ -131,7 +142,13 @@ from an unwrapped BBH phase of at least `2*pi`, not from final time alone.
 
 The qualification output policy is history and event log plus both COM-following local
 slices every root endpoint, global primitive and native-GR state every `48M`, global
-`divB` every `96M`, and restart every `19.2M`.  Transfer only checksum-verified closed
+`divB` every `19.2M`, and restart every `19.2M`.  The event log writes a row even when
+all fault counters are zero and records 64-bit totals for conserved/primitive floors,
+C2P failures and actual iteration maxima, conserved and magnetization adjustments,
+non-excision FOFC corrections, normal C2P calls, and FOFC trial solves.  Detailed C2P
+failure dumps are independently capped at eight per rank, so aggregate failure counts
+remain exact without allowing a first-failure GPU log storm.  Transfer only
+checksum-verified closed
 files and retain at least the latest three restart generations until NAS acknowledgement.
 
 ## The horizon lower bound matters
@@ -214,10 +231,12 @@ from the input file.  The half-CFL variant therefore receives a `2.4M` root-step
 Use `--cfl-number 0.15` to generate the half-CFL temporal-convergence variant; the
 generator permits decreasing, but never silently increasing, the audited baseline CFL.
 
-At a segment endpoint, the driver snaps a residual within 64 machine epsilons of `tlim`
-to the exact requested time before AMR, output, and timestep recomputation.  This avoids
-recursively advancing every refined level through a physically meaningless roundoff-sized
-root step.  Restart files still preserve the actual last completed timestep for
+At a segment endpoint, the driver treats a residual within eight adjacent representable
+times of `tlim` as reached without changing the stored evolution time.  This avoids recursively advancing
+every refined level through a physically meaningless roundoff-sized root step while keeping
+prescribed dynamic metrics restart-equivalent to an uninterrupted run: a run-specific
+`tlim` must not rewrite the arithmetic root endpoint.  Restart files preserve the actual
+last completed timestep for
 time-derived diagnostics and separately serialize `time/restart_dt_growth`, the
 CFL/growth-limited value before any genuine final `tlim` clip.  Old checkpoints without
 this internal parameter treat only a machine-roundoff-scale header timestep as an endpoint

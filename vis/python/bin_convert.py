@@ -76,8 +76,7 @@ The read_*(...) functions return a filedata dictionary-like object with
     filedata['mb_logical'] = array with shape [n_mbs, 4]
         i,j,k,level coordinates for each MeshBlock
     filedata['mb_geometry'] = array with shape [n_mbs, 6]
-        x1i,x2i,x3i,dx1,dx2,dx3 including cell-centered location of left-most
-        cell and offsets between cells
+        x1min,x1max,x2min,x2max,x3min,x3max physical MeshBlock face limits
     filedata['mb_data'] = dict of arrays with shape [n_mbs, nx3, nx2, nx1]
         {'var1':var1_array, 'var2':var2_array, ...} dictionary of fluid data arrays
         for each variable in var_names
@@ -89,7 +88,7 @@ import h5py
 import glob
 
 
-def read_binary(filename):
+def read_binary(filename, variables=None):
     """
     Reads a bin file from filename to dictionary.
 
@@ -100,6 +99,11 @@ def read_binary(filename):
     args:
       filename - string
           filename of bin file to read
+      variables - optional iterable of strings
+          variables whose cell arrays should be loaded.  Header metadata and
+          ``var_names`` always describe the complete file.  Passing an empty
+          iterable reads only metadata and MeshBlock topology.  The default
+          (None) preserves the historical behavior and loads every variable.
 
     returns:
       filedata - dict
@@ -188,6 +192,25 @@ def read_binary(filename):
     x3min = float(get_from_header(header, "<mesh>", "x3min"))
     x3max = float(get_from_header(header, "<mesh>", "x3max"))
 
+    # Select variables before loading MeshBlocks.  Keep ``var_names`` as the
+    # complete on-disk list so callers can inspect a file with variables=().
+    # The optional path is useful for comparisons of very large outputs: it
+    # permits one field at a time to be resident without changing the default
+    # API or its fast contiguous read.
+    if variables is None:
+        loaded_var_list = list(var_list)
+    else:
+        requested = list(variables)
+        if len(requested) != len(set(requested)):
+            raise ValueError("duplicate variable requested")
+        missing = [var for var in requested if var not in var_list]
+        if missing:
+            raise KeyError(
+                "variables not present in binary output: " + ", ".join(missing)
+            )
+        loaded_var_list = requested
+    loaded_var_indices = {var: var_list.index(var) for var in loaded_var_list}
+
     # load data from each meshblock
     n_vars = len(var_list)
     mb_count = 0
@@ -197,7 +220,7 @@ def read_binary(filename):
     mb_geometry = []
 
     mb_data = {}
-    for var in var_list:
+    for var in loaded_var_list:
         mb_data[var] = []
     while fp.tell() < filesize:
         mb_index.append(
@@ -214,14 +237,33 @@ def read_binary(filename):
             )
         )
 
-        data = np.fromfile(
-            fp,
-            dtype=np.float64 if varfmt == "d" else np.float32,
-            count=nx1_out * nx2_out * nx3_out * n_vars,
-        )
-        data = data.reshape(nvars, nx3_out, nx2_out, nx1_out)
-        for vari, var in enumerate(var_list):
-            mb_data[var].append(data[vari])
+        cell_count = nx1_out * nx2_out * nx3_out
+        variable_dtype = np.float64 if varfmt == "d" else np.float32
+        if variables is None:
+            data = np.fromfile(
+                fp,
+                dtype=variable_dtype,
+                count=cell_count * n_vars,
+            )
+            if data.size != cell_count * n_vars:
+                raise ValueError("truncated MeshBlock variable data")
+            data = data.reshape(nvars, nx3_out, nx2_out, nx1_out)
+            for vari, var in enumerate(var_list):
+                mb_data[var].append(data[vari])
+        else:
+            data_offset = fp.tell()
+            for var in loaded_var_list:
+                fp.seek(
+                    data_offset
+                    + loaded_var_indices[var] * cell_count * varsizebytes
+                )
+                data = np.fromfile(fp, dtype=variable_dtype, count=cell_count)
+                if data.size != cell_count:
+                    raise ValueError(
+                        f"truncated MeshBlock variable data while reading {var}"
+                    )
+                mb_data[var].append(data.reshape(nx3_out, nx2_out, nx1_out))
+            fp.seek(data_offset + cell_count * n_vars * varsizebytes)
         mb_count += 1
 
     fp.close()
@@ -230,6 +272,7 @@ def read_binary(filename):
     filedata["time"] = time
     filedata["cycle"] = cycle
     filedata["var_names"] = var_list
+    filedata["loaded_var_names"] = loaded_var_list
 
     filedata["Nx1"] = Nx1
     filedata["Nx2"] = Nx2

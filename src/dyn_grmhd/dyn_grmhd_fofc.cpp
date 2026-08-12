@@ -6,6 +6,7 @@
 //! \file mhd_fofc.cpp
 //! \brief Implements functions for first-order flux correction (FOFC) algorithm.
 
+#include <cstdint>
 #include <limits>
 
 #include "athena.hpp"
@@ -741,21 +742,42 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
     });
   }
 
-  // reset FOFC flag (do not reset excision flag)
+  // Count cells whose fluxes were corrected because of an MHD or scalar FOFC flag, and
+  // reset those flags in the same pass.  Excision has a separate flag, so excision-only
+  // corrections are deliberately absent from this diagnostic.  Reduce over cells (rather
+  // than variables) to count a cell carrying multiple scalar flags only once.  Combining
+  // the count and reset avoids adding a full extra device traversal for telemetry.
   if (use_fofc_) {
-    par_for_active("FOFC-reset", DevExeSpace(), active_lids, active_offset, nmb_active,
-    0, fofc_.extent_int(1)-1, 0, fofc_.extent_int(2)-1, 0, fofc_.extent_int(3)-1,
-    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-      fofc_(m,k,j,i) = false;
-    });
-    if (nscal_ > 0) {
-      par_for_active("FOFC-reset-scalars", DevExeSpace(), active_lids, active_offset,
-      nmb_active, 0, fofc_scal_.extent_int(1)-1, 0, fofc_scal_.extent_int(2)-1,
-      0, fofc_scal_.extent_int(3)-1, 0, fofc_scal_.extent_int(4)-1,
-      KOKKOS_LAMBDA(const int m, const int n, const int k, const int j, const int i) {
-        fofc_scal_(m,n,k,j,i) = false;
+    const int nk = fofc_.extent_int(1);
+    const int nj = fofc_.extent_int(2);
+    const int ni = fofc_.extent_int(3);
+    const int nji = nj*ni;
+    const int nkji = nk*nji;
+    const int nactive_cells = nmb_active*nkji;
+    auto nfofc_stage = pmy_pack->pmesh->device_nfofc_stage;
+    auto nfofc_pending = pmy_pack->pmesh->device_nfofc_pending;
+    Kokkos::parallel_reduce(
+      "FOFC-count-reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, nactive_cells),
+      KOKKOS_LAMBDA(const int &idx, std::uint64_t &count) {
+        const int a = idx/nkji;
+        const int m = active_lids(active_offset + a);
+        const int k = (idx - a*nkji)/nji;
+        const int j = (idx - a*nkji - k*nji)/ni;
+        const int i = idx - a*nkji - k*nji - j*ni;
+
+        bool corrected = fofc_(m,k,j,i);
+        fofc_(m,k,j,i) = false;
+        for (int n=0; n<nscal_; ++n) {
+          corrected |= fofc_scal_(m,n,k,j,i);
+          fofc_scal_(m,n,k,j,i) = false;
+        }
+        count += static_cast<std::uint64_t>(corrected);
+      }, nfofc_stage);
+    Kokkos::parallel_for(
+      "FOFC-defer-count", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
+      KOKKOS_LAMBDA(const int) {
+        nfofc_pending() += nfofc_stage();
       });
-    }
   }
 
   return;

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <cstdio> // fclose
@@ -34,6 +35,24 @@
 #include <mpi.h>
 #endif
 
+namespace {
+
+// Avoid changing a physically full timestep merely because its computed endpoint lies
+// a few ulps above tlim.  Driver termination applies the same eight-ULP tolerance.
+bool ReachesTimeLimitWithinRoundoff(const Real time, const Real tlim) {
+  if (!std::isfinite(time) || !std::isfinite(tlim)) return false;
+  if (time >= tlim) {
+    Real upper = tlim;
+    for (int n=0; n<8; ++n) {
+      upper = std::nextafter(upper, std::numeric_limits<Real>::infinity());
+    }
+    return time <= upper;
+  }
+  return false;
+}
+
+} // namespace
+
 //----------------------------------------------------------------------------------------
 //! Mesh constructor:
 //! initializes some mesh variables using parameters in input file.
@@ -54,7 +73,11 @@ Mesh::Mesh(ParameterInput *pin) :
   nprtcl_total(0),
   dtold(0.),
   dt_last_completed(0.),
-  dt_restart_growth(0.) {
+  dt_restart_growth(0.),
+  device_nfofc_stage("device_nfofc_stage"),
+  device_nfofc_pending("device_nfofc_pending") {
+  Kokkos::deep_copy(device_nfofc_stage, std::uint64_t{0});
+  Kokkos::deep_copy(device_nfofc_pending, std::uint64_t{0});
   // Set physical size and number of cells in mesh (root level)
   mesh_size.x1min = pin->GetReal("mesh", "x1min");
   mesh_size.x1max = pin->GetReal("mesh", "x1max");
@@ -332,6 +355,22 @@ Mesh::Mesh(ParameterInput *pin) :
     mb_indcs.ke   = 0;
     mb_indcs.cke  = 0;
   }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void Mesh::DrainDeviceEventCounters()
+//! \brief Moves asynchronously accumulated device counters into the host-side interval.
+
+void Mesh::DrainDeviceEventCounters() {
+  std::uint64_t pending_nfofc = 0;
+  Kokkos::deep_copy(pending_nfofc, device_nfofc_pending);
+  if (pending_nfofc > std::numeric_limits<std::uint64_t>::max() - ecounter.nfofc) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "FOFC event counter overflow" << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  ecounter.nfofc += pending_nfofc;
+  Kokkos::deep_copy(device_nfofc_pending, std::uint64_t{0});
 }
 
 //----------------------------------------------------------------------------------------
@@ -644,7 +683,10 @@ void Mesh::NewTimeStep(const Real tlim) {
   dt_restart_growth = dt;
 
   // limit last time step to stop at tlim *exactly*
-  if ( (time < tlim) && ((time + dt) > tlim) ) {dt = tlim - time;}
+  if ((time < tlim) && ((time + dt) > tlim)
+      && !ReachesTimeLimitWithinRoundoff(time + dt, tlim)) {
+    dt = tlim - time;
+  }
 
   return;
 }

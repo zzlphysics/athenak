@@ -34,18 +34,25 @@
 
 namespace {
 
-// Snap a time that differs from tlim only by accumulated floating-point roundoff.  A
-// full root step can land one or two representable values below an analytically aligned
-// endpoint (for example 100.8 + 2*4.8 versus 110.4).  Treating that residue as a physical
-// timestep is both meaningless and, with deep level subcycling, very expensive.
-bool SnapToTimeLimit(Real &time, const Real tlim) {
+// A full step can land a few representable values on either side of an analytically
+// aligned endpoint (for example, repeated additions of 4.8 versus the literal 96.0).
+// Treat that residue as roundoff for termination without changing the stored time.
+// Mutating it to a run-specific tlim would make an endpoint/restart branch evaluate a
+// prescribed dynamic metric at a different time from an uninterrupted branch.
+bool TimesEqualWithinRoundoff(const Real time, const Real reference) {
+  if (!std::isfinite(time) || !std::isfinite(reference)) return false;
+  Real lower = reference;
+  Real upper = reference;
+  for (int n=0; n<8; ++n) {
+    lower = std::nextafter(lower, -std::numeric_limits<Real>::infinity());
+    upper = std::nextafter(upper, std::numeric_limits<Real>::infinity());
+  }
+  return time >= lower && time <= upper;
+}
+
+bool ReachedTimeLimit(const Real time, const Real tlim) {
   if (!std::isfinite(time) || !std::isfinite(tlim)) return false;
-  const Real scale = std::max({static_cast<Real>(1.0), std::abs(time), std::abs(tlim)});
-  const Real tolerance =
-      static_cast<Real>(64.0)*std::numeric_limits<Real>::epsilon()*scale;
-  if (std::abs(time - tlim) > tolerance) return false;
-  time = tlim;
-  return true;
+  return time >= tlim || TimesEqualWithinRoundoff(time, tlim);
 }
 
 } // namespace
@@ -563,7 +570,9 @@ void Driver::SetLevelSubcyclingTimeStep(Mesh *pmesh) {
   // Retain the pre-clip value so a checkpoint at the endpoint can resume without a
   // long 2x growth staircase from a roundoff-sized tail step.
   pmesh->dt_restart_growth = next_dt;
-  if ((pmesh->time < tlim) && (pmesh->time + next_dt > tlim)) {
+  if (!ReachedTimeLimit(pmesh->time, tlim) && (pmesh->time < tlim)
+      && (pmesh->time + next_dt > tlim)
+      && !TimesEqualWithinRoundoff(pmesh->time + next_dt, tlim)) {
     next_dt = tlim - pmesh->time;
   }
   pmesh->dt = next_dt;
@@ -780,12 +789,6 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 //  outputting ICs, and computing initial time step
 
 void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool res_flag) {
-  // A checkpoint from an older executable may be a few ulps below its endpoint.  Snap
-  // before computing the first timestep so a zero-length continuation cannot be armed.
-  if (time_evolution != TimeEvolution::tstatic) {
-    (void)SnapToTimeLimit(pmesh->time, tlim);
-  }
-
   //---- Step 1.  Set conserved variables in ghost zones for all physics
   InitBoundaryValuesAndPrimitives(pmesh);
 
@@ -885,7 +888,8 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     if (wall_time > 0.) {
       elapsed_time = UpdateWallClock();
     }
-    while ((pmesh->time < tlim) && (pmesh->ncycle < nlim || nlim < 0) &&
+    while (!ReachedTimeLimit(pmesh->time, tlim)
+           && (pmesh->ncycle < nlim || nlim < 0) &&
            (elapsed_time < wall_time)) {
       if (global_variable::my_rank == 0) {OutputCycleDiagnostics(pmesh);}
 
@@ -911,7 +915,6 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       // Work outside of TaskLists:
       // increment time, ncycle, etc.
       pmesh->time = pmesh->time + pmesh->dt;
-      (void)SnapToTimeLimit(pmesh->time, tlim);
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
       if (LevelSubcyclingRequested()) {
@@ -1060,7 +1063,7 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       OutputCycleDiagnostics(pmesh);
       if (pmesh->ncycle == nlim) {
         std::cout << std::endl << "Terminating on cycle limit" << std::endl;
-      } else if (pmesh->time >= tlim) {
+      } else if (ReachedTimeLimit(pmesh->time, tlim)) {
         std::cout << std::endl << "Terminating on time limit" << std::endl;
       } else {
         std::cout << std::endl << "Terminating on wall clock limit" << std::endl;

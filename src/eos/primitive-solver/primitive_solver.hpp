@@ -359,8 +359,17 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
 
   // Check the conserved variables for consistency and do whatever
   // the EOSPolicy wants us to.
+  const Real D_before_floor = D;
+  const Real tau_before_floor = tau;
   bool floored = eos.ApplyConservedFloor(D, S_d, tau, Y, SquareVector(B_u, g3d));
   solver_result.cons_floor = floored;
+  if (floored) {
+    if (D != D_before_floor) {
+      solver_result.events |= CONS_DENSITY_FLOOR;
+    } else if (tau != tau_before_floor) {
+      solver_result.events |= CONS_ENERGY_FLOOR;
+    }
+  }
   if (floored && eos.IsConservedFlooringFailure()) {
     solver_result.cons_adjusted = HandleFailure(prim, cons, b, g3d) ||
                                   solver_result.cons_adjusted;
@@ -413,12 +422,13 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
     return solver_result;
   } else if (error == Error::CONS_ADJUSTED) {
     solver_result.cons_adjusted = true;
+    solver_result.events |= MAGNETIZATION_ADJUSTED;
     // If b_u is rescaled, we also need to adjust D, which means we'll
     // have to adjust all our other rescalings, too.
     Real Bsq = SquareVector(B_u, g3d);
     D = Bsq/bsqr;
     r_d[0] = S_d[0]/D; r_d[1] = S_d[1]/D; r_d[2] = S_d[2]/D;
-    RaiseForm(r_u, r_d, g3d);
+    RaiseForm(r_u, r_d, g3u);
     rb = Contract(b_u, r_d);
     rbsqr = rb*rb;
     q = tau/D;
@@ -502,11 +512,10 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
 
   // Do the root solve.
   Real n, P, T, mu;
-  bool result = root.FalsePosition(RootFunction, mul, muh, mu, tol,
+  unsigned int iterations_used = 0;
+  bool result = root.FalsePosition(RootFunction, mul, muh, mu, tol, iterations_used,
                                    D, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P);
-  // WARNING: the reported number of iterations is not thread-safe and should only be
-  // trusted on single-thread benchmarks.
-  solver_result.iterations = root.iterations;
+  solver_result.iterations = static_cast<int>(iterations_used);
   if (!result) {
     solver_result.cons_adjusted = HandleFailure(prim, cons, b, g3d) ||
                                   solver_result.cons_adjusted;
@@ -529,8 +538,17 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Wv_u[2] = Wmux*(r_u[2] + rbmu*b_u[2]);
 
   // Apply the flooring policy to the primitive variables.
+  const Real n_before_floor = n;
+  const Real T_before_floor = T;
   floored = eos.ApplyPrimitiveFloor(n, Wv_u, P, T, Y);
   solver_result.prim_floor = floored;
+  if (floored) {
+    if (n != n_before_floor) {
+      solver_result.events |= PRIM_DENSITY_FLOOR;
+    } else if (T != T_before_floor) {
+      solver_result.events |= PRIM_TEMPERATURE_FLOOR;
+    }
+  }
   if (floored && eos.IsPrimitiveFlooringFailure()) {
     solver_result.cons_adjusted = HandleFailure(prim, cons, b, g3d) ||
                                   solver_result.cons_adjusted;

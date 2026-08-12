@@ -458,9 +458,12 @@ def test_tlim_roundoff_tail_is_skipped_and_restart_stays_at_cap(tmp_path):
         checkpoint
     )
     # The root-cap step lands one representable value below the requested endpoint.  The
-    # driver snaps that roundoff residue instead of executing a second, tail-sized cycle.
+    # driver treats that roundoff residue as reached without executing a second,
+    # tail-sized cycle or changing the stored evolution time to this run's tlim.  Keeping
+    # the arithmetic endpoint is essential for prescribed dynamic metrics to remain
+    # restart-equivalent to an uninterrupted execution.
     assert checkpoint_cycle == 1
-    assert checkpoint_time == pytest.approx(endpoint, rel=0.0, abs=0.0)
+    assert checkpoint_time == pytest.approx(cap, rel=0.0, abs=0.0)
     assert checkpoint_dt == pytest.approx(cap, rel=2.0e-14, abs=0.0)
 
     parameter_text = _restart_parameter_text(checkpoint)
@@ -478,7 +481,7 @@ def test_tlim_roundoff_tail_is_skipped_and_restart_stays_at_cap(tmp_path):
         overrides=("time/tlim=1.0", "output4/dcycle=1"),
     )
     resumed_time, resumed_dt = _history_time_and_dt(resumed_dir)
-    np.testing.assert_allclose(resumed_time, endpoint + cap, rtol=2.0e-14, atol=0.0)
+    np.testing.assert_allclose(resumed_time, 2.0 * cap, rtol=2.0e-14, atol=0.0)
     np.testing.assert_allclose(resumed_dt, cap, rtol=2.0e-14, atol=0.0)
 
     # Existing checkpoints have no optional parameter.  The completed cap remains a
@@ -494,7 +497,7 @@ def test_tlim_roundoff_tail_is_skipped_and_restart_stays_at_cap(tmp_path):
         overrides=("time/tlim=1.0", "output4/dcycle=1"),
     )
     legacy_time, legacy_dt = _history_time_and_dt(legacy_dir)
-    np.testing.assert_allclose(legacy_time, endpoint + cap, rtol=2.0e-14, atol=0.0)
+    np.testing.assert_allclose(legacy_time, 2.0 * cap, rtol=2.0e-14, atol=0.0)
     np.testing.assert_allclose(legacy_dt, cap, rtol=2.0e-14, atol=0.0)
 
 

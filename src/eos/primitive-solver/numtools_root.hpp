@@ -41,10 +41,11 @@ class Root {
   template<class Functor, class ... Types>
   KOKKOS_INLINE_FUNCTION
   bool FalsePosition(Functor&& f, Real &lb, Real &ub, Real& x, Real tol,
-                     Types ... args) const {
+                     unsigned int &iterations_used, Types ... args) const {
     int side = 0;
     Real ftest;
     unsigned int count = 0;
+    iterations_used = 0;
     //last_count = 0;
     // Get our initial bracket.
     Real flb = f(lb, args...);
@@ -70,6 +71,7 @@ class Root {
       // Calculate f at the prospective root.
       ftest = f(x,args...);
       if (fabs((x-xold)/x) <= tol) {
+        iterations_used = count;
         return true;
       }
       // Check the sign of f. If f is on the same side as the lower bound, then we adjust
@@ -97,7 +99,7 @@ class Root {
         side = -1;
       }
     } while (count < iterations);
-    //last_count = count;
+    iterations_used = count;
 
     // Return success if we're below the tolerance, otherwise report failure.
     return fabs((x-xold)/x) <= tol;
