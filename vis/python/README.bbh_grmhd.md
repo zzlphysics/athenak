@@ -110,13 +110,17 @@ python3 vis/python/plot_bbh_grmhd.py state/bin/run.mhd_divb.00005.bin \
 
 Fresh DynGRMHD builds also provide a compact native diagnostic stream.  It evaluates
 the contractions against the synchronized ADM spatial metric inside AthenaK, including
-the required `bcc/sqrt(det(gamma))` conversion:
+the required `bcc/sqrt(det(gamma))` conversion.  New files append
+`gr_excision_mask` (one inside the evolution's excision-floor region, zero outside),
+and the dashboard automatically masks those cells from the four physical GR panels.
+Legacy four-field files remain readable; use the optional `excision_mask` panel to audit
+new output explicitly:
 
 ```bash
 python3 vis/python/plot_bbh_grmhd.py \
   state/bin/run.mhd_gr_diagnostics.00005.bin \
   --output-dir output/gr-diagnostics \
-  --panels gr_bsq,gr_lorentz,gr_sigma,gr_beta_inv,level \
+  --panels gr_bsq,gr_lorentz,gr_sigma,gr_beta_inv,excision_mask,level \
   --plane z --extent 80
 ```
 

@@ -266,10 +266,11 @@ dyn_scratch = 1
 fofc = true
 enforce_maximum = false
 # Qualification telemetry is intentionally fail-visible: cap detailed per-cell reports
-# while retaining exact aggregate counts, and make the magnetization response threshold
-# explicit rather than relying on a constructor default.
+# while retaining exact aggregate counts.  The V100 long-soak baseline limits the
+# conserved B^2/D proxy to 100 after the t=96M A/B gate; this is a software-stability
+# setting, not a publication floor prescription (which requires a sensitivity sweep).
 c2perrs = 8
-max_bsq = 1.0e6
+max_bsq = 100.0
 
 <problem>
 pgen_name = dynbbh

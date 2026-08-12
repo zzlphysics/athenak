@@ -161,17 +161,22 @@ def verify_file(record: VerifiedFile, verify_sha256: bool) -> None:
 
 
 def classify_binary(name: str, variables: tuple[str, ...]) -> str:
+    gr_diagnostics = (
+        "gr_bsq",
+        "gr_lorentz",
+        "gr_sigma",
+        "gr_beta_inv",
+    )
     if ".bbh_local_w." in name:
         return "bbh_local_w"
     if ".bbh_local_gr." in name:
         return "bbh_local_gr"
     if ".mhd_w_bcc." in name:
         return "mhd_w_bcc"
-    if ".mhd_gr_diagnostics." in name or variables == (
-        "gr_bsq",
-        "gr_lorentz",
-        "gr_sigma",
-        "gr_beta_inv",
+    if (
+        ".mhd_gr_diagnostics." in name
+        or variables == gr_diagnostics
+        or variables == gr_diagnostics + ("gr_excision_mask",)
     ):
         return "mhd_gr_diagnostics"
     if ".mhd_divb." in name or variables == ("divb",):

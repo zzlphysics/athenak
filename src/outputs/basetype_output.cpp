@@ -492,11 +492,12 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     if (variable.compare("mhd_gr_diagnostics") == 0) {
       out_params.contains_derived = true;
       int i_derived = out_params.n_derived;
-      out_params.n_derived += 4;
+      out_params.n_derived += 5;
       outvars.emplace_back("gr_bsq", i_derived, &(derived_var));
       outvars.emplace_back("gr_lorentz", i_derived + 1, &(derived_var));
       outvars.emplace_back("gr_sigma", i_derived + 2, &(derived_var));
       outvars.emplace_back("gr_beta_inv", i_derived + 3, &(derived_var));
+      outvars.emplace_back("gr_excision_mask", i_derived + 4, &(derived_var));
     }
 
     // hydro/mhd z-component of vorticity (useful in 2D)
@@ -921,15 +922,15 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
     Kokkos::realloc(outarray, nout_vars, nout_mbs, nout3, nout2, nout1);
   }
 
-  // Native GRMHD diagnostics are four independent scalars.  On large AMR packs a
-  // simultaneous four-component device allocation can exceed otherwise sufficient GPU
+  // Native GRMHD diagnostics are five independent scalars.  On large AMR packs a
+  // simultaneous five-component device allocation can exceed otherwise sufficient GPU
   // memory.  Stage one component at a time into the already allocated host output array;
-  // the binary file still contains the same four variables in the same order.
+  // the binary file contains the four physical variables followed by an excision mask.
   const bool stream_gr_diagnostics =
       (out_params.variable.compare("mhd_gr_diagnostics") == 0);
-  if (stream_gr_diagnostics && nout_vars != 4) {
+  if (stream_gr_diagnostics && nout_vars != 5) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "mhd_gr_diagnostics must contain exactly four variables, got "
+              << std::endl << "mhd_gr_diagnostics must contain exactly five variables, got "
               << nout_vars << std::endl;
     std::exit(EXIT_FAILURE);
   }
@@ -973,8 +974,9 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   };
 
   if (stream_gr_diagnostics) {
-    static const char *component_names[4] = {
-      "mhd_gr_bsq", "mhd_gr_lorentz", "mhd_gr_sigma", "mhd_gr_beta_inv"
+    static const char *component_names[5] = {
+      "mhd_gr_bsq", "mhd_gr_lorentz", "mhd_gr_sigma", "mhd_gr_beta_inv",
+      "mhd_gr_excision_mask"
     };
     for (int n=0; n<nout_vars; ++n) {
       out_params.i_derived = 0;

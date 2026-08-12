@@ -10,7 +10,8 @@ pressure, temperature, densitized magnetic components, and primitive velocity
 components are therefore plotted exactly as stored.  Quantities involving contractions
 of those components are explicitly labelled ``proxy`` and must not be interpreted as
 covariant GR diagnostics.  The separate ``mhd_gr_diagnostics`` output contains native
-metric-aware magnetic invariants and the Lorentz factor.
+metric-aware magnetic invariants and the Lorentz factor.  New files also contain
+``gr_excision_mask``; physical GR panels automatically hide excised cells.
 """
 
 from __future__ import annotations
@@ -35,6 +36,9 @@ PROXY_WARNING = (
     "Stored-component proxy: DynGRMHD bcc is sqrt(det(gamma_ij))*B^i, and the "
     "mhd_w_bcc dump does not contain the metric needed for a covariant contraction."
 )
+
+EXCISION_MASK_FIELD = "gr_excision_mask"
+MASKED_GR_PANELS = {"gr_bsq", "gr_lorentz", "gr_sigma", "gr_beta_inv"}
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,14 @@ PANELS = {
         "cividis",
         "log",
     ),
+    "excision_mask": Panel(
+        "excision_mask",
+        "excision mask (1 = excluded)",
+        (EXCISION_MASK_FIELD,),
+        _identity(EXCISION_MASK_FIELD),
+        "gray_r",
+        "linear",
+    ),
     "divb": Panel(
         "divb",
         r"$\nabla\!\cdot\!B$",
@@ -318,6 +330,13 @@ def read_slice(
         for panel_name in panel_names
         for dependency in PANELS[panel_name].dependencies
     }
+    # New diagnostics carry an exact cell mask from the evolution.  Continue to read
+    # legacy four-field files, but automatically load and apply the mask when present.
+    if (
+        EXCISION_MASK_FIELD in header.variables
+        and any(panel_name in MASKED_GR_PANELS for panel_name in panel_names)
+    ):
+        dependencies.add(EXCISION_MASK_FIELD)
     missing = sorted(dependencies.difference(header.variables))
     if missing:
         raise RuntimeError(
@@ -474,6 +493,10 @@ def panel_values(
         else:
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
                 value = panel.calculate(block.fields, block.level)
+            if panel.name in MASKED_GR_PANELS and EXCISION_MASK_FIELD in block.fields:
+                value = np.where(
+                    block.fields[EXCISION_MASK_FIELD] < 0.5, value, np.nan
+                )
             if panel.proxy and density_threshold is not None:
                 value = np.where(block.fields["dens"] >= density_threshold, value, np.nan)
         values.append(np.asarray(value))
@@ -1025,6 +1048,11 @@ def main() -> int:
                 for level, count in sorted(slice_data.selected_level_counts.items())
             },
             "trajectory": trajectory,
+            "excision_mask_available": EXCISION_MASK_FIELD
+            in slice_data.header.variables,
+            "excision_mask_applied": EXCISION_MASK_FIELD
+            in slice_data.header.variables
+            and any(name in MASKED_GR_PANELS for name in panel_names),
             **numerical_summary,
         }
         frame_manifest_path = figure_path.with_suffix(".json")

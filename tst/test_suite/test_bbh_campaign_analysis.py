@@ -30,6 +30,7 @@ from analyze_bbh_grmhd_campaign import (  # noqa: E402
     verify_file,
 )
 from compare_bbh_grmhd_convergence import analyze, automatic_diagnostics  # noqa: E402
+from plot_bbh_grmhd import PANELS, SliceBlock, panel_values  # noqa: E402
 
 
 def digest(payload: bytes) -> str:
@@ -205,10 +206,45 @@ def test_native_grmhd_diagnostic_stream_is_classified() -> None:
         "mhd_gr_diagnostics"
     )
     assert classify_binary("renamed-output.bin", variables) == "mhd_gr_diagnostics"
+    assert classify_binary(
+        "renamed-masked-output.bin", variables + ("gr_excision_mask",)
+    ) == "mhd_gr_diagnostics"
     assert classify_binary("run.bbh_local_gr.00001.bin", variables) == "bbh_local_gr"
     assert classify_binary(
         "run.bbh_local_w.00001.bin", ("dens", "velx", "bcc1")
     ) == "bbh_local_w"
+
+
+def test_native_gr_panel_automatically_masks_excised_cells() -> None:
+    block = SliceBlock(
+        extent=(-1.0, 1.0, -1.0, 1.0),
+        level=0,
+        logical_location=(0, 0, 0),
+        slice_shape=(1, 2),
+        fields={
+            "gr_sigma": np.asarray([[2.0, 1.0e8]]),
+            "gr_excision_mask": np.asarray([[0.0, 1.0]]),
+        },
+    )
+    values = panel_values(
+        SimpleNamespace(blocks=[block]), PANELS["gr_sigma"], density_threshold=None
+    )
+    np.testing.assert_array_equal(np.isfinite(values[0]), [[True, False]])
+    assert values[0][0, 0] == 2.0
+
+    legacy_block = SliceBlock(
+        extent=block.extent,
+        level=block.level,
+        logical_location=block.logical_location,
+        slice_shape=block.slice_shape,
+        fields={"gr_sigma": np.asarray([[2.0, 1.0e8]])},
+    )
+    legacy_values = panel_values(
+        SimpleNamespace(blocks=[legacy_block]),
+        PANELS["gr_sigma"],
+        density_threshold=None,
+    )
+    assert np.isfinite(legacy_values[0]).all()
 
 
 def test_local_and_global_duplicate_variables_use_ids_for_cadence() -> None:

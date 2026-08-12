@@ -98,12 +98,14 @@ def test_native_grmhd_diagnostics_match_synchronized_metric_reconstruction(tmp_p
         "gr_lorentz",
         "gr_sigma",
         "gr_beta_inv",
+        "gr_excision_mask",
     ]
 
     fluid_blocks = _block_map(fluid)
     metric_blocks = _block_map(metric)
     diagnostic_blocks = _block_map(diagnostics)
     assert fluid_blocks.keys() == metric_blocks.keys() == diagnostic_blocks.keys()
+    mask_values = set()
     for logical_location in fluid_blocks:
         expected = _reconstruct(
             fluid,
@@ -118,3 +120,8 @@ def test_native_grmhd_diagnostics_match_synchronized_metric_reconstruction(tmp_p
             np.testing.assert_allclose(measured, reference, rtol=5.0e-6, atol=1.0e-20)
         assert np.min(_field(diagnostics, "gr_bsq", diagnostic_block)) >= 0.0
         assert np.min(_field(diagnostics, "gr_lorentz", diagnostic_block)) >= 1.0
+        mask = _field(diagnostics, "gr_excision_mask", diagnostic_block)
+        assert np.isfinite(mask).all()
+        mask_values.update(float(value) for value in np.unique(mask))
+    assert mask_values.issubset({0.0, 1.0})
+    assert mask_values == {0.0, 1.0}

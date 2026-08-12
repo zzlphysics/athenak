@@ -140,6 +140,37 @@ an observed partition no larger than 1,024 blocks/rank.  The first runtime gates
 should restart-safe segments advance toward `604.8M`; a completed orbit is established
 from an unwrapped BBH phase of at least `2*pi`, not from final time alone.
 
+The first 8xV100-32G qualification allocated only 14.07--14.14 GiB per GPU over
+3,928--4,068 live MeshBlocks, leaving about 17.9 GiB per device.  A deliberately loose
+`max_bsq=1e6` branch remained finite through `105.6M`, held
+`|divB|_max <= 5.0e-14`, and showed no GPU-memory growth, but its outside-excision
+`sigma_max` jumped after `86.4M` and reached `1.05e4`; C2P floor and FOFC rates rose at
+the same time.  A fair one-root-step restart gate at `96M` found that `max_bsq=100`
+reduced outside-excision `sigma_max` from 6,589 to 4,403, maximum C2P iterations from 17
+to 14, and FOFC corrections by 14%, with no C2P failure and only a `1.1e-12` relative
+change in baryon mass.  The standalone V100 input therefore uses 100 for long software
+soaks.
+
+This is not a science choice: production runs must include at least a `25/100/1000`
+floor-sensitivity group and report injected-floor diagnostics before interpreting the
+funnel or jet.
+
+The first cap-100 soak restarted from the `96M` checkpoint and reached `134.4M` in eight
+root steps with exit status zero.  It used 26m15.8s wall time (about `87.9M/hour`),
+14.07--14.14 GiB/GPU, and no volatile corrected or uncorrected ECC event.  The final
+checkpoint held 4,012 MeshBlocks, at most 673 blocks/rank, 351 spare slots on the most
+populated rank, and exact level-subcycling costs.  At the final synchronized endpoint all
+16,433,152 cells in both the native-GR and `divB` audits were finite,
+`|divB|_max=1.46e-13`, there were no C2P failures or velocity-ceiling corrections, and
+the maximum outside coordinate distance `r>1M` from either hole was `sigma=44.96` (none
+above 100).  Baryon mass changed by -0.342% over the `96--134.4M` segment.  The raw
+unmasked `sigma=1.43e9` maximum was at distance `0.974M` from a hole and is explicitly
+inside the evolution's excision-floor region; this is the case that motivated the exact
+mask output below.  The endpoint's weighted level work is 582,904 block-updates versus
+2,054,144 for finest-cadence stepping of every live block, a 71.6% update reduction
+(3.52x ideal work ratio).  This is a software-soak result, not a resolution-convergence
+or physical-floor validation.
+
 The qualification output policy is history and event log plus both COM-following local
 slices every root endpoint, global primitive and native-GR state every `48M`, global
 `divB` every `19.2M`, and restart every `19.2M`.  The event log writes a row even when
@@ -148,8 +179,13 @@ C2P failures and actual iteration maxima, conserved and magnetization adjustment
 non-excision FOFC corrections, normal C2P calls, and FOFC trial solves.  Detailed C2P
 failure dumps are independently capped at eight per rank, so aggregate failure counts
 remain exact without allowing a first-failure GPU log storm.  Transfer only
-checksum-verified closed
-files and retain at least the latest three restart generations until NAS acknowledgement.
+checksum-verified closed files and retain at least the latest three restart generations
+until NAS acknowledgement.
+Native GR diagnostic files produced after this qualification append an exact
+`gr_excision_mask`; the dashboard masks those cells automatically while remaining able
+to read earlier four-field files.  This prevents horizon-interior regularization values
+(`sigma` reached `2.3e8` in the raw unmasked field) from being confused with the
+outside-excision physical maximum.
 
 ## The horizon lower bound matters
 

@@ -11,7 +11,8 @@
 //!   - magnitude of vorticity Curl(v)^2  [non-relativistic]
 //!   - z-component of current density Jz  [non-relativistic]
 //!   - magnitude of current density J^2  [non-relativistic]
-//!   - native metric-aware b^2, Lorentz factor, magnetization, and inverse magnetic beta
+//!   - native metric-aware b^2, Lorentz factor, magnetization, inverse magnetic beta,
+//!     and the evolution's excision-floor mask
 
 #include <iostream>
 #include <sstream>
@@ -128,8 +129,9 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
   if (name.compare("mhd_gr_lorentz") == 0) gr_diagnostic_component = 1;
   if (name.compare("mhd_gr_sigma") == 0) gr_diagnostic_component = 2;
   if (name.compare("mhd_gr_beta_inv") == 0) gr_diagnostic_component = 3;
+  if (name.compare("mhd_gr_excision_mask") == 0) gr_diagnostic_component = 4;
   if (all_gr_diagnostics || gr_diagnostic_component >= 0) {
-    const int output_components = all_gr_diagnostics ? 4 : 1;
+    const int output_components = all_gr_diagnostics ? 5 : 1;
     if (DerivedVariableShapeChanged(
             derived_var, nmb, output_components, n3, n2, n1)) {
       Kokkos::realloc(derived_var, nmb, output_components, n3, n2, n1);
@@ -138,6 +140,15 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
     auto &w0 = pm->pmb_pack->pmhd->w0;
     auto &bcc = pm->pmb_pack->pmhd->bcc0;
     auto &adm = pm->pmb_pack->padm->adm;
+    auto &excision_floor = pm->pmb_pack->pcoord->excision_floor;
+    if (gr_diagnostic_component == 4) {
+      par_for("mhd_gr_excision_mask", DevExeSpace(), 0, (nmb-1), ks, ke, js, je,
+      is, ie, KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        dv(m, i_dv, k, j, i) = excision_floor(m,k,j,i) ? 1.0 : 0.0;
+      });
+      i_dv += 1;
+      return;
+    }
     par_for("mhd_gr_diagnostics", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
       const Real gxx = adm.g_dd(m, 0, 0, k, j, i);
@@ -177,14 +188,17 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
         dv(m, i_dv + 1, k, j, i) = W;
         dv(m, i_dv + 2, k, j, i) = bsq/rho;
         dv(m, i_dv + 3, k, j, i) = 0.5*bsq/pgas;
+        dv(m, i_dv + 4, k, j, i) = excision_floor(m,k,j,i) ? 1.0 : 0.0;
       } else if (gr_diagnostic_component == 0) {
         dv(m, i_dv, k, j, i) = bsq;
       } else if (gr_diagnostic_component == 1) {
         dv(m, i_dv, k, j, i) = W;
       } else if (gr_diagnostic_component == 2) {
         dv(m, i_dv, k, j, i) = bsq/rho;
-      } else {
+      } else if (gr_diagnostic_component == 3) {
         dv(m, i_dv, k, j, i) = 0.5*bsq/pgas;
+      } else {
+        dv(m, i_dv, k, j, i) = excision_floor(m,k,j,i) ? 1.0 : 0.0;
       }
     });
     i_dv += output_components;
