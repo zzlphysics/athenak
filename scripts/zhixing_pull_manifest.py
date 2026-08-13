@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -23,6 +24,7 @@ import posixpath
 import secrets
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import threading
@@ -41,6 +43,11 @@ PARALLEL_THRESHOLD = 512 * 1024 * 1024
 PARALLEL_STREAMS = 2
 CONNECT_ATTEMPTS = 5
 CONNECT_BACKOFF_SECONDS = 5.0
+STREAM_RECONNECT_ATTEMPTS = 4
+STREAM_RECONNECT_BACKOFF_SECONDS = 2.0
+STREAM_WINDOW_BYTES = 256 * 1024 * 1024
+CHANNEL_IO_TIMEOUT_SECONDS = 120.0
+CHANNEL_STATUS_POLL_SECONDS = 0.1
 RESERVED_DESTINATION_COMPONENTS = frozenset({
     ".acks", ".incoming", ".locks", ".manifests",
 })
@@ -740,7 +747,9 @@ def connect(config: ConnectionConfig) -> tuple[paramiko.SSHClient, paramiko.SFTP
                     f"{actual} != {config.host_key_sha256}"
                 )
             transport.set_keepalive(20)
-            return client, client.open_sftp()
+            sftp = client.open_sftp()
+            sftp.get_channel().settimeout(CHANNEL_IO_TIMEOUT_SECONDS)
+            return client, sftp
         except (OSError, EOFError, paramiko.SSHException) as error:
             last_error = error
             client.close()
@@ -910,6 +919,183 @@ def read_remote_bytes(
     return data
 
 
+class TrustBoundaryViolation(RuntimeError):
+    """A reconnect no longer proves the same remote and local transaction."""
+
+
+class RetryableRemoteTransport(RuntimeError):
+    """A failure known to originate in remote SSH/SFTP transport I/O."""
+
+
+REMOTE_RETRYABLE_ERRORS = (
+    EOFError,
+    socket.timeout,
+    paramiko.SSHException,
+    RetryableRemoteTransport,
+)
+
+
+def retryable_remote_io(operation):
+    """Classify only an explicitly remote operation as reconnectable."""
+
+    try:
+        return operation()
+    except TrustBoundaryViolation:
+        raise
+    except FileNotFoundError as exc:
+        raise TrustBoundaryViolation(f"pinned remote path disappeared: {exc}") from exc
+    except (EOFError, OSError, paramiko.SSHException) as exc:
+        raise RetryableRemoteTransport(str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class ReconnectValidation:
+    """Immutable evidence that every replacement SSH session must re-prove."""
+
+    config: ConnectionConfig
+    remote_manifest: str
+    manifest_bytes: bytes
+    destination: DestinationRoot
+    destination_path: Path
+    expected_mount_source: str
+    expected_mount_fstype: str
+    mount_snapshot: dict[str, str]
+
+    def open_validated(
+        self,
+    ) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+        client, sftp = connect(self.config)
+        try:
+            try:
+                current_manifest = retryable_remote_io(
+                    lambda: read_remote_bytes(
+                        sftp,
+                        self.remote_manifest,
+                        require_read_only=True,
+                    )
+                )
+            except REMOTE_RETRYABLE_ERRORS:
+                raise
+            except BaseException as exc:
+                raise TrustBoundaryViolation(
+                    f"cannot revalidate pinned remote manifest: {exc}"
+                ) from exc
+            if current_manifest != self.manifest_bytes:
+                raise TrustBoundaryViolation(
+                    "pinned remote manifest changed after reconnect"
+                )
+            try:
+                self.destination.assert_visible()
+                mount = verify_mount(
+                    self.destination_path,
+                    self.expected_mount_source,
+                    self.expected_mount_fstype,
+                )
+                if mount != self.mount_snapshot:
+                    raise TrustBoundaryViolation(
+                        "NAS mount identity/options changed after reconnect"
+                    )
+                write_probe(self.destination)
+                self.destination.assert_visible()
+            except TrustBoundaryViolation:
+                raise
+            except BaseException as exc:
+                raise TrustBoundaryViolation(
+                    f"cannot revalidate destination after reconnect: {exc}"
+                ) from exc
+            return client, sftp
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                sftp.close()
+            with contextlib.suppress(BaseException):
+                client.close()
+            raise
+
+
+class ValidatedRemoteSession:
+    """One replaceable SSH session with bounded fail-closed recovery."""
+
+    def __init__(
+        self,
+        validation: ReconnectValidation,
+        client: paramiko.SSHClient | None = None,
+        sftp: paramiko.SFTPClient | None = None,
+    ) -> None:
+        if (client is None) != (sftp is None):
+            raise ValueError("client and SFTP must be supplied together")
+        self.validation = validation
+        self.client = client
+        self.sftp = sftp
+        if self.client is None:
+            try:
+                self.client, self.sftp = validation.open_validated()
+            except REMOTE_RETRYABLE_ERRORS as exc:
+                self.recover(exc, 0, "validated SSH session")
+
+    def close(self) -> None:
+        if self.sftp is not None:
+            with contextlib.suppress(BaseException):
+                self.sftp.close()
+        if self.client is not None:
+            with contextlib.suppress(BaseException):
+                self.client.close()
+        self.sftp = None
+        self.client = None
+
+    def recover(
+        self,
+        error: BaseException,
+        attempts_used: int,
+        label: str,
+    ) -> int:
+        """Replace a failed transport, consuming one bounded exponential retry."""
+
+        self.close()
+        last_error: BaseException = error
+        while attempts_used < STREAM_RECONNECT_ATTEMPTS:
+            attempts_used += 1
+            delay = STREAM_RECONNECT_BACKOFF_SECONDS * (2 ** (attempts_used - 1))
+            with PRINT_LOCK:
+                print(
+                    f"{label}: transport failed; reconnect "
+                    f"{attempts_used}/{STREAM_RECONNECT_ATTEMPTS} in {delay:.0f}s: "
+                    f"{last_error}",
+                    flush=True,
+                )
+            time.sleep(delay)
+            try:
+                self.client, self.sftp = self.validation.open_validated()
+                return attempts_used
+            except TrustBoundaryViolation:
+                self.close()
+                raise
+            except REMOTE_RETRYABLE_ERRORS as reconnect_error:
+                last_error = reconnect_error
+            except RuntimeError as reconnect_error:
+                # connect() reports its own bounded attempt exhaustion as RuntimeError.
+                last_error = reconnect_error
+            self.close()
+        raise RuntimeError(
+            f"{label}: reconnect limit {STREAM_RECONNECT_ATTEMPTS} exhausted: "
+            f"{last_error}"
+        ) from last_error
+
+    def remote_call(self, label: str, operation):
+        attempts = 0
+        while True:
+            assert self.client is not None and self.sftp is not None
+            try:
+                return operation(self.client, self.sftp)
+            except REMOTE_RETRYABLE_ERRORS as exc:
+                attempts = self.recover(exc, attempts, label)
+
+    def __enter__(self) -> "ValidatedRemoteSession":
+        return self
+
+    def __exit__(self, *unused: object) -> None:
+        self.close()
+
+
 def remote_mkdirs(sftp: paramiko.SFTPClient, path: str) -> None:
     current = "/"
     for part in PurePosixPath(path).parts[1:]:
@@ -925,9 +1111,23 @@ def remote_mkdirs(sftp: paramiko.SFTPClient, path: str) -> None:
 
 def exec_checked(client: paramiko.SSHClient, argv: list[str]) -> None:
     command = shlex.join(argv)
-    _, stdout, stderr = client.exec_command(command, timeout=120)
-    status = stdout.channel.recv_exit_status()
-    error = stderr.read().decode("utf-8", errors="replace").strip()
+    _, stdout, _ = client.exec_command(command, timeout=CHANNEL_IO_TIMEOUT_SECONDS)
+    channel = stdout.channel
+    channel.settimeout(CHANNEL_IO_TIMEOUT_SECONDS)
+    deadline = time.monotonic() + CHANNEL_IO_TIMEOUT_SECONDS
+    error_chunks: list[bytes] = []
+    while not retryable_remote_io(channel.exit_status_ready):
+        while retryable_remote_io(channel.recv_stderr_ready):
+            error_chunks.append(retryable_remote_io(lambda: channel.recv_stderr(CHUNK)))
+        if time.monotonic() >= deadline:
+            raise RetryableRemoteTransport(
+                f"timed out waiting for remote command: {command}"
+            )
+        time.sleep(CHANNEL_STATUS_POLL_SECONDS)
+    while retryable_remote_io(channel.recv_stderr_ready):
+        error_chunks.append(retryable_remote_io(lambda: channel.recv_stderr(CHUNK)))
+    status = retryable_remote_io(channel.recv_exit_status)
+    error = b"".join(error_chunks).decode("utf-8", errors="replace").strip()
     if status != 0:
         raise RuntimeError(f"remote command failed ({status}): {command}: {error}")
 
@@ -982,6 +1182,8 @@ def remote_immutable_write(
                     require_read_only=True,
                     require_single_link=False,
                 )
+            except RetryableRemoteTransport:
+                raise
             except (FileNotFoundError, RuntimeError):
                 # An incomplete pre-link temporary record is not an alias of the
                 # ready ACK.  Leave it untouched for a separate stale-temp audit.
@@ -1007,11 +1209,15 @@ def remote_immutable_write(
         try:
             exec_checked(client, ["/usr/bin/ln", "--", temporary, path])
             created = True
-        except RuntimeError:
+        except RuntimeError as link_error:
             try:
                 raced = read_remote_bytes(sftp, path, require_read_only=True)
             except FileNotFoundError:
-                raise
+                # Preserve whether `ln` itself failed deterministically or its
+                # response was lost before the link existed.  Re-raising the
+                # transport error lets the outer validated transaction reconnect;
+                # a deterministic command failure remains fail-closed.
+                raise link_error
             if raced != data:
                 raise RuntimeError(f"remote immutable-record creation raced: {path}")
     finally:
@@ -1078,7 +1284,110 @@ def open_append_nofollow_at(
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(descriptor)
         raise RuntimeError(f"partial is not a one-link regular file: {name}")
-    return os.fdopen(descriptor, "ab"), info.st_size
+    # Unbuffered writes make the stat-derived resume offset exactly the bytes that
+    # recv() returned, even when an SSH exception tears down the stream mid-window.
+    return os.fdopen(descriptor, "ab", buffering=0), info.st_size
+
+
+def _append_validated_window(
+    session: ValidatedRemoteSession,
+    remote_path: str,
+    expected_remote_identity: tuple[int, int, int, int],
+    parent_descriptor: int,
+    piece_name: str,
+    range_start: int,
+    target_size: int,
+    label: str,
+) -> None:
+    """Append through target_size, safely resuming after a torn SSH channel."""
+
+    def operation(client: paramiko.SSHClient, sftp: paramiko.SFTPClient) -> None:
+        remote_info = retryable_remote_io(
+            lambda: remote_regular_attributes(sftp, remote_path)
+        )
+        if _remote_identity(remote_info) != expected_remote_identity:
+            raise TrustBoundaryViolation(
+                f"remote source identity changed after reconnect: {remote_path}"
+            )
+        try:
+            current = stat_regular_at(parent_descriptor, piece_name).st_size
+        except FileNotFoundError:
+            current = 0
+        if current > target_size:
+            raise RuntimeError(f"partial grew past transfer window: {piece_name}")
+        if current == target_size:
+            return
+        remaining = target_size - current
+        command = (
+            f"dd if={shlex.quote(remote_path)} iflag=skip_bytes,count_bytes "
+            f"skip={range_start + current} count={remaining} status=none"
+        )
+        _, stdout, _ = retryable_remote_io(
+            lambda: client.exec_command(command, timeout=None)
+        )
+        channel = stdout.channel
+        channel.settimeout(CHANNEL_IO_TIMEOUT_SECONDS)
+        stream, opened_size = open_append_nofollow_at(
+            parent_descriptor,
+            piece_name,
+        )
+        if opened_size != current:
+            stream.close()
+            raise RuntimeError(f"partial changed while opening: {piece_name}")
+        try:
+            while current < target_size:
+                chunk = retryable_remote_io(
+                    lambda: channel.recv(min(CHUNK, target_size - current))
+                )
+                if not chunk:
+                    raise EOFError(
+                        f"early EOF for {piece_name} at {current}/{target_size}"
+                    )
+                view = memoryview(chunk)
+                while view:
+                    written = stream.write(view)
+                    if written is None or written <= 0:
+                        raise OSError("short local partial write")
+                    current += written
+                    view = view[written:]
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fsync(parent_descriptor)
+        except BaseException as transfer_error:
+            # Preserve all complete bytes already returned by recv().  The next
+            # validated connection derives its skip offset only from this durable
+            # inode.  A local flush/fsync error must override an SSH error so it can
+            # never be misclassified as reconnectable.
+            try:
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fsync(parent_descriptor)
+            except BaseException as durability_error:
+                raise durability_error from transfer_error
+            raise
+        finally:
+            stream.close()
+        deadline = time.monotonic() + CHANNEL_IO_TIMEOUT_SECONDS
+        while not retryable_remote_io(channel.exit_status_ready):
+            if time.monotonic() >= deadline:
+                raise RetryableRemoteTransport(
+                    f"timed out waiting for remote dd exit status: {piece_name}"
+                )
+            time.sleep(CHANNEL_STATUS_POLL_SECONDS)
+        status = retryable_remote_io(channel.recv_exit_status)
+        if status != 0:
+            raise paramiko.SSHException(
+                f"remote dd failed for {piece_name}: {status}"
+            )
+        remote_after = retryable_remote_io(
+            lambda: remote_regular_attributes(sftp, remote_path)
+        )
+        if _remote_identity(remote_after) != expected_remote_identity:
+            raise TrustBoundaryViolation(
+                f"remote source changed while transferring: {remote_path}"
+            )
+
+    session.remote_call(label, operation)
 
 
 def download_range(
@@ -1089,6 +1398,8 @@ def download_range(
     start: int,
     end: int,
     number: int,
+    validation: ReconnectValidation | None = None,
+    expected_remote_identity: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, float]:
     try:
         expected = end - start
@@ -1100,52 +1411,40 @@ def download_range(
             raise RuntimeError(f"range {number} is too large: {piece_name}")
         if offset == expected:
             return expected, 0.0
-        client, sftp = connect(config)
-        try:
-            remaining = expected - offset
-            command = (
-                f"dd if={shlex.quote(remote_path)} iflag=skip_bytes,count_bytes "
-                f"skip={start + offset} count={remaining} status=none"
-            )
-            _, stdout, _ = client.exec_command(command, timeout=None)
-            channel = stdout.channel
-            current = offset
-            next_fsync = current + FSYNC_INTERVAL
-            started = time.monotonic()
-            stream, opened_size = open_append_nofollow_at(
-                parent_descriptor,
-                piece_name,
-            )
-            if opened_size != offset:
-                stream.close()
-                raise RuntimeError(
-                    f"parallel partial changed while opening: {piece_name}"
+        if validation is None or expected_remote_identity is None:
+            raise RuntimeError("incomplete reconnect validation for remote range")
+        started = time.monotonic()
+        while offset < expected:
+            target = min(expected, offset + STREAM_WINDOW_BYTES)
+            # Proactively use a fresh pinned and revalidated transport for each
+            # <=256 MiB window, safely below Paramiko 2.12's 512 MiB rekey point.
+            with ValidatedRemoteSession(validation) as session:
+                _append_validated_window(
+                    session,
+                    remote_path,
+                    expected_remote_identity,
+                    parent_descriptor,
+                    piece_name,
+                    start,
+                    target,
+                    f"range {number} {piece_name}",
                 )
-            with stream:
-                while current < expected:
-                    chunk = channel.recv(min(CHUNK, expected - current))
-                    if not chunk:
-                        raise EOFError(
-                            f"early EOF in range {number} at {current}/{expected}"
-                        )
-                    stream.write(chunk)
-                    current += len(chunk)
-                    if current >= next_fsync:
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                        next_fsync = current + FSYNC_INTERVAL
-                stream.flush()
-                os.fsync(stream.fileno())
-            status = channel.recv_exit_status()
-            if status != 0:
-                raise RuntimeError(f"remote range {number} failed: {status}")
-            info, _ = sha256_regular_at(parent_descriptor, piece_name)
-            if info.st_size != expected:
-                raise RuntimeError(f"range {number} size mismatch")
-            return expected, time.monotonic() - started
-        finally:
-            sftp.close()
-            client.close()
+            offset = stat_regular_at(parent_descriptor, piece_name).st_size
+            if offset != target:
+                raise RuntimeError(f"range {number} window size mismatch")
+            os.fsync(parent_descriptor)
+            elapsed = max(time.monotonic() - started, 1e-9)
+            with PRINT_LOCK:
+                print(
+                    f"{piece_name}: {100.0 * offset / expected:.1f}% "
+                    f"({offset}/{expected}), "
+                    f"{(offset / elapsed) / (1024 * 1024):.2f} MiB/s",
+                    flush=True,
+                )
+        info, _ = sha256_regular_at(parent_descriptor, piece_name)
+        if info.st_size != expected:
+            raise RuntimeError(f"range {number} size mismatch")
+        return expected, time.monotonic() - started
     finally:
         os.close(parent_descriptor)
 
@@ -1156,6 +1455,8 @@ def parallel_download(
     parent_descriptor: int,
     partial_name: str,
     expected_size: int,
+    validation: ReconnectValidation | None = None,
+    expected_remote_identity: tuple[int, int, int, int] | None = None,
 ) -> None:
     piece_span = (expected_size + PARALLEL_STREAMS - 1) // PARALLEL_STREAMS
     piece_span = ((piece_span + CHUNK - 1) // CHUNK) * CHUNK
@@ -1196,6 +1497,8 @@ def parallel_download(
                 start,
                 end,
                 number,
+                validation,
+                expected_remote_identity,
             )
             for number, start, end, piece_name in ranges
         ]
@@ -1314,8 +1617,7 @@ def install_no_replace(partial: Path, final_path: Path) -> None:
 
 def transfer_file(
     config: ConnectionConfig,
-    client: paramiko.SSHClient,
-    sftp: paramiko.SFTPClient,
+    validation: ReconnectValidation,
     remote_root: str,
     destination: DestinationRoot,
     incoming_segment: str,
@@ -1381,7 +1683,16 @@ def transfer_file(
             print(f"[{index}/{count}] verified existing {relative}", flush=True)
             return
 
-        remote_before = remote_regular_attributes(sftp, remote_path)
+        with ValidatedRemoteSession(validation) as source_session:
+            remote_before = source_session.remote_call(
+                f"source stat {relative}",
+                lambda _client, current_sftp: retryable_remote_io(
+                    lambda: remote_regular_attributes(
+                        current_sftp,
+                        remote_path,
+                    )
+                ),
+            )
         if remote_before.st_size != expected_size:
             raise RuntimeError(
                 f"remote size mismatch for {relative}: "
@@ -1411,54 +1722,23 @@ def transfer_file(
                 partial_parent,
                 partial_name,
                 expected_size,
+                validation,
+                _remote_identity(remote_before),
             )
             offset = expected_size
         if offset < expected_size:
-            remaining = expected_size - offset
-            command = (
-                f"dd if={shlex.quote(remote_path)} iflag=skip_bytes,count_bytes "
-                f"skip={offset} count={remaining} status=none"
-            )
-            _, stdout, _ = client.exec_command(command, timeout=None)
-            channel = stdout.channel
-            stream, opened_size = open_append_nofollow_at(
-                partial_parent,
+            download_range(
+                config,
+                remote_path,
+                os.dup(partial_parent),
                 partial_name,
+                0,
+                expected_size,
+                0,
+                validation,
+                _remote_identity(remote_before),
             )
-            if opened_size != offset:
-                stream.close()
-                raise RuntimeError(f"partial changed while opening: {relative}")
-            next_report = offset + PROGRESS_INTERVAL
-            next_fsync = offset + FSYNC_INTERVAL
-            started = time.monotonic()
-            with stream:
-                while offset < expected_size:
-                    chunk = channel.recv(min(CHUNK, expected_size - offset))
-                    if not chunk:
-                        raise EOFError(f"early EOF for {relative} at {offset}")
-                    stream.write(chunk)
-                    offset += len(chunk)
-                    if offset >= next_fsync:
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                        next_fsync = offset + FSYNC_INTERVAL
-                    if offset >= next_report or offset == expected_size:
-                        elapsed = max(time.monotonic() - started, 1e-9)
-                        rate = (
-                            offset - (expected_size - remaining)
-                        ) / elapsed / (1024 * 1024)
-                        print(
-                            f"[{index}/{count}] {relative}: "
-                            f"{100.0 * offset / expected_size:.1f}% "
-                            f"({offset}/{expected_size}), {rate:.2f} MiB/s",
-                            flush=True,
-                        )
-                        next_report = offset + PROGRESS_INTERVAL
-                stream.flush()
-                os.fsync(stream.fileno())
-            status = channel.recv_exit_status()
-            if status != 0:
-                raise RuntimeError(f"remote dd failed for {relative}: {status}")
+            offset = expected_size
         partial_info, digest = sha256_regular_at(
             partial_parent,
             partial_name,
@@ -1471,7 +1751,16 @@ def transfer_file(
                 f"local verification failed and corrupt partial was discarded for "
                 f"{relative}: size={partial_info.st_size}, sha256={digest}"
             )
-        remote_after = remote_regular_attributes(sftp, remote_path)
+        with ValidatedRemoteSession(validation) as source_session:
+            remote_after = source_session.remote_call(
+                f"final source stat {relative}",
+                lambda _client, current_sftp: retryable_remote_io(
+                    lambda: remote_regular_attributes(
+                        current_sftp,
+                        remote_path,
+                    )
+                ),
+            )
         if _remote_identity(remote_before) != _remote_identity(remote_after):
             raise RuntimeError(f"remote source changed while transferring: {relative}")
         install_no_replace_at(
@@ -1795,6 +2084,16 @@ def main() -> int:
                     args.remote_root,
                     args.segment,
                 )
+                validation = ReconnectValidation(
+                    config=config,
+                    remote_manifest=args.remote_manifest,
+                    manifest_bytes=manifest_bytes,
+                    destination=local,
+                    destination_path=destination,
+                    expected_mount_source=args.expected_mount_source,
+                    expected_mount_fstype=args.expected_mount_fstype,
+                    mount_snapshot=mount_before,
+                )
                 manifest_parent = local.open_directory(
                     (".manifests",),
                     create=True,
@@ -1807,6 +2106,14 @@ def main() -> int:
                     )
                 finally:
                     os.close(manifest_parent)
+
+                # The bootstrap session has served its only purpose.  Transfers
+                # below use bounded <=256 MiB windows on freshly revalidated
+                # sessions, so no data channel reaches Paramiko's rekey boundary.
+                sftp.close()
+                client.close()
+                sftp = None
+                client = None
 
                 unverified_sizes: list[int] = []
                 for record in records:
@@ -1850,8 +2157,7 @@ def main() -> int:
                 for index, record in enumerate(records, start=1):
                     transfer_file(
                         config,
-                        client,
-                        sftp,
+                        validation,
                         args.remote_root,
                         local,
                         args.segment,
@@ -1860,10 +2166,19 @@ def main() -> int:
                         len(records),
                     )
 
-                if read_remote_bytes(
-                    sftp, args.remote_manifest, require_read_only=True
-                ) != manifest_bytes:
-                    raise RuntimeError("remote manifest changed during transfer")
+                with ValidatedRemoteSession(validation) as verify_session:
+                    verified_manifest = verify_session.remote_call(
+                        "post-transfer remote manifest readback",
+                        lambda _client, current_sftp: retryable_remote_io(
+                            lambda: read_remote_bytes(
+                                current_sftp,
+                                args.remote_manifest,
+                                require_read_only=True,
+                            )
+                        ),
+                    )
+                    if verified_manifest != manifest_bytes:
+                        raise RuntimeError("remote manifest changed during transfer")
                 mount_mid = verify_mount(
                     destination,
                     args.expected_mount_source,
@@ -1882,11 +2197,6 @@ def main() -> int:
                 )
                 if mount_final != mount_before:
                     raise RuntimeError("NAS mount identity/options changed before ACK")
-                if read_remote_bytes(
-                    sftp, args.remote_manifest, require_read_only=True
-                ) != manifest_bytes:
-                    raise RuntimeError("remote manifest changed before ACK")
-
                 expected_core = ack_core(
                     manifest_name,
                     manifest_bytes,
@@ -1897,107 +2207,139 @@ def main() -> int:
                 )
                 local_ack_name = f"{manifest_name}.ack"
                 ack_parent = local.open_directory((".acks",), create=True)
-                try:
-                    remote_ack = posixpath.join(
-                        posixpath.dirname(args.remote_manifest),
-                        "acks",
-                        f"{manifest_name}.ack",
-                    )
-                    ack_bytes = choose_ack_bytes(
-                        expected_core,
-                        optional_local_record_at(ack_parent, local_ack_name),
-                        optional_remote_record(sftp, remote_ack),
-                    )
-                    immutable_write_at(ack_parent, local_ack_name, ack_bytes)
-                    mount_ack = verify_mount(
-                        destination,
-                        args.expected_mount_source,
-                        args.expected_mount_fstype,
-                    )
-                    if mount_ack != mount_before:
-                        raise RuntimeError(
-                            "NAS mount identity/options changed while writing ACK"
-                        )
-                    if read_regular_bytes_at(
-                        ack_parent,
-                        local_ack_name,
-                        require_read_only=True,
-                    ) != ack_bytes:
-                        raise RuntimeError(
-                            "local ACK readback differs before remote commit"
-                        )
-                    local.assert_directory_visible((".acks",), ack_parent)
-                    visible_ack_parent = local.open_directory((".acks",))
+                with ValidatedRemoteSession(validation) as ack_session:
                     try:
+                        remote_ack = posixpath.join(
+                            posixpath.dirname(args.remote_manifest),
+                            "acks",
+                            f"{manifest_name}.ack",
+                        )
+                        ack_bytes = choose_ack_bytes(
+                            expected_core,
+                            optional_local_record_at(ack_parent, local_ack_name),
+                            ack_session.remote_call(
+                                "read existing remote ACK",
+                                lambda _client, current_sftp: retryable_remote_io(
+                                    lambda: optional_remote_record(
+                                        current_sftp,
+                                        remote_ack,
+                                    )
+                                ),
+                            ),
+                        )
+                        immutable_write_at(ack_parent, local_ack_name, ack_bytes)
+                        mount_ack = verify_mount(
+                            destination,
+                            args.expected_mount_source,
+                            args.expected_mount_fstype,
+                        )
+                        if mount_ack != mount_before:
+                            raise RuntimeError(
+                                "NAS mount identity/options changed while writing ACK"
+                            )
                         if read_regular_bytes_at(
-                            visible_ack_parent,
+                            ack_parent,
                             local_ack_name,
                             require_read_only=True,
                         ) != ack_bytes:
                             raise RuntimeError(
-                                "visible local ACK differs before remote commit"
+                                "local ACK readback differs before remote commit"
                             )
-                    finally:
-                        os.close(visible_ack_parent)
-                    # Rebind the local payload immediately before publishing the
-                    # non-authorizing transfer receipt. An already-open writable fd
-                    # can still invalidate this receipt after publication; therefore
-                    # no transfer ACK is ever accepted as cloud-cleanup authority.
-                    verify_final_identities(local, final_proofs)
-                    remote_immutable_write(client, sftp, remote_ack, ack_bytes)
-                    mount_committed = verify_mount(
-                        destination,
-                        args.expected_mount_source,
-                        args.expected_mount_fstype,
-                    )
-                    if mount_committed != mount_before:
-                        raise RuntimeError(
-                            "NAS mount identity/options changed after ACK commit"
+                        local.assert_directory_visible((".acks",), ack_parent)
+                        visible_ack_parent = local.open_directory((".acks",))
+                        try:
+                            if read_regular_bytes_at(
+                                visible_ack_parent,
+                                local_ack_name,
+                                require_read_only=True,
+                            ) != ack_bytes:
+                                raise RuntimeError(
+                                    "visible local ACK differs before remote commit"
+                                )
+                        finally:
+                            os.close(visible_ack_parent)
+                        # Rebind the local payload immediately before publishing the
+                        # non-authorizing receipt. No receipt authorizes cleanup.
+                        verify_final_identities(local, final_proofs)
+                        ack_session.remote_call(
+                            "publish immutable remote ACK",
+                            lambda current_client, current_sftp: retryable_remote_io(
+                                lambda: remote_immutable_write(
+                                    current_client,
+                                    current_sftp,
+                                    remote_ack,
+                                    ack_bytes,
+                                )
+                            ),
                         )
-                    if read_regular_bytes_at(
-                        ack_parent,
-                        local_ack_name,
-                        require_read_only=True,
-                    ) != ack_bytes:
-                        raise RuntimeError("local ACK readback differs")
-                    local.assert_directory_visible((".acks",), ack_parent)
-                    visible_ack_parent = local.open_directory((".acks",))
-                    try:
+                        mount_committed = verify_mount(
+                            destination,
+                            args.expected_mount_source,
+                            args.expected_mount_fstype,
+                        )
+                        if mount_committed != mount_before:
+                            raise RuntimeError(
+                                "NAS mount identity/options changed after ACK commit"
+                            )
                         if read_regular_bytes_at(
-                            visible_ack_parent,
+                            ack_parent,
                             local_ack_name,
                             require_read_only=True,
                         ) != ack_bytes:
-                            raise RuntimeError("visible local ACK readback differs")
-                    finally:
-                        os.close(visible_ack_parent)
-                    verify_final_identities(local, final_proofs)
-                    if read_remote_bytes(
-                        sftp,
-                        remote_ack,
-                        require_read_only=True,
-                    ) != ack_bytes:
-                        raise RuntimeError("remote ACK readback differs")
-                    if read_remote_bytes(
-                        sftp,
-                        args.remote_manifest,
-                        require_read_only=True,
-                    ) != manifest_bytes:
-                        raise RuntimeError(
-                            "remote manifest changed while publishing ACK"
+                            raise RuntimeError("local ACK readback differs")
+                        local.assert_directory_visible((".acks",), ack_parent)
+                        visible_ack_parent = local.open_directory((".acks",))
+                        try:
+                            if read_regular_bytes_at(
+                                visible_ack_parent,
+                                local_ack_name,
+                                require_read_only=True,
+                            ) != ack_bytes:
+                                raise RuntimeError("visible local ACK readback differs")
+                        finally:
+                            os.close(visible_ack_parent)
+                        verify_final_identities(local, final_proofs)
+                        remote_ack_readback = ack_session.remote_call(
+                            "read back immutable remote ACK",
+                            lambda _client, current_sftp: retryable_remote_io(
+                                lambda: read_remote_bytes(
+                                    current_sftp,
+                                    remote_ack,
+                                    require_read_only=True,
+                                )
+                            ),
                         )
-                    print(
-                        f"COMPLETE: {len(records)} files, "
-                        f"{expected_core['total_bytes']} bytes, durable local+remote "
-                        "immutable transfer ACK verified (cleanup not authorized)",
-                        flush=True,
-                    )
-                    return 0
-                finally:
-                    os.close(ack_parent)
+                        if remote_ack_readback != ack_bytes:
+                            raise RuntimeError("remote ACK readback differs")
+                        final_manifest_readback = ack_session.remote_call(
+                            "final remote manifest readback",
+                            lambda _client, current_sftp: retryable_remote_io(
+                                lambda: read_remote_bytes(
+                                    current_sftp,
+                                    args.remote_manifest,
+                                    require_read_only=True,
+                                )
+                            ),
+                        )
+                        if final_manifest_readback != manifest_bytes:
+                            raise RuntimeError(
+                                "remote manifest changed while publishing ACK"
+                            )
+                        print(
+                            f"COMPLETE: {len(records)} files, "
+                            f"{expected_core['total_bytes']} bytes, durable "
+                            "local+remote immutable transfer ACK verified "
+                            "(cleanup not authorized)",
+                            flush=True,
+                        )
+                        return 0
+                    finally:
+                        os.close(ack_parent)
             finally:
-                sftp.close()
-                client.close()
+                if sftp is not None:
+                    sftp.close()
+                if client is not None:
+                    client.close()
 
 
 if __name__ == "__main__":

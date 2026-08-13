@@ -271,6 +271,16 @@ complete the other side.  The ACK is a non-authorizing transfer receipt even if 
 payload identity check fails and leaves one side of that receipt in place.  Neither
 transfer program deletes cloud files.
 
+Payload streams use at most 256 MiB per SSH transport, below Paramiko 2.12's 512 MiB
+rekey threshold.  Every planned transport rotation and every bounded reconnect repeats
+the pinned host-key check, byte-for-byte remote-manifest verification, remote-source
+identity check, held destination-directory identity check, exact `findmnt` snapshot,
+and NAS write probe.  Sequential partials and each parallel range are fsynced and resume
+from their pinned local inode size.  Transport failures use at most four exponential-
+backoff reconnects per window; during payload transfer, a changed manifest/source/mount
+or a local I/O failure stops immediately before the ACK phase.  The source and already
+committed local payloads are never removed by recovery.
+
 `authorize_zhixing_cleanup.py` documents the pinned inputs and exact per-file delete-set
 shape required by a future cleanup gate, while deliberately having no successful path
 today.  On the deployed multi-client read-write NFS mount it exits nonzero before making
