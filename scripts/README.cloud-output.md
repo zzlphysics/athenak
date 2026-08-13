@@ -16,17 +16,22 @@ run.  The intended protocol is:
    transfers, verifies every final NAS path, fsyncs the files and directories, rereads the
    remote manifest, and create-no-replace publishes matching local and remote ACKs.  The
    generic `pull_ready_outputs.py` remains useful for non-destructive legacy pulls, but
-   its ACK is not sufficient authorization for cloud deletion.
-4. Delete cloud files only after their ACK exists.  Keep at least the two newest restart
-   files on the compute host.  Remote deletion is intentionally not implemented by the
-   puller, so a transfer failure cannot destroy the only copy.
+   its ACK likewise never authorizes cloud deletion.
+4. Treat every local or remote transfer ACK as a receipt only.  ACK v2 carries
+   `authorizes_remote_deletion: false`; old ACKs are equally non-authorizing.  No cloud
+   file may be deleted from an ACK.  The current multi-client read-write NFS topology has
+   no verifiable server-side read-only snapshot/write barrier, so
+   `authorize_zhixing_cleanup.py` fails closed and emits no cleanup authorization.
+   Remote deletion is intentionally not implemented by either transfer program.
 
 Never publish the newest in-progress output merely because its size has stopped changing.
 For mid-segment streaming, publish a binary dump only after the following numbered dump
 exists and the closure checks pass.  History files are append-only and remain unpublished
 until the AthenaK segment exits.  Restart files are published only after synchronized
-shutdown; retain two newer verified restart generations before considering an ACK-gated
-cleanup.
+shutdown.  A future cleanup design must retain at least the newest three independently
+verified restart generations, but cleanup remains disabled until both a verifiable
+storage snapshot/write barrier and a transactional per-file authorization consumer are
+implemented.
 
 ## Strict long-run segment gate
 
@@ -241,8 +246,9 @@ The generic and user history files and the event log are append-only and must be
 published only after the segment process exits.  Keep all three in the same immutable
 segment manifest so post-processing can align physics diagnostics with numerical events.
 
-Deletion-enabled Zhixing workflow on the workstation (the manifest SHA and SSH host-key
-fingerprint must come from independent trusted channels, not from this SSH session):
+Receipt-only Zhixing transfer workflow on the workstation (the manifest SHA and SSH
+host-key fingerprint must come from independent trusted channels, not from this SSH
+session):
 
 ```bash
 python3 scripts/zhixing_pull_manifest.py \
@@ -261,7 +267,26 @@ The receiver requires the ready manifest to be non-writable and creates a dedica
 segment lock.  Re-running the same transaction is safe: an existing manifest or ACK is
 accepted only when its immutable bytes match exactly.  If only one ACK was committed
 before a network interruption, its original `verified_unix` and bytes are reused to
-complete the other side.  Neither transfer program deletes cloud files.
+complete the other side.  The ACK is a non-authorizing transfer receipt even if a later
+payload identity check fails and leaves one side of that receipt in place.  Neither
+transfer program deletes cloud files.
+
+`authorize_zhixing_cleanup.py` documents the pinned inputs and exact per-file delete-set
+shape required by a future cleanup gate, while deliberately having no successful path
+today.  On the deployed multi-client read-write NFS mount it exits nonzero before making
+an SSH connection or creating any authorization artifact.  Local mode bits, local
+`/proc` scans, advisory locks, and a client-side read-only remount cannot revoke a writer
+already open on another NFS client.  There is no `--force` escape hatch.
+
+A future implementation may enable authorization only after code verifies an immutable
+server-side snapshot/generation, rehashes the complete remote source and NAS replica,
+binds the exact pinned manifest plus byte-identical local and remote transfer ACKs,
+enforces the newest-three-restart retention policy, and emits a short-lived immutable
+authorization for explicit individual files.  A fixed transactional consumer must then
+re-establish the barrier and repeat identity/SHA/retention checks immediately before
+quarantining and unlinking each file.  An authorization must never be interpreted as
+permission for manual, recursive, prefix, or glob deletion.  Until that backend and
+consumer exist, all cloud source files remain retained.
 
 Legacy/non-destructive example on the workstation:
 

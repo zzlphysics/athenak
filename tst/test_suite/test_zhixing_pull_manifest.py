@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
 
 import paramiko
 import pytest
@@ -202,6 +203,8 @@ def test_remote_paths_must_be_canonical_absolute(value: str) -> None:
 def _ack_core() -> dict[str, object]:
     return {
         "schema": 1,
+        "kind": "athenak_transfer_ack_v2",
+        "authorizes_remote_deletion": False,
         "manifest": "segment-1.manifest.ready",
         "manifest_sha256": "a" * 64,
         "segment": "segment-1",
@@ -216,6 +219,45 @@ def _ack_core() -> dict[str, object]:
         "total_bytes": 7,
         "files": [{"path": "state/a", "size": 7, "sha256": "b" * 64}],
     }
+
+
+def test_production_ack_is_explicitly_non_authorizing() -> None:
+    manifest_bytes = b'{"schema":1}\n'
+    records = [{
+        "path": PULLER.PurePosixPath("state/bin/output.bin"),
+        "size": 7,
+        "sha256": "b" * 64,
+    }]
+    core = PULLER.ack_core(
+        "segment-1.manifest.ready",
+        manifest_bytes,
+        "segment-1",
+        Path("/nas/segment-1"),
+        _ack_core()["mount"],
+        records,
+    )
+
+    assert core["kind"] == "athenak_transfer_ack_v2"
+    assert core["authorizes_remote_deletion"] is False
+    encoded = PULLER.choose_ack_bytes(core, None, None, now=123.5)
+    assert json.loads(encoded)["authorizes_remote_deletion"] is False
+
+    forged = json.loads(encoded)
+    forged["authorizes_remote_deletion"] = True
+    forged_bytes = (
+        json.dumps(forged, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    with pytest.raises(RuntimeError, match="does not match"):
+        PULLER.validate_ack_bytes(forged_bytes, core)
+
+    legacy = json.loads(encoded)
+    legacy.pop("kind")
+    legacy.pop("authorizes_remote_deletion")
+    legacy_bytes = (
+        json.dumps(legacy, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    with pytest.raises(RuntimeError, match="unexpected fields"):
+        PULLER.validate_ack_bytes(legacy_bytes, core)
 
 
 def test_ack_reuses_one_sided_transaction_bytes() -> None:
@@ -242,6 +284,22 @@ def test_ack_refuses_changed_destination_even_with_valid_json() -> None:
     changed["destination"] = "/local-disk"
     with pytest.raises(RuntimeError, match="does not match"):
         PULLER.validate_ack_bytes(encoded, changed)
+
+
+def test_ack_rejects_duplicate_keys_and_noncanonical_bytes() -> None:
+    core = _ack_core()
+    encoded = PULLER.choose_ack_bytes(core, None, None, now=123.0)
+    ambiguous = encoded.replace(
+        b'  "authorizes_remote_deletion": false,\n',
+        b'  "authorizes_remote_deletion": true,\n'
+        b'  "authorizes_remote_deletion": false,\n',
+    )
+    with pytest.raises(RuntimeError, match="invalid existing ACK JSON"):
+        PULLER.validate_ack_bytes(ambiguous, core)
+
+    compact = json.dumps(json.loads(encoded), sort_keys=True).encode("utf-8")
+    with pytest.raises(RuntimeError, match="not canonical"):
+        PULLER.validate_ack_bytes(compact, core)
 
 
 def test_final_verification_hashes_installed_path_and_fsyncs(tmp_path: Path) -> None:
@@ -275,6 +333,66 @@ def test_final_verification_seals_payload_read_only(tmp_path: Path) -> None:
     assert "state/closed.bin" in proofs
     with pytest.raises(PermissionError):
         final.write_bytes(b"damage")
+
+
+def test_preopened_writer_can_invalidate_payload_but_not_authorize_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Regress the ACK-publication attack window from the P1 review."""
+
+    destination = tmp_path / "destination"
+    final = destination / "state" / "bin" / "closed.bin"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"closed")
+    record = {
+        "path": PULLER.PurePosixPath("state/bin/closed.bin"),
+        "size": 6,
+        "sha256": PULLER.hashlib.sha256(b"closed").hexdigest(),
+    }
+    writer = os.open(final, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        with PULLER.DestinationRoot(destination) as root:
+            proofs = PULLER.verify_final_files(root, [record])
+            assert stat.S_IMODE(final.stat().st_mode) == 0o400
+            core = PULLER.ack_core(
+                "segment-1.manifest.ready",
+                b'{"schema":1}\n',
+                "segment-1",
+                destination,
+                {
+                    "target": str(destination),
+                    "source": "server:/nas",
+                    "fstype": "nfs",
+                    "options": "rw",
+                },
+                [record],
+            )
+            published_receipt = PULLER.choose_ack_bytes(
+                core,
+                None,
+                None,
+                now=123.5,
+            )
+            remote_receipt = tmp_path / "remote" / "segment-1.transfer.ack"
+            assert PULLER.immutable_write(remote_receipt, published_receipt)
+
+            # Some test filesystems expose coarse timestamp updates.  Cross one
+            # timestamp tick so the existing identity-only postcheck observes the
+            # attack deterministically; the changed bytes are the security issue.
+            time.sleep(0.02)
+            os.pwrite(writer, b"damage", 0)
+            os.fsync(writer)
+            with pytest.raises(RuntimeError, match="identity changed"):
+                PULLER.verify_final_identities(root, proofs)
+    finally:
+        os.close(writer)
+
+    # The receipt can remain after the failed postcheck, but it cannot be
+    # interpreted as a cloud-deletion capability.
+    assert remote_receipt.is_file()
+    assert stat.S_IMODE(remote_receipt.stat().st_mode) == 0o400
+    assert json.loads(published_receipt)["authorizes_remote_deletion"] is False
+    assert json.loads(remote_receipt.read_bytes())["authorizes_remote_deletion"] is False
 
 
 def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> None:

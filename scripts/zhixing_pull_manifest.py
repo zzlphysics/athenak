@@ -2,8 +2,9 @@
 """Resume and verify one immutable AthenaK manifest over Zhixing SFTP.
 
 This program deliberately stops at a durable local+remote acknowledgement.  It never
-deletes cloud data.  A separate cleanup gate must independently bind the manifest and
-ACK before removing any source file.
+deletes cloud data, and its ACK never authorizes deletion.  The current independent
+cleanup gate fails closed; a future storage-barrier-backed gate and transactional
+consumer would have to revalidate all evidence before removing any source file.
 """
 
 from __future__ import annotations
@@ -1555,6 +1556,11 @@ def ack_core(
 ) -> dict[str, object]:
     return {
         "schema": 1,
+        "kind": "athenak_transfer_ack_v2",
+        # A transfer ACK is deliberately never a cloud-deletion capability.
+        # The current independent cleanup gate fails closed; only a future
+        # storage-barrier-backed verifier and consumer may qualify deletion.
+        "authorizes_remote_deletion": False,
         "manifest": manifest_name,
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "segment": segment,
@@ -1573,13 +1579,39 @@ def ack_core(
     }
 
 
+class DuplicateJsonKey(ValueError):
+    """A security record contains a key with ambiguous duplicate values."""
+
+
+def reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJsonKey(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+def reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
 def validate_ack_bytes(data: bytes, expected_core: dict[str, object]) -> None:
     try:
-        value = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(
+            data,
+            object_pairs_hook=reject_duplicate_json_keys,
+            parse_constant=reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError("invalid existing ACK JSON") from exc
     if not isinstance(value, dict):
         raise RuntimeError("existing ACK is not an object")
+    canonical = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if data != canonical:
+        raise RuntimeError("existing ACK bytes are not canonical JSON")
     if set(value) != set(expected_core) | {"verified_unix"}:
         raise RuntimeError("existing ACK has unexpected fields")
     timestamp = value.pop("verified_unix")
@@ -1907,9 +1939,10 @@ def main() -> int:
                             )
                     finally:
                         os.close(visible_ack_parent)
-                    # Final files are now non-writable and their complete SHA256 was
-                    # just verified. Rebind every inode/ctime immediately before
-                    # exposing the remote deletion acknowledgement.
+                    # Rebind the local payload immediately before publishing the
+                    # non-authorizing transfer receipt. An already-open writable fd
+                    # can still invalidate this receipt after publication; therefore
+                    # no transfer ACK is ever accepted as cloud-cleanup authority.
                     verify_final_identities(local, final_proofs)
                     remote_immutable_write(client, sftp, remote_ack, ack_bytes)
                     mount_committed = verify_mount(
@@ -1956,7 +1989,7 @@ def main() -> int:
                     print(
                         f"COMPLETE: {len(records)} files, "
                         f"{expected_core['total_bytes']} bytes, durable local+remote "
-                        "immutable ACK verified",
+                        "immutable transfer ACK verified (cleanup not authorized)",
                         flush=True,
                     )
                     return 0
