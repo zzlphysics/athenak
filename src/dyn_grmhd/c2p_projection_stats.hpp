@@ -9,10 +9,14 @@
 //! \brief Lightweight diagnostics for conservative-to-primitive cache projections.
 
 #include <cstdint>
+#include <limits>
 
 #include "athena.hpp"
 
 namespace dyngr {
+
+constexpr Real kPreservedConsMixedTolerance =
+    static_cast<Real>(4096.0)*std::numeric_limits<Real>::epsilon();
 
 struct C2PProjectionStats {
   std::uint64_t solver_failures = 0;
@@ -20,6 +24,7 @@ struct C2PProjectionStats {
   std::uint64_t preserved_cons_nonfinite = 0;
   Real max_preserved_cons_relative_change = 0.0;
   Real max_preserved_cons_absolute_change = 0.0;
+  Real max_preserved_cons_mixed_scaled_change = 0.0;
 };
 
 } // namespace dyngr

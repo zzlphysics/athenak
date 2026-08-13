@@ -369,6 +369,10 @@ void Driver::ValidateLevelSubcyclingConfiguration(ParameterInput *pin,
   if (integrator != "rk2") {
     violations.emplace_back("<time>/integrator must be rk2");
   }
+  if (std::numeric_limits<Real>::digits < std::numeric_limits<double>::digits) {
+    violations.emplace_back(
+        "double precision is required for the strict restart projection contract");
+  }
   if (!pmesh->multilevel || pmesh->max_level <= pmesh->root_level) {
     violations.emplace_back("mesh refinement must provide at least two levels");
   }
@@ -1106,6 +1110,8 @@ void Driver::RebuildLevelSubcyclingRestartCaches(Mesh *pm, ParameterInput *pin) 
   std::uint64_t global_solver_failures = projection.solver_failures;
   Real global_max_relative = projection.max_preserved_cons_relative_change;
   Real global_max_absolute = projection.max_preserved_cons_absolute_change;
+  Real global_max_mixed_scaled =
+      projection.max_preserved_cons_mixed_scaled_change;
 #if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, &global_mismatches, 1, MPI_UINT64_T, MPI_SUM,
                 MPI_COMM_WORLD);
@@ -1116,6 +1122,8 @@ void Driver::RebuildLevelSubcyclingRestartCaches(Mesh *pm, ParameterInput *pin) 
   MPI_Allreduce(MPI_IN_PLACE, &global_max_relative, 1, MPI_ATHENA_REAL, MPI_MAX,
                 MPI_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &global_max_absolute, 1, MPI_ATHENA_REAL, MPI_MAX,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max_mixed_scaled, 1, MPI_ATHENA_REAL, MPI_MAX,
                 MPI_COMM_WORLD);
 #endif
 
@@ -1130,7 +1138,9 @@ void Driver::RebuildLevelSubcyclingRestartCaches(Mesh *pm, ParameterInput *pin) 
                 << global_nonfinite << ", max relative proposed conserved change="
                 << std::setprecision(std::numeric_limits<Real>::max_digits10)
                 << global_max_relative << ", max absolute proposed conserved change="
-                << global_max_absolute << std::endl;
+                << global_max_absolute << ", max mixed-scale proposed conserved change="
+                << global_max_mixed_scaled << ", mixed-scale acceptance tolerance="
+                << dyngr::kPreservedConsMixedTolerance << std::endl;
     }
 #if MPI_PARALLEL_ENABLED
     if (global_variable::nranks > 1) {
@@ -1138,6 +1148,16 @@ void Driver::RebuildLevelSubcyclingRestartCaches(Mesh *pm, ParameterInput *pin) 
     }
 #endif
     std::exit(EXIT_FAILURE);
+  }
+  if (global_variable::my_rank == 0) {
+    std::cout << "Strict-subcycling restart cache reconstruction passed: "
+              << "solver failures=0, non-finite proposed values=0, "
+              << "maximum raw component-relative proposed change="
+              << std::setprecision(std::numeric_limits<Real>::max_digits10)
+              << global_max_relative << ", maximum absolute proposed change="
+              << global_max_absolute << ", maximum mixed-scale proposed change="
+              << global_max_mixed_scaled << ", mixed-scale acceptance tolerance="
+              << dyngr::kPreservedConsMixedTolerance << "." << std::endl;
   }
   if (accepted_legacy) {
     // Make the opt-in one-shot in the versioned checkpoint emitted by this run.

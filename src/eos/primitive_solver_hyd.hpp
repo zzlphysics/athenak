@@ -404,12 +404,17 @@ class PrimitiveSolverHydro {
     int max_iterations=0;
     Real max_preserved_cons_relative_change=0.0;
     Real max_preserved_cons_absolute_change=0.0;
-    constexpr Real preserve_relative_tolerance =
-        static_cast<Real>(256.0)*std::numeric_limits<Real>::epsilon();
+    Real max_preserved_cons_mixed_scaled_change=0.0;
+    // A projection traverses metric inversion, magnetic densitization, and a nonlinear
+    // C2P solve before reconstructing each conserved component.  Bound the accumulated
+    // roundoff from those operations, rather than applying a single-operation epsilon
+    // test.  In double precision this remains below 1e-12: enough to reject material
+    // floor/repair changes while accepting sub-ULP-to-few-ULP accumulated projections.
     // All undensitized conserved components have density units in c=1 code units.
-    // Use the configured rest-mass atmosphere floor as the comparison scale near zero;
-    // using an O(1) absolute tolerance here would admit changes that are significant
-    // relative to low-density production cells.
+    // Use the configured rest-mass atmosphere floor as the lower comparison scale near
+    // zero.  The per-cell loop also includes the local conserved mass so cancellation in
+    // momentum or energy is judged against that cell, not against an arbitrary O(1)
+    // absolute tolerance.
     const Real preserve_reference_scale = fmax(
         eos_.GetDensityFloor()*mb, std::numeric_limits<Real>::min());
     Kokkos::parallel_reduce("pshyd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
@@ -420,7 +425,8 @@ class PrimitiveSolverHydro {
                   std::uint64_t &sumprinted, int &max_iterations_used,
                   std::uint64_t &sumpreservedmismatches,
                   std::uint64_t &sumpreservednonfinite,
-                  Real &max_preserved_relative, Real &max_preserved_absolute) {
+                  Real &max_preserved_relative, Real &max_preserved_absolute,
+                  Real &max_preserved_mixed_scaled) {
       const int a = idx/nkji;
       const int m = active_lids(active_offset + a);
       int k = (idx - a*nkji)/nji;
@@ -660,6 +666,12 @@ class PrimitiveSolverHydro {
         if (preserve_cons) {
           bool mismatch = false;
           bool nonfinite = projection_nonfinite;
+          // Momentum and energy can be close to zero even in a finite-density cell.
+          // Their meaningful absolute roundoff scale is therefore the local conserved
+          // mass, not only their own cancellation-prone component magnitude.
+          const Real local_mass_scale = fmax(
+              fmax(fabs(cons_pt[CDN]), fabs(cons_pt_old[CDN])),
+              preserve_reference_scale);
           for (int n = CDN; n <= CTA; ++n) {
             const Real difference = fabs(cons_pt[n] - cons_pt_old[n]);
             const Real scale = fmax(fabs(cons_pt[n]), fabs(cons_pt_old[n]));
@@ -671,9 +683,13 @@ class PrimitiveSolverHydro {
               max_preserved_relative = fmax(max_preserved_relative, relative);
             }
             nonfinite = nonfinite || !finite_pair;
-            const Real comparison_scale = fmax(scale, preserve_reference_scale);
+            const Real comparison_scale = fmax(scale, local_mass_scale);
+            const Real mixed_scaled = finite_pair
+                ? difference/comparison_scale : 0.0;
+            max_preserved_mixed_scaled =
+                fmax(max_preserved_mixed_scaled, mixed_scaled);
             mismatch = mismatch || (finite_pair &&
-                difference > preserve_relative_tolerance*comparison_scale);
+                mixed_scaled > dyngr::kPreservedConsMixedTolerance);
           }
           for (int n = 0; n < nscal; ++n) {
             const int v = CYD + n;
@@ -687,9 +703,13 @@ class PrimitiveSolverHydro {
               max_preserved_relative = fmax(max_preserved_relative, relative);
             }
             nonfinite = nonfinite || !finite_pair;
-            const Real comparison_scale = fmax(scale, preserve_reference_scale);
+            const Real comparison_scale = fmax(scale, local_mass_scale);
+            const Real mixed_scaled = finite_pair
+                ? difference/comparison_scale : 0.0;
+            max_preserved_mixed_scaled =
+                fmax(max_preserved_mixed_scaled, mixed_scaled);
             mismatch = mismatch || (finite_pair &&
-                difference > preserve_relative_tolerance*comparison_scale);
+                mixed_scaled > dyngr::kPreservedConsMixedTolerance);
           }
           for (int n = IBX; n <= IBZ; ++n) {
             nonfinite = nonfinite || !isfinite(bcc0(m,n,k,j,i)) || !isfinite(b3u[n]);
@@ -768,7 +788,8 @@ class PrimitiveSolverHydro {
        Kokkos::Sum<std::uint64_t>(count_preserved_cons_mismatches),
        Kokkos::Sum<std::uint64_t>(count_preserved_cons_nonfinite),
        Kokkos::Max<Real>(max_preserved_cons_relative_change),
-       Kokkos::Max<Real>(max_preserved_cons_absolute_change));
+       Kokkos::Max<Real>(max_preserved_cons_absolute_change),
+       Kokkos::Max<Real>(max_preserved_cons_mixed_scaled_change));
 
     if (floors_only) {
       ps.GetEOSMutable().SetPrimitiveFloorFailure(prim_failure);
@@ -794,7 +815,8 @@ class PrimitiveSolverHydro {
     return {count_fail, count_preserved_cons_mismatches,
             count_preserved_cons_nonfinite,
             max_preserved_cons_relative_change,
-            max_preserved_cons_absolute_change};
+            max_preserved_cons_absolute_change,
+            max_preserved_cons_mixed_scaled_change};
   }
 
   // Get the transformed magnetosonic speeds at a point in a given direction.
