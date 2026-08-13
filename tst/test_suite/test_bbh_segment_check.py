@@ -62,6 +62,19 @@ ABSOLUTE_THRESHOLDS = {
     "hard_equal_zero": ["eos_fail", "eos_vceil"],
     "c2p_iterations_exclusive_max": 25,
 }
+CANONICAL_EVENT_THRESHOLDS = [{
+    "name": "fofc_per_test", "numerator": "fofc",
+    "denominator": "fofc_tests", "max_ratio": 0.005,
+}, {
+    "name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
+    "denominator": "c2p_calls", "max_ratio": 0.005,
+}, {
+    "name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
+    "denominator": "c2p_calls", "max_ratio": 0.005,
+}]
+CANONICAL_YELLOW_EVENT_THRESHOLDS = [{
+    **rule, "max_ratio": 0.001, "consecutive_rows": 3,
+} for rule in CANONICAL_EVENT_THRESHOLDS]
 
 
 def _environment_contract() -> dict[str, object]:
@@ -259,6 +272,10 @@ def _plan() -> dict[str, object]:
                 "name": "cons_adjust_per_c2p_call",
                 "numerator": "cons_adjust", "denominator": "c2p_calls",
                 "max_ratio": 0.005,
+            }, {
+                "name": "mag_adjust_per_c2p_call",
+                "numerator": "mag_adjust", "denominator": "c2p_calls",
+                "max_ratio": 0.005,
             }],
             "event_absolute_thresholds": ABSOLUTE_THRESHOLDS,
             "yellow_event_thresholds": [{
@@ -269,6 +286,10 @@ def _plan() -> dict[str, object]:
                 "name": "cons_adjust_per_c2p_call",
                 "numerator": "cons_adjust", "denominator": "c2p_calls",
                 "max_ratio": 0.001, "consecutive_rows": 3,
+            }, {
+                "name": "mag_adjust_per_c2p_call",
+                "numerator": "mag_adjust", "denominator": "c2p_calls",
+                "max_ratio": 0.001, "consecutive_rows": 3,
             }],
             "nonfinite_count_max": 0,
             "divb_max_abs": {"hard": 1.0e-8, "yellow": 1.0e-11},
@@ -276,6 +297,7 @@ def _plan() -> dict[str, object]:
                 "hard_per_root_step": 0.005,
                 "yellow_per_root_step": 0.0025,
                 "yellow_per_48M": 0.02,
+                "rolling_window_root_steps": 10,
             },
             "restart_contract": {
                 "real_bytes": 8, "subcycling": "level",
@@ -573,6 +595,25 @@ def test_validate_plan_requires_every_execution_tool_binding() -> None:
 
 
 @pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda plan: plan["policy"]["event_thresholds"].pop(),
+        lambda plan: plan["policy"]["yellow_event_thresholds"][2].__setitem__(
+            "consecutive_rows", 2),
+        lambda plan: plan["policy"]["baryon_mass_fractional_loss"].__setitem__(
+            "rolling_window_root_steps", 9),
+    ),
+    ids=("remove-magnetic-hard-rule", "weaken-yellow-consecutive-run",
+         "change-baryon-window"),
+)
+def test_validate_plan_rejects_tampered_scientific_policy(mutate) -> None:
+    plan = _plan()
+    mutate(plan)
+    with pytest.raises(CHECKER.CheckFailure, match="policy|threshold"):
+        CHECKER.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
     ("mutate", "message"),
     (
         (lambda plan: plan["tools"].pop("nvidia_smi"), "nvidia_smi"),
@@ -790,6 +831,84 @@ def test_event_log_requires_every_cycle_exactly_once(
     with pytest.raises(CHECKER.CheckFailure, match="ordered, unique"):
         CHECKER.audit_event_log(
             event_log, 10, 13, THRESHOLDS, ABSOLUTE_THRESHOLDS)
+
+
+def test_mag_adjust_hard_ratio_is_enforced_at_exact_boundary(
+        tmp_path: Path) -> None:
+    event_log = tmp_path / "events.log"
+    rows = [
+        # ratio=0.005 is allowed by the inclusive hard maximum.
+        "11 0 0 0 0 0 1 0 0 5 1000 1",
+        "12 0 0 0 0 0 1 0 0 6 1000 1",
+    ]
+    event_log.write_text(EVENT_HEADER + "\n" + "\n".join(rows) + "\n",
+                         encoding="utf-8")
+    with pytest.raises(CHECKER.CheckFailure, match="mag_adjust/c2p_calls"):
+        CHECKER.audit_event_log(
+            event_log, 10, 12, CANONICAL_EVENT_THRESHOLDS,
+            ABSOLUTE_THRESHOLDS)
+
+    event_log.write_text(
+        EVENT_HEADER + "\n" + rows[0] + "\n"
+        "12 0 0 0 0 0 1 0 0 5 1000 1\n", encoding="utf-8")
+    result = CHECKER.audit_event_log(
+        event_log, 10, 12, CANONICAL_EVENT_THRESHOLDS,
+        ABSOLUTE_THRESHOLDS)
+    magnetic = next(row for row in result["hard_ratio_observations"]
+                    if row["name"] == "mag_adjust_per_c2p_call")
+    assert magnetic["maximum_ratio"] == 0.005
+    assert magnetic["maximum_cycle"] == 11
+
+
+def test_yellow_event_ratio_requires_three_consecutive_exceedances() -> None:
+    ratios = (0.0011, 0.0012, 0.001, 0.0013, 0.0014, 0.0015)
+    rows = [{
+        "cycle": 11 + index,
+        "fofc": round(ratio * 10000), "fofc_tests": 10000,
+        "cons_adjust": 0, "mag_adjust": 0, "c2p_calls": 10000,
+    } for index, ratio in enumerate(ratios)]
+    audit = CHECKER.audit_event_ratio_advisories(
+        {"_rows": rows}, CANONICAL_YELLOW_EVENT_THRESHOLDS)
+    fofc = next(row for row in audit["ratios"]
+                if row["name"] == "fofc_per_test")
+    assert audit["severity"] == "yellow"
+    assert fofc["severity"] == "yellow"
+    assert fofc["maximum_consecutive_exceedances"] == 3
+    assert fofc["triggered_runs"] == [{
+        "cycle_start": 14, "cycle_end": 16, "rows": 3,
+        "maximum_ratio": 0.0015, "maximum_cycle": 16,
+    }]
+    # Equality is green, and two yellow rows alone are not sustained.
+    assert next(row for row in audit["ratios"]
+                if row["name"] == "cons_adjust_per_c2p_call")["severity"] == "green"
+
+
+def test_floor_rates_record_anchor_and_parent_normalized_trends() -> None:
+    current = {
+        "cycle_min": 21, "cycle_max": 30,
+        "totals": {"c2p_calls": 1000, "eos_dfloor": 10,
+                   "eos_efloor": 20, "eos_tfloor": 50},
+    }
+    anchor = CHECKER.audit_floor_rate_trends(current, None)
+    assert anchor["severity"] == "green"
+    assert anchor["current"]["rates_per_c2p_call"]["eos_tfloor"] == 0.05
+    assert anchor["parent_comparison"]["status"] == "unavailable_anchor"
+
+    parent = {"event_log_audit": {
+        "cycle_min": 11, "cycle_max": 20,
+        "totals": {"c2p_calls": 2000, "eos_dfloor": 40,
+                   "eos_efloor": 20, "eos_tfloor": 50},
+    }}
+    chained = CHECKER.audit_floor_rate_trends(current, parent)
+    comparison = chained["parent_comparison"]
+    assert comparison["status"] == "available"
+    assert comparison["rates"]["eos_dfloor"] == {
+        "current_rate": 0.01, "parent_rate": 0.02,
+        "absolute_change": -0.01, "current_over_parent": 0.5,
+        "trend": "decreased",
+    }
+    assert comparison["rates"]["eos_tfloor"]["current_over_parent"] == 2.0
+    assert comparison["rates"]["eos_tfloor"]["trend"] == "increased"
 
 
 def test_four_column_gpu_snapshot_is_rejected(tmp_path: Path) -> None:
@@ -1270,6 +1389,58 @@ def test_baryon_hard_limit_includes_source_to_first_step(tmp_path: Path) -> None
     assert history["baryon_step_loss"]["maximum_fractional_loss"] == 0.0
     with pytest.raises(CHECKER.CheckFailure, match="adjacent-step"):
         CHECKER.audit_baryon_mass(history, 0.005, 3, 100.0)
+
+
+def test_baryon_yellow_audits_adjacent_and_every_ten_step_window() -> None:
+    source_mass = 100.0
+    per_step_factor = 0.9979
+    rows = [{"time": 52.8 + 4.8 * index,
+             "baryon_m": source_mass * per_step_factor ** (index + 1)}
+            for index in range(11)]
+    history = {
+        "_row_values": rows,
+        "fixed_root_dt": 4.8,
+        "implicit_cycle_min": 11,
+        "time_min": 52.8,
+    }
+    advisory = CHECKER.audit_baryon_mass_advisory(
+        history, source_mass, 10, 0.0025, 0.02, 10)
+    assert advisory["severity"] == "yellow"
+    assert advisory["per_root_step"]["severity"] == "green"
+    assert advisory["per_root_step"]["maximum_fractional_loss"] == pytest.approx(
+        0.0021)
+    rolling = advisory["rolling_window"]
+    assert rolling["severity"] == "yellow"
+    assert rolling["windows_checked"] == 2
+    assert rolling["cycle_to"] - rolling["cycle_from"] == 10
+    assert rolling["cycle_from"] in (10, 11)
+    assert rolling["maximum_fractional_loss"] > 0.02
+
+    # The yellow comparison is strict: equality with the observed maximum stays green.
+    boundary = CHECKER.audit_baryon_mass_advisory(
+        history, source_mass, 10, 0.0025,
+        rolling["maximum_fractional_loss"], 10)
+    assert boundary["rolling_window"]["severity"] == "green"
+
+
+def test_short_segment_records_unevaluated_ten_step_window() -> None:
+    history = {
+        "_row_values": [{"time": 52.8, "baryon_m": 99.9}],
+        "fixed_root_dt": 4.8,
+        "implicit_cycle_min": 11,
+        "time_min": 52.8,
+    }
+    advisory = CHECKER.audit_baryon_mass_advisory(
+        history, 100.0, 10, 0.0025, 0.02, 10)
+    assert advisory["severity"] == "green"
+    assert advisory["rolling_window"] == {
+        "severity": "green", "status": "insufficient_segment_span",
+        "yellow_fractional_loss_exclusive_min": 0.02,
+        "window_root_steps": 10, "window_duration": 48.0,
+        "windows_checked": 0, "maximum_fractional_loss": None,
+        "cycle_from": None, "cycle_to": None,
+        "time_from": None, "time_to": None,
+    }
 
 
 def test_anchor_source_baryon_is_reparsed_not_trusted(tmp_path: Path) -> None:

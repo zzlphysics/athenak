@@ -123,6 +123,16 @@ stored endpoint-restart Real, every planned binary field, `divB`, histories, and
 baryon-mass loss.  Publish and transfer the closed segment only after this qualification;
 do not let a launcher silently continue past a missing or failed report.
 
+Each immutable pass also contains `scientific_advisories`.  These advisories do not
+weaken or replace the hard gate: they mark `yellow` only after three consecutive root
+cycles above 0.001 for FOFC/tests, conservative-adjust/C2P, or magnetic-adjust/C2P;
+after a baryon-mass loss above 0.0025 in one root step; after a loss above 0.02 in any
+sliding ten-root-step window (48M when `root_dt=4.8`); or when `divB` exceeds its yellow
+level.  The report names the concrete cycles, intervals, and observed rates.  Density,
+energy, and temperature floor counts are always summarized per C2P call; chained
+segments additionally record their normalized change from the bound parent pass as a
+trend, without silently converting that trend into a pass/fail threshold.
+
 Example on the compute host after a segment has closed:
 
 ```bash

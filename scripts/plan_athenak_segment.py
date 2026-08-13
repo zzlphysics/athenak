@@ -754,6 +754,12 @@ def _policy(root_dt: float, ranks: int) -> dict[str, Any]:
             "denominator": "c2p_calls",
             "max_ratio": 0.005,
         },
+        {
+            "name": "mag_adjust_per_c2p_call",
+            "numerator": "mag_adjust",
+            "denominator": "c2p_calls",
+            "max_ratio": 0.005,
+        },
     ]
     yellow_ratios = [
         {**item, "max_ratio": 0.001, "consecutive_rows": 3}
@@ -811,6 +817,7 @@ def _policy(root_dt: float, ranks: int) -> dict[str, Any]:
             "hard_per_root_step": 0.005,
             "yellow_per_root_step": 0.0025,
             "yellow_per_48M": 0.02,
+            "rolling_window_root_steps": 10,
         },
         "gpu_exit_memory_mib_max": 100.0,
         "gpu_ecc": {

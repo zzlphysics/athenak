@@ -880,6 +880,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
          "denominator": "c2p_calls",
          "max_ratio": 0.005},
+        {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
+         "denominator": "c2p_calls", "max_ratio": 0.005},
     ], "policy event ratios differ from strict campaign thresholds")
     absolute_events = policy.get("event_absolute_thresholds")
     _require(absolute_events == {
@@ -899,6 +901,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "hard_per_root_step": 0.005,
         "yellow_per_root_step": 0.0025,
         "yellow_per_48M": 0.02,
+        "rolling_window_root_steps": 10,
     }, "baryon policy differs from strict campaign thresholds")
     _require(memory_limit == 100.0,
              "GPU exit-memory limit must equal the strict value 100 MiB")
@@ -937,6 +940,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
          "denominator": "fofc_tests", "max_ratio": 0.001,
          "consecutive_rows": 3},
         {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
+         "denominator": "c2p_calls", "max_ratio": 0.001,
+         "consecutive_rows": 3},
+        {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
          "denominator": "c2p_calls", "max_ratio": 0.001,
          "consecutive_rows": 3},
     ], "yellow event policy differs from strict campaign thresholds")
@@ -1808,6 +1814,27 @@ def _normalize_event_thresholds(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _normalize_yellow_event_thresholds(value: Any) -> list[dict[str, Any]]:
+    """Validate non-fatal ratio warnings without weakening the hard rules."""
+
+    _require(isinstance(value, list) and value,
+             "yellow event thresholds must be a nonempty array")
+    normalized = _normalize_event_thresholds(value)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, (raw, rule) in enumerate(zip(value, normalized)):
+        name = rule.get("name")
+        consecutive = _integer(raw.get("consecutive_rows"),
+                               f"yellow_event_thresholds[{index}].consecutive_rows")
+        _require(isinstance(name, str) and bool(name) and name not in seen,
+                 f"yellow event threshold {index} has an invalid or duplicate name")
+        _require(consecutive > 0,
+                 f"yellow event threshold {index} consecutive_rows must be positive")
+        seen.add(name)
+        result.append({**rule, "consecutive_rows": consecutive})
+    return result
+
+
 def audit_event_log(path: Path, source_cycle: int, final_cycle: int,
                     thresholds: Any,
                     absolute_thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1854,6 +1881,7 @@ def audit_event_log(path: Path, source_cycle: int, final_cycle: int,
     expected_cycles = list(range(source_cycle + 1, final_cycle + 1))
     _require(cycles == expected_cycles,
              "event cycles must be ordered, unique, and exactly source+1..endpoint")
+    ratio_observations: list[dict[str, Any]] = []
     for row in rows:
         _require(row["eos_fail"] == 0 and row["eos_vceil"] == 0,
                  f"cycle {row['cycle']}: eos_fail and eos_vceil must be zero")
@@ -1869,6 +1897,16 @@ def audit_event_log(path: Path, source_cycle: int, final_cycle: int,
             _require(math.isfinite(ratio) and ratio <= rule["max_ratio"],
                      f"cycle {row['cycle']}: {rule['numerator']}/{rule['denominator']} "
                      f"={ratio} exceeds {rule['max_ratio']}")
+    for rule in rules:
+        ratios = [row[rule["numerator"]] / row[rule["denominator"]]
+                  for row in rows]
+        maximum_index = max(range(len(ratios)), key=ratios.__getitem__)
+        ratio_observations.append({
+            **rule,
+            "rows_checked": len(rows),
+            "maximum_ratio": ratios[maximum_index],
+            "maximum_cycle": rows[maximum_index]["cycle"],
+        })
     return {
         "schema": list(EVENT_COLUMNS),
         "rows": len(rows),
@@ -1879,6 +1917,134 @@ def audit_event_log(path: Path, source_cycle: int, final_cycle: int,
         "totals": {
             name: sum(row[name] for row in rows) for name in EVENT_COLUMNS[1:]
         },
+        "hard_ratio_observations": ratio_observations,
+        "_rows": rows,
+    }
+
+
+def audit_event_ratio_advisories(event_audit: dict[str, Any],
+                                 yellow_thresholds: Any) -> dict[str, Any]:
+    """Report sustained yellow ratios while leaving hard pass/fail unchanged."""
+
+    rules = _normalize_yellow_event_thresholds(yellow_thresholds)
+    rows = event_audit.get("_rows")
+    _require(isinstance(rows, list) and rows,
+             "event audit lacks rows needed for scientific advisories")
+    audits: list[dict[str, Any]] = []
+    for rule in rules:
+        observations: list[tuple[int, float]] = []
+        for row in rows:
+            _require(isinstance(row, dict), "event advisory row must be an object")
+            denominator = _integer(row.get(rule["denominator"]),
+                                   f"cycle event {rule['denominator']}")
+            numerator = _integer(row.get(rule["numerator"]),
+                                 f"cycle event {rule['numerator']}")
+            _require(denominator > 0,
+                     f"event advisory denominator {rule['denominator']} is zero")
+            observations.append((_integer(row.get("cycle"), "event cycle"),
+                                 numerator / denominator))
+
+        runs: list[list[tuple[int, float]]] = []
+        active: list[tuple[int, float]] = []
+        for observation in observations:
+            if observation[1] > rule["max_ratio"]:
+                active.append(observation)
+            elif active:
+                runs.append(active)
+                active = []
+        if active:
+            runs.append(active)
+        qualifying = [run for run in runs if len(run) >= rule["consecutive_rows"]]
+        maximum_cycle, maximum_ratio = max(observations, key=lambda item: item[1])
+        triggered_runs: list[dict[str, Any]] = []
+        for run in qualifying:
+            peak_cycle, peak_ratio = max(run, key=lambda item: item[1])
+            triggered_runs.append({
+                "cycle_start": run[0][0],
+                "cycle_end": run[-1][0],
+                "rows": len(run),
+                "maximum_ratio": peak_ratio,
+                "maximum_cycle": peak_cycle,
+            })
+        audits.append({
+            "name": rule["name"],
+            "severity": "yellow" if triggered_runs else "green",
+            "numerator": rule["numerator"],
+            "denominator": rule["denominator"],
+            "yellow_ratio_exclusive_min": rule["max_ratio"],
+            "required_consecutive_rows": rule["consecutive_rows"],
+            "rows_checked": len(observations),
+            "cycle_min": observations[0][0],
+            "cycle_max": observations[-1][0],
+            "maximum_ratio": maximum_ratio,
+            "maximum_cycle": maximum_cycle,
+            "maximum_consecutive_exceedances": max(
+                (len(run) for run in runs), default=0),
+            "triggered_runs": triggered_runs,
+        })
+    return {
+        "severity": ("yellow" if any(row["severity"] == "yellow" for row in audits)
+                     else "green"),
+        "ratios": audits,
+    }
+
+
+def audit_floor_rate_trends(event_audit: dict[str, Any],
+                            parent: dict[str, Any] | None) -> dict[str, Any]:
+    """Record floor rates normalized by C2P calls; never turn a trend into failure."""
+
+    floor_columns = ("eos_dfloor", "eos_efloor", "eos_tfloor")
+
+    def summary(audit: dict[str, Any], label: str) -> dict[str, Any]:
+        totals = audit.get("totals")
+        _require(isinstance(totals, dict), f"{label} event audit lacks totals")
+        calls = _integer(totals.get("c2p_calls"), f"{label} c2p_calls")
+        _require(calls > 0, f"{label} c2p_calls must be positive")
+        cycles = (_integer(audit.get("cycle_min"), f"{label} cycle_min"),
+                  _integer(audit.get("cycle_max"), f"{label} cycle_max"))
+        counts = {name: _integer(totals.get(name), f"{label} {name}")
+                  for name in floor_columns}
+        _require(all(value >= 0 for value in counts.values()),
+                 f"{label} floor counts must be nonnegative")
+        return {
+            "cycle_min": cycles[0], "cycle_max": cycles[1],
+            "c2p_calls": calls, "counts": counts,
+            "rates_per_c2p_call": {
+                name: counts[name] / calls for name in floor_columns
+            },
+        }
+
+    current = summary(event_audit, "current")
+    if parent is None:
+        comparison: dict[str, Any] = {
+            "status": "unavailable_anchor",
+            "reason": "no parent segment pass",
+        }
+    else:
+        parent_summary = summary(parent.get("event_log_audit", {}), "parent")
+        rates: dict[str, Any] = {}
+        for name in floor_columns:
+            current_rate = current["rates_per_c2p_call"][name]
+            parent_rate = parent_summary["rates_per_c2p_call"][name]
+            rates[name] = {
+                "current_rate": current_rate,
+                "parent_rate": parent_rate,
+                "absolute_change": current_rate - parent_rate,
+                "current_over_parent": (
+                    current_rate / parent_rate if parent_rate > 0.0 else None),
+                "trend": ("increased" if current_rate > parent_rate else
+                          "decreased" if current_rate < parent_rate else "unchanged"),
+            }
+        comparison = {
+            "status": "available",
+            "parent": parent_summary,
+            "rates": rates,
+        }
+    return {
+        "severity": "green",
+        "classification": "trend_only_no_pass_fail_threshold",
+        "current": current,
+        "parent_comparison": comparison,
     }
 
 
@@ -2560,6 +2726,93 @@ def audit_baryon_mass(history: dict[str, Any], hard_per_root_step: Any,
             "maximum_fractional_loss": maximum_step_loss,
             "hard_fractional_loss": hard,
         },
+    }
+
+
+def audit_baryon_mass_advisory(history: dict[str, Any], source_mass: Any,
+                               source_cycle: int, yellow_per_root_step: Any,
+                               yellow_per_window: Any,
+                               window_root_steps: Any) -> dict[str, Any]:
+    """Compute per-step and sliding-window yellow baryon-loss diagnostics."""
+
+    rows = history.get("_row_values")
+    _require(isinstance(rows, list) and rows,
+             "baryon history lacks rows needed for scientific advisories")
+    source = _number(source_mass, "source baryon mass")
+    _require(source > 0.0, "source baryon mass must be positive")
+    step_threshold = _number(yellow_per_root_step,
+                             "baryon yellow_per_root_step")
+    window_threshold = _number(yellow_per_window, "baryon yellow_per_48M")
+    window_steps = _integer(window_root_steps, "baryon rolling_window_root_steps")
+    _require(step_threshold >= 0.0 and window_threshold >= 0.0 and window_steps > 0,
+             "baryon yellow thresholds and window must be nonnegative/positive")
+    root_dt = _number(history.get("fixed_root_dt"), "baryon fixed_root_dt")
+    first_cycle = _integer(history.get("implicit_cycle_min"),
+                           "baryon implicit_cycle_min")
+    _require(first_cycle == source_cycle + 1,
+             "baryon advisory source cycle differs from history")
+    masses = [source]
+    times = [_number(history.get("time_min"), "baryon time_min") - root_dt]
+    for index, row in enumerate(rows):
+        _require(isinstance(row, dict), f"baryon row {index} must be an object")
+        mass = _number(row.get("baryon_m"), f"baryon row {index} mass")
+        row_time = _number(row.get("time"), f"baryon row {index} time")
+        _require(mass > 0.0, f"baryon row {index} mass must be positive")
+        masses.append(mass)
+        times.append(row_time)
+    cycles = list(range(source_cycle, source_cycle + len(masses)))
+
+    adjacent = [max(0.0, (left - right) / left)
+                for left, right in zip(masses, masses[1:])]
+    maximum_step_index = max(range(len(adjacent)), key=adjacent.__getitem__)
+    maximum_step = adjacent[maximum_step_index]
+    step_audit = {
+        "severity": "yellow" if maximum_step > step_threshold else "green",
+        "yellow_fractional_loss_exclusive_min": step_threshold,
+        "intervals_checked": len(adjacent),
+        "maximum_fractional_loss": maximum_step,
+        "cycle_from": cycles[maximum_step_index],
+        "cycle_to": cycles[maximum_step_index + 1],
+        "time_from": times[maximum_step_index],
+        "time_to": times[maximum_step_index + 1],
+    }
+
+    rolling: list[tuple[int, float]] = []
+    for index in range(len(masses) - window_steps):
+        rolling.append((index, max(
+            0.0, (masses[index] - masses[index + window_steps]) / masses[index])))
+    if rolling:
+        maximum_window_index, maximum_window = max(rolling, key=lambda item: item[1])
+        window_audit: dict[str, Any] = {
+            "severity": ("yellow" if maximum_window > window_threshold else "green"),
+            "status": "evaluated",
+            "yellow_fractional_loss_exclusive_min": window_threshold,
+            "window_root_steps": window_steps,
+            "window_duration": root_dt * window_steps,
+            "windows_checked": len(rolling),
+            "maximum_fractional_loss": maximum_window,
+            "cycle_from": cycles[maximum_window_index],
+            "cycle_to": cycles[maximum_window_index + window_steps],
+            "time_from": times[maximum_window_index],
+            "time_to": times[maximum_window_index + window_steps],
+        }
+    else:
+        window_audit = {
+            "severity": "green",
+            "status": "insufficient_segment_span",
+            "yellow_fractional_loss_exclusive_min": window_threshold,
+            "window_root_steps": window_steps,
+            "window_duration": root_dt * window_steps,
+            "windows_checked": 0,
+            "maximum_fractional_loss": None,
+            "cycle_from": None, "cycle_to": None,
+            "time_from": None, "time_to": None,
+        }
+    return {
+        "severity": ("yellow" if step_audit["severity"] == "yellow" or
+                     window_audit["severity"] == "yellow" else "green"),
+        "per_root_step": step_audit,
+        "rolling_window": window_audit,
     }
 
 
@@ -3903,21 +4156,6 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
                 coverage_by_path[audited["path"]].items() if key != "path"
             }
 
-    # Full topology/history row arrays are retained only until cross-file proofs finish;
-    # compact digests and coverage summaries are the immutable report binding.
-    for rows in binary_by_block.values():
-        for audited in rows:
-            audited.pop("_logical_locations", None)
-            audited.pop("_topology_records", None)
-    for audited in output_rows:
-        audited.pop("_logical_locations", None)
-        audited.pop("_topology_records", None)
-        history = audited.get("history")
-        if isinstance(history, dict):
-            history.pop("_row_values", None)
-    for history in (*baryon_histories, *bbh_histories):
-        history.pop("_row_values", None)
-
     divb_hard = _number(plan["policy"]["divb_max_abs"]["hard"],
                          "divb_max_abs.hard")
     _require(divb_maxima, "no inspected binary output contained the divB field")
@@ -3934,6 +4172,37 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         plan["policy"]["baryon_mass_fractional_loss"]["hard_per_root_step"],
         expected["root_steps"],
         source_baryon_mass)
+    baryon_policy = plan["policy"]["baryon_mass_fractional_loss"]
+    baryon_advisory = audit_baryon_mass_advisory(
+        baryon_history, source_baryon_mass, expected["source_cycle"],
+        baryon_policy["yellow_per_root_step"],
+        baryon_policy["yellow_per_48M"],
+        baryon_policy["rolling_window_root_steps"])
+    event_advisories = audit_event_ratio_advisories(
+        events, plan["policy"]["yellow_event_thresholds"])
+    floor_trends = audit_floor_rate_trends(events, parent)
+    divb_yellow = _number(plan["policy"]["divb_max_abs"]["yellow"],
+                           "divb_max_abs.yellow")
+    worst_divb_file = max(divb_maxima, key=lambda item: item["max_abs"])
+    divb_advisory = {
+        "severity": "yellow" if worst_divb > divb_yellow else "green",
+        "yellow_max_abs_exclusive_min": divb_yellow,
+        "observed_max_abs": worst_divb,
+        "path": worst_divb_file["path"],
+        "cycle": worst_divb_file["cycle"],
+        "time": worst_divb_file["time"],
+    }
+    scientific_advisories = {
+        "schema": "athenak_scientific_advisories_v1",
+        "severity": ("yellow" if event_advisories["severity"] == "yellow" or
+                     baryon_advisory["severity"] == "yellow" or
+                     divb_advisory["severity"] == "yellow" else "green"),
+        "event_ratios": event_advisories,
+        "baryon_mass": baryon_advisory,
+        "divb": divb_advisory,
+        "floor_rates": floor_trends,
+        "pass_fail_effect": "none_yellow_advisories_are_nonfatal",
+    }
     scientific = {
         "nonfinite_count": 0,
         "divb": {"hard_max_abs": divb_hard, "observed_max_abs": worst_divb,
@@ -3943,6 +4212,22 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
             **baryon_audit,
         },
     }
+
+    # Row-level scratch arrays are retained until every hard and advisory proof has
+    # finished; only compact, concrete cycle/rate summaries enter the pass report.
+    events.pop("_rows", None)
+    for rows in binary_by_block.values():
+        for audited in rows:
+            audited.pop("_logical_locations", None)
+            audited.pop("_topology_records", None)
+    for audited in output_rows:
+        audited.pop("_logical_locations", None)
+        audited.pop("_topology_records", None)
+        history = audited.get("history")
+        if isinstance(history, dict):
+            history.pop("_row_values", None)
+    for history in (*baryon_histories, *bbh_histories):
+        history.pop("_row_values", None)
 
     script_path = Path(__file__).resolve()
     audit_tool = Path(sys.modules[audit_restart.__module__].__file__).resolve()
@@ -4024,6 +4309,7 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_audit": gpus,
         "parameter_audit": parameters,
         "scientific_threshold_audit": scientific,
+        "scientific_advisories": scientific_advisories,
         "binary_topology_pair_audit": binary_pairs,
         "binary_selection_coverage_audit": selection_coverage,
         "state_directory_audit": state_tree,
