@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -91,7 +92,7 @@ def _run_restart(
 
 def _run_restart_expect_failure(
         restart: Path, run_dir: Path, *, ranks: int,
-        expected: str) -> None:
+        expected: str, overrides: tuple[str, ...] = ()) -> None:
     command = [
         _mpi_launcher(),
         "-np",
@@ -103,6 +104,7 @@ def _run_restart_expect_failure(
         str(run_dir),
         "time/nlim=1",
         "time/tlim=100",
+        *overrides,
     ]
     result = subprocess.run(
         command,
@@ -141,6 +143,23 @@ def _restart_metadata(restart: Path, *, ranks: int) -> dict[str, object]:
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def _restart_parameter(restart: Path, block: str, name: str) -> str:
+    raw = restart.read_bytes()
+    marker = b"<par_end>\n"
+    parameter_end = raw.find(marker)
+    assert parameter_end >= 0, f"No ParameterInput terminator in {restart}"
+    text = raw[:parameter_end].decode("utf-8")
+    section = re.search(
+        rf"(?ms)^<{re.escape(block)}>\s*$\n(.*?)(?=^<[^>]+>\s*$|\Z)", text
+    )
+    assert section is not None, f"No <{block}> block in {restart}"
+    values = re.findall(
+        rf"(?m)^\s*{re.escape(name)}\s*=\s*(\S+)", section.group(1)
+    )
+    assert len(values) == 1, f"Unexpected {block}/{name}: {values}"
+    return values[0]
 
 
 def _run_expect_failure(run_dir: Path, *overrides: str) -> str:
@@ -242,8 +261,29 @@ def test_dense_event_rows_and_mpi_uint64_aggregation(tmp_path: Path) -> None:
         ):
             assert mpi_row[name] == 2 * serial_row[name]
         assert mpi_row["c2p_it"] == serial_row["c2p_it"]
-    assert [row["c2p_calls"] for row in serial] == [14, 28, 28]
-    assert [row["fofc_tests"] for row in serial] == [0, 20, 20]
+    # Telemetry counts physical active zones, not the six ghost cells in this 1D
+    # problem.  This keeps the values invariant under ghost width and decomposition.
+    assert [row["c2p_calls"] for row in serial] == [8, 16, 16]
+    assert [row["fofc_tests"] for row in serial] == [0, 16, 16]
+
+
+def test_active_zone_events_are_decomposition_invariant(tmp_path: Path) -> None:
+    """The same physical mesh must not gain events merely from more ghost zones."""
+    one_block_dir = tmp_path / "one_block"
+    two_block_dir = tmp_path / "two_blocks"
+    global_mesh = ("mesh/nx1=16",)
+    _run(
+        one_block_dir,
+        ranks=1,
+        overrides=(*global_mesh, "meshblock/nx1=16"),
+    )
+    _run(
+        two_block_dir,
+        ranks=2,
+        overrides=(*global_mesh, "meshblock/nx1=8"),
+    )
+
+    assert _event_rows(two_block_dir) == _event_rows(one_block_dir)
 
 
 def test_c2p_print_cap_does_not_truncate_failure_counter(tmp_path: Path) -> None:
@@ -263,9 +303,9 @@ def test_c2p_print_cap_does_not_truncate_failure_counter(tmp_path: Path) -> None
 
     rows = _event_rows(run_dir)
     assert [row["cycle"] for row in rows] == [0, 1]
-    assert sum(row["eos_fail"] for row in rows) == 42
-    assert sum(row["c2p_calls"] for row in rows) == 42
-    assert sum(row["cons_adjust"] for row in rows) == 42
+    assert sum(row["eos_fail"] for row in rows) == 24
+    assert sum(row["c2p_calls"] for row in rows) == 24
+    assert sum(row["cons_adjust"] for row in rows) == 24
 
 
 def test_restart_segments_have_one_dense_row_per_completed_cycle(tmp_path: Path) -> None:
@@ -352,7 +392,7 @@ def test_device_fofc_pending_is_drained_into_restart(tmp_path: Path) -> None:
     checkpoint = source_dir / "rst" / "dyngrmhd_eventlog.00001.rst"
     pending = _restart_metadata(checkpoint, ranks=1)["event_counters"]
     assert isinstance(pending, dict)
-    assert pending["nfofc"] == 20
+    assert pending["nfofc"] == 16
 
     _run_restart(checkpoint, resumed_dir, nlim=1)
     resumed_rows = _event_rows(resumed_dir)
@@ -379,13 +419,14 @@ def test_pending_event_counters_survive_shared_and_per_rank_restarts(
         shared_dir / "rst" / "dyngrmhd_eventlog.00001.rst"
     )
     metadata = _restart_metadata(shared_checkpoint, ranks=2)
+    assert metadata["event_counter_version"] == 2
     pending = metadata["event_counters"]
     assert isinstance(pending, dict)
-    assert pending["nfofc_tests"] == 40
+    assert pending["nfofc_tests"] == 32
 
     # A zero-step two-rank restart isolates restoration from further FOFC evolution.
     # The shared global value is placed on rank zero only; otherwise the event-log
-    # Allreduce would incorrectly turn 40 into 80.
+    # Allreduce would incorrectly turn 32 into 64.
     _run_restart(
         shared_checkpoint,
         shared_resumed_dir,
@@ -417,6 +458,48 @@ def test_pending_event_counters_survive_shared_and_per_rank_restarts(
     legacy_rows = _event_rows(legacy_resumed_dir)
     assert [row["cycle"] for row in legacy_rows] == [1]
     assert legacy_rows[0]["fofc_tests"] == 0
+
+    # Version 1 used the same fields but included ghost-zone events.  It cannot be
+    # converted to the active-zone v2 denominator.  Refuse it by default; an explicit
+    # one-time migration discards pending totals and emits a clean v2 checkpoint.
+    event_marker = (0x41544B4556543031).to_bytes(8, byteorder=sys.byteorder)
+    event_start = shared_bytes.find(event_marker)
+    assert event_start >= 0
+    assert shared_bytes.find(event_marker, event_start + 1) == -1
+    legacy_v1_checkpoint = tmp_path / "legacy_v1_events.rst"
+    legacy_v1_bytes = bytearray(shared_bytes)
+    legacy_v1_bytes[event_start + 8:event_start + 12] = (1).to_bytes(
+        4, byteorder=sys.byteorder, signed=True
+    )
+    legacy_v1_checkpoint.write_bytes(legacy_v1_bytes)
+    _run_restart_expect_failure(
+        legacy_v1_checkpoint,
+        tmp_path / "legacy_v1_rejected",
+        ranks=2,
+        expected="allow_legacy_ghost_event_counters=true",
+    )
+    migrated_v1_dir = tmp_path / "legacy_v1_migrated"
+    migration_stdout = _run_restart(
+        legacy_v1_checkpoint,
+        migrated_v1_dir,
+        nlim=1,
+        ranks=2,
+        overrides=("time/allow_legacy_ghost_event_counters=true",),
+    )
+    assert "discarding pending legacy v1 event counters" in migration_stdout
+    migrated_rows = _event_rows(migrated_v1_dir)
+    assert [row["cycle"] for row in migrated_rows] == [1]
+    assert migrated_rows[0]["fofc_tests"] == 0
+    migrated_checkpoint = (
+        migrated_v1_dir / "rst" / "dyngrmhd_eventlog.00002.rst"
+    )
+    assert migrated_checkpoint.is_file()
+    migrated_metadata = _restart_metadata(migrated_checkpoint, ranks=2)
+    assert migrated_metadata["event_counter_version"] == 2
+    assert migrated_metadata["event_counters"]["nfofc_tests"] == 0
+    assert _restart_parameter(
+        migrated_checkpoint, "time", "allow_legacy_ghost_event_counters"
+    ) in ("false", "0")
 
     per_rank_dir = tmp_path / "per_rank_source"
     per_rank_resumed_dir = tmp_path / "per_rank_resumed"
@@ -454,7 +537,6 @@ def test_pending_event_counters_survive_shared_and_per_rank_restarts(
     assert per_rank_rows[0]["fofc_tests"] == pending["nfofc_tests"]
 
     legacy_per_rank_root = tmp_path / "legacy_per_rank" / "rst"
-    event_marker = (0x41544B4556543031).to_bytes(8, byteorder=sys.byteorder)
     for rank in range(2):
         source = (
             per_rank_dir
@@ -499,6 +581,30 @@ def test_pending_event_counters_survive_shared_and_per_rank_restarts(
         tmp_path / "mixed_event_extension_run",
         ranks=2,
         expected="Per-rank restart files disagree on event-counter metadata",
+    )
+
+    # Presence alone is insufficient: a mixed v1/v2 per-rank set would otherwise
+    # restore counters on one rank and discard them on another.
+    mixed_version_root = tmp_path / "mixed_event_version" / "rst"
+    for rank in range(2):
+        source = (
+            per_rank_dir / "rst" / f"rank_{rank:08d}" / rank_zero_checkpoint.name
+        )
+        source_bytes = bytearray(source.read_bytes())
+        version_start = source_bytes.find(event_marker) + 8
+        assert version_start >= 8
+        if rank == 1:
+            source_bytes[version_start:version_start + 4] = (1).to_bytes(
+                4, byteorder=sys.byteorder, signed=True
+            )
+        destination_dir = mixed_version_root / f"rank_{rank:08d}"
+        destination_dir.mkdir(parents=True)
+        (destination_dir / source.name).write_bytes(source_bytes)
+    _run_restart_expect_failure(
+        mixed_version_root / "rank_00000000" / rank_zero_checkpoint.name,
+        tmp_path / "mixed_event_version_run",
+        ranks=2,
+        expected="Per-rank restart files disagree on event-counter format version",
     )
 
 

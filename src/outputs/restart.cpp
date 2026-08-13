@@ -30,6 +30,7 @@
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "coordinates/adm.hpp"
+#include "driver/level_subcycling_restart.hpp"
 #include "z4c/compact_object_tracker.hpp"
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
@@ -41,7 +42,10 @@ namespace {
 constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
 constexpr int kAmrCycleCounterVersion = 1;
 constexpr std::uint64_t kEventCounterMagic = UINT64_C(0x41544b4556543031);
-constexpr int kEventCounterVersion = 1;
+// For DynGRMHD, v1 included ghost-zone solver events; v2 marks the physical-active-zone
+// semantics.  Other physics modules retain v1 until their counters adopt that contract.
+constexpr int kEventCounterVersion = 2;
+constexpr int kClassicEventCounterVersion = 1;
 constexpr int kEventSumCounterCount = 10;
 constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
 constexpr int kPerRankPartitionVersion = 2;
@@ -220,6 +224,9 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     nadm = padm->nadm;
   }
   bool single_file_per_rank = out_params.single_file_per_rank;
+  const int restart_event_counter_version =
+      (pm->pmb_pack->pdyngr != nullptr) ? kEventCounterVersion
+                                       : kClassicEventCounterVersion;
   // FOFC counting is deferred on the device to avoid a fence at every subcycled RK
   // stage.  A checkpoint is a diagnostic boundary too: move pending increments into
   // the host interval before serializing it.  Draining clears only the device scalar;
@@ -398,7 +405,8 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     // parameter overrides cannot accidentally change the binary layout.
     resfile.Write_any_type(&kEventCounterMagic, sizeof(kEventCounterMagic),
                            "byte", single_file_per_rank);
-    resfile.Write_any_type(&kEventCounterVersion, sizeof(kEventCounterVersion),
+    resfile.Write_any_type(&restart_event_counter_version,
+                           sizeof(restart_event_counter_version),
                            "byte", single_file_per_rank);
     resfile.Write_any_type(&kEventSumCounterCount, sizeof(kEventSumCounterCount),
                            "byte", single_file_per_rank);
@@ -406,6 +414,15 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                            "byte", single_file_per_rank);
     resfile.Write_any_type(&restart_event_maxit, sizeof(restart_event_maxit),
                            "byte", single_file_per_rank);
+    if (pin->DoesParameterExist("time", "subcycling") &&
+        pin->GetString("time", "subcycling") == "level") {
+      resfile.Write_any_type(&level_subcycling::kRestartCacheContractMagic,
+                             sizeof(level_subcycling::kRestartCacheContractMagic),
+                             "byte", single_file_per_rank);
+      resfile.Write_any_type(&level_subcycling::kRestartCacheContractVersion,
+                             sizeof(level_subcycling::kRestartCacheContractVersion),
+                             "byte", single_file_per_rank);
+    }
   }
 
   //--- STEP 3.  Root process writes internal state of objects that require it
@@ -474,6 +491,11 @@ void RestartOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   }
   step2size += sizeof(kEventCounterMagic) + 2*sizeof(int)
              + kEventSumCounterCount*sizeof(std::uint64_t) + sizeof(int);
+  if (pin->DoesParameterExist("time", "subcycling") &&
+      pin->GetString("time", "subcycling") == "level") {
+    step2size += sizeof(level_subcycling::kRestartCacheContractMagic)
+               + sizeof(level_subcycling::kRestartCacheContractVersion);
+  }
 
   IOWrapperSizeT step3size = 3*nco*sizeof(Real);
   if (pz4c != nullptr) step3size += sizeof(Real);

@@ -23,6 +23,7 @@
 #include "coordinates/cell_locations.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
+#include "driver/level_subcycling_restart.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -33,7 +34,8 @@ namespace {
 constexpr std::uint64_t kAmrCycleCounterMagic = UINT64_C(0x41544b414d524331);
 constexpr int kAmrCycleCounterVersion = 1;
 constexpr std::uint64_t kEventCounterMagic = UINT64_C(0x41544b4556543031);
-constexpr int kEventCounterVersion = 1;
+constexpr int kEventCounterVersion = 2;
+constexpr int kLegacyEventCounterVersion = 1;
 constexpr int kEventSumCounterCount = 10;
 constexpr std::uint64_t kPerRankPartitionMagic = UINT64_C(0x41544b5052543031);
 constexpr int kPerRankPartitionVersion = 2;
@@ -700,7 +702,8 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
                               single_file_per_rank, true) ==
            sizeof(stored_sum_count));
       metadata_read_ok = metadata_read_ok &&
-                         stored_version == kEventCounterVersion &&
+                         (stored_version == kEventCounterVersion ||
+                          stored_version == kLegacyEventCounterVersion) &&
                          stored_sum_count == kEventSumCounterCount;
       if (metadata_read_ok) {
         metadata_read_ok =
@@ -715,6 +718,22 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
     if (single_file_per_rank) {
       MPI_Allreduce(MPI_IN_PLACE, &metadata_read_ok, 1, MPI_INT, MPI_MIN,
                     MPI_COMM_WORLD);
+      int version_min = 0;
+      int version_max = 0;
+      int count_min = 0;
+      int count_max = 0;
+      MPI_Allreduce(&stored_version, &version_min, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD);
+      MPI_Allreduce(&stored_version, &version_max, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD);
+      MPI_Allreduce(&stored_sum_count, &count_min, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD);
+      MPI_Allreduce(&stored_sum_count, &count_max, 1, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD);
+      if (version_min != version_max || count_min != count_max) {
+        BuildTreeError(
+            "Per-rank restart files disagree on event-counter format version");
+      }
     } else {
       MPI_Bcast(&stored_version, 1, MPI_INT, 0, MPI_COMM_WORLD);
       MPI_Bcast(&stored_sum_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -726,11 +745,39 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
       }
     }
 #endif
-    if (!metadata_read_ok || stored_version != kEventCounterVersion ||
+    if (!metadata_read_ok ||
+        (stored_version != kEventCounterVersion &&
+         stored_version != kLegacyEventCounterVersion) ||
         stored_sum_count != kEventSumCounterCount) {
       BuildTreeError("Event-counter metadata in restart is invalid");
     }
-    if (single_file_per_rank || global_variable::my_rank == 0) {
+    const bool dyn_grmhd_event_semantics =
+        pin->DoesParameterExist("mhd", "dyn_eos") &&
+        (pin->DoesBlockExist("adm") || pin->DoesBlockExist("z4c"));
+    const bool legacy_event_counters = dyn_grmhd_event_semantics &&
+        stored_version == kLegacyEventCounterVersion;
+    const bool allow_legacy_event_counters = pin->GetOrAddBoolean(
+        "time", "allow_legacy_ghost_event_counters", false);
+    if (legacy_event_counters && !allow_legacy_event_counters) {
+      BuildTreeError(
+          "Restart contains legacy event-counter version 1, whose pending totals "
+          "include ghost zones.  An explicit, one-time "
+          "<time>/allow_legacy_ghost_event_counters=true qualification is required; "
+          "the incompatible carried totals will be discarded.");
+    }
+    if (legacy_event_counters) {
+      // v1 cannot be converted to active-zone v2 without per-cell history.  Never mix
+      // the two scientific denominators.  The old segment's event log remains the
+      // authoritative record; this one-time migration deliberately starts a fresh
+      // interval and makes its opt-in false in the next checkpoint's ParameterInput.
+      if (global_variable::my_rank == 0) {
+        std::cout << "### WARNING: discarding pending legacy v1 event counters that "
+                  << "include ghost zones; new checkpoints use active-zone-only "
+                  << "event-counter version " << kEventCounterVersion << "."
+                  << std::endl;
+      }
+      pin->SetBoolean("time", "allow_legacy_ghost_event_counters", false);
+    } else if (single_file_per_rank || global_variable::my_rank == 0) {
       ecounter.neos_dfloor = stored_sums[0];
       ecounter.neos_efloor = stored_sums[1];
       ecounter.neos_tfloor = stored_sums[2];
@@ -744,6 +791,61 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
       ecounter.maxit_c2p = stored_maxit;
     }
   }
+
+  // A strict-subcycling cache-contract marker certifies that active and ghost U/B were
+  // serialized at a synchronized root-step endpoint.  Probe the binary marker itself:
+  // ParameterInput can be intentionally overlaid during a legacy qualification run.
+  int cache_contract_present = 0;
+  int cache_contract_version = 0;
+  if (global_variable::my_rank == 0 || single_file_per_rank) {
+    const IOWrapperSizeT extension_offset =
+        resfile.GetPosition(single_file_per_rank);
+    std::uint64_t cache_contract_magic = 0;
+    const std::size_t magic_bytes =
+        resfile.Read_bytes(&cache_contract_magic, 1, sizeof(cache_contract_magic),
+                           single_file_per_rank);
+    if (magic_bytes == sizeof(cache_contract_magic) &&
+        cache_contract_magic == level_subcycling::kRestartCacheContractMagic) {
+      cache_contract_present = 1;
+      if (resfile.Read_bytes(&cache_contract_version, 1,
+                             sizeof(cache_contract_version),
+                             single_file_per_rank, true) !=
+          sizeof(cache_contract_version)) {
+        BuildTreeError("Subcycling restart cache-contract metadata is truncated");
+      }
+    } else if (resfile.Seek(extension_offset, single_file_per_rank) != 0) {
+      BuildTreeError("Could not restore the pre-cache-contract restart position");
+    }
+  }
+#if MPI_PARALLEL_ENABLED
+  if (single_file_per_rank) {
+    int present_min = 0;
+    int present_max = 0;
+    int version_min = 0;
+    int version_max = 0;
+    MPI_Allreduce(&cache_contract_present, &present_min, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&cache_contract_present, &present_max, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&cache_contract_version, &version_min, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(&cache_contract_version, &version_max, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+    if (present_min != present_max || version_min != version_max) {
+      BuildTreeError("Per-rank restart files disagree on cache-contract metadata");
+    }
+  } else {
+    MPI_Bcast(&cache_contract_present, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&cache_contract_version, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  }
+#endif
+  if (cache_contract_present != 0 &&
+      cache_contract_version != level_subcycling::kRestartCacheContractVersion) {
+    BuildTreeError("Subcycling restart cache-contract version is unsupported");
+  }
+  level_subcycling_restart_cache_contract_version =
+      cache_contract_present != 0 ? cache_contract_version : 0;
+
   if (!adaptive) max_level = current_level;
 
   // Checkpoints made before level-aware costs were introduced contain a uniform unit

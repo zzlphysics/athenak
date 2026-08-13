@@ -205,6 +205,7 @@ class Mesh {
 
   Real time, dt, dtold, dt_last_completed, dt_restart_growth, cfl_no;
   int ncycle;
+  int level_subcycling_restart_cache_contract_version;
   EventCounters ecounter;
   Kokkos::View<std::uint64_t, DevMemSpace> device_nfofc_stage;
   Kokkos::View<std::uint64_t, DevMemSpace> device_nfofc_pending;

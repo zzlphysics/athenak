@@ -45,6 +45,7 @@ dynamic = true
 <time>
 evolution = dynamic
 integrator = rk2
+allow_legacy_ghost_event_counters = false
 cfl_number = 0.3
 nlim = 2
 tlim = 100.0

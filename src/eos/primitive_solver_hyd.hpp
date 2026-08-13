@@ -19,6 +19,7 @@
 #include <string>
 #include <type_traits>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <algorithm>
 
@@ -35,7 +36,7 @@
 // AthenaK headers
 #include "athena.hpp"
 #include "globals.hpp"
-#include "dyn_grmhd/dyn_grmhd.hpp"
+#include "dyn_grmhd/c2p_projection_stats.hpp"
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "coordinates/adm.hpp"
@@ -336,17 +337,19 @@ class PrimitiveSolverHydro {
     return;
   }
 
-  void ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &bfc,
-                  DvceArray5D<Real> &bcc0, DvceArray5D<Real> &prim,
-                  DvceArray5D<Real> &temperature,
-                  const int il, const int iu, const int jl, const int ju,
-                  const int kl, const int ku, bool floors_only=false) {
+  dyngr::C2PProjectionStats ConsToPrim(
+      DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &bfc,
+      DvceArray5D<Real> &bcc0, DvceArray5D<Real> &prim,
+      DvceArray5D<Real> &temperature,
+      const int il, const int iu, const int jl, const int ju,
+      const int kl, const int ku, bool floors_only=false,
+      bool preserve_cons=false, bool count_events=true) {
     int &nhyd = pmy_pack->pmhd->nmhd;
     int &nscal = pmy_pack->pmhd->nscalars;
     auto active_lids = pmy_pack->active_lids.d_view;
     const int active_offset = pmy_pack->active_offset;
     const int nmb_active = pmy_pack->nmb_active;
-    if (nmb_active <= 0) return;
+    if (nmb_active <= 0) return {};
     auto &fofc_ = pmy_pack->pmhd->fofc;
 
     // Some problem-specific parameters
@@ -357,13 +360,17 @@ class PrimitiveSolverHydro {
     auto &pexcise_ = pmy_pack->pcoord->coord_data.pexcise;
 
     auto &adm  = pmy_pack->padm->adm;
+    auto adm_u = pmy_pack->padm->u_adm;
     auto &eos_ = ps.GetEOS();
     auto &ps_  = ps;
 
     auto &indcs = pmy_pack->pmesh->mb_indcs;
     int &is = indcs.is;
+    int &ie = indcs.ie;
     int &js = indcs.js;
+    int &je = indcs.je;
     int &ks = indcs.ks;
+    int &ke = indcs.ke;
     auto &size = pmy_pack->pmb->mb_size;
 
     const int ni = (iu - il + 1);
@@ -392,13 +399,28 @@ class PrimitiveSolverHydro {
     std::uint64_t count_dfloor=0, count_efloor=0, count_tfloor=0, count_fail=0;
     std::uint64_t count_cons_adjust=0, count_mag_adjust=0, count_c2p_calls=0;
     std::uint64_t count_fofc_tests=0, count_printed=0;
+    std::uint64_t count_preserved_cons_mismatches=0;
+    std::uint64_t count_preserved_cons_nonfinite=0;
     int max_iterations=0;
+    Real max_preserved_cons_relative_change=0.0;
+    Real max_preserved_cons_absolute_change=0.0;
+    constexpr Real preserve_relative_tolerance =
+        static_cast<Real>(256.0)*std::numeric_limits<Real>::epsilon();
+    // All undensitized conserved components have density units in c=1 code units.
+    // Use the configured rest-mass atmosphere floor as the comparison scale near zero;
+    // using an O(1) absolute tolerance here would admit changes that are significant
+    // relative to low-density production cells.
+    const Real preserve_reference_scale = fmax(
+        eos_.GetDensityFloor()*mb, std::numeric_limits<Real>::min());
     Kokkos::parallel_reduce("pshyd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
     KOKKOS_LAMBDA(const int &idx, std::uint64_t &sumd, std::uint64_t &sume,
                   std::uint64_t &sumt, std::uint64_t &sumfail,
                   std::uint64_t &sumconsadjust, std::uint64_t &summagadjust,
                   std::uint64_t &sumcalls, std::uint64_t &sumfofctests,
-                  std::uint64_t &sumprinted, int &max_iterations_used) {
+                  std::uint64_t &sumprinted, int &max_iterations_used,
+                  std::uint64_t &sumpreservedmismatches,
+                  std::uint64_t &sumpreservednonfinite,
+                  Real &max_preserved_relative, Real &max_preserved_absolute) {
       const int a = idx/nkji;
       const int m = active_lids(active_offset + a);
       int k = (idx - a*nkji)/nji;
@@ -406,6 +428,14 @@ class PrimitiveSolverHydro {
       int i = (idx - a*nkji - k*nji - j*ni) + il;
       j += jl;
       k += kl;
+      // Event telemetry describes physical evolution, so it must be independent of
+      // ghost width, MeshBlock decomposition, and restart-only cache reconstruction.
+      // C2P still operates on the requested ghost cells; only their diagnostic events
+      // are excluded.  When event counting is disabled (the restart audit), retain
+      // full-range failure accounting for the returned projection statistics.
+      const bool physical_cell =
+          i >= is && i <= ie && j >= js && j <= je && k >= ks && k <= ke;
+      const bool diagnostic_cell = physical_cell || !count_events;
 
       // Add in a short circuit where FOFC is guaranteed.
       if (floors_only && fofc_(m, k, j, i)) {
@@ -432,6 +462,20 @@ class PrimitiveSolverHydro {
                   g3d[S11], g3d[S12], g3d[S13], g3d[S22], g3d[S23], g3d[S33],
                  &g3u[S11], &g3u[S12], &g3u[S13], &g3u[S22], &g3u[S23], &g3u[S33]);
 
+      bool projection_nonfinite = false;
+      if (preserve_cons) {
+        projection_nonfinite = !isfinite(detg) || !isfinite(sdetg) ||
+                               !isfinite(isdetg) || !(detg > 0.0) ||
+                               !isfinite(preserve_reference_scale);
+        for (int n = 0; n < adm::ADM::nadm; ++n) {
+          projection_nonfinite = projection_nonfinite ||
+                                 !isfinite(adm_u(m,n,k,j,i));
+        }
+        for (int n = 0; n < NSPMETRIC; ++n) {
+          projection_nonfinite = projection_nonfinite || !isfinite(g3u[n]);
+        }
+      }
+
       // Extract the conserved variables
       Real cons_pt[NCONS], cons_pt_old[NCONS], prim_pt[NPRIM];
       cons_pt[CDN] = cons_pt_old[CDN] = cons(m, IDN, k, j, i)*isdetg;
@@ -451,9 +495,21 @@ class PrimitiveSolverHydro {
       } else {
         // Otherwise we don't have the correct CC fields yet, so use
         // the FC fields.
-        bcc0(m, IBX, k, j, i) = 0.5*(bfc.x1f(m,k,j,i) + bfc.x1f(m,k,j,i+1));
-        bcc0(m, IBY, k, j, i) = 0.5*(bfc.x2f(m,k,j,i) + bfc.x2f(m,k,j+1,i));
-        bcc0(m, IBZ, k, j, i) = 0.5*(bfc.x3f(m,k,j,i) + bfc.x3f(m,k+1,j,i));
+        const Real b1l = bfc.x1f(m,k,j,i);
+        const Real b1r = bfc.x1f(m,k,j,i+1);
+        const Real b2l = bfc.x2f(m,k,j,i);
+        const Real b2r = bfc.x2f(m,k,j+1,i);
+        const Real b3l = bfc.x3f(m,k,j,i);
+        const Real b3r = bfc.x3f(m,k+1,j,i);
+        bcc0(m, IBX, k, j, i) = 0.5*(b1l + b1r);
+        bcc0(m, IBY, k, j, i) = 0.5*(b2l + b2r);
+        bcc0(m, IBZ, k, j, i) = 0.5*(b3l + b3r);
+        if (preserve_cons) {
+          projection_nonfinite = projection_nonfinite ||
+                                 !isfinite(b1l) || !isfinite(b1r) ||
+                                 !isfinite(b2l) || !isfinite(b2r) ||
+                                 !isfinite(b3l) || !isfinite(b3r);
+        }
         b3u[IBX] = bcc0(m, IBX, k, j, i)*isdetg;
         b3u[IBY] = bcc0(m, IBY, k, j, i)*isdetg;
         b3u[IBZ] = bcc0(m, IBZ, k, j, i)*isdetg;
@@ -494,13 +550,13 @@ class PrimitiveSolverHydro {
 
       if (floors_only) {
         if (solver_called) {
-          sumfofctests++;
+          if (diagnostic_cell) sumfofctests++;
           if (result.error != Primitive::Error::SUCCESS) {
             fofc_(m,k,j,i) = true;
           }
         }
       } else {
-        if (solver_called) {
+        if (solver_called && diagnostic_cell) {
           sumcalls++;
           const std::uint32_t events = result.events;
           if ((events & (Primitive::CONS_DENSITY_FLOOR |
@@ -526,7 +582,11 @@ class PrimitiveSolverHydro {
                                 result.iterations : max_iterations_used;
         }
 
-        if (solver_called && result.error != Primitive::Error::SUCCESS &&
+        // Solver failures in ghosts can still contaminate an active reconstruction
+        // stencil.  Keep the bounded detailed report over the full requested range even
+        // though scientific event totals above deliberately include active zones only.
+        if (count_events && solver_called &&
+            result.error != Primitive::Error::SUCCESS &&
             print_cap > 0) {
           // Once the sample budget is exhausted, avoid serializing every subsequent
           // failure on an unnecessary read-modify-write.
@@ -551,6 +611,7 @@ class PrimitiveSolverHydro {
               Kokkos::printf("An error occurred during the primitive solve: %s\n"
                  "  Location: (%d, %d, %d, %d)\n"
                  "            (%.17g, %.17g, %.17g)\n"
+                 "  Physical active zone: %s\n"
                  "  Conserved vars: \n"
                  "    D   = %.17g\n"
                  "    Sx  = %.17g\n"
@@ -571,6 +632,7 @@ class PrimitiveSolverHydro {
                  ErrorToString(result.error),
                  m, k, j, i,
                  x1v, x2v, x3v,
+                 physical_cell ? "true" : "false",
                  cons_pt_old[CDN], cons_pt_old[CSX], cons_pt_old[CSY], cons_pt_old[CSZ],
                  cons_pt_old[CTA], (nscal > 0) ? cons_pt_old[CYD] : 0.0,
                  b3u[IBX], b3u[IBY], b3u[IBZ], detg,
@@ -592,6 +654,56 @@ class PrimitiveSolverHydro {
             }
           }
         }
+        // A synchronized endpoint/restart cache closure must derive w0/bcc0 without
+        // changing authoritative u0.  Audit every projection, rather than trusting
+        // solver adjustment flags, and reject non-finite source or derived cache state.
+        if (preserve_cons) {
+          bool mismatch = false;
+          bool nonfinite = projection_nonfinite;
+          for (int n = CDN; n <= CTA; ++n) {
+            const Real difference = fabs(cons_pt[n] - cons_pt_old[n]);
+            const Real scale = fmax(fabs(cons_pt[n]), fabs(cons_pt_old[n]));
+            const bool finite_pair = isfinite(cons_pt[n]) && isfinite(cons_pt_old[n])
+                                  && isfinite(difference) && isfinite(scale);
+            const Real relative = finite_pair && scale > 0.0 ? difference/scale : 0.0;
+            if (finite_pair) {
+              max_preserved_absolute = fmax(max_preserved_absolute, difference);
+              max_preserved_relative = fmax(max_preserved_relative, relative);
+            }
+            nonfinite = nonfinite || !finite_pair;
+            const Real comparison_scale = fmax(scale, preserve_reference_scale);
+            mismatch = mismatch || (finite_pair &&
+                difference > preserve_relative_tolerance*comparison_scale);
+          }
+          for (int n = 0; n < nscal; ++n) {
+            const int v = CYD + n;
+            const Real difference = fabs(cons_pt[v] - cons_pt_old[v]);
+            const Real scale = fmax(fabs(cons_pt[v]), fabs(cons_pt_old[v]));
+            const bool finite_pair = isfinite(cons_pt[v]) && isfinite(cons_pt_old[v])
+                                  && isfinite(difference) && isfinite(scale);
+            const Real relative = finite_pair && scale > 0.0 ? difference/scale : 0.0;
+            if (finite_pair) {
+              max_preserved_absolute = fmax(max_preserved_absolute, difference);
+              max_preserved_relative = fmax(max_preserved_relative, relative);
+            }
+            nonfinite = nonfinite || !finite_pair;
+            const Real comparison_scale = fmax(scale, preserve_reference_scale);
+            mismatch = mismatch || (finite_pair &&
+                difference > preserve_relative_tolerance*comparison_scale);
+          }
+          for (int n = IBX; n <= IBZ; ++n) {
+            nonfinite = nonfinite || !isfinite(bcc0(m,n,k,j,i)) || !isfinite(b3u[n]);
+          }
+          for (int n = PRH; n <= PTM; ++n) {
+            nonfinite = nonfinite || !isfinite(prim_pt[n]);
+          }
+          for (int n = 0; n < nscal; ++n) {
+            nonfinite = nonfinite || !isfinite(prim_pt[PYF + n]);
+          }
+          if (nonfinite) sumpreservednonfinite++;
+          if (mismatch || nonfinite) sumpreservedmismatches++;
+        }
+
         // Regardless of failure, we need to copy the primitives.
         prim(m, IDN, k, j, i) = prim_pt[PRH]*mb;
         prim(m, IVX, k, j, i) = prim_pt[PVX];
@@ -606,7 +718,7 @@ class PrimitiveSolverHydro {
 
         // If the conservative variables were floored or adjusted for consistency,
         // we need to copy the conserved variables, too.
-        if (result.cons_floor || result.cons_adjusted) {
+        if (!preserve_cons && (result.cons_floor || result.cons_adjusted)) {
           /*if (fabs((cons_pt[CDN] - cons_pt_old[CDN])/cons_pt_old[CDN]) > 1e-12) {
             Real &x1min = size.d_view(m).x1min;
             Real &x1max = size.d_view(m).x1max;
@@ -652,13 +764,19 @@ class PrimitiveSolverHydro {
        Kokkos::Sum<std::uint64_t>(count_c2p_calls),
        Kokkos::Sum<std::uint64_t>(count_fofc_tests),
        Kokkos::Sum<std::uint64_t>(count_printed),
-       Kokkos::Max<int>(max_iterations));
+       Kokkos::Max<int>(max_iterations),
+       Kokkos::Sum<std::uint64_t>(count_preserved_cons_mismatches),
+       Kokkos::Sum<std::uint64_t>(count_preserved_cons_nonfinite),
+       Kokkos::Max<Real>(max_preserved_cons_relative_change),
+       Kokkos::Max<Real>(max_preserved_cons_absolute_change));
 
     if (floors_only) {
       ps.GetEOSMutable().SetPrimitiveFloorFailure(prim_failure);
       ps.GetEOSMutable().SetConservedFloorFailure(cons_failure);
-      pmy_pack->pmesh->ecounter.nfofc_tests += count_fofc_tests;
-    } else {
+      if (count_events) {
+        pmy_pack->pmesh->ecounter.nfofc_tests += count_fofc_tests;
+      }
+    } else if (count_events) {
       auto &ecounter = pmy_pack->pmesh->ecounter;
       ecounter.neos_dfloor += count_dfloor;
       ecounter.neos_efloor += count_efloor;
@@ -673,6 +791,10 @@ class PrimitiveSolverHydro {
       // neos_fail even after stdout sampling reaches its configured cap.
       nerrs += static_cast<unsigned int>(count_printed);
     }
+    return {count_fail, count_preserved_cons_mismatches,
+            count_preserved_cons_nonfinite,
+            max_preserved_cons_relative_change,
+            max_preserved_cons_absolute_change};
   }
 
   // Get the transformed magnetosonic speeds at a point in a given direction.

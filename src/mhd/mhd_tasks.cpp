@@ -618,6 +618,16 @@ TaskStatus MHD::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
     pbval_u->FillCoarseInBndryCC(u0, coarse_u0);
     pbval_b->FillCoarseInBndryFC(b0, coarse_b0);
+    if (pdrive->LevelSubcyclingRequested() && !pmy_pack->pmesh->strictly_periodic) {
+      // Restriction initializes the active coarse representation and receives/fills
+      // supply its inter-block ghost zones.  At an AMR interface that meets a physical
+      // boundary, however, the prolongation stencil also needs coarse edge/corner ghosts.
+      // Rebuild them from the current-stage coarse donor before prolongation.  These
+      // scratch arrays are not serialized, so leaving the cells stale also makes a
+      // continuous run and an otherwise identical restart diverge on their next step.
+      pbval_u->HydroBCs(pmy_pack, pbval_u->u_in, coarse_u0, true);
+      pbval_b->BFieldBCs(pmy_pack, pbval_b->b_in, coarse_b0, true);
+    }
     if (pmy_pack->pmesh->pmr->prolong_prims) {
       pbval_u->ConsToPrimCoarseBndry(coarse_u0, coarse_b0, coarse_w0);
       pbval_u->ProlongateCC(w0, coarse_w0);

@@ -411,14 +411,17 @@ void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
   int &ng = indcs.ng;
   int is = indcs.is, js = indcs.js, ks = indcs.ks;
   int ie = indcs.ie, je = indcs.je, ke = indcs.ke;
-  int nmb = pmbp->nmb_thispack;
+  auto active_lids = pmbp->active_lids.d_view;
+  const int active_offset = pmbp->active_offset;
+  const int nmb_active = pmbp->nmb_active;
   int n1 = indcs.nx1 + 2*ng;
   int n2 = (indcs.nx2 > 1) ? (indcs.nx2 + 2*ng) : 1;
   int n3 = (indcs.nx3 > 1) ? (indcs.nx3 + 2*ng) : 1;
 
   Real a = 1.0 + fac*(t-t0);
   Real a2 = a*a;
-  par_for("update_adm_vars", DevExeSpace(), 0,nmb-1,0,(n3-1),0,(n2-1),0,(n1-1),
+  par_for_active("update_adm_vars", DevExeSpace(), active_lids, active_offset,
+  nmb_active, 0,(n3-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real &x1min = size.d_view(m).x1min;
     Real &x1max = size.d_view(m).x1max;

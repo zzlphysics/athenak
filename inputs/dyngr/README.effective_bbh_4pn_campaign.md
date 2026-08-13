@@ -181,6 +181,13 @@ failure dumps are independently capped at eight per rank, so aggregate failure c
 remain exact without allowing a first-failure GPU log storm.  Transfer only
 checksum-verified closed files and retain at least the latest three restart generations
 until NAS acknowledgement.
+These totals count the physical active zones of every leaf MeshBlock; ghost-zone C2P and
+FOFC cache work still executes but is excluded, so rates are invariant to ghost width,
+MPI decomposition, and restart-only cache hydration.  Excision-floor cells bypass the
+normal C2P solver and are not part of the `c2p_calls` denominator.  Restart event-counter
+format v2 stores this active-zone definition.  Legacy v1 pending totals included ghosts
+and cannot be converted: an explicit one-time
+`allow_legacy_ghost_event_counters=true` qualification discards them and writes v2.
 Native GR diagnostic files produced after this qualification append an exact
 `gr_excision_mask`; the dashboard masks those cells automatically while remaining able
 to read earlier four-field files.  This prevents horizon-interior regularization values

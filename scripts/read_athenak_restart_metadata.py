@@ -16,8 +16,11 @@ from typing import BinaryIO
 AMR_COUNTER_MAGIC = 0x41544B414D524331
 AMR_COUNTER_VERSION = 1
 EVENT_COUNTER_MAGIC = 0x41544B4556543031
-EVENT_COUNTER_VERSION = 1
+EVENT_COUNTER_VERSION = 2
+LEGACY_EVENT_COUNTER_VERSION = 1
 EVENT_SUM_COUNTER_COUNT = 10
+RESTART_CACHE_CONTRACT_MAGIC = 0x41544B5343433031
+RESTART_CACHE_CONTRACT_VERSION = 1
 MAX_PARAMETER_BYTES = 16 * 1024 * 1024
 MAX_MESH_METADATA_BYTES = 512 * 1024 * 1024
 REGION_INDEX_COUNT = 19
@@ -97,6 +100,8 @@ class RestartMetadata:
     costs: tuple[float, ...]
     amr_cycle_counters: tuple[int, ...] | None
     event_counters: RestartEventCounters | None
+    event_counter_version: int | None
+    restart_cache_contract_version: int | None
     parameters: dict[str, dict[str, str]]
 
     def physical_level_rows(self) -> list[dict[str, int | float]]:
@@ -260,7 +265,8 @@ def _close(value: float, expected: float) -> bool:
 
 def _mesh_metadata_size(
         nmb_total: int, include_counters: bool,
-        include_event_counters: bool = False) -> int:
+        include_event_counters: bool = False,
+        include_restart_cache_contract: bool = False) -> int:
     """Return variable-size tree metadata bytes for the configured extension."""
 
     size = nmb_total * (4 * 4 + 4)
@@ -272,14 +278,18 @@ def _mesh_metadata_size(
             + EVENT_SUM_COUNTER_COUNT * struct.calcsize("Q")
             + struct.calcsize("i")
         )
+    if include_restart_cache_contract:
+        size += struct.calcsize("Qi")
     return size
 
 
 def _validate_metadata_capacity(
         nmb_total: int, include_counters: bool,
-        include_event_counters: bool = False) -> None:
+        include_event_counters: bool = False,
+        include_restart_cache_contract: bool = False) -> None:
     metadata_bytes = _mesh_metadata_size(
-        nmb_total, include_counters, include_event_counters
+        nmb_total, include_counters, include_event_counters,
+        include_restart_cache_contract
     )
     if metadata_bytes > MAX_MESH_METADATA_BYTES:
         extensions = []
@@ -287,6 +297,8 @@ def _validate_metadata_capacity(
             extensions.append("AMR counters")
         if include_event_counters:
             extensions.append("event counters")
+        if include_restart_cache_contract:
+            extensions.append("restart cache contract")
         extension = f" including {' and '.join(extensions)}" if extensions else ""
         raise ValueError(
             f"MeshBlock metadata{extension} requires {metadata_bytes} bytes, "
@@ -484,6 +496,7 @@ def _parse_layout(
         reader.seek(extension_offset)
 
     event_counters: RestartEventCounters | None = None
+    event_counter_version: int | None = None
     event_extension_offset = reader.tell()
     event_magic_bytes = reader.read(magic_struct.size)
     event_magic_present = (
@@ -502,7 +515,8 @@ def _parse_layout(
                 reader, extension_struct.size, "event-counter extension header"
             )
         )
-        if version != EVENT_COUNTER_VERSION or count != EVENT_SUM_COUNTER_COUNT:
+        if version not in (LEGACY_EVENT_COUNTER_VERSION, EVENT_COUNTER_VERSION) or \
+                count != EVENT_SUM_COUNTER_COUNT:
             raise ValueError(
                 f"invalid event-counter extension: version={version}, count={count}"
             )
@@ -519,8 +533,43 @@ def _parse_layout(
         if maxit_c2p < 0:
             raise ValueError("restart contains a negative maximum C2P iteration count")
         event_counters = RestartEventCounters(*sums, maxit_c2p=maxit_c2p)
+        event_counter_version = version
     else:
         reader.seek(event_extension_offset)
+
+    # A synchronized strict-subcycling checkpoint may advertise that its serialized
+    # U/B ghost zones satisfy the cache-hydration contract consumed by the next root
+    # step.  Match the C++ reader's extension-chain behavior: probe the magic and roll
+    # back before object/field state when reading a legacy checkpoint.
+    restart_cache_contract_version: int | None = None
+    cache_contract_extension_offset = reader.tell()
+    cache_contract_magic_bytes = reader.read(magic_struct.size)
+    cache_contract_magic_present = (
+        len(cache_contract_magic_bytes) == magic_struct.size
+        and magic_struct.unpack(cache_contract_magic_bytes)[0]
+        == RESTART_CACHE_CONTRACT_MAGIC
+    )
+    if cache_contract_magic_present:
+        _validate_metadata_capacity(
+            nmb_total,
+            include_counters=counters is not None,
+            include_event_counters=event_counters is not None,
+            include_restart_cache_contract=True,
+        )
+        version_struct = struct.Struct(f"{byte_order}i")
+        restart_cache_contract_version = version_struct.unpack(
+            _read_exact(
+                reader, version_struct.size,
+                "restart cache-contract extension version",
+            )
+        )[0]
+        if restart_cache_contract_version != RESTART_CACHE_CONTRACT_VERSION:
+            raise ValueError(
+                "invalid restart cache-contract extension: "
+                f"version={restart_cache_contract_version}"
+            )
+    else:
+        reader.seek(cache_contract_extension_offset)
 
     return RestartMetadata(
         source="",
@@ -539,6 +588,8 @@ def _parse_layout(
         costs=costs,
         amr_cycle_counters=counters,
         event_counters=event_counters,
+        event_counter_version=event_counter_version,
+        restart_cache_contract_version=restart_cache_contract_version,
         parameters=parameters,
     )
 
@@ -548,8 +599,8 @@ def read_restart_metadata_stream(
     """Read metadata from a seekable single-file restart stream.
 
     Apart from the eight-byte marker probes used by AthenaK itself for a legacy file,
-    the function stops after the optional AMR age-counter and event-counter extensions.
-    It never reads per-MeshBlock field arrays.
+    the function stops after the optional AMR age-counter, event-counter, and restart
+    cache-contract extensions.  It never reads per-MeshBlock field arrays.
     """
 
     parameter_reader = AuditedReader(stream)
@@ -742,6 +793,8 @@ def metadata_dict(
             metadata.event_counters.as_dict()
             if metadata.event_counters is not None else None
         ),
+        "event_counter_version": metadata.event_counter_version,
+        "restart_cache_contract_version": metadata.restart_cache_contract_version,
         "partition": {
             "nranks": nranks,
             "max_blocks_per_rank": max_blocks_per_rank,

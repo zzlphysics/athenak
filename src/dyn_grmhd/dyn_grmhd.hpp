@@ -12,6 +12,7 @@
 #include "parameter_input.hpp"
 #include "tasklist/task_list.hpp"
 #include "driver/driver.hpp"
+#include "dyn_grmhd/c2p_projection_stats.hpp"
 #include "eos/primitive_solver_hyd.hpp"
 
 enum class DynGRMHD_RSolver {llf_dyngr, hlle_dyngr};   // Riemann solvers for dynamical GR
@@ -86,7 +87,10 @@ class DynGRMHD {
   virtual void QueueDynGRMHDTasks() = 0;
 
   virtual TaskStatus ConToPrim(Driver* pdrive, int stage) = 0;
-  virtual void ConToPrimBC(int is, int ie, int js, int je, int ks, int ke) = 0;
+  virtual C2PProjectionStats ConToPrimBC(int is, int ie, int js, int je,
+                                         int ks, int ke,
+                                         bool preserve_cons = false,
+                                         bool count_events = true) = 0;
   virtual void PrimToConInit(int is, int ie, int js, int je, int ks, int ke) = 0;
   virtual void ConvertInternalEnergyToPressure(int is, int ie,
                                                int js, int je, int ks, int ke) = 0;
@@ -133,7 +137,10 @@ class DynGRMHDPS : public DynGRMHD {
   virtual void QueueDynGRMHDTasks();
 
   virtual TaskStatus ConToPrim(Driver* pdrive, int stage);
-  virtual void ConToPrimBC(int is, int ie, int js, int je, int ks, int ke);
+  virtual C2PProjectionStats ConToPrimBC(int is, int ie, int js, int je,
+                                         int ks, int ke,
+                                         bool preserve_cons = false,
+                                         bool count_events = true);
   virtual void PrimToConInit(int is, int ie, int js, int je, int ks, int ke);
   virtual void ConvertInternalEnergyToPressure(int is, int ie,
                                                int js, int je, int ks, int ke);

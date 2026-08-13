@@ -20,16 +20,19 @@
 //! are at the edge of the computational domain
 
 void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
-                                  DvceArray5D<Real> u0) {
+                                  DvceArray5D<Real> u0, bool coarse_grid) {
   // loop over all MeshBlocks in this MeshBlockPack
   auto &pm = ppack->pmesh;
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
   auto &mb_bcs = ppack->pmb->mb_bcs;
 
-  int n1 = indcs.nx1 + 2*ng;
-  int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
-  int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
+  const int nx1 = coarse_grid ? indcs.cnx1 : indcs.nx1;
+  const int nx2 = coarse_grid ? indcs.cnx2 : indcs.nx2;
+  const int nx3 = coarse_grid ? indcs.cnx3 : indcs.nx3;
+  int n1 = nx1 + 2*ng;
+  int n2 = (nx2 > 1)? (nx2 + 2*ng) : 1;
+  int n3 = (nx3 > 1)? (nx3 + 2*ng) : 1;
   int nvar = u0.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   auto active_lids = ppack->active_lids.d_view;
   const int active_offset = ppack->active_offset;
@@ -38,8 +41,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
   // only apply BCs if not (periodic) or (shear_periodic)
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic &&
       pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) {
-    int &is = indcs.is;
-    int &ie = indcs.ie;
+    const int is = coarse_grid ? indcs.cis : indcs.is;
+    const int ie = coarse_grid ? indcs.cie : indcs.ie;
     par_for_active("hydrobc_x1", DevExeSpace(), active_lids, active_offset, nmb_active,
     0,(nvar-1),0,(n3-1),0,(n2-1),
     KOKKOS_LAMBDA(int m, int n, int k, int j) {
@@ -127,8 +130,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
-    int &js = indcs.js;
-    int &je = indcs.je;
+    const int js = coarse_grid ? indcs.cjs : indcs.js;
+    const int je = coarse_grid ? indcs.cje : indcs.je;
     par_for_active("hydrobc_x2", DevExeSpace(), active_lids, active_offset, nmb_active,
     0,(nvar-1),0,(n3-1),0,(n1-1),
     KOKKOS_LAMBDA(int m, int n, int k, int i) {
@@ -215,8 +218,8 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
-  int &ks = indcs.ks;
-  int &ke = indcs.ke;
+  const int ks = coarse_grid ? indcs.cks : indcs.ks;
+  const int ke = coarse_grid ? indcs.cke : indcs.ke;
   par_for_active("hydrobc_x3", DevExeSpace(), active_lids, active_offset, nmb_active,
   0,(nvar-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int n, int j, int i) {

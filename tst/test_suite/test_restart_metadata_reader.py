@@ -28,6 +28,8 @@ def write_fixture(
         event_version: int | None = None,
         event_count: int | None = None,
         event_maxit: int = 7,
+        cache_contract_marker: bool = True,
+        cache_contract_version: int | None = None,
         single_file_per_rank: str | None = None,
         sentinel: bytes = b"FIELD_DATA_MUST_NOT_BE_READ" * 128) -> int:
     """Write metadata for one refined root block followed by an opaque field payload."""
@@ -122,6 +124,13 @@ subcycling = level
             f"<{READER.EVENT_SUM_COUNTER_COUNT}Q", *event_sums
         ))
         content.extend(struct.pack("<i", event_maxit))
+    if cache_contract_marker:
+        content.extend(struct.pack(
+            "<Qi",
+            READER.RESTART_CACHE_CONTRACT_MAGIC,
+            (READER.RESTART_CACHE_CONTRACT_VERSION
+             if cache_contract_version is None else cache_contract_version),
+        ))
     metadata_end = len(content)
     content.extend(sentinel)
     path.write_bytes(content)
@@ -165,6 +174,10 @@ def test_restart_metadata_stops_before_field_data(tmp_path: Path) -> None:
         "nfofc_tests": 20,
         "maxit_c2p": 7,
     }
+    assert metadata.event_counter_version == READER.EVENT_COUNTER_VERSION
+    assert payload["event_counter_version"] == READER.EVENT_COUNTER_VERSION
+    assert metadata.restart_cache_contract_version == 1
+    assert payload["restart_cache_contract_version"] == 1
 
 
 def test_capacity_partition_matches_cpp_regression() -> None:
@@ -186,6 +199,7 @@ def test_static_refinement_does_not_require_num_levels(tmp_path: Path) -> None:
         counter_marker=False,
         counter_key=False,
         event_marker=False,
+        cache_contract_marker=False,
     )
 
     metadata = READER.read_restart_metadata(restart)
@@ -243,19 +257,68 @@ def test_real4_single_block_does_not_probe_real8_or_sentinel(tmp_path: Path) -> 
 def test_legacy_restart_without_event_extension_restores_empty_state(
         tmp_path: Path) -> None:
     restart = tmp_path / "legacy_no_events.rst"
+    expected_end = write_fixture(
+        restart, event_marker=False, cache_contract_marker=False
+    )
+
+    metadata = READER.read_restart_metadata(restart)
+
+    assert metadata.event_counters is None
+    assert metadata.event_counter_version is None
+    assert metadata.restart_cache_contract_version is None
+    assert metadata.metadata_end == expected_end
+    assert metadata.max_read_offset == expected_end + 8
+
+
+def test_restart_cache_contract_can_follow_legacy_missing_event_extension(
+        tmp_path: Path) -> None:
+    restart = tmp_path / "cache_contract_without_events.rst"
     expected_end = write_fixture(restart, event_marker=False)
 
     metadata = READER.read_restart_metadata(restart)
 
     assert metadata.event_counters is None
+    assert metadata.restart_cache_contract_version == 1
+    assert metadata.metadata_end == expected_end
+    assert metadata.max_read_offset == expected_end
+
+
+def test_legacy_restart_without_cache_contract_rolls_back_before_fields(
+        tmp_path: Path) -> None:
+    restart = tmp_path / "legacy_no_cache_contract.rst"
+    expected_end = write_fixture(restart, cache_contract_marker=False)
+
+    metadata = READER.read_restart_metadata(restart)
+
+    assert metadata.event_counters is not None
+    assert metadata.restart_cache_contract_version is None
     assert metadata.metadata_end == expected_end
     assert metadata.max_read_offset == expected_end + 8
+
+
+def test_invalid_restart_cache_contract_version_fails_closed(
+        tmp_path: Path) -> None:
+    restart = tmp_path / "invalid_cache_contract.rst"
+    write_fixture(restart, cache_contract_version=2)
+
+    with pytest.raises(ValueError, match="invalid restart cache-contract extension"):
+        READER.read_restart_metadata(restart)
+
+
+def test_legacy_ghost_event_counter_version_is_identified(tmp_path: Path) -> None:
+    restart = tmp_path / "legacy_v1_events.rst"
+    write_fixture(restart, event_version=READER.LEGACY_EVENT_COUNTER_VERSION)
+
+    metadata = READER.read_restart_metadata(restart)
+
+    assert metadata.event_counters is not None
+    assert metadata.event_counter_version == READER.LEGACY_EVENT_COUNTER_VERSION
 
 
 @pytest.mark.parametrize(
     ("event_version", "event_count", "pattern"),
     (
-        (2, None, "invalid event-counter extension"),
+        (3, None, "invalid event-counter extension"),
         (None, 9, "invalid event-counter extension"),
     ),
 )
@@ -315,9 +378,20 @@ def test_counter_array_is_included_in_metadata_capacity_limit(
     assert READER._mesh_metadata_size(
         8, include_counters=True, include_event_counters=True
     ) == 308
-    monkeypatch.setattr(READER, "MAX_MESH_METADATA_BYTES", 250)
+    assert READER._mesh_metadata_size(
+        8,
+        include_counters=True,
+        include_event_counters=True,
+        include_restart_cache_contract=True,
+    ) == 320
+    monkeypatch.setattr(READER, "MAX_MESH_METADATA_BYTES", 310)
 
-    with pytest.raises(ValueError, match="including AMR counters and event counters"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "including AMR counters and event counters and restart cache contract"
+        ),
+    ):
         READER.read_restart_metadata(restart)
 
 

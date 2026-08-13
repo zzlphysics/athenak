@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import test_suite.testutils as testutils
@@ -20,12 +21,19 @@ def _write_input(
     output_dt: float = OUTPUT_DT,
     *,
     restart_dcycle: int | None = None,
+    event_log: bool = False,
 ) -> None:
     restart_cadence = (
         f"dcycle = {restart_dcycle}"
         if restart_dcycle is not None
         else f"dt = {output_dt:.17g}"
     )
+    event_output = """
+<output4>
+file_type = log
+dcycle = 1
+write_zeros = true
+""" if event_log else ""
     path.write_text(
         f"""
 <job>
@@ -96,6 +104,7 @@ file_type = rst
 file_type = hst
 data_format = %.17e
 dt = {output_dt:.17g}
+{event_output}
 """.lstrip(),
         encoding="utf-8",
     )
@@ -177,6 +186,29 @@ def _restart_parameter_text(path: Path) -> str:
     offset = raw.find(marker)
     assert offset >= 0, f"No ParameterInput terminator in {path}"
     return raw[: offset + len(marker)].decode("utf-8")
+
+
+def _event_counter_version(path: Path) -> int:
+    raw = path.read_bytes()
+    marker = (0x41544B4556543031).to_bytes(8, byteorder=sys.byteorder)
+    offset = raw.find(marker)
+    assert offset >= 0, f"No event-counter extension in {path}"
+    assert raw.find(marker, offset + 1) == -1, f"Ambiguous event marker in {path}"
+    version = raw[offset + len(marker): offset + len(marker) + 4]
+    assert len(version) == 4, f"Truncated event-counter version in {path}"
+    return int.from_bytes(version, byteorder=sys.byteorder, signed=True)
+
+
+def _set_first_event_counter(path: Path, value: int) -> None:
+    raw = bytearray(path.read_bytes())
+    marker = (0x41544B4556543031).to_bytes(8, byteorder=sys.byteorder)
+    offset = raw.find(marker)
+    assert offset >= 0, f"No event-counter extension in {path}"
+    first_sum = offset + 8 + 2 * 4
+    raw[first_sum:first_sum + 8] = value.to_bytes(
+        8, byteorder=sys.byteorder, signed=False
+    )
+    path.write_bytes(raw)
 
 
 def _parameter(text: str, block: str, name: str) -> str:
@@ -271,6 +303,37 @@ def test_early_finalize_preserves_scheduled_phase_across_restart(tmp_path):
     _assert_checkpoint_contract(
         continuous_restarts[-1], last_time=0.1, next_file_number=3
     )
+
+
+def test_classic_hydro_event_v1_restart_needs_no_dyngr_migration(tmp_path):
+    """Classic event v1 remains valid; only ghost-inclusive DynGRMHD v1 migrates."""
+    input_path = tmp_path / "classic_event_v1.athinput"
+    _write_input(input_path, restart_dcycle=1, event_log=True)
+
+    fresh = tmp_path / "classic_event_fresh"
+    _run(fresh, input_path, None, nlim=1, tlim=1.0)
+    checkpoint = _numbered_paths(fresh, "rst", "rst")[-1]
+    assert _event_counter_version(checkpoint) == 1
+    assert "dyn_eos" not in _restart_parameter_text(checkpoint)
+    event_header = (fresh / f"{BASENAME}.log").read_text(encoding="utf-8")
+    assert "DynGRMHD event totals" not in event_header
+    _set_first_event_counter(checkpoint, 17)
+
+    # A zero-step restore isolates metadata classification from further evolution.
+    # It must neither require the DynGRMHD legacy opt-in nor discard classic counters.
+    resumed = tmp_path / "classic_event_resumed"
+    stdout = _run(resumed, None, checkpoint, nlim=1, tlim=1.0)
+    assert "allow_legacy_ghost_event_counters=true" not in stdout
+    assert "discarding pending legacy v1 event counters" not in stdout
+    resumed_rows = [
+        line.split()
+        for line in (resumed / f"{BASENAME}.log").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert len(resumed_rows) == 1
+    assert int(resumed_rows[0][1]) == 17
 
 
 def test_finalize_at_due_tlim_consumes_exactly_one_phase(tmp_path):

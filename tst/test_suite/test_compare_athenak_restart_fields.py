@@ -123,6 +123,10 @@ def test_identical_fixture_reports_derived_layout_and_region_sizes(
     assert result["mhd_u0"]["active"]["elements"] == 6 * 2 * 2 * 2
     assert result["mhd_u0"]["ghost"]["elements"] == 6 * (4**3 - 2**3)
     assert result["face_b"]["active_faces"]["elements"] == 3 * 3 * 2 * 2
+    assert result["face_b"]["ghost_faces"]["elements"] == (
+        4 * 4 * 5 + 4 * 5 * 4 + 5 * 4 * 4 - 3 * 3 * 2 * 2
+    )
+    assert result["face_b"]["ghost_faces_compared"] is True
     assert result["adm"]["active"]["elements"] == 17 * 2 * 2 * 2
     assert result["adm"]["ghost"]["elements"] == 17 * (4**3 - 2**3)
     assert result["mhd_u0"]["active"]["first_difference"] is None
@@ -210,6 +214,25 @@ def test_derived_ghost_difference_is_distinct_from_authoritative_state(
     assert result["authoritative_match"] is True
     assert result["mhd_u0"]["active"]["match"] is True
     assert result["mhd_u0"]["ghost"]["match"] is False
+
+
+def test_face_ghost_difference_fails_all_stored_fields_only(tmp_path: Path) -> None:
+    left = tmp_path / "left.rst"
+    right = tmp_path / "right.rst"
+    write_fixture(left)
+
+    def mutate(arrays: Arrays) -> None:
+        arrays["x1f"][0, 0, 0] += 0.75  # face ghost only
+
+    write_fixture(right, mutate=mutate)
+    result = FIELDS.compare_restart_fields(left, right)
+
+    assert result["match"] is False
+    assert result["all_stored_fields_match"] is False
+    assert result["authoritative_match"] is True
+    assert result["face_b"]["active_faces"]["match"] is True
+    assert result["face_b"]["ghost_faces"]["match"] is False
+    assert result["face_b"]["ghost_components"]["x1f"]["max_abs"] == pytest.approx(0.75)
 
 
 def test_stored_data_size_and_topology_are_fail_closed(tmp_path: Path) -> None:

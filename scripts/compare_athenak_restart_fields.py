@@ -525,7 +525,9 @@ def compare_restart_fields(
     mhd_active = _empty_accumulator()
     mhd_ghost = _empty_accumulator()
     face_active = _empty_accumulator()
-    face_components = [_empty_accumulator() for _ in range(3)]
+    face_ghost = _empty_accumulator()
+    face_active_components = [_empty_accumulator() for _ in range(3)]
+    face_ghost_components = [_empty_accumulator() for _ in range(3)]
     adm_active = _empty_accumulator()
     adm_ghost = _empty_accumulator()
     active_mask = _active_spatial_mask(layout)
@@ -634,12 +636,18 @@ def compare_restart_fields(
                         "i": i,
                     }
 
-                for accumulator in (face_active, face_components[component]):
+                face_ghost_mask = ~mask
+                for accumulator, selector in (
+                    (face_active, mask),
+                    (face_active_components[component], mask),
+                    (face_ghost, face_ghost_mask),
+                    (face_ghost_components[component], face_ghost_mask),
+                ):
                     _accumulate_region(
                         accumulator,
                         left_face,
                         right_face,
-                        mask,
+                        selector,
                         describe_face,
                         unsigned_dtype=layout.unsigned_dtype,
                         rtol=rtol,
@@ -699,16 +707,26 @@ def compare_restart_fields(
 
     mhd_active_result = _finalize(mhd_active)
     mhd_ghost_result = _finalize(mhd_ghost)
-    face_result = _finalize(face_active)
-    face_component_results = {
+    face_active_result = _finalize(face_active)
+    face_ghost_result = _finalize(face_ghost)
+    face_active_component_results = {
         f"x{component + 1}f": _finalize(accumulator)
-        for component, accumulator in enumerate(face_components)
+        for component, accumulator in enumerate(face_active_components)
+    }
+    face_ghost_component_results = {
+        f"x{component + 1}f": _finalize(accumulator)
+        for component, accumulator in enumerate(face_ghost_components)
     }
     same_endpoint = bool(
         left_metadata.time == right_metadata.time
         and left_metadata.cycle == right_metadata.cycle
     )
-    included_results = [mhd_active_result, mhd_ghost_result, face_result]
+    included_results = [
+        mhd_active_result,
+        mhd_ghost_result,
+        face_active_result,
+        face_ghost_result,
+    ]
     adm_result: dict[str, object]
     if layout.nadm:
         adm_active_result = _finalize(adm_active)
@@ -723,7 +741,7 @@ def compare_restart_fields(
         adm_result = {"present": False}
 
     authoritative_fields_match = bool(
-        mhd_active_result["match"] and face_result["match"]
+        mhd_active_result["match"] and face_active_result["match"]
     )
     fields_match = all(bool(result["match"]) for result in included_results)
     return {
@@ -775,9 +793,14 @@ def compare_restart_fields(
             "ghost": mhd_ghost_result,
         },
         "face_b": {
-            "active_faces": face_result,
-            "components": face_component_results,
-            "ghost_faces_compared": False,
+            "active_faces": face_active_result,
+            "ghost_faces": face_ghost_result,
+            # Backward-compatible alias retained for analysis consumers written before
+            # ghost face fields became part of the exact restart contract.
+            "components": face_active_component_results,
+            "active_components": face_active_component_results,
+            "ghost_components": face_ghost_component_results,
+            "ghost_faces_compared": True,
         },
         "adm": adm_result,
     }

@@ -37,6 +37,14 @@ class Driver {
     Real time = 0.0;
     Real dt = 0.0;
     bool at_sync_point = false;
+    // Canonical coordinates of the enclosing root step.  Fine-level start/end times
+    // must be derived from this pair and the integer substep ordinal, rather than from
+    // recursively accumulated half-steps: the latter can differ by a few ULPs from the
+    // synchronized root endpoint and makes prescribed spacetime caches restart-path
+    // dependent.
+    int root_level = -1;
+    Real root_time = 0.0;
+    Real root_dt = 0.0;
   };
 
   Driver(ParameterInput *pin, Mesh *pmesh, Real wtlim, Kokkos::Timer* ptimer);
@@ -104,5 +112,6 @@ class Driver {
                                       Real parent_dt);
   void SynchronizeLevelPair(Mesh *pmesh, int coarse_level, int fine_level,
                             Real sync_time, Real coarse_dt);
+  void RebuildLevelSubcyclingRestartCaches(Mesh *pmesh, ParameterInput *pin);
 };
 #endif // DRIVER_DRIVER_HPP_

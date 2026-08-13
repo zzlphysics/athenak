@@ -27,6 +27,7 @@
 #include "ion-neutral/ion-neutral.hpp"
 #include "radiation/radiation.hpp"
 #include "driver.hpp"
+#include "driver/level_subcycling_restart.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -380,6 +381,9 @@ void Driver::ValidateLevelSubcyclingConfiguration(ParameterInput *pin,
   if (pmbp->pmhd == nullptr || pmbp->phydro != nullptr || pmbp->pionn != nullptr) {
     violations.emplace_back("physics must be single-fluid MHD (not hydro or ion-neutral)");
   }
+  if (pmbp->pdyngr != nullptr && pin->GetOrAddBoolean("mhd", "fixed", false)) {
+    violations.emplace_back("<mhd>/fixed must be false");
+  }
   if (pmbp->padm == nullptr || pmbp->pdyngr == nullptr || pmbp->pz4c != nullptr ||
       (pmbp->padm != nullptr && !pmbp->padm->is_dynamic)) {
     violations.emplace_back("GRMHD must use a prescribed dynamic <adm> metric without Z4c");
@@ -439,7 +443,8 @@ void Driver::ValidateLevelSubcyclingConfiguration(ParameterInput *pin,
       std::cout << "Supported envelope: one MeshBlockPack per MPI rank, multilevel "
                 << "static SMR or synchronized AMR, "
                 << "RK2, MHD+CT with a "
-                << "prescribed dynamic ADM metric and no auxiliary physics/source "
+                << "prescribed dynamic ADM metric whose callback updates only the "
+                << "published active MeshBlocks, and no auxiliary physics/source "
                 << "modules." << std::endl;
     }
     std::exit(EXIT_FAILURE);
@@ -790,7 +795,14 @@ void Driver::ExecuteTaskList(Mesh *pm, std::string tl, int stage) {
 
 void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool res_flag) {
   //---- Step 1.  Set conserved variables in ghost zones for all physics
-  InitBoundaryValuesAndPrimitives(pmesh);
+  if (LevelSubcyclingRequested() && res_flag) {
+    // A synchronized strict-subcycling restart stores the complete U/B state consumed
+    // by the next root step, including ghost zones.  Preserve it bit-for-bit and rebuild
+    // only prescribed-metric and primitive caches that are not serialized.
+    RebuildLevelSubcyclingRestartCaches(pmesh, pin);
+  } else {
+    InitBoundaryValuesAndPrimitives(pmesh);
+  }
 
   //---- Step 2.  Compute time step (if problem involves time evolution)
   hydro::Hydro *phydro = pmesh->pmb_pack->phydro;
@@ -896,6 +908,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       if (LevelSubcyclingRequested()) {
         const Real root_time = pmesh->time;
         const Real root_dt = pmesh->dt;
+        level_subcycling.root_level = pmesh->root_level;
+        level_subcycling.root_time = root_time;
+        level_subcycling.root_dt = root_dt;
         AdvanceLevel(pmesh, pmesh->root_level, 0, root_time, root_dt);
         pmesh->pmb_pack->SetAllBlocksActive();
         ResetLevelSubcyclingContext();
@@ -1004,6 +1019,135 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     }  // end while
   }    // end of (time_evolution != tstatic) clause
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Driver::RebuildLevelSubcyclingRestartCaches()
+//! \brief Rebuild non-serialized caches without changing a strict-subcycling restart.
+//!
+//! Restart files serialize u0 and face-centered b0 over active and ghost zones, but not
+//! w0, bcc0, or temperature.  A completed strict-subcycling root step has already
+//! exchanged/prolongated every synchronized level and run C2P over the resulting full
+//! state; after an AMR topology change, InitBoundaryValuesAndPrimitives does the same.
+//! Those stored ghosts are therefore part of the exact next-step state, not disposable
+//! boundary scratch.  Re-exchanging them during restart hydration is non-idempotent:
+//! restriction can consume a fine ghost before a later C2P projection changes it, so
+//! repeated hydration propagates changes through successive AMR levels.
+//!
+//! Recompute only the prescribed spacetime caches, then derive primitive caches from the
+//! serialized U/B state while suppressing all conserved writes.  A non-roundoff proposed
+//! change anywhere, including a ghost zone, means the checkpoint was not taken at a
+//! canonical synchronized endpoint and is rejected rather than silently perturbed.
+
+void Driver::RebuildLevelSubcyclingRestartCaches(Mesh *pm, ParameterInput *pin) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  dyngr::DynGRMHD *pdyngr = pmbp->pdyngr;
+
+  const int stored_contract = pm->level_subcycling_restart_cache_contract_version;
+  const bool allow_legacy = pin->GetOrAddBoolean(
+      "time", "allow_legacy_subcycling_restart", false);
+  const bool accepted_legacy = stored_contract == 0 && allow_legacy;
+  if (stored_contract != level_subcycling::kRestartCacheContractVersion) {
+    if (!accepted_legacy) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl
+                  << "Strict-subcycling restart lacks a compatible synchronized-cache "
+                  << "contract: stored version=" << stored_contract
+                  << ", required version="
+                  << level_subcycling::kRestartCacheContractVersion << ". "
+                  << "Legacy checkpoints require an explicit, one-time "
+                  << "<time>/allow_legacy_subcycling_restart=true qualification run."
+                  << std::endl;
+      }
+#if MPI_PARALLEL_ENABLED
+      if (global_variable::nranks > 1) {
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+      }
+#endif
+      std::exit(EXIT_FAILURE);
+    }
+    if (global_variable::my_rank == 0) {
+      std::cout << "### WARNING: explicitly qualifying a legacy strict-subcycling "
+                << "checkpoint without synchronized-cache contract metadata.  The "
+                << "full-domain C2P audit below must pass before a versioned restart "
+                << "is written." << std::endl;
+    }
+  }
+
+  pmbp->SetAllBlocksActive();
+  SetLevelSubcyclingContext(pm->root_level, 0, pm->time, pm->dt, true);
+
+  // Re-evaluate prescribed spacetime state at the exact endpoint before deriving any
+  // primitive cache.  This also refreshes dynbbh's metric-time cache used by its mask
+  // augmentation callback.
+  if (pmbp->pz4c == nullptr && pmbp->padm != nullptr && pmbp->padm->is_dynamic) {
+    pmbp->padm->SetADMVariables(pmbp);
+    if (pmbp->pcoord->coord_data.bh_excise) {
+      pmbp->pcoord->UpdateExcisionMasks();
+    }
+  }
+  Kokkos::fence();
+
+  auto &indcs = pm->mb_indcs;
+  const int n1 = indcs.nx1 + 2*indcs.ng;
+  const int n2 = (indcs.nx2 > 1) ? indcs.nx2 + 2*indcs.ng : 1;
+  const int n3 = (indcs.nx3 > 1) ? indcs.nx3 + 2*indcs.ng : 1;
+
+  // One full-domain projection reconstructs bcc0/w0/temperature using exactly the
+  // metric, masks, U, and face-B values that the uninterrupted next step would consume.
+  // Conserved writes and event counting are disabled over both active and ghost zones.
+  dyngr::C2PProjectionStats projection = pdyngr->ConToPrimBC(
+      0, n1 - 1, 0, n2 - 1, 0, n3 - 1, true, false);
+  Kokkos::fence();
+
+  std::uint64_t global_mismatches = projection.preserved_cons_mismatches;
+  std::uint64_t global_nonfinite = projection.preserved_cons_nonfinite;
+  std::uint64_t global_solver_failures = projection.solver_failures;
+  Real global_max_relative = projection.max_preserved_cons_relative_change;
+  Real global_max_absolute = projection.max_preserved_cons_absolute_change;
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, &global_mismatches, 1, MPI_UINT64_T, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &global_solver_failures, 1, MPI_UINT64_T, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &global_nonfinite, 1, MPI_UINT64_T, MPI_SUM,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max_relative, 1, MPI_ATHENA_REAL, MPI_MAX,
+                MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &global_max_absolute, 1, MPI_ATHENA_REAL, MPI_MAX,
+                MPI_COMM_WORLD);
+#endif
+
+  if (global_mismatches > 0 || global_nonfinite > 0 || global_solver_failures > 0) {
+    if (global_variable::my_rank == 0) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Strict-subcycling restart cache reconstruction rejected a "
+                << "noncanonical stored state: projection mismatches="
+                << global_mismatches << ", solver failures="
+                << global_solver_failures << ", non-finite proposed values="
+                << global_nonfinite << ", max relative proposed conserved change="
+                << std::setprecision(std::numeric_limits<Real>::max_digits10)
+                << global_max_relative << ", max absolute proposed conserved change="
+                << global_max_absolute << std::endl;
+    }
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::nranks > 1) {
+      MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+#endif
+    std::exit(EXIT_FAILURE);
+  }
+  if (accepted_legacy) {
+    // Make the opt-in one-shot in the versioned checkpoint emitted by this run.
+    pin->SetBoolean("time", "allow_legacy_subcycling_restart", false);
+    if (global_variable::my_rank == 0) {
+      std::cout << "Legacy strict-subcycling restart qualification passed; future "
+                << "checkpoints will require cache-contract version "
+                << level_subcycling::kRestartCacheContractVersion << "." << std::endl;
+    }
+  }
 }
 
 //----------------------------------------------------------------------------------------

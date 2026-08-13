@@ -102,6 +102,11 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     // Write header, if it has not been written already
     if (!(header_written)) {
       std::fprintf(pfile,"# Athena event counter data\n");
+      if (pm->pmb_pack->pdyngr != nullptr) {
+        std::fprintf(pfile,
+            "# DynGRMHD event totals count physical active zones only; ghost-zone "
+            "cache work is excluded.\n");
+      }
       std::fprintf(pfile,"#  cycle eos_dfloor eos_efloor eos_tfloor eos_vceil");
       std::fprintf(pfile," eos_fail c2p_it fofc cons_adjust mag_adjust");
       std::fprintf(pfile," c2p_calls fofc_tests");

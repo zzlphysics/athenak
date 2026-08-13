@@ -324,6 +324,13 @@ half step.  Production inputs therefore use `dcycle=1` explicitly.  The campaign
 writes `file_type=log` every root cycle; this is the authoritative interval record for
 density/energy/temperature floors, velocity ceilings, C2P failures and iteration maxima,
 and FOFC events.
+DynGRMHD event totals use physical active zones of leaf MeshBlocks only.  Ghost-zone C2P
+and FOFC work still runs but is not counted, making the log independent of ghost width,
+MeshBlock/MPI decomposition, and restart cache hydration; excision-floor cells that skip
+the normal solver are also absent from `c2p_calls`.  Restart event format v2 carries this
+definition.  Legacy v1 pending totals included ghost zones and require an explicit
+one-time `allow_legacy_ghost_event_counters=true` migration, which discards the
+incompatible accumulator rather than mixing definitions.
 
 ### Strict 2:1 level subcycling
 
@@ -348,8 +355,9 @@ synchronized root cycle.
 
 The implementation remains deliberately fail-fast outside its validated physics envelope:
 one MeshBlockPack per MPI rank, RK2, single-fluid MHD+CT with a prescribed dynamic ADM
-metric, conserved-variable prolongation, and no radiation, particles, Z4c, diffusion,
-built-in source terms, turbulence, shearing-box, orbital-advection, or full-mesh user
+metric whose callback honors the pack's published active-MeshBlock list,
+conserved-variable prolongation, and no radiation, particles, Z4c, diffusion, built-in
+source terms, turbulence, shearing-box, orbital-advection, or full-mesh user
 boundary/source modules.  `mhd_jcon` output is also unavailable because it is not
 time-consistent on intermediate levels and assumes a single Kerr metric.  Use
 `subcycling=none` for the historical global-timestep path.

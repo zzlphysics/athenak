@@ -771,7 +771,12 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
           corrected |= fofc_scal_(m,n,k,j,i);
           fofc_scal_(m,n,k,j,i) = false;
         }
-        count += static_cast<std::uint64_t>(corrected);
+        // Reset every slot because ghost flags are transient scratch, but report only
+        // physical cells.  Otherwise this scientific diagnostic varies with ghost
+        // width, MeshBlock decomposition, and restart cache history.
+        const bool physical_cell =
+            i >= is && i <= ie && j >= js && j <= je && k >= ks && k <= ke;
+        count += static_cast<std::uint64_t>(corrected && physical_cell);
       }, nfofc_stage);
     Kokkos::parallel_for(
       "FOFC-defer-count", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),

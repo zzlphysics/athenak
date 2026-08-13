@@ -233,6 +233,8 @@ x3max = 1
 evolution = dynamic
 integrator = rk2
 subcycling = level
+allow_legacy_subcycling_restart = false
+allow_legacy_ghost_event_counters = false
 cfl_number = 0.3
 # Deliberately retain the L campaign's 4.8M synchronization/regrid cadence.  Since this
 # qualification root spacing is 32M, the cap is more conservative than its 9.6M CFL limit.

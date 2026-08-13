@@ -74,6 +74,7 @@ Mesh::Mesh(ParameterInput *pin) :
   dtold(0.),
   dt_last_completed(0.),
   dt_restart_growth(0.),
+  level_subcycling_restart_cache_contract_version(0),
   device_nfofc_stage("device_nfofc_stage"),
   device_nfofc_pending("device_nfofc_pending") {
   Kokkos::deep_copy(device_nfofc_stage, std::uint64_t{0});

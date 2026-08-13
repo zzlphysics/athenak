@@ -334,8 +334,9 @@ TaskStatus DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim(Driver *pdrive, int sta
   int n1m1 = indcs.nx1 + 2*ng - 1;
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
-  eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0, pmy_pack->pmhd->bcc0,
-                 pmy_pack->pmhd->w0, temperature, 0, n1m1, 0, n2m1, 0, n3m1, false);
+  (void) eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0,
+                        pmy_pack->pmhd->bcc0, pmy_pack->pmhd->w0, temperature,
+                        0, n1m1, 0, n2m1, 0, n3m1, false);
   return TaskStatus::complete;
 }
 
@@ -343,13 +344,16 @@ TaskStatus DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim(Driver *pdrive, int sta
 //! \fn void DynGRMHDPS::ConToPrimBC(int is, int ie, int js, int je, int ks, int ke)
 //  \brief
 template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrimBC(int is, int ie, int js, int je,
-                                                int ks, int ke) {
+C2PProjectionStats DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrimBC(
+    int is, int ie, int js, int je, int ks, int ke,
+    bool preserve_cons, bool count_events) {
   if (fixed_evolution) {
-    return;
+    return {};
   }
-  eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0, pmy_pack->pmhd->bcc0,
-                 pmy_pack->pmhd->w0, temperature, is, ie, js, je, ks, ke, false);
+  return eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0,
+                        pmy_pack->pmhd->bcc0, pmy_pack->pmhd->w0, temperature,
+                        is, ie, js, je, ks, ke, false,
+                        preserve_cons, count_events);
 }
 
 //----------------------------------------------------------------------------------------
@@ -513,7 +517,22 @@ TaskStatus DynGRMHD::SetADMVariables(Driver *pdrive, int stage) {
   }
   Mesh *pmesh = pmy_pack->pmesh;
   const Real cycle_time = pmesh->time;
-  pmesh->time = cycle_time + stage_fraction*pmesh->dt;
+  Real metric_time = cycle_time + stage_fraction*pmesh->dt;
+  if (pdrive->LevelSubcyclingRequested()) {
+    const auto &context = pdrive->level_subcycling;
+    const int level_offset = context.active_level - context.root_level;
+    if (context.root_level >= 0 && level_offset >= 0 &&
+        std::isfinite(context.root_time) && std::isfinite(context.root_dt)) {
+      // Use one root-anchored expression for every level.  In particular, the last
+      // fine endpoint is root_time + root_dt bit-for-bit, instead of
+      // (root_time + root_dt/2) + root_dt/2.  Restart hydration evaluates the metric at
+      // that same serialized root endpoint, keeping prescribed ADM/mask caches exact.
+      const Real root_fraction = std::ldexp(
+          static_cast<Real>(context.substep) + stage_fraction, -level_offset);
+      metric_time = context.root_time + root_fraction*context.root_dt;
+    }
+  }
+  pmesh->time = metric_time;
   pmy_pack->padm->SetADMVariables(pmy_pack);
   pmesh->time = cycle_time;
   return TaskStatus::complete;
