@@ -144,8 +144,9 @@ def _absent_mca_contract(home: str, prefix_value: str) -> dict[str, object]:
 def _rank_environment(*, rank: int, world_size: int, launcher_pid: int,
                       hostname: str, state_dir: Path,
                       athena_argv: list[str]) -> dict[str, str]:
-    namespace = f"prterun-{hostname}-{launcher_pid}@1"
-    uri = f"{namespace}@0.0;tcp4://127.0.0.1:43210"
+    namespace_family = f"prterun-{hostname}-{launcher_pid}"
+    namespace = f"{namespace_family}@1"
+    uri = f"{namespace_family}@0.0;tcp4://127.0.0.1:43210"
     state = str(state_dir.resolve(strict=True))
     home = str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True))
     return {
@@ -1535,6 +1536,33 @@ def test_launch_record_binds_exact_mpi_and_athena_argv(tmp_path: Path) -> None:
     launch_path.write_text(json.dumps(launch), encoding="utf-8")
     launch_path.chmod(0o444)
     with pytest.raises(CHECKER.CheckFailure, match="exact planned argv"):
+        CHECKER.audit_launch_record(launch_path, plan, plan_path, state_dir)
+
+
+def test_launch_record_accepts_namespace_family_server_rank_uri(
+        tmp_path: Path) -> None:
+    plan, plan_path, state_dir, launch_path, launch = _launch_record_fixture(tmp_path)
+    environment = launch["ranks"][0]["mpi_environment"]
+    assert environment["PMIX_NAMESPACE"] == "prterun-gpu-node-500@1"
+    assert environment["PMIX_SERVER_URI21"] == (
+        "prterun-gpu-node-500@0.0;tcp4://127.0.0.1:43210")
+    assert CHECKER.audit_launch_record(
+        launch_path, plan, plan_path, state_dir)["world_size"] == 2
+
+
+def test_launch_record_rejects_namespace_identifier_as_server_uri_family(
+        tmp_path: Path) -> None:
+    plan, plan_path, state_dir, launch_path, launch = _launch_record_fixture(tmp_path)
+    for rank in launch["ranks"]:
+        environment = rank["mpi_environment"]
+        invalid_uri = (
+            f'{environment["PMIX_NAMESPACE"]}@0.0;tcp4://127.0.0.1:43210')
+        for key in CHECKER.RANK_URI_ENVIRONMENT_KEYS:
+            environment[key] = invalid_uri
+    launch_path.chmod(0o644)
+    launch_path.write_text(json.dumps(launch), encoding="utf-8")
+    launch_path.chmod(0o444)
+    with pytest.raises(CHECKER.CheckFailure, match="PMIx server URI is invalid"):
         CHECKER.audit_launch_record(launch_path, plan, plan_path, state_dir)
 
 

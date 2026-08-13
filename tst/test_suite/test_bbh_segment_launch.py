@@ -1063,8 +1063,9 @@ class FakeProcess:
 def _rank_environment(prepared: Any, rank: int, *, launcher_pid: int = 500,
                       hostname: str = "v100-node", port: int = 43210) \
         -> dict[str, str]:
-    namespace = f"prterun-{hostname}-{launcher_pid}@1"
-    uri = f"{namespace}@0.0;tcp4://127.0.0.1:{port}"
+    namespace_family = f"prterun-{hostname}-{launcher_pid}"
+    namespace = f"{namespace_family}@1"
+    uri = f"{namespace_family}@0.0;tcp4://127.0.0.1:{port}"
     state = str(prepared.state_dir)
     return {
         "HOME": prepared.launch_environment["HOME"],
@@ -1385,6 +1386,48 @@ def test_rank_environment_rejects_tampered_derived_values(
         environment = _rank_environment(prepared, 0)
         environment[key] = value
         with pytest.raises(LAUNCHER.LaunchFailure, match=message):
+            LAUNCHER._parse_rank_environment(
+                environment, 1, 600, prepared.launch_environment,
+                launcher_pid=500, hostname="v100-node",
+                state_dir=prepared.state_dir,
+                athena_argv=prepared.athena_argv)
+    finally:
+        prepared.close()
+
+
+def test_rank_environment_accepts_namespace_family_server_rank_uri(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, world_size=1)
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        environment = _rank_environment(prepared, 0)
+        assert environment["PMIX_NAMESPACE"] == "prterun-v100-node-500@1"
+        assert environment["PMIX_SERVER_URI21"] == (
+            "prterun-v100-node-500@0.0;tcp4://127.0.0.1:43210")
+        _, _, selected = LAUNCHER._parse_rank_environment(
+            environment, 1, 600, prepared.launch_environment,
+            launcher_pid=500, hostname="v100-node",
+            state_dir=prepared.state_dir,
+            athena_argv=prepared.athena_argv)
+        assert selected == environment
+    finally:
+        prepared.close()
+
+
+def test_rank_environment_rejects_namespace_identifier_as_server_uri_family(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, world_size=1)
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        environment = _rank_environment(prepared, 0)
+        invalid_uri = (
+            f'{environment["PMIX_NAMESPACE"]}@0.0;tcp4://127.0.0.1:43210')
+        for key in LAUNCHER.RANK_URI_ENVIRONMENT_KEYS:
+            environment[key] = invalid_uri
+        with pytest.raises(LAUNCHER.LaunchFailure,
+                           match="not the derived loopback URI"):
             LAUNCHER._parse_rank_environment(
                 environment, 1, 600, prepared.launch_environment,
                 launcher_pid=500, hostname="v100-node",

@@ -993,7 +993,8 @@ def _validate_rank_environment(value: Any, *, global_rank: int,
              f"launch rank {global_rank} environment key closure differs: "
              f"missing={sorted(expected_keys - actual_keys)!r}, "
              f"unexpected={sorted(actual_keys - expected_keys)!r}")
-    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    namespace_family = f"prterun-{hostname}-{launcher_pid}"
+    namespace = f"{namespace_family}@1"
     inherited = {
         "HOME": str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)),
         "LANG": "C", "LC_ALL": "C", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
@@ -1024,7 +1025,8 @@ def _validate_rank_environment(value: Any, *, global_rank: int,
              f"launch rank {global_rank} PMIx server URI aliases differ")
     uri = next(iter(uri_values))
     match = re.fullmatch(
-        rf"{re.escape(namespace)}@0\.0;tcp4://127\.0\.0\.1:(\d+)", uri)
+        rf"{re.escape(namespace_family)}@0\.0;tcp4://127\.0\.0\.1:(\d+)",
+        uri)
     _require(match is not None and 1 <= int(match.group(1)) <= 65535,
              f"launch rank {global_rank} PMIx server URI is invalid")
     return {key: value[key] for key in RANK_ENVIRONMENT_KEYS}

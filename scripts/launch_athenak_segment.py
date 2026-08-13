@@ -2511,7 +2511,8 @@ def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
              f"rank pid {pid} is not in the planned single-node MPI world")
     _require(0 <= global_rank < world_size and 0 <= local_rank < world_size,
              f"rank pid {pid} has out-of-range MPI rank")
-    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    namespace_family = f"prterun-{hostname}-{launcher_pid}"
+    namespace = f"{namespace_family}@1"
     expected = {
         **{key: launch_environment[key]
            for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS},
@@ -2542,7 +2543,8 @@ def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
              f"rank pid {pid} PMIx server URI aliases differ")
     uri = next(iter(uri_values))
     uri_match = re.fullmatch(
-        rf"{re.escape(namespace)}@0\.0;tcp4://127\.0\.0\.1:(\d+)", uri)
+        rf"{re.escape(namespace_family)}@0\.0;tcp4://127\.0\.0\.1:(\d+)",
+        uri)
     _require(uri_match is not None and 1 <= int(uri_match.group(1)) <= 65535,
              f"rank pid {pid} PMIx server URI is not the derived loopback URI")
     return global_rank, local_rank, selected
