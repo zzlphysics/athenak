@@ -24,6 +24,92 @@ until the AthenaK segment exits.  Restart files are published only after synchro
 shutdown; retain two newer verified restart generations before considering an ACK-gated
 cleanup.
 
+## Strict long-run segment gate
+
+For a chained BBH run, terminate each production segment by root-cycle count.  Do not use
+the decimal time limit as the primary endpoint: repeated binary64 additions can put the
+stored time several ULPs away from the printed decimal value.  Create an immutable plan
+from the closed source restart before launch:
+
+```bash
+python3 scripts/plan_athenak_segment.py \
+  --repo /data/athenak/repo-clean \
+  --source-restart /scratch/run/previous/state/rst/effective_bbh.00010.rst \
+  --source-history /scratch/run/previous/state/effective_bbh.user.hst \
+  --anchor \
+  --binary /data/athenak/build/src/athena \
+  --trajectory /data/athenak/trajectory/trajectory.dat \
+  --root-steps 100 --root-dt 4.8 --tlim-guard-steps 2 --ranks 8 \
+  --launcher /opt/openmpi/bin/mpirun \
+  --state-dir /scratch/run/segment-0002/state \
+  --staging-dir /scratch/run/segment-0002/staging \
+  --evidence-dir /scratch/run/segment-0002/evidence \
+  --wall-time-seconds 28800 \
+  --required-unnumbered effective_bbh.mhd.hst \
+  --required-unnumbered effective_bbh.user.hst \
+  --required-unnumbered effective_bbh.log \
+  --output /scratch/run/segment-0002/evidence/segment.plan.json
+```
+
+Use `--anchor` only for the first segment imported from the legacy campaign.  Every
+subsequent segment must instead supply the preceding immutable
+`--parent-segment-pass .../segment.pass.ready` report.  The planner binds the clean Git
+commit, executable and tool hashes, source history/restart, trajectory, directories,
+MPI launcher, the exact `nvidia-smi` executable, GPU/rank count, and wall limit.  It also
+binds a minimal explicit child environment and fixed directory descriptors, so inherited
+`LD_*`, `OMPI_MCA_*`, `PATH`, and other ambient variables cannot alter the run.  The plan
+filename is fixed to the direct evidence child `segment.plan.json`.  The planner also
+proves that the sole runtime
+cadence override `output3/dt=4.8` produces one full-domain, ghost-free `divB` topology
+file on every root cycle; a serialized `output3/dcycle` is rejected.
+
+Use the plan's exact `time/nlim` value as the primary stop and its `time/tlim` value only
+as a two-root-step guard.  Launch exactly that immutable plan; the launcher holds private
+read-only descriptors for the staged restart and trajectory and fixed descriptors for
+the state/evidence directories for the complete MPI lifetime, proves the rank-to-GPU
+mapping, and writes immutable launch and completion records.  A failed launch proof
+terminates the whole new MPI process group.  The launcher waits for this one segment but
+never monitors or chains another segment:
+
+```bash
+python3 scripts/launch_athenak_segment.py \
+  --plan /scratch/run/segment-0002/evidence/segment.plan.json \
+  --state-dir /scratch/run/segment-0002/state \
+  --launch-record /scratch/run/segment-0002/evidence/segment.launch.ready \
+  --completion-record /scratch/run/segment-0002/evidence/segment.completion.ready \
+  --run-log /scratch/run/segment-0002/evidence/run.log \
+  --exit-status /scratch/run/segment-0002/evidence/exit.status \
+  --gpu-before /scratch/run/segment-0002/evidence/gpu-before.csv \
+  --gpu-after /scratch/run/segment-0002/evidence/gpu-after.csv
+```
+
+After a clean process exit and a 120-second settling interval, qualify the entire closed
+segment:
+
+```bash
+python3 scripts/check_athenak_segment.py \
+  --plan /scratch/run/segment-0002/evidence/segment.plan.json \
+  --launch-record /scratch/run/segment-0002/evidence/segment.launch.ready \
+  --completion-record /scratch/run/segment-0002/evidence/segment.completion.ready \
+  --endpoint-restart /scratch/run/segment-0002/state/rst/effective_bbh.00020.rst \
+  --state-dir /scratch/run/segment-0002/state \
+  --run-log /scratch/run/segment-0002/evidence/run.log \
+  --event-log /scratch/run/segment-0002/state/effective_bbh.log \
+  --exit-status /scratch/run/segment-0002/evidence/exit.status \
+  --gpu-before /scratch/run/segment-0002/evidence/gpu-before.csv \
+  --gpu-after /scratch/run/segment-0002/evidence/gpu-after.csv \
+  --output /scratch/run/segment-0002/evidence/segment.pass.ready
+```
+
+Exit status 75 means that at least one file is still inside the settling interval; wait
+and retry manually.  Any other nonzero status is a failed gate.  Only a newly created,
+immutable `segment.pass.ready` permits the endpoint restart to become the source for the
+next segment.  The gate rechecks the source hash, exact cycle/time endpoint, strict-level
+subcycling restart contract, capacity headroom, event counters, GPU UUID/ECC state, every
+stored endpoint-restart Real, every planned binary field, `divB`, histories, and per-step
+baryon-mass loss.  Publish and transfer the closed segment only after this qualification;
+do not let a launcher silently continue past a missing or failed report.
+
 Example on the compute host after a segment has closed:
 
 ```bash
