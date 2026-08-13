@@ -45,6 +45,7 @@ python3 scripts/plan_athenak_segment.py \
   --staging-dir /scratch/run/segment-0002/staging \
   --evidence-dir /scratch/run/segment-0002/evidence \
   --wall-time-seconds 28800 \
+  --planned-peak-output-gib 110 \
   --required-unnumbered effective_bbh.mhd.hst \
   --required-unnumbered effective_bbh.user.hst \
   --required-unnumbered effective_bbh.log \
@@ -62,6 +63,18 @@ filename is fixed to the direct evidence child `segment.plan.json`.  The planner
 proves that the sole runtime
 cadence override `output3/dt=4.8` produces one full-domain, ghost-free `divB` topology
 file on every root cycle; a serialized `output3/dcycle` is rejected.
+
+`--planned-peak-output-gib` is a conservative peak for files newly created under the
+segment's state directory.  It does not include the staged source-restart and trajectory
+copies or the reserved recovery space; the launcher adds those separately.  The default
+is 200 GiB;
+pass an explicit measured upper bound for production (for example 30--40 GiB for a
+10-root-step qualification segment or 110 GiB for a 50-root-step segment).  Before any
+staging copy and again through fixed directory descriptors immediately before spawning
+MPI, the launcher rejects every involved filesystem when its exact used-space fraction
+reaches 75% (independent of `df` display rounding), or when it has less than
+the larger of the computed budget and 180 GiB free.  State and staging contributions are
+combined once when they share a filesystem and budgeted independently when they do not.
 
 Use the plan's exact `time/nlim` value as the primary stop and its `time/tlim` value only
 as a two-root-step guard.  Launch exactly that immutable plan; the launcher holds private
@@ -166,6 +179,6 @@ Use the following remote disk policy for the segment launcher:
 - 80%: finish the current synchronized checkpoint and stop;
 - 85%: emergency stop before another output write.
 
-Always reserve the larger of 50 GB or twice the largest restart.  At a measured 10 MB/s,
+Always reserve the larger of 50 GiB or twice the largest restart.  At a measured 10 MB/s,
 the theoretical transfer ceiling is 36 GB/hour (0.864 TB/day); scheduling to 25 GB/hour
 leaves useful retry margin.  A 1 TB backlog needs at least about 28 hours to drain.

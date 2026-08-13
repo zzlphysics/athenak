@@ -49,6 +49,14 @@ from read_athenak_restart_metadata import (
 
 
 SCHEMA = 1
+GIB_BYTES = 1 << 30
+DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
+DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
+DISK_PREFLIGHT_FORMULA = (
+    "per_filesystem_required_free_bytes=max(additional_hard_minimum_free_bytes,"
+    "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
+    "source_restart_size_bytes)+sum(role_contribution_bytes))"
+)
 MIN_READY_AGE_SECONDS = 120.0
 RETRY_EXIT_STATUS = 75
 EVENT_COLUMNS = (
@@ -168,6 +176,192 @@ def _number(value: Any, name: str) -> float:
 def _integer(value: Any, name: str) -> int:
     _require(isinstance(value, int) and not isinstance(value, bool),
              f"{name} must be an integer")
+    return value
+
+
+def _validate_disk_preflight_contract(value: Any,
+                                      source_restart_size: int,
+                                      trajectory_size: int) -> dict[str, Any]:
+    _require(isinstance(value, dict),
+             "launch_contract.disk_preflight must be an object")
+    peak_gib = _integer(
+        value.get("planned_peak_output_gib"),
+        "disk_preflight.planned_peak_output_gib")
+    _require(peak_gib > 0, "planned peak output GiB must be positive")
+    peak_bytes = peak_gib * GIB_BYTES
+    expected = {
+        "kind": DISK_PREFLIGHT_KIND,
+        "accounting": DISK_PREFLIGHT_ACCOUNTING,
+        "formula": DISK_PREFLIGHT_FORMULA,
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * GIB_BYTES,
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * GIB_BYTES,
+        "source_restart_size_bytes": source_restart_size,
+        "source_restart_staging_bytes": source_restart_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": source_restart_size + trajectory_size,
+        "planned_peak_output_gib": peak_gib,
+        "planned_peak_output_bytes": peak_bytes,
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": peak_bytes},
+            "staging_dir": {
+                "source_restart_staging_bytes": source_restart_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {
+            "state_dir": STATE_DIRECTORY_FD,
+            "staging_dir": 206,
+        },
+    }
+    _require(value == expected,
+             "launch disk-preflight contract is not the exact capacity policy")
+    return value
+
+
+def _validate_disk_preflight_snapshot(value: Any, contract: dict[str, Any],
+                                      phase: str,
+                                      state_dir: str,
+                                      staging_dir: str,
+                                      expected_devices: dict[str, int]) \
+        -> dict[str, Any]:
+    """Validate immutable arithmetic evidence without trusting its conclusions."""
+
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "phase", "created_utc", "contract_sha256", "filesystems",
+        "status",
+    }, f"disk preflight {phase} evidence shape is invalid")
+    _require(value.get("kind") == DISK_PREFLIGHT_KIND and
+             value.get("phase") == phase and value.get("status") == "pass" and
+             isinstance(value.get("created_utc"), str) and value["created_utc"] and
+             value.get("contract_sha256") == _canonical_json_sha256(contract),
+             f"disk preflight {phase} identity is invalid")
+    filesystems = value.get("filesystems")
+    _require(isinstance(filesystems, list) and 1 <= len(filesystems) <= 2,
+             f"disk preflight {phase} must cover one or two filesystems")
+    expected_access = ({
+        "state_dir": {"method": "bound_fd_fstatvfs_v1",
+                      "fd": contract["bound_directory_fds"]["state_dir"]},
+        "staging_dir": {"method": "bound_fd_fstatvfs_v1",
+                        "fd": contract["bound_directory_fds"]["staging_dir"]},
+    } if phase == "before_spawn" else {})
+    expected_contributions = {
+        "state_dir": contract["planned_peak_output_bytes"],
+        "staging_dir": contract["staging_copy_bytes"],
+    }
+    seen_roles: set[str] = set()
+    seen_devices: set[int] = set()
+    reserve = max(
+        contract["minimum_reserve_bytes"],
+        contract["minimum_reserve_restart_multiples"] *
+        contract["source_restart_size_bytes"],
+    )
+    for row in filesystems:
+        _require(isinstance(row, dict) and set(row) == {
+            "device", "roles", "observations", "role_contribution_bytes",
+            "contribution_bytes_total", "reserve_bytes", "required_free_bytes",
+            "status",
+        }, f"disk preflight {phase} filesystem evidence shape is invalid")
+        device = _integer(row.get("device"), f"disk preflight {phase} device")
+        roles = row.get("roles")
+        _require(device >= 0 and device not in seen_devices and
+                 isinstance(roles, list) and roles == sorted(roles) and roles and
+                 set(roles) <= {"state_dir", "staging_dir"} and
+                 not (set(roles) & seen_roles),
+                 f"disk preflight {phase} filesystem roles/devices are invalid")
+        seen_devices.add(device)
+        seen_roles.update(roles)
+        _require(all(expected_devices.get(role) == device for role in roles),
+                 f"disk preflight {phase} device binding is invalid")
+        contributions = {role: expected_contributions[role] for role in roles}
+        contribution_total = sum(contributions.values())
+        required_free = max(
+            contract["additional_hard_minimum_free_bytes"],
+            reserve + contribution_total,
+        )
+        _require(row.get("role_contribution_bytes") == contributions and
+                 row.get("contribution_bytes_total") == contribution_total and
+                 row.get("reserve_bytes") == reserve and
+                 row.get("required_free_bytes") == required_free,
+                 f"disk preflight {phase} budget arithmetic is invalid")
+        observations = row.get("observations")
+        _require(isinstance(observations, dict) and set(observations) == set(roles),
+                 f"disk preflight {phase} does not measure every role")
+        for role in roles:
+            observation = observations[role]
+            access = observation.get("access") if isinstance(observation, dict) \
+                else None
+            expected_path = state_dir if role == "state_dir" else staging_dir
+            access_valid = (access == expected_access[role]
+                            if phase == "before_spawn" else
+                            isinstance(access, dict) and
+                            set(access) == {"method", "fd", "planned_path"} and
+                            access.get("method") ==
+                            "bound_directory_fstatvfs_v1" and
+                            isinstance(access.get("fd"), int) and
+                            not isinstance(access.get("fd"), bool) and
+                            access["fd"] >= 0 and
+                            access.get("planned_path") == expected_path)
+            _require(isinstance(observation, dict) and set(observation) == {
+                "access", "statvfs", "used_percent_pass", "free_bytes_pass",
+            } and access_valid,
+                     f"disk preflight {phase} {role} access proof is invalid")
+            fs = observation.get("statvfs")
+            _require(isinstance(fs, dict) and set(fs) == {
+                "fragment_size_bytes", "total_blocks", "free_blocks",
+                "available_blocks", "total_bytes", "free_bytes",
+                "available_bytes", "effective_free_bytes", "used_bytes",
+                "used_percent_numerator", "used_percent_denominator",
+            }, f"disk preflight {phase} statvfs evidence shape is invalid")
+            fragment = _integer(
+                fs.get("fragment_size_bytes"), "statvfs fragment size")
+            total_blocks = _integer(fs.get("total_blocks"), "statvfs total blocks")
+            free_blocks = _integer(fs.get("free_blocks"), "statvfs free blocks")
+            available_blocks = _integer(
+                fs.get("available_blocks"), "statvfs available blocks")
+            _require(fragment > 0 and total_blocks > 0 and
+                     0 <= available_blocks <= free_blocks <= total_blocks,
+                     f"disk preflight {phase} statvfs block counts are invalid")
+            free_bytes = free_blocks * fragment
+            available_bytes = available_blocks * fragment
+            used_bytes = (total_blocks - free_blocks) * fragment
+            used_numerator = (total_blocks - free_blocks) * 100
+            used_denominator = total_blocks - free_blocks + available_blocks
+            _require(used_denominator > 0,
+                     f"disk preflight {phase} has no usable filesystem blocks")
+            _require(fs == {
+                "fragment_size_bytes": fragment,
+                "total_blocks": total_blocks,
+                "free_blocks": free_blocks,
+                "available_blocks": available_blocks,
+                "total_bytes": total_blocks * fragment,
+                "free_bytes": free_bytes,
+                "available_bytes": available_bytes,
+                "effective_free_bytes": min(free_bytes, available_bytes),
+                "used_bytes": used_bytes,
+                "used_percent_numerator": used_numerator,
+                "used_percent_denominator": used_denominator,
+            }, f"disk preflight {phase} statvfs byte arithmetic is invalid")
+            used_pass = used_numerator < (
+                used_denominator * contract["used_percent_exclusive_max"])
+            free_pass = min(free_bytes, available_bytes) >= required_free
+            _require(used_pass and free_pass and
+                     observation.get("used_percent_pass") is True and
+                     observation.get("free_bytes_pass") is True,
+                     f"disk preflight {phase} does not prove {role} capacity")
+        _require(row.get("status") == "pass",
+                 f"disk preflight {phase} filesystem status is invalid")
+    _require(seen_roles == {"state_dir", "staging_dir"},
+             f"disk preflight {phase} does not cover both directory roles")
+    if phase == "before_staging":
+        measured_fds = {
+            observation["access"]["fd"]
+            for row in filesystems
+            for observation in row["observations"].values()
+        }
+        _require(len(measured_fds) == 2,
+                 "before-staging disk preflight must bind two distinct directories")
     return value
 
 
@@ -590,6 +784,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     staging_dir = transport.get("staging_dir")
     _require(isinstance(staging_dir, str) and Path(staging_dir).is_absolute(),
              "input_transport.staging_dir must be absolute")
+    _validate_disk_preflight_contract(
+        launch_contract.get("disk_preflight"), source_input["size"],
+        inputs["trajectory"]["size"])
     roles = transport.get("roles")
     _require(isinstance(roles, dict) and
              set(roles) == {"source_restart", "trajectory"},
@@ -1351,6 +1548,32 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
              all(isinstance(staging_directory.get(name), int)
                  for name in ("device", "inode")),
              "launch record staging bindings are invalid")
+    disk_contract = _validate_disk_preflight_contract(
+        launch_contract.get("disk_preflight"), inputs["source_restart"]["size"],
+        inputs["trajectory"]["size"])
+    disk_evidence = record.get("disk_preflight")
+    _require(isinstance(disk_evidence, dict) and set(disk_evidence) == {
+        "contract", "before_staging", "before_spawn",
+    } and disk_evidence.get("contract") == disk_contract,
+             "launch record disk-preflight contract differs from the plan")
+    _validate_disk_preflight_snapshot(
+        disk_evidence["before_staging"], disk_contract, "before_staging",
+        state_dir=str(state_dir.resolve(strict=True)),
+        staging_dir=str(Path(transport_contract["staging_dir"])),
+        expected_devices={
+            "state_dir": directory_transport["roles"]["state_dir"]["device"],
+            "staging_dir": staging_directory["device"],
+        },
+    )
+    _validate_disk_preflight_snapshot(
+        disk_evidence["before_spawn"], disk_contract, "before_spawn",
+        state_dir=str(state_dir.resolve(strict=True)),
+        staging_dir=str(Path(transport_contract["staging_dir"])),
+        expected_devices={
+            "state_dir": directory_transport["roles"]["state_dir"]["device"],
+            "staging_dir": staging_directory["device"],
+        },
+    )
     planned_roles = transport_contract.get("roles", {})
     _require(isinstance(planned_roles, dict) and
              set(planned_roles) == {"source_restart", "trajectory"},
@@ -1545,6 +1768,7 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
         "original_inputs": original_inputs,
         "staged_inputs": staged_inputs,
         "staging_directory": staging_directory,
+        "disk_preflight": disk_evidence,
         "repository_preflight": repository_preflight,
         "repository_at_launch": repository_at_launch,
         "nvidia_smi": nvidia_smi_binding,

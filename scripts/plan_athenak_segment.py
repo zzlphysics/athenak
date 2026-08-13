@@ -55,6 +55,15 @@ GIT_PATH = Path(shutil.which("git") or "").resolve(strict=True)
 MAX_ATHENA_CYCLE = 2**31 - 1
 MIN_CAPACITY_HEADROOM = 64
 YELLOW_CAPACITY_HEADROOM = 128
+GIB_BYTES = 1 << 30
+DEFAULT_PLANNED_PEAK_OUTPUT_GIB = 200
+DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
+DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
+DISK_PREFLIGHT_FORMULA = (
+    "per_filesystem_required_free_bytes=max(additional_hard_minimum_free_bytes,"
+    "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
+    "source_restart_size_bytes)+sum(role_contribution_bytes))"
+)
 GIT_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -184,6 +193,38 @@ def _positive_integer(value: int, label: str) -> int:
     if value < 1:
         raise ValueError(f"{label} must be positive")
     return value
+
+
+def _disk_preflight_contract(source_restart_size: int, trajectory_size: int,
+                             planned_peak_output_gib: int) -> dict[str, Any]:
+    """Bind the conservative, per-filesystem launch capacity budget."""
+
+    peak_gib = _positive_integer(
+        planned_peak_output_gib, "--planned-peak-output-gib")
+    peak_bytes = peak_gib * GIB_BYTES
+    return {
+        "kind": DISK_PREFLIGHT_KIND,
+        "accounting": DISK_PREFLIGHT_ACCOUNTING,
+        "formula": DISK_PREFLIGHT_FORMULA,
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * GIB_BYTES,
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * GIB_BYTES,
+        "source_restart_size_bytes": source_restart_size,
+        "source_restart_staging_bytes": source_restart_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": source_restart_size + trajectory_size,
+        "planned_peak_output_gib": peak_gib,
+        "planned_peak_output_bytes": peak_bytes,
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": peak_bytes},
+            "staging_dir": {
+                "source_restart_staging_bytes": source_restart_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {"state_dir": 202, "staging_dir": 206},
+    }
 
 
 def _sequential_add(initial: float, increment: float, count: int) -> float:
@@ -1130,6 +1171,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                     "runtime_value_template": trajectory_proc_template,
                 },
             },
+            "disk_preflight": _disk_preflight_contract(
+                source_restart["size"], trajectory["size"],
+                args.planned_peak_output_gib),
             "evidence_dir": str(evidence_dir),
             "evidence": evidence,
             "wall_time_seconds": wall_time_seconds,
@@ -1180,6 +1224,12 @@ def main() -> int:
     parser.add_argument("--staging-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--wall-time-seconds", required=True, type=int)
+    parser.add_argument(
+        "--planned-peak-output-gib", type=int,
+        default=DEFAULT_PLANNED_PEAK_OUTPUT_GIB,
+        help=("conservative peak GiB of new state output only; staging copy and "
+              "reserve are added separately (default: 200)"),
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--required-unnumbered",

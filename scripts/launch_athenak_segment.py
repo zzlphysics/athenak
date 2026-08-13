@@ -62,6 +62,14 @@ from read_athenak_restart_metadata import (
 
 
 SCHEMA = 1
+GIB_BYTES = 1 << 30
+DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
+DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
+DISK_PREFLIGHT_FORMULA = (
+    "per_filesystem_required_free_bytes=max(additional_hard_minimum_free_bytes,"
+    "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
+    "source_restart_size_bytes)+sum(role_contribution_bytes))"
+)
 DEFAULT_PROOF_TIMEOUT_SECONDS = 120.0
 DEFAULT_PROOF_POLL_SECONDS = 0.25
 GPU_QUERY = (
@@ -84,6 +92,7 @@ STATE_DIRECTORY_FD = 202
 EVIDENCE_DIRECTORY_FD = 203
 MPI_LAUNCHER_FD = 204
 BINARY_EXECUTABLE_FD = 205
+STAGING_DIRECTORY_PREFLIGHT_FD = 206
 HOLDER_PID_TOKEN = "{holder_pid}"
 DIRECTORY_TRANSPORT_KIND = "linux_proc_holder_dirfd_v1"
 EXECUTABLE_TRANSPORT_KIND = "linux_proc_holder_execfd_v1"
@@ -297,6 +306,155 @@ def _canonical_sha256(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_disk_preflight_contract(value: Any,
+                                      source_restart_size: int,
+                                      trajectory_size: int) -> dict[str, Any]:
+    _require(isinstance(value, dict),
+             "launch_contract.disk_preflight must be an object")
+    peak_gib = _integer(
+        value.get("planned_peak_output_gib"),
+        "disk_preflight.planned_peak_output_gib")
+    _require(peak_gib > 0, "planned peak output GiB must be positive")
+    peak_bytes = peak_gib * GIB_BYTES
+    expected = {
+        "kind": DISK_PREFLIGHT_KIND,
+        "accounting": DISK_PREFLIGHT_ACCOUNTING,
+        "formula": DISK_PREFLIGHT_FORMULA,
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * GIB_BYTES,
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * GIB_BYTES,
+        "source_restart_size_bytes": source_restart_size,
+        "source_restart_staging_bytes": source_restart_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": source_restart_size + trajectory_size,
+        "planned_peak_output_gib": peak_gib,
+        "planned_peak_output_bytes": peak_bytes,
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": peak_bytes},
+            "staging_dir": {
+                "source_restart_staging_bytes": source_restart_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {
+            "state_dir": STATE_DIRECTORY_FD,
+            "staging_dir": STAGING_DIRECTORY_PREFLIGHT_FD,
+        },
+    }
+    _require(value == expected,
+             "launch disk-preflight contract is not the exact capacity policy")
+    return value
+
+
+def _disk_preflight_snapshot(
+        contract: Mapping[str, Any], phase: str,
+        role_bindings: Mapping[str, Mapping[str, Any]],
+        statvfs_reader: Callable[[Any], Any]) -> dict[str, Any]:
+    """Measure and enforce one conservative budget per unique ``st_dev``."""
+
+    _require(phase in ("before_staging", "before_spawn"),
+             "disk preflight phase is invalid")
+    _require(set(role_bindings) == {"state_dir", "staging_dir"},
+             "disk preflight must bind state and staging directories")
+    grouped: dict[int, list[str]] = {}
+    for role, binding in role_bindings.items():
+        device = binding.get("device")
+        _require(isinstance(device, int) and not isinstance(device, bool) and device >= 0,
+                 f"disk preflight {role} device is invalid")
+        grouped.setdefault(device, []).append(role)
+
+    reserve = max(
+        int(contract["minimum_reserve_bytes"]),
+        int(contract["minimum_reserve_restart_multiples"]) *
+        int(contract["source_restart_size_bytes"]),
+    )
+    role_contributions = {
+        "state_dir": int(contract["planned_peak_output_bytes"]),
+        "staging_dir": int(contract["staging_copy_bytes"]),
+    }
+    filesystems: list[dict[str, Any]] = []
+    for device in sorted(grouped):
+        roles = sorted(grouped[device])
+        contributions = {role: role_contributions[role] for role in roles}
+        contribution_total = sum(contributions.values())
+        required_free = max(
+            int(contract["additional_hard_minimum_free_bytes"]),
+            reserve + contribution_total,
+        )
+        observations: dict[str, dict[str, Any]] = {}
+        for role in roles:
+            binding = role_bindings[role]
+            try:
+                fs = statvfs_reader(binding["target"])
+            except OSError as exc:
+                raise LaunchFailure(
+                    f"cannot read {phase} statvfs for {role} on device "
+                    f"{device}: {exc}") from exc
+            fragment = int(getattr(fs, "f_frsize", 0))
+            total_blocks = int(getattr(fs, "f_blocks", -1))
+            free_blocks = int(getattr(fs, "f_bfree", -1))
+            available_blocks = int(getattr(fs, "f_bavail", -1))
+            _require(fragment > 0 and total_blocks > 0 and
+                     0 <= available_blocks <= free_blocks <= total_blocks,
+                     f"disk preflight {phase} returned invalid statvfs counts")
+            free_bytes = free_blocks * fragment
+            available_bytes = available_blocks * fragment
+            effective_free = min(free_bytes, available_bytes)
+            used_blocks = total_blocks - free_blocks
+            used_numerator = used_blocks * 100
+            used_denominator = used_blocks + available_blocks
+            _require(used_denominator > 0,
+                     f"disk preflight {phase} has no usable filesystem blocks")
+            used_pass = used_numerator < (
+                used_denominator * int(contract["used_percent_exclusive_max"]))
+            free_pass = effective_free >= required_free
+            _require(used_pass,
+                     f"disk preflight {phase} rejects {role} on device {device}: "
+                     f"used space is at or above "
+                     f"{contract['used_percent_exclusive_max']}%")
+            _require(free_pass,
+                     f"disk preflight {phase} rejects {role} on device {device}: "
+                     f"effective free {effective_free} bytes is below required "
+                     f"{required_free} bytes")
+            observations[role] = {
+                "access": dict(binding["access"]),
+                "statvfs": {
+                    "fragment_size_bytes": fragment,
+                    "total_blocks": total_blocks,
+                    "free_blocks": free_blocks,
+                    "available_blocks": available_blocks,
+                    "total_bytes": total_blocks * fragment,
+                    "free_bytes": free_bytes,
+                    "available_bytes": available_bytes,
+                    "effective_free_bytes": effective_free,
+                    "used_bytes": used_blocks * fragment,
+                    "used_percent_numerator": used_numerator,
+                    "used_percent_denominator": used_denominator,
+                },
+                "used_percent_pass": True,
+                "free_bytes_pass": True,
+            }
+        filesystems.append({
+            "device": device,
+            "roles": roles,
+            "observations": observations,
+            "role_contribution_bytes": contributions,
+            "contribution_bytes_total": contribution_total,
+            "reserve_bytes": reserve,
+            "required_free_bytes": required_free,
+            "status": "pass",
+        })
+    return {
+        "kind": DISK_PREFLIGHT_KIND,
+        "phase": phase,
+        "created_utc": _utc_now(),
+        "contract_sha256": _canonical_sha256(contract),
+        "filesystems": filesystems,
+        "status": "pass",
+    }
 
 
 def _athena_float32(value: float) -> float:
@@ -564,6 +722,10 @@ def _staging_directory(path: Path, state_dir: Path) -> tuple[Path, int]:
     _require(stat.S_IMODE(info.st_mode) & 0o200,
              "empty staging directory must initially be owner-writable")
     _require(not any(staging.iterdir()), "staging directory must initially be empty")
+    _require(not _fd_is_open(STAGING_DIRECTORY_PREFLIGHT_FD),
+             f"refusing to replace existing process fd "
+             f"{STAGING_DIRECTORY_PREFLIGHT_FD}")
+    descriptor: int | None = None
     try:
         descriptor = os.open(
             staging,
@@ -576,10 +738,23 @@ def _staging_directory(path: Path, state_dir: Path) -> tuple[Path, int]:
         bound = os.fstat(descriptor)
         _require(bound.st_dev == info.st_dev and bound.st_ino == info.st_ino,
                  "staging directory changed while being opened")
+        if descriptor != STAGING_DIRECTORY_PREFLIGHT_FD:
+            os.dup2(
+                descriptor, STAGING_DIRECTORY_PREFLIGHT_FD, inheritable=False)
+            os.close(descriptor)
+            descriptor = None
+        else:
+            os.set_inheritable(descriptor, False)
+        fixed = os.fstat(STAGING_DIRECTORY_PREFLIGHT_FD)
+        _require(fixed.st_dev == info.st_dev and fixed.st_ino == info.st_ino,
+                 "fixed staging directory descriptor changed while being bound")
     except BaseException:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        if _fd_is_open(STAGING_DIRECTORY_PREFLIGHT_FD):
+            os.close(STAGING_DIRECTORY_PREFLIGHT_FD)
         raise
-    return staging, descriptor
+    return staging, STAGING_DIRECTORY_PREFLIGHT_FD
 
 
 def _stage_from_audited_descriptor(source: Mapping[str, Any],
@@ -610,6 +785,9 @@ def _stage_from_audited_descriptor(source: Mapping[str, Any],
     descriptor: int | None = None
     staged_fd: int | None = None
     source_stream: Any | None = None
+    destination_signature: tuple[int, int, int, int] | None = None
+    destination_installed = False
+    committed = False
     digest = hashlib.sha256()
     try:
         try:
@@ -647,6 +825,15 @@ def _stage_from_audited_descriptor(source: Mapping[str, Any],
                 _assert_closed(checked_path, source_signature)
                 _require(digest.hexdigest() == source["sha256"],
                          f"original {label} bytes differ from immutable plan")
+                temporary_info = os.stat(
+                    temporary.name, dir_fd=staging_directory_fd,
+                    follow_symlinks=False)
+                _require(stat.S_ISREG(temporary_info.st_mode),
+                         f"temporary staged {label} is not regular")
+                destination_signature = (
+                    temporary_info.st_dev, temporary_info.st_ino,
+                    temporary_info.st_size, temporary_info.st_mtime_ns,
+                )
                 try:
                     os.link(
                         temporary.name, destination.name,
@@ -657,6 +844,14 @@ def _stage_from_audited_descriptor(source: Mapping[str, Any],
                 except FileExistsError as exc:
                     raise LaunchFailure(
                         f"refusing pre-existing staged target: {destination}") from exc
+                destination_installed = True
+                linked = os.stat(
+                    destination.name, dir_fd=staging_directory_fd,
+                    follow_symlinks=False)
+                _require(stat.S_ISREG(linked.st_mode) and
+                         (linked.st_dev, linked.st_ino) ==
+                         (temporary_info.st_dev, temporary_info.st_ino),
+                         f"new staged {label} link does not bind the copied inode")
                 staged_fd = os.open(
                     destination.name,
                     os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
@@ -681,6 +876,7 @@ def _stage_from_audited_descriptor(source: Mapping[str, Any],
         audited = _audit_open_descriptor(staged_fd, planned, f"staged {label}")
         result_fd = staged_fd
         staged_fd = None
+        committed = True
         return audited, result_fd
     finally:
         if staged_fd is not None:
@@ -688,6 +884,25 @@ def _stage_from_audited_descriptor(source: Mapping[str, Any],
                 os.close(staged_fd)
             except OSError:
                 pass
+        if destination_installed and destination_signature is not None and not committed:
+            try:
+                current = os.stat(
+                    destination.name, dir_fd=staging_directory_fd,
+                    follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                current_signature = (
+                    current.st_dev, current.st_ino, current.st_size,
+                    current.st_mtime_ns,
+                )
+                if (stat.S_ISREG(current.st_mode) and
+                        current_signature == destination_signature):
+                    os.unlink(destination.name, dir_fd=staging_directory_fd)
+                    os.fsync(staging_directory_fd)
+                else:
+                    raise LaunchFailure(
+                        f"refusing cleanup of changed staged {label} inode")
 
 
 def _seal_staging_directory(staging_dir: Path, descriptor: int) -> dict[str, Any]:
@@ -702,6 +917,36 @@ def _seal_staging_directory(staging_dir: Path, descriptor: int) -> dict[str, Any
         "inode": info.st_ino,
         "mode": "0555",
     }
+
+
+def _cleanup_bound_staged_inputs(staging_fd: int,
+                                 staging_record: Mapping[str, Any],
+                                 staged_records: Sequence[Mapping[str, Any]]) -> None:
+    """Remove only this launch's inode-bound direct children after a pre-spawn fail."""
+
+    info = os.fstat(staging_fd)
+    _require(stat.S_ISDIR(info.st_mode) and
+             info.st_dev == staging_record.get("device") and
+             info.st_ino == staging_record.get("inode"),
+             "refusing cleanup through a changed staging directory descriptor")
+    os.fchmod(staging_fd, 0o700)
+    for record in staged_records:
+        path = Path(str(record.get("path", "")))
+        _require(path.name not in ("", ".", "..") and
+                 str(path.parent) == str(staging_record.get("path")),
+                 "refusing cleanup of a non-direct staged child")
+        entry = os.stat(path.name, dir_fd=staging_fd, follow_symlinks=False)
+        expected = tuple(record.get(name) for name in (
+            "device", "inode", "size", "mtime_ns", "ctime_ns",
+        ))
+        actual = (entry.st_dev, entry.st_ino, entry.st_size,
+                  entry.st_mtime_ns, entry.st_ctime_ns)
+        _require(stat.S_ISREG(entry.st_mode) and actual == expected,
+                 f"refusing cleanup of changed staged inode {path.name}")
+        os.unlink(path.name, dir_fd=staging_fd)
+    os.fsync(staging_fd)
+    _require(not os.listdir(staging_fd),
+             "staging directory is not empty after bounded pre-spawn cleanup")
 
 
 @dataclass
@@ -1453,6 +1698,8 @@ class Runtime:
     killpg: Callable[[int, int], None] = os.killpg
     get_signal_handler: Callable[[int], Any] = signal.getsignal
     set_signal_handler: Callable[[int, Any], Any] = signal.signal
+    statvfs: Callable[[Any], Any] = os.statvfs
+    fstatvfs: Callable[[int], Any] = os.fstatvfs
     plan_validator: Callable[[dict[str, Any]], dict[str, Any]] = \
         _production_validate_plan
     source_validator: Callable[[Path, Mapping[str, Any]], dict[str, Any]] = \
@@ -1479,6 +1726,8 @@ class PreparedLaunch:
     staging_directory: dict[str, Any]
     staged_source_restart: dict[str, Any]
     staged_trajectory: dict[str, Any]
+    staging_directory_fd: int = field(repr=False)
+    disk_preflight_before_staging: dict[str, Any]
     input_holder: HolderInputs
     directory_holder: HolderDirectories
     executable_holder: HolderExecutables
@@ -1488,6 +1737,22 @@ class PreparedLaunch:
     launch_argv: tuple[str, ...]
     gpus: tuple[GPURecord, ...]
     gpu_visibility_environment: dict[str, str | None]
+
+    def close(self) -> None:
+        self.input_holder.close()
+        self.directory_holder.close()
+        self.executable_holder.close()
+        descriptor = self.staging_directory_fd
+        if descriptor >= 0:
+            object.__setattr__(self, "staging_directory_fd", -1)
+            if _fd_is_open(descriptor):
+                os.close(descriptor)
+
+    def __del__(self) -> None:  # pragma: no cover - defensive library-use fallback
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
 
 
 def prepare_launch(plan_path: Path, state_dir: Path,
@@ -1688,6 +1953,13 @@ def prepare_launch(plan_path: Path, state_dir: Path,
     staging_value = transport.get("staging_dir")
     _require(isinstance(staging_value, str) and Path(staging_value).is_absolute(),
              "input_transport.staging_dir must be an absolute path")
+    disk_contract = _validate_disk_preflight_contract(
+        contract.get("disk_preflight"), inputs["source_restart"]["size"],
+        inputs["trajectory"]["size"])
+    resolved_staging = _safe_directory(
+        Path(staging_value), "staging directory")
+    _require(str(resolved_staging) == staging_value,
+             "input_transport.staging_dir must be canonical")
 
     source_template = f"/proc/{HOLDER_PID_TOKEN}/fd/{SOURCE_RESTART_FD}"
     state_template = f"/proc/{HOLDER_PID_TOKEN}/fd/{STATE_DIRECTORY_FD}"
@@ -1742,15 +2014,49 @@ def prepare_launch(plan_path: Path, state_dir: Path,
 
     state_path, state_fd, state_record = _open_bound_directory(
         resolved_state, "state directory")
+    staging_fd: int | None = None
+    try:
+        staging_dir, staging_fd = _staging_directory(
+            resolved_staging, state_path)
+        state_info = os.fstat(state_fd)
+        staging_info = os.fstat(staging_fd)
+        disk_preflight_before_staging = _disk_preflight_snapshot(
+            disk_contract,
+            "before_staging",
+            {
+                "state_dir": {
+                    "device": state_info.st_dev, "target": state_fd,
+                    "access": {
+                        "method": "bound_directory_fstatvfs_v1",
+                        "fd": state_fd, "planned_path": str(state_path),
+                    },
+                },
+                "staging_dir": {
+                    "device": staging_info.st_dev, "target": staging_fd,
+                    "access": {
+                        "method": "bound_directory_fstatvfs_v1",
+                        "fd": staging_fd, "planned_path": str(staging_dir),
+                    },
+                },
+            },
+            runtime.fstatvfs,
+        )
+    except BaseException:
+        os.close(state_fd)
+        if staging_fd is not None and _fd_is_open(staging_fd):
+            os.close(staging_fd)
+        raise
     evidence_path: Path | None = None
     evidence_fd: int | None = None
     directory_holder: HolderDirectories | None = None
     launcher_fd: int | None = None
     binary_fd: int | None = None
     executable_holder: HolderExecutables | None = None
-    staging_fd: int | None = None
     staged_source_fd: int | None = None
     staged_trajectory_fd: int | None = None
+    staged_source: dict[str, Any] | None = None
+    staged_trajectory: dict[str, Any] | None = None
+    staging_record: dict[str, Any] | None = None
     holder: HolderInputs | None = None
     try:
         evidence_path, evidence_fd, evidence_record = _open_bound_directory(
@@ -1762,8 +2068,6 @@ def prepare_launch(plan_path: Path, state_dir: Path,
         binary_fd = _open_executable_descriptor(binary, "Athena binary")
         executable_holder = _install_holder_executables(
             launcher_fd, binary_fd, launcher, binary, runtime.inspector)
-        staging_dir, staging_fd = _staging_directory(
-            Path(staging_value), state_path)
         _paths_separate(
             evidence_path, staging_dir,
             "staging and launch evidence directories must not contain each other")
@@ -1784,10 +2088,23 @@ def prepare_launch(plan_path: Path, state_dir: Path,
             directory_holder.close()
         if executable_holder is not None:
             executable_holder.close()
+        if staging_fd is not None:
+            created = [record for record in (staged_source, staged_trajectory)
+                       if record is not None]
+            if created:
+                bound = os.fstat(staging_fd)
+                _cleanup_bound_staged_inputs(
+                    staging_fd,
+                    {"path": str(resolved_staging), "device": bound.st_dev,
+                     "inode": bound.st_ino},
+                    created,
+                )
+            os.close(staging_fd)
+            staging_fd = None
         raise
     finally:
         for descriptor in (
-                staged_source_fd, staged_trajectory_fd, staging_fd,
+                staged_source_fd, staged_trajectory_fd,
                 state_fd, evidence_fd, launcher_fd, binary_fd):
             if descriptor is not None:
                 try:
@@ -1795,7 +2112,9 @@ def prepare_launch(plan_path: Path, state_dir: Path,
                 except OSError:
                     pass
     _require(holder is not None and directory_holder is not None and
-             executable_holder is not None,
+             executable_holder is not None and staging_fd is not None and
+             staging_record is not None and staged_source is not None and
+             staged_trajectory is not None,
              "failed to install holder descriptors")
     try:
         _require(holder.pid == directory_holder.pid,
@@ -1820,6 +2139,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
             repository=repository, binary=binary, source_restart=source,
             trajectory=trajectory, staging_directory=staging_record,
             staged_source_restart=staged_source, staged_trajectory=staged_trajectory,
+            staging_directory_fd=staging_fd,
+            disk_preflight_before_staging=disk_preflight_before_staging,
             input_holder=holder, directory_holder=directory_holder,
             executable_holder=executable_holder,
             launcher=launcher,
@@ -1835,6 +2156,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
         holder.close()
         directory_holder.close()
         executable_holder.close()
+        if _fd_is_open(staging_fd):
+            os.close(staging_fd)
         raise
 
 
@@ -2420,6 +2743,51 @@ def _run_segment_with_holder(
              "a GPU compute application appeared after preflight")
     prepared.input_holder.audit()
     prepared.directory_holder.audit()
+    disk_contract = _validate_disk_preflight_contract(
+        contract.get("disk_preflight"),
+        prepared.plan["inputs"]["source_restart"]["size"],
+        prepared.plan["inputs"]["trajectory"]["size"],
+    )
+    state_preflight_fd = prepared.directory_holder.roles["state_dir"]["fd"]
+    staging_preflight_fd = prepared.staging_directory_fd
+    _require(state_preflight_fd ==
+             disk_contract["bound_directory_fds"]["state_dir"] and
+             staging_preflight_fd ==
+             disk_contract["bound_directory_fds"]["staging_dir"],
+             "bound disk-preflight descriptors differ from the plan")
+    state_fs_info = os.fstat(state_preflight_fd)
+    staging_fs_info = os.fstat(staging_preflight_fd)
+    try:
+        disk_preflight_before_spawn = _disk_preflight_snapshot(
+            disk_contract,
+            "before_spawn",
+            {
+                "state_dir": {
+                    "device": state_fs_info.st_dev,
+                    "target": state_preflight_fd,
+                    "access": {
+                        "method": "bound_fd_fstatvfs_v1",
+                        "fd": state_preflight_fd,
+                    },
+                },
+                "staging_dir": {
+                    "device": staging_fs_info.st_dev,
+                    "target": staging_preflight_fd,
+                    "access": {
+                        "method": "bound_fd_fstatvfs_v1",
+                        "fd": staging_preflight_fd,
+                    },
+                },
+            },
+            runtime.fstatvfs,
+        )
+    except BaseException:
+        _cleanup_bound_staged_inputs(
+            staging_preflight_fd,
+            prepared.staging_directory,
+            (prepared.staged_source_restart, prepared.staged_trajectory),
+        )
+        raise
     before_binding = _install_evidence_bytes(
         prepared,
         normalized.gpu_before, _gpu_csv(before))
@@ -2484,6 +2852,11 @@ def _run_segment_with_holder(
             "staged_inputs": {
                 "source_restart": prepared.staged_source_restart,
                 "trajectory": prepared.staged_trajectory,
+            },
+            "disk_preflight": {
+                "contract": disk_contract,
+                "before_staging": prepared.disk_preflight_before_staging,
+                "before_spawn": disk_preflight_before_spawn,
             },
             "input_transport_contract": (
                 prepared.plan["launch_contract"]["input_transport"]
@@ -2623,9 +2996,7 @@ def run_segment(prepared: PreparedLaunch, plan_path: Path, outputs: OutputPaths,
         return _run_segment_with_holder(
             prepared, plan_path, outputs, runtime, proof_timeout_seconds)
     finally:
-        prepared.input_holder.close()
-        prepared.directory_holder.close()
-        prepared.executable_holder.close()
+        prepared.close()
 
 
 def _prepared_summary(prepared: PreparedLaunch) -> dict[str, Any]:
@@ -2644,6 +3015,7 @@ def _prepared_summary(prepared: PreparedLaunch) -> dict[str, Any]:
             "source_restart": prepared.staged_source_restart,
             "trajectory": prepared.staged_trajectory,
         },
+        "disk_preflight_before_staging": prepared.disk_preflight_before_staging,
         "gpu_visibility_environment": prepared.gpu_visibility_environment,
         "launch_environment": {
             "kind": LAUNCH_ENVIRONMENT_KIND,
@@ -2689,9 +3061,7 @@ def main(argv: Sequence[str] | None = None, runtime: Runtime | None = None) -> i
                 print(json.dumps(_prepared_summary(prepared), sort_keys=True,
                                  allow_nan=False))
             finally:
-                prepared.input_holder.close()
-                prepared.directory_holder.close()
-                prepared.executable_holder.close()
+                prepared.close()
             return 0
         return run_segment(
             prepared, args.plan,
@@ -2700,9 +3070,7 @@ def main(argv: Sequence[str] | None = None, runtime: Runtime | None = None) -> i
         )
     except (OSError, LaunchFailure, ValueError) as exc:
         if prepared is not None:
-            prepared.input_holder.close()
-            prepared.directory_holder.close()
-            prepared.executable_holder.close()
+            prepared.close()
         parser.error(str(exc))
     return 2  # pragma: no cover
 

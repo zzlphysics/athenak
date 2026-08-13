@@ -76,6 +76,93 @@ def _environment_contract() -> dict[str, object]:
     }
 
 
+def _disk_contract(source_size: int = 1, trajectory_size: int = 1,
+                   peak_gib: int = 200) \
+        -> dict[str, object]:
+    peak_bytes = peak_gib * CHECKER.GIB_BYTES
+    return {
+        "kind": CHECKER.DISK_PREFLIGHT_KIND,
+        "accounting": CHECKER.DISK_PREFLIGHT_ACCOUNTING,
+        "formula": CHECKER.DISK_PREFLIGHT_FORMULA,
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * CHECKER.GIB_BYTES,
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * CHECKER.GIB_BYTES,
+        "source_restart_size_bytes": source_size,
+        "source_restart_staging_bytes": source_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": source_size + trajectory_size,
+        "planned_peak_output_gib": peak_gib,
+        "planned_peak_output_bytes": peak_bytes,
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": peak_bytes},
+            "staging_dir": {
+                "source_restart_staging_bytes": source_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {"state_dir": 202, "staging_dir": 206},
+    }
+
+
+def _disk_snapshot(contract: dict[str, object], phase: str, device: int,
+                   state_dir: Path, staging_dir: Path) -> dict[str, object]:
+    roles = ["staging_dir", "state_dir"]
+    contributions = {
+        "staging_dir": int(contract["staging_copy_bytes"]),
+        "state_dir": int(contract["planned_peak_output_bytes"]),
+    }
+    reserve = max(
+        int(contract["minimum_reserve_bytes"]),
+        int(contract["minimum_reserve_restart_multiples"]) *
+        int(contract["source_restart_size_bytes"]),
+    )
+    contribution_total = sum(contributions.values())
+    required = max(
+        int(contract["additional_hard_minimum_free_bytes"]),
+        reserve + contribution_total,
+    )
+    access = ({
+        "state_dir": {"method": "bound_directory_fstatvfs_v1", "fd": 17,
+                      "planned_path": str(state_dir)},
+        "staging_dir": {
+            "method": "bound_directory_fstatvfs_v1", "fd": 18,
+            "planned_path": str(staging_dir),
+        },
+    } if phase == "before_staging" else {
+        "state_dir": {"method": "bound_fd_fstatvfs_v1", "fd": 202},
+        "staging_dir": {"method": "bound_fd_fstatvfs_v1", "fd": 206},
+    })
+    return {
+        "kind": CHECKER.DISK_PREFLIGHT_KIND,
+        "phase": phase,
+        "created_utc": "2026-08-13T00:00:00+00:00",
+        "contract_sha256": CHECKER._canonical_json_sha256(contract),
+        "filesystems": [{
+            "device": device, "roles": roles,
+            "observations": {role: {
+                "access": access[role],
+                "statvfs": {
+                    "fragment_size_bytes": CHECKER.GIB_BYTES,
+                    "total_blocks": 1000, "free_blocks": 900,
+                    "available_blocks": 900,
+                    "total_bytes": 1000 * CHECKER.GIB_BYTES,
+                    "free_bytes": 900 * CHECKER.GIB_BYTES,
+                    "available_bytes": 900 * CHECKER.GIB_BYTES,
+                    "effective_free_bytes": 900 * CHECKER.GIB_BYTES,
+                    "used_bytes": 100 * CHECKER.GIB_BYTES,
+                    "used_percent_numerator": 10000,
+                    "used_percent_denominator": 1000,
+                },
+                "used_percent_pass": True, "free_bytes_pass": True,
+            } for role in roles},
+            "role_contribution_bytes": contributions,
+            "contribution_bytes_total": contribution_total,
+            "reserve_bytes": reserve, "required_free_bytes": required,
+            "status": "pass",
+        }],
+        "status": "pass",
+    }
 def _plan() -> dict[str, object]:
     return {
         "schema": 1,
@@ -299,6 +386,7 @@ def _plan() -> dict[str, object]:
                     "runtime_value_template": "/proc/{holder_pid}/fd/201",
                 },
             },
+            "disk_preflight": _disk_contract(),
             "evidence_dir": "/campaign/evidence",
             "evidence": {
                 "launch_record": "/campaign/evidence/segment.launch.ready",
@@ -504,6 +592,8 @@ def test_validate_plan_requires_every_execution_tool_binding() -> None:
             "binary"].__setitem__("fd", 204), "executable transport"),
         (lambda plan: plan["launch_contract"]["executable_transport"].__setitem__(
             "unreviewed", True), "executable descriptors"),
+        (lambda plan: plan["launch_contract"]["disk_preflight"].__setitem__(
+            "planned_peak_output_bytes", 1), "disk-preflight contract"),
     ),
 )
 def test_validate_plan_rejects_tampered_execution_provenance(
@@ -863,6 +953,9 @@ def _launch_record_fixture(tmp_path: Path):
         "environment": _environment_contract(),
         "directory_transport": directory_contract,
         "executable_transport": executable_contract,
+            "disk_preflight": _disk_contract(
+                int(plan["inputs"]["source_restart"]["size"]),
+                int(plan["inputs"]["trajectory"]["size"])),
     }
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     transport = {
@@ -949,6 +1042,17 @@ def _launch_record_fixture(tmp_path: Path):
         },
         "staged_inputs": {
             "source_restart": staged_source, "trajectory": staged_trajectory,
+        },
+        "disk_preflight": {
+            "contract": plan["launch_contract"]["disk_preflight"],
+            "before_staging": _disk_snapshot(
+                plan["launch_contract"]["disk_preflight"],
+                "before_staging", state_dir.stat().st_dev,
+                state_dir.resolve(), staging_dir.resolve()),
+            "before_spawn": _disk_snapshot(
+                plan["launch_contract"]["disk_preflight"],
+                "before_spawn", state_dir.stat().st_dev,
+                state_dir.resolve(), staging_dir.resolve()),
         },
         "input_transport_contract": plan["launch_contract"]["input_transport"],
         "input_transport": transport,
@@ -1077,6 +1181,10 @@ def test_launch_record_requires_bound_nvidia_smi_to_remain_executable(
             "pgid", 999), "managed process-group"),
         (lambda launch: launch["proc_access_probe"]["families"][
             "executable"].remove("binary"), "proc-holder access proof"),
+        (lambda launch: launch["disk_preflight"]["before_spawn"]["filesystems"][
+            0]["observations"]["state_dir"]["statvfs"].__setitem__(
+                "free_bytes", 1),
+         "statvfs byte arithmetic"),
     ),
 )
 def test_launch_record_rejects_tampered_environment_tools_and_holders(

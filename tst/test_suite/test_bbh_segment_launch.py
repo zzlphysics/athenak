@@ -15,6 +15,7 @@ import signal
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -40,7 +41,8 @@ def _close_fixed_holder_descriptors_after_test():
     for descriptor in (
             LAUNCHER.SOURCE_RESTART_FD, LAUNCHER.TRAJECTORY_FD,
             LAUNCHER.STATE_DIRECTORY_FD, LAUNCHER.EVIDENCE_DIRECTORY_FD,
-            LAUNCHER.MPI_LAUNCHER_FD, LAUNCHER.BINARY_EXECUTABLE_FD):
+            LAUNCHER.MPI_LAUNCHER_FD, LAUNCHER.BINARY_EXECUTABLE_FD,
+            LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD):
         try:
             os.close(descriptor)
         except OSError:
@@ -62,6 +64,47 @@ def _record(path: Path) -> dict[str, Any]:
         "size": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
         "closure_check": "fixture",
+    }
+
+
+def _ample_statvfs(_target: Any) -> Any:
+    return SimpleNamespace(
+        f_frsize=1 << 30, f_blocks=1000, f_bfree=900, f_bavail=900)
+
+
+def _exactly_75_percent_used_statvfs(_target: Any) -> Any:
+    return SimpleNamespace(
+        f_frsize=1 << 30, f_blocks=1000, f_bfree=250, f_bavail=250)
+
+
+def _disk_contract(source_size: int, trajectory_size: int = 0,
+                   peak_gib: int = 200) -> dict[str, Any]:
+    peak_bytes = peak_gib * LAUNCHER.GIB_BYTES
+    return {
+        "kind": LAUNCHER.DISK_PREFLIGHT_KIND,
+        "accounting": LAUNCHER.DISK_PREFLIGHT_ACCOUNTING,
+        "formula": LAUNCHER.DISK_PREFLIGHT_FORMULA,
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * LAUNCHER.GIB_BYTES,
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * LAUNCHER.GIB_BYTES,
+        "source_restart_size_bytes": source_size,
+        "source_restart_staging_bytes": source_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": source_size + trajectory_size,
+        "planned_peak_output_gib": peak_gib,
+        "planned_peak_output_bytes": peak_bytes,
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": peak_bytes},
+            "staging_dir": {
+                "source_restart_staging_bytes": source_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {
+            "state_dir": LAUNCHER.STATE_DIRECTORY_FD,
+            "staging_dir": LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD,
+        },
     }
 
 
@@ -280,6 +323,8 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
                     "runtime_value_template": f"/proc/{holder}/fd/201",
                 },
             },
+            "disk_preflight": _disk_contract(
+                source_record["size"], trajectory_record["size"]),
             "launcher": _record(mpirun),
             "mpi_argv": mpi_argv,
             "athena_argv_template": athena_argv_template,
@@ -290,7 +335,8 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
         json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     plan_path.chmod(0o444)
     fake_run = FakeRun(world_size)
-    runtime = LAUNCHER.Runtime(run=fake_run)
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     runtime.plan_validator = lambda plan: {"fixture": "plan-validated"}
     runtime.source_validator = lambda path, plan: {
         "fixture": "source-validated",
@@ -352,6 +398,91 @@ def test_prepare_derives_only_the_canonical_token_arrays(tmp_path: Path) -> None
         prepared.source_restart["sha256"]
 
 
+def test_disk_budget_counts_one_reserve_on_a_shared_filesystem() -> None:
+    contract = _disk_contract(
+        10 * LAUNCHER.GIB_BYTES, 0, peak_gib=200)
+    calls: list[object] = []
+
+    def observe(target: object) -> Any:
+        calls.append(target)
+        return _ample_statvfs(target)
+
+    snapshot = LAUNCHER._disk_preflight_snapshot(
+        contract, "before_spawn", {
+            "state_dir": {
+                "device": 7, "target": LAUNCHER.STATE_DIRECTORY_FD,
+                "access": {"method": "bound_fd_fstatvfs_v1",
+                           "fd": LAUNCHER.STATE_DIRECTORY_FD},
+            },
+            "staging_dir": {
+                "device": 7,
+                "target": LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD,
+                "access": {"method": "bound_fd_fstatvfs_v1",
+                           "fd": LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD},
+            },
+        }, observe)
+
+    # Both paths are really measured, while the shared-device budget below
+    # contains one reserve and one copy of each role contribution.
+    assert len(calls) == 2
+    assert set(calls) == {
+        LAUNCHER.STATE_DIRECTORY_FD,
+        LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD,
+    }
+    filesystem = snapshot["filesystems"][0]
+    assert filesystem["reserve_bytes"] == 50 * LAUNCHER.GIB_BYTES
+    assert filesystem["required_free_bytes"] == 260 * LAUNCHER.GIB_BYTES
+
+
+def test_disk_budget_keeps_independent_reserves_on_split_filesystems() -> None:
+    contract = _disk_contract(
+        10 * LAUNCHER.GIB_BYTES, 0, peak_gib=200)
+    snapshot = LAUNCHER._disk_preflight_snapshot(
+        contract, "before_staging", {
+            "state_dir": {
+                "device": 7, "target": "/state",
+                "access": {"method": "path_statvfs_v1", "path": "/state"},
+            },
+            "staging_dir": {
+                "device": 8, "target": "/staging",
+                "access": {"method": "path_statvfs_v1", "path": "/staging"},
+            },
+        }, _ample_statvfs)
+
+    by_role = {
+        tuple(row["roles"]): row for row in snapshot["filesystems"]
+    }
+    assert by_role[("state_dir",)]["required_free_bytes"] == \
+        250 * LAUNCHER.GIB_BYTES
+    # The staging filesystem gets its own reserve and hard 180-GiB floor;
+    # neither reserve is merged into or omitted from the other filesystem.
+    assert by_role[("staging_dir",)]["reserve_bytes"] == \
+        50 * LAUNCHER.GIB_BYTES
+    assert by_role[("staging_dir",)]["required_free_bytes"] == \
+        180 * LAUNCHER.GIB_BYTES
+
+
+def test_first_disk_failure_precedes_staging_and_never_calls_popen(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    popen_called = False
+
+    def forbidden_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("disk-rejected launch called Popen")
+
+    campaign["runtime"].fstatvfs = _exactly_75_percent_used_statvfs
+    campaign["runtime"].popen = forbidden_popen
+    with pytest.raises(LAUNCHER.LaunchFailure, match="at or above 75%"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+    assert popen_called is False
+    assert not any(campaign["staging"].iterdir())
+    assert campaign["staging"].stat().st_mode & 0o777 == 0o700
+
+
 def test_source_path_swap_during_descriptor_copy_is_rejected(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     campaign = _campaign(tmp_path)
@@ -376,6 +507,56 @@ def test_source_path_swap_during_descriptor_copy_is_rejected(
 
     assert not campaign["staged_source"].exists()
     assert not any(campaign["staging"].iterdir())
+
+
+def test_stage_link_is_removed_if_post_link_descriptor_audit_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    campaign = _campaign(tmp_path)
+    original_audit = LAUNCHER._audit_open_descriptor
+
+    def failing_audit(descriptor, planned, label):
+        if label == "staged source_restart":
+            raise LAUNCHER.LaunchFailure("injected post-link audit failure")
+        return original_audit(descriptor, planned, label)
+
+    monkeypatch.setattr(LAUNCHER, "_audit_open_descriptor", failing_audit)
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="injected post-link audit failure"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+    assert not campaign["staged_source"].exists()
+    assert not any(campaign["staging"].iterdir())
+
+
+def test_first_disk_gate_measures_bound_descriptors_not_paths(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    targets: list[object] = []
+
+    def forbidden_path_statvfs(_target: object) -> Any:
+        raise AssertionError("first disk gate used a path statvfs")
+
+    def observe_fd(descriptor: object) -> Any:
+        assert isinstance(descriptor, int)
+        os.fstat(descriptor)
+        targets.append(descriptor)
+        return _ample_statvfs(descriptor)
+
+    campaign["runtime"].statvfs = forbidden_path_statvfs
+    campaign["runtime"].fstatvfs = observe_fd
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert len(targets) == 2
+        observations = prepared.disk_preflight_before_staging["filesystems"][0][
+            "observations"]
+        assert observations["state_dir"]["access"]["method"] == \
+            "bound_directory_fstatvfs_v1"
+        assert observations["staging_dir"]["access"]["fd"] == \
+            LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD
+    finally:
+        prepared.close()
 
 
 def test_preexisting_staged_target_is_never_overwritten(tmp_path: Path) -> None:
@@ -782,6 +963,7 @@ def _proof_runtime(campaign: dict[str, Any], prepared,
         nvidia_smi=prepared.execution_tools["nvidia_smi"]["path"],
         getpgid=lambda pid: pid,
         killpg=fake_killpg,
+        statvfs=_ample_statvfs, fstatvfs=_ample_statvfs,
     )
 
 
@@ -804,6 +986,30 @@ def _lifecycle_fixture(tmp_path: Path):
         evidence / "gpu-before.csv", evidence / "gpu-after.csv",
     )
     return campaign, prepared, runtime, process, paths
+
+
+def test_bound_second_disk_failure_cleans_only_staged_inputs_without_popen(
+        tmp_path: Path) -> None:
+    campaign, prepared, runtime, _, paths = _lifecycle_fixture(tmp_path)
+    popen_called = False
+
+    def forbidden_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("second disk rejection called Popen")
+
+    runtime.fstatvfs = _exactly_75_percent_used_statvfs
+    runtime.popen = forbidden_popen
+    with pytest.raises(LAUNCHER.LaunchFailure, match="before_spawn.*75%"):
+        LAUNCHER.run_segment(
+            prepared, campaign["plan_path"], paths, runtime,
+            proof_timeout_seconds=1)
+
+    assert popen_called is False
+    assert not any(campaign["staging"].iterdir())
+    assert campaign["staging"].stat().st_mode & 0o777 == 0o700
+    assert not paths.launch_record.exists()
+    assert not paths.gpu_before.exists()
 
 
 def test_live_proof_binds_every_rank_pid_argv_exe_and_gpu(tmp_path: Path) -> None:
@@ -1436,7 +1642,8 @@ def test_real_planner_artifact_is_accepted_by_launcher_prepare(
     plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
     ranks = plan["policy"]["ranks"]
     fake_run = FakeRun(ranks)
-    runtime = LAUNCHER.Runtime(run=fake_run)
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     prepared = LAUNCHER.prepare_launch(
         campaign["output"], campaign["state_dir"], runtime)
     try:
@@ -1467,7 +1674,8 @@ def test_real_planner_mocked_eight_rank_lifecycle_passes_checker_consumers(
     assert checker.validate_plan(plan)["ranks"] == 8
 
     fake_run = FakeRun(8)
-    prepare_runtime = LAUNCHER.Runtime(run=fake_run)
+    prepare_runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     prepared = LAUNCHER.prepare_launch(
         plan_path, campaign["state_dir"], prepare_runtime)
     runtime = _proof_runtime({"run": fake_run}, prepared)
@@ -1554,7 +1762,9 @@ def test_real_planner_tamper_is_rejected_before_popen(
         popen_called = True
         raise AssertionError("tampered plan reached Popen")
 
-    runtime = LAUNCHER.Runtime(run=fake_run, popen=forbidden_popen)
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, popen=forbidden_popen,
+        statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     with pytest.raises(LAUNCHER.LaunchFailure, match=message):
         LAUNCHER.prepare_launch(plan_path, campaign["state_dir"], runtime)
     assert popen_called is False
@@ -1577,7 +1787,8 @@ def test_live_source_dcycle_is_rejected_before_popen(
 
     monkeypatch.setattr(LAUNCHER, "read_restart_metadata", reader_with_dcycle)
     fake_run = FakeRun(plan["policy"]["ranks"])
-    runtime = LAUNCHER.Runtime(run=fake_run)
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     with pytest.raises(LAUNCHER.LaunchFailure,
                        match="output3 must use dt.*must not serialize dcycle"):
         LAUNCHER.prepare_launch(
@@ -1602,7 +1813,8 @@ def test_output3_file_number_limit_is_rejected_before_popen(
 
     monkeypatch.setattr(LAUNCHER, "read_restart_metadata", reader_near_limit)
     fake_run = FakeRun(plan["policy"]["ranks"])
-    runtime = LAUNCHER.Runtime(run=fake_run)
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     runtime.plan_validator = lambda value: {"fixture": "plan-validated"}
     with pytest.raises(LAUNCHER.LaunchFailure,
                        match="file_number reaches.*five-digit limit"):

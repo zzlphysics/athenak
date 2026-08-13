@@ -234,6 +234,7 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         "guard_steps": "2",
         "ranks": "8",
         "wall": "28800",
+        "planned_peak_output_gib": "200",
         **overrides,
     }
     return [
@@ -254,6 +255,7 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         "--staging-dir", str(campaign["staging_dir"]),
         "--evidence-dir", str(campaign["evidence_dir"]),
         "--wall-time-seconds", values["wall"],
+        "--planned-peak-output-gib", values["planned_peak_output_gib"],
         "--required-unnumbered", "effective_bbh_4pn_V100Q.mhd.hst",
         "--required-unnumbered", "effective_bbh_4pn_V100Q.user.hst",
         "--required-unnumbered", "effective_bbh_4pn_V100Q.log",
@@ -308,6 +310,36 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         str(campaign["launcher"].resolve()), "--allow-run-as-root", "--bind-to",
         "none", "-np", "8",
     ]
+    restart_size = plan["inputs"]["source_restart"]["size"]
+    trajectory_size = plan["inputs"]["trajectory"]["size"]
+    assert plan["launch_contract"]["disk_preflight"] == {
+        "kind": "statvfs_unique_filesystem_budget_v1",
+        "accounting": "group_roles_by_st_dev_once_v1",
+        "formula": (
+            "per_filesystem_required_free_bytes=max("
+            "additional_hard_minimum_free_bytes,max(minimum_reserve_bytes,"
+            "minimum_reserve_restart_multiples*source_restart_size_bytes)+"
+            "sum(role_contribution_bytes))"
+        ),
+        "used_percent_exclusive_max": 75,
+        "minimum_reserve_bytes": 50 * (1 << 30),
+        "minimum_reserve_restart_multiples": 2,
+        "additional_hard_minimum_free_bytes": 180 * (1 << 30),
+        "source_restart_size_bytes": restart_size,
+        "source_restart_staging_bytes": restart_size,
+        "trajectory_staging_bytes": trajectory_size,
+        "staging_copy_bytes": restart_size + trajectory_size,
+        "planned_peak_output_gib": 200,
+        "planned_peak_output_bytes": 200 * (1 << 30),
+        "role_contributions_bytes": {
+            "state_dir": {"planned_peak_output_bytes": 200 * (1 << 30)},
+            "staging_dir": {
+                "source_restart_staging_bytes": restart_size,
+                "trajectory_staging_bytes": trajectory_size,
+            },
+        },
+        "bound_directory_fds": {"state_dir": 202, "staging_dir": 206},
+    }
     assert plan["launch_contract"]["athena_argv_template"] == [
         "/proc/{holder_pid}/fd/205", "--kokkos-map-device-id-by=mpi_rank",
         "-r", "/proc/{holder_pid}/fd/200",
@@ -454,6 +486,8 @@ def test_metadata_contract_rejections(
         ({"guard_steps": "0"}, "--tlim-guard-steps must be positive"),
         ({"ranks": "0"}, "--ranks must be positive"),
         ({"wall": "0"}, "--wall-time-seconds must be positive"),
+        ({"planned_peak_output_gib": "0"},
+         "--planned-peak-output-gib must be positive"),
     ],
 )
 def test_invalid_plan_parameters_are_rejected(
@@ -465,6 +499,19 @@ def test_invalid_plan_parameters_are_rejected(
     assert result.returncode != 0
     assert message in result.stderr
     assert not campaign["output"].exists()
+
+
+def test_explicit_planned_peak_output_is_bound_as_integer_bytes(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    result = _run(campaign, planned_peak_output_gib="110")
+
+    assert result.returncode == 0, result.stderr
+    contract = json.loads(campaign["output"].read_text(
+        encoding="utf-8"))["launch_contract"]["disk_preflight"]
+    assert contract["planned_peak_output_gib"] == 110
+    assert contract["planned_peak_output_bytes"] == 110 * (1 << 30)
 
 
 def test_existing_plan_is_never_overwritten(tmp_path: Path) -> None:
