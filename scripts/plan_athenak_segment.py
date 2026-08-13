@@ -48,6 +48,7 @@ from output_integrity import (
     strict_json_loads,
 )
 from audit_athenak_restart import audit_restart
+import check_athenak_segment as SEGMENT_CHECKER
 
 
 SCHEMA_VERSION = 1
@@ -57,6 +58,11 @@ MIN_CAPACITY_HEADROOM = 64
 YELLOW_CAPACITY_HEADROOM = 128
 GIB_BYTES = 1 << 30
 DEFAULT_PLANNED_PEAK_OUTPUT_GIB = 200
+MAX_NMB_PER_RANK = 16384
+CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
+CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
+CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
+CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR = 5
 DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
 DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
 DISK_PREFLIGHT_FORMULA = (
@@ -64,6 +70,34 @@ DISK_PREFLIGHT_FORMULA = (
     "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
     "source_restart_size_bytes)+sum(role_contribution_bytes))"
 )
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
+RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
+RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+)
+RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
+PREFIX_RECOVERY_POLICY = {
+    "kind": "scheduled_prefix_recovery_v1",
+    "candidate_kind": "original_plan_scheduled_restart_only",
+    "selection": "highest_complete_candidate",
+    "later_complete_scientific_failure": "fatal_no_fallback",
+    "cadence_replay": "execute_only_binary64_v1",
+    "original_trees": "read_only_no_delete",
+    "derived_text": "exact_original_byte_prefix",
+    "unknown_state_nodes": "fatal",
+    "lifecycle": "nonzero_completion_or_same_boot_closed_processes",
+}
+
+
+class _StoreOnce(argparse.Action):
+    """Reject duplicate security-sensitive planner options."""
+
+    def __call__(self, parser: argparse.ArgumentParser,
+                 namespace: argparse.Namespace, values: Any,
+                 option_string: str | None = None) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} may be specified only once")
+        setattr(namespace, self.dest, values)
 GIT_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -141,7 +175,7 @@ def _repository_record(path: Path) -> dict[str, Any]:
 
 
 def _launch_environment() -> dict[str, Any]:
-    """Bind the sole explicit environment permitted for MPI/AthenaK."""
+    """Bind the exact launcher environment and its observed PRRTE rank projection."""
 
     try:
         passwd_home = pwd.getpwuid(os.geteuid()).pw_dir
@@ -166,11 +200,23 @@ def _launch_environment() -> dict[str, Any]:
         "LANG": "C",
         "LC_ALL": "C",
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
+    }
+    rank_projection_payload = {
+        "inherited_values": {
+            key: values[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
+        },
+        "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
     }
     return {
-        "kind": "explicit_values_v1",
+        "kind": LAUNCH_ENVIRONMENT_KIND,
         "values": values,
         "sha256": _canonical_sha256(values),
+        "rank_projection": {
+            "kind": RANK_ENVIRONMENT_PROJECTION_KIND,
+            **rank_projection_payload,
+            "sha256": _canonical_sha256(rank_projection_payload),
+        },
     }
 
 
@@ -193,6 +239,65 @@ def _positive_integer(value: int, label: str) -> int:
     if value < 1:
         raise ValueError(f"{label} must be positive")
     return value
+
+
+def _ceil_ratio(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def _capacity_transition(source_capacity: int,
+                         requested_target: int | None) -> dict[str, Any]:
+    """Bind the sole permitted MeshBlock-capacity runtime transition."""
+
+    if source_capacity < 1 or source_capacity > MAX_NMB_PER_RANK:
+        raise ValueError(
+            f"source max_nmb_per_rank must be in [1,{MAX_NMB_PER_RANK}]")
+    if requested_target is None:
+        target = source_capacity
+        kind = "unchanged_v1"
+        runtime_override = None
+    else:
+        target = _positive_integer(
+            requested_target, "--target-max-nmb-per-rank")
+        if target <= source_capacity:
+            raise ValueError(
+                "--target-max-nmb-per-rank must be a strict increase over the "
+                "source restart; omit it to keep the capacity unchanged")
+        if target > MAX_NMB_PER_RANK:
+            raise ValueError(
+                f"--target-max-nmb-per-rank may not exceed {MAX_NMB_PER_RANK}")
+        kind = "increase_v1"
+        runtime_override = f"mesh_refinement/max_nmb_per_rank={target}"
+
+    required_mib = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR)
+    minimum_total_mib = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR *
+        CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR *
+        CAPACITY_GPU_USABLE_FRACTION_NUMERATOR)
+    return {
+        "kind": kind,
+        "parameter": "mesh_refinement/max_nmb_per_rank",
+        "source_max_nmb_per_rank": source_capacity,
+        "target_max_nmb_per_rank": target,
+        "maximum_target_max_nmb_per_rank": MAX_NMB_PER_RANK,
+        "runtime_override": runtime_override,
+        "gpu_memory_model": {
+            "kind": "fixed_conservative_per_meshblock_slot_v1",
+            "mib_per_slot_numerator":
+                CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+            "mib_per_slot_denominator":
+                CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR,
+            "usable_fraction_numerator":
+                CAPACITY_GPU_USABLE_FRACTION_NUMERATOR,
+            "usable_fraction_denominator":
+                CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+            "required_per_rank_memory_mib_ceiling": required_mib,
+            "minimum_gpu_memory_total_mib": minimum_total_mib,
+        },
+    }
 
 
 def _disk_preflight_contract(source_restart_size: int, trajectory_size: int,
@@ -297,6 +402,26 @@ def _load_parent_segment_pass(path: Path, source_restart: dict[str, Any],
             parent.get("kind") != "athenak_segment_pass" or
             parent.get("status") != "pass"):
         raise ValueError("parent segment pass has unsupported schema/kind/status")
+    qualification_mode = parent.get("qualification_mode")
+    if qualification_mode is None:
+        if ("recovery_provenance" in parent or
+                parent.get("completion_record_audit", {}).get("return_code") != 0 or
+                parent.get("run_log_audit", {}).get("termination") !=
+                "cycle_limit"):
+            raise ValueError(
+                "legacy parent without qualification_mode lacks a complete "
+                "zero-exit cycle-limit lifecycle")
+        qualification_mode = "legacy_complete_segment_v1"
+    if qualification_mode not in (
+            "complete_segment_v1", "legacy_complete_segment_v1",
+            "scheduled_prefix_recovery_v1"):
+        raise ValueError("parent segment pass lacks an explicit supported "
+                         "qualification_mode")
+    # Normalize only the in-memory copy.  The immutable legacy report remains
+    # byte-for-byte unchanged, while every newly produced plan carries an explicit
+    # qualification mode.
+    parent = copy.deepcopy(parent)
+    parent["qualification_mode"] = qualification_mode
     endpoint_binding = parent.get("bindings", {}).get("endpoint_restart")
     endpoint_audit = parent.get("endpoint_restart_audit")
     expected = parent.get("expected")
@@ -335,6 +460,12 @@ def _load_parent_segment_pass(path: Path, source_restart: dict[str, Any],
     if (expected.get("final_cycle") != source_cycle or
             expected.get("final_time") != source_time):
         raise ValueError("parent planned endpoint does not match --source-restart")
+    if qualification_mode == "scheduled_prefix_recovery_v1":
+        _validate_recovery_parent_provenance(
+            parent, source_restart, source_cycle, source_time, parent_path)
+    elif "recovery_provenance" in parent:
+        raise ValueError(
+            "complete parent pass may not contain recovery provenance")
     # Reconcile the parent's embedded audit with the new planner's independent live
     # audit, so a structurally plausible hand-written pass cannot qualify the source.
     if (endpoint_audit.get("layout") != source_audit.get("layout") or
@@ -376,6 +507,33 @@ def _load_parent_segment_pass(path: Path, source_restart: dict[str, Any],
         "sha256": binding["sha256"],
         "closure_check": binding["closure_check"],
     }
+
+
+def _validate_recovery_parent_provenance(
+        parent: dict[str, Any], source_restart: dict[str, Any],
+        source_cycle: int, source_time: float,
+        parent_path: Path) -> None:
+    """Reject a recovery-shaped parent unless its immutable provenance is exact."""
+
+    try:
+        _, source_binding = _read_stable_bytes(Path(source_restart["path"]))
+        baryon_rows = [
+            row for row in parent.get("output_inventory", [])
+            if isinstance(row, dict) and
+            isinstance(row.get("history"), dict) and
+            "baryon_m" in row["history"].get("columns", [])
+        ]
+        if len(baryon_rows) != 1:
+            raise ValueError(
+                "recovery parent must bind exactly one baryon history")
+        _, mass_binding = _read_stable_bytes(Path(baryon_rows[0]["path"]))
+        SEGMENT_CHECKER.audit_parent_qualification_provenance(
+            parent,
+            {"parent_qualification_mode": "scheduled_prefix_recovery_v1"},
+            source_binding, mass_binding, source_cycle, source_time,
+            parent_path)
+    except SEGMENT_CHECKER.CheckFailure as exc:
+        raise ValueError(f"recovery parent strict provenance failed: {exc}") from exc
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -766,6 +924,7 @@ def _policy(root_dt: float, ranks: int) -> dict[str, Any]:
         for item in hard_ratios
     ]
     return {
+        "scheduled_prefix_recovery": copy.deepcopy(PREFIX_RECOVERY_POLICY),
         "ranks": ranks,
         "endpoint_time_ulp_tolerance": 0,
         "segment_termination": {
@@ -941,11 +1100,20 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("source restart has invalid max_nmb_per_rank") from exc
     if capacity < 1:
         raise ValueError("source restart max_nmb_per_rank must be positive")
-    partitions = READER.load_balance(metadata.costs, ranks, capacity)
-    minimum_headroom = min(capacity - row.blocks for row in partitions)
-    if minimum_headroom < MIN_CAPACITY_HEADROOM:
+    if parameters["mesh_refinement"]["max_nmb_per_rank"] != str(capacity):
         raise ValueError(
-            f"rank capacity headroom {minimum_headroom} is below "
+            "source restart max_nmb_per_rank must be canonical decimal")
+    capacity_transition = _capacity_transition(
+        capacity, getattr(args, "target_max_nmb_per_rank", None))
+    READER.load_balance(metadata.costs, ranks, capacity)
+    target_capacity = capacity_transition["target_max_nmb_per_rank"]
+    target_partitions = READER.load_balance(
+        metadata.costs, ranks, target_capacity)
+    target_headroom = min(
+        target_capacity - row.blocks for row in target_partitions)
+    if target_headroom < MIN_CAPACITY_HEADROOM:
+        raise ValueError(
+            f"target rank capacity headroom {target_headroom} is below "
             f"hard minimum {MIN_CAPACITY_HEADROOM}"
         )
 
@@ -990,7 +1158,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "source_baryon_mass": source_baryon_mass,
         }
     else:
-        _, parent_record = _load_parent_segment_pass(
+        parent_report, parent_record = _load_parent_segment_pass(
             parent_segment_pass, source_restart, source_full_audit,
             metadata.time, metadata.cycle,
             source_baryon_mass, trajectory)
@@ -998,6 +1166,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "mode": "parent_segment_pass",
             "audit": source_full_audit,
             "parent_segment_pass": parent_record,
+            "parent_qualification_mode":
+                parent_report["qualification_mode"],
             "source_baryon_mass": source_baryon_mass,
         }
 
@@ -1060,6 +1230,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         f"problem/trajectory_file={trajectory_proc_template}",
         f"output3/dt={root_dt!r}",
     ]
+    if capacity_transition["runtime_override"] is not None:
+        athena_argv_template.append(capacity_transition["runtime_override"])
     evidence = {
         "launch_record": str(evidence_dir / "segment.launch.ready"),
         "completion_record": str(evidence_dir / "segment.completion.ready"),
@@ -1084,6 +1256,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "restart_auditor": _file_record(SCRIPT_DIR / "audit_athenak_restart.py"),
             "restart_layout": _file_record(
                 SCRIPT_DIR / "compare_athenak_restart_fields.py"),
+            "prefix_recovery": _file_record(
+                SCRIPT_DIR / "recover_athenak_segment_prefix.py"),
             "git": _file_record(GIT_PATH, executable=True),
             "nvidia_smi": _file_record(
                 _canonical_executable("nvidia-smi"), executable=True),
@@ -1097,6 +1271,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         },
         "source_qualification": source_qualification,
         "source": source_summary,
+        "capacity_transition": capacity_transition,
         "expected": {
             "source_cycle": metadata.cycle,
             "source_time": metadata.time,
@@ -1111,6 +1286,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "time/nlim": final_cycle,
             "time/tlim": tlim,
             "output3/dt": root_dt,
+            **({"mesh_refinement/max_nmb_per_rank":
+                capacity_transition["target_max_nmb_per_rank"]}
+               if capacity_transition["runtime_override"] is not None else {}),
         },
         "launch_contract": {
             "launcher": launcher,
@@ -1226,6 +1404,11 @@ def main() -> int:
     parser.add_argument("--root-dt", required=True, type=float)
     parser.add_argument("--tlim-guard-steps", required=True, type=int)
     parser.add_argument("--ranks", required=True, type=int)
+    parser.add_argument(
+        "--target-max-nmb-per-rank", type=int, action=_StoreOnce,
+        help=("strictly increase max_nmb_per_rank for this segment; omit to "
+              "preserve the source capacity (maximum: 16384)"),
+    )
     parser.add_argument("--launcher", required=True, type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--staging-dir", required=True, type=Path)

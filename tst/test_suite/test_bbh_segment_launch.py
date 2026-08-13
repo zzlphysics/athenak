@@ -121,6 +121,8 @@ class FakeRun:
         self.reuse_process_ids_after_wait = False
         self.cleanup_signals: list[int] = []
         self.rank_pids = [600 + index for index in range(world_size)]
+        self.memory_total_mib = 32768
+        self.memory_used_base_mib = 5
 
     def __call__(self, command, **kwargs):
         if Path(command[0]).name != "nvidia-smi":
@@ -129,7 +131,8 @@ class FakeRun:
             output = "".join(
                 f"{self.world_size - 1 - index if self.reverse_nvidia_indices else index}, "
                 f"GPU-{index}, 00000000:{16 + index:02X}:00.0, "
-                f"0, 0, {5 + index}\n"
+                f"0, 0, {self.memory_total_mib}, "
+                f"{self.memory_used_base_mib + index}\n"
                 for index in range(self.world_size)
             )
         elif command[1].startswith("--query-compute-apps="):
@@ -215,6 +218,14 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
     launch_environment = {
         "HOME": str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)),
         "LANG": "C", "LC_ALL": "C", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
+    }
+    rank_projection_payload = {
+        "inherited_values": {
+            key: launch_environment[key]
+            for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
+        },
+        "consumed_absent": ["PRTE_MCA_schizo_proxy"],
     }
     plan = {
         "schema": 1,
@@ -226,9 +237,27 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
             "time/nlim": final_cycle, "time/tlim": tlim,
             "output3/dt": root_dt,
         },
+        "capacity_transition": {
+            "kind": "unchanged_v1",
+            "parameter": "mesh_refinement/max_nmb_per_rank",
+            "source_max_nmb_per_rank": 1024,
+            "target_max_nmb_per_rank": 1024,
+            "maximum_target_max_nmb_per_rank": 16384,
+            "runtime_override": None,
+            "gpu_memory_model": {
+                "kind": "fixed_conservative_per_meshblock_slot_v1",
+                "mib_per_slot_numerator": 1433,
+                "mib_per_slot_denominator": 100,
+                "usable_fraction_numerator": 4,
+                "usable_fraction_denominator": 5,
+                "required_per_rank_memory_mib_ceiling": 14674,
+                "minimum_gpu_memory_total_mib": 18343,
+            },
+        },
         "source": {
             "parameters": {
                 "problem": {"trajectory_file": str(trajectory.resolve())},
+                "mesh_refinement": {"max_nmb_per_rank": "1024"},
             },
         },
         "inputs": {
@@ -261,8 +290,15 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
             "evidence_dir": str(evidence.resolve()),
             "evidence": evidence_paths,
             "environment": {
-                "kind": "explicit_values_v1", "values": launch_environment,
+                "kind": "explicit_values_with_rank_projection_v2",
+                "values": launch_environment,
                 "sha256": LAUNCHER._canonical_sha256(launch_environment),
+                "rank_projection": {
+                    "kind": "prrte_consumed_projection_v1",
+                    **rank_projection_payload,
+                    "sha256": LAUNCHER._canonical_sha256(
+                        rank_projection_payload),
+                },
             },
             "directory_transport": {
                 "kind": "linux_proc_holder_dirfd_v1",
@@ -360,6 +396,31 @@ def _rewrite_plan(campaign: dict[str, Any], mutate) -> None:
     path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
     path.chmod(0o444)
+
+
+def _set_capacity_increase(plan: dict[str, Any], target: int = 1280) -> None:
+    required = (target * 1433 + 99) // 100
+    minimum_total = (target * 1433 * 5 + 399) // 400
+    token = f"mesh_refinement/max_nmb_per_rank={target}"
+    plan["capacity_transition"] = {
+        "kind": "increase_v1",
+        "parameter": "mesh_refinement/max_nmb_per_rank",
+        "source_max_nmb_per_rank": 1024,
+        "target_max_nmb_per_rank": target,
+        "maximum_target_max_nmb_per_rank": 16384,
+        "runtime_override": token,
+        "gpu_memory_model": {
+            "kind": "fixed_conservative_per_meshblock_slot_v1",
+            "mib_per_slot_numerator": 1433,
+            "mib_per_slot_denominator": 100,
+            "usable_fraction_numerator": 4,
+            "usable_fraction_denominator": 5,
+            "required_per_rank_memory_mib_ceiling": required,
+            "minimum_gpu_memory_total_mib": minimum_total,
+        },
+    }
+    plan["command_overrides"]["mesh_refinement/max_nmb_per_rank"] = target
+    plan["launch_contract"]["athena_argv_template"].append(token)
 
 
 def test_prepare_derives_only_the_canonical_token_arrays(tmp_path: Path) -> None:
@@ -557,6 +618,65 @@ def test_first_disk_gate_measures_bound_descriptors_not_paths(
             LAUNCHER.STAGING_DIRECTORY_PREFLIGHT_FD
     finally:
         prepared.close()
+
+
+def test_prepare_accepts_exact_1024_to_1280_capacity_transition(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(campaign, _set_capacity_increase)
+
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert prepared.athena_argv[-1] == \
+            "mesh_refinement/max_nmb_per_rank=1280"
+        assert prepared.athena_argv.count(
+            "mesh_refinement/max_nmb_per_rank=1280") == 1
+    finally:
+        prepared.close()
+
+
+def test_prepare_rejects_low_total_memory_before_popen(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(campaign, _set_capacity_increase)
+    campaign["run"].memory_total_mib = 22000
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match="GPU total memory"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+def test_prepare_rejects_high_used_memory_without_compute_app(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(campaign, _set_capacity_increase)
+    campaign["run"].memory_used_base_mib = 15000
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match="available memory"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+    assert campaign["run"].launched is False
+
+
+@pytest.mark.parametrize("token", (
+    "mesh_refinement/max_nmb_per_rank=1280",
+    "mesh_refinement/refinement=static",
+    "mesh/nx1=32",
+    "meshblock/nx1=8",
+))
+def test_prepare_rejects_duplicate_or_extra_mesh_override(
+        tmp_path: Path, token: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_capacity_increase(plan)
+        plan["launch_contract"]["athena_argv_template"].append(token)
+
+    _rewrite_plan(campaign, mutate)
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="athena_argv_template is not canonical"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
 
 
 def test_preexisting_staged_target_is_never_overwritten(tmp_path: Path) -> None:
@@ -768,6 +888,45 @@ def test_dangerous_parent_environment_is_never_forwarded(
         prepared.executable_holder.close()
 
 
+def test_parent_cannot_override_bound_prrte_personality(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    campaign["runtime"].environment = lambda: {
+        "PRTE_MCA_schizo_proxy": "prte",
+    }
+
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert prepared.launch_environment["PRTE_MCA_schizo_proxy"] == "ompi"
+        assert prepared.launch_environment == \
+            campaign["plan"]["launch_contract"]["environment"]["values"]
+    finally:
+        prepared.input_holder.close()
+        prepared.directory_holder.close()
+        prepared.executable_holder.close()
+
+
+@pytest.mark.parametrize("mode", ["retained", "missing", "wrong_hash"])
+def test_prrte_rank_environment_projection_is_exactly_plan_bound(
+        tmp_path: Path, mode: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        projection = plan["launch_contract"]["environment"]["rank_projection"]
+        if mode == "retained":
+            projection["consumed_absent"] = []
+        elif mode == "missing":
+            del projection["inherited_values"]["LANG"]
+        else:
+            projection["sha256"] = "f" * 64
+
+    _rewrite_plan(campaign, mutate)
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="rank environment projection"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
 def test_runtime_cannot_override_plan_bound_nvidia_smi(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path)
     campaign["runtime"].nvidia_smi = "/attacker/nvidia-smi"
@@ -939,6 +1098,11 @@ class FakeInspector:
 def _proof_runtime(campaign: dict[str, Any], prepared,
                    *, bad_cmdline: bool = False,
                    gpu_visibility: str | None = None) -> LAUNCHER.Runtime:
+    clock = [0.0]
+
+    def fake_sleep(seconds: float) -> None:
+        clock[0] += seconds
+
     def fake_killpg(pgid: int, number: int) -> None:
         assert pgid == 500
         live = (campaign["run"].launched or
@@ -955,7 +1119,8 @@ def _proof_runtime(campaign: dict[str, Any], prepared,
         campaign["run"].retain_process_identity_after_wait = False
 
     return LAUNCHER.Runtime(
-        run=campaign["run"], sleep=lambda seconds: None,
+        run=campaign["run"], sleep=fake_sleep,
+        monotonic=lambda: clock[0],
         hostname=lambda: "v100-node",
         inspector=FakeInspector(prepared, campaign["run"],
                                 bad_cmdline=bad_cmdline,
@@ -1109,6 +1274,25 @@ def test_missing_openmpi_rank_environment_is_rejected() -> None:
         })
 
 
+def test_rank_projection_requires_prrte_personality_to_be_consumed() -> None:
+    environment = {
+        "OMPI_COMM_WORLD_RANK": "0",
+        "OMPI_COMM_WORLD_SIZE": "1",
+        "OMPI_COMM_WORLD_LOCAL_RANK": "0",
+        "OMPI_COMM_WORLD_LOCAL_SIZE": "1",
+        "HOME": "/root", "LANG": "C", "LC_ALL": "C",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
+    }
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="retained launcher-only environment"):
+        LAUNCHER._parse_rank_environment(environment, 1, 600, {
+            "HOME": "/root", "LANG": "C", "LC_ALL": "C",
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "PRTE_MCA_schizo_proxy": "ompi",
+        })
+
+
 def test_live_proof_rejects_rank_specific_cuda_visibility(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path)
     prepared = LAUNCHER.prepare_launch(
@@ -1199,9 +1383,9 @@ def test_full_lifecycle_uses_no_shell_and_publishes_closed_evidence(
     assert len(record["ranks"]) == prepared.world_size
     assert paths.exit_status.read_text(encoding="ascii") == "0\n"
     assert paths.gpu_before.read_text(encoding="ascii").splitlines()[0] == (
-        "0,GPU-0,00000000:10:00.0,0,0,0,5")
+        "0,GPU-0,00000000:10:00.0,0,0,0,32768,5")
     assert paths.gpu_before.read_text(encoding="ascii").splitlines()[1] == (
-        "1,GPU-1,00000000:11:00.0,1,0,0,6")
+        "1,GPU-1,00000000:11:00.0,1,0,0,32768,6")
     completion = json.loads(paths.completion_record.read_text(encoding="utf-8"))
     assert completion["kind"] == "athenak_segment_completion"
     assert completion["status"] == "ready"
@@ -1345,6 +1529,52 @@ def test_completion_accepts_pid_reuse_but_records_it(tmp_path: Path) -> None:
     assert observations
     assert {row["state"] for row in observations} == {"pid_reused"}
     assert all(row["original_identity_gone"] is True for row in observations)
+
+
+def test_completion_boundedly_polls_until_managed_group_disappears(
+        tmp_path: Path) -> None:
+    campaign, prepared, runtime, _, paths = _lifecycle_fixture(tmp_path)
+    original_killpg = runtime.killpg
+    post_exit_polls = [0]
+
+    def transient_group(pgid: int, number: int) -> None:
+        if number == 0 and campaign["run"].completed:
+            post_exit_polls[0] += 1
+            if post_exit_polls[0] < 3:
+                return
+        original_killpg(pgid, number)
+
+    runtime.killpg = transient_group
+    assert LAUNCHER.run_segment(
+        prepared, campaign["plan_path"], paths, runtime,
+        proof_timeout_seconds=1) == 0
+
+    completion = json.loads(paths.completion_record.read_text(encoding="utf-8"))
+    assert post_exit_polls[0] == 3
+    assert completion["quiescence"]["managed_process_group_gone"] is True
+
+
+def test_completion_is_withheld_when_managed_group_never_disappears(
+        tmp_path: Path) -> None:
+    campaign, prepared, runtime, process, paths = _lifecycle_fixture(tmp_path)
+    original_killpg = runtime.killpg
+
+    def persistent_group(pgid: int, number: int) -> None:
+        if number == 0 and campaign["run"].completed:
+            return
+        original_killpg(pgid, number)
+
+    runtime.killpg = persistent_group
+    with pytest.raises(
+            LAUNCHER.LaunchFailure,
+            match="managed MPI process group remains after bounded"):
+        LAUNCHER.run_segment(
+            prepared, campaign["plan_path"], paths, runtime,
+            proof_timeout_seconds=1)
+
+    assert process.exited is True
+    assert campaign["run"].cleanup_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert not paths.completion_record.exists()
 
 
 def test_completion_is_withheld_when_gpu_after_install_fails(

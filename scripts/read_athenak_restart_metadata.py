@@ -26,6 +26,10 @@ MAX_MESH_METADATA_BYTES = 512 * 1024 * 1024
 REGION_INDEX_COUNT = 19
 
 
+class RestartTruncationError(ValueError):
+    """The available bytes end before a complete restart structure exists."""
+
+
 @dataclass(frozen=True)
 class LogicalLocation:
     """Logical MeshBlock coordinates stored in a restart."""
@@ -188,7 +192,7 @@ def _read_exact(reader: AuditedReader, size: int, description: str) -> bytes:
         remaining -= len(piece)
     data = b"".join(pieces)
     if remaining:
-        raise ValueError(
+        raise RestartTruncationError(
             f"truncated restart while reading {description}: expected {size} bytes, "
             f"got {len(data)}"
         )
@@ -201,7 +205,8 @@ def _read_parameter_dump(reader: AuditedReader) -> tuple[bytes, int]:
     while total < MAX_PARAMETER_BYTES:
         line = reader.readline(MAX_PARAMETER_BYTES - total + 1)
         if not line:
-            raise ValueError("restart has no <par_end> parameter terminator")
+            raise RestartTruncationError(
+                "restart has no <par_end> parameter terminator")
         total += len(line)
         if total > MAX_PARAMETER_BYTES:
             raise ValueError(
@@ -386,7 +391,8 @@ def _parse_fixed_header(
         nmb_total, include_counters=False
     )
     if minimum_list_end > file_size:
-        raise ValueError("restart is too small for its MeshBlock metadata")
+        raise RestartTruncationError(
+            "restart is too small for its MeshBlock metadata")
 
     return FixedHeader(
         nmb_total=nmb_total,
@@ -626,6 +632,7 @@ def read_restart_metadata_stream(
         return AuditedReader(stream)
 
     fixed_failures: list[str] = []
+    fixed_failure_exceptions: list[BaseException] = []
 
     def fixed_candidates(real_bytes: int) -> list[str]:
         candidates: list[str] = []
@@ -638,6 +645,7 @@ def read_restart_metadata_stream(
                 )
             except (ValueError, struct.error) as exc:
                 fixed_failures.append(f"{byte_order}/Real{real_bytes}: {exc}")
+                fixed_failure_exceptions.append(exc)
             else:
                 candidates.append(byte_order)
         return candidates
@@ -652,6 +660,12 @@ def read_restart_metadata_stream(
         byte_orders = fixed_candidates(real_bytes)
     if len(byte_orders) != 1:
         detail = "; ".join(fixed_failures)
+        if fixed_failure_exceptions and all(
+                isinstance(exc, RestartTruncationError)
+                for exc in fixed_failure_exceptions):
+            raise RestartTruncationError(
+                "restart is truncated before a complete native ABI header; " +
+                detail)
         raise ValueError(
             f"could not determine a unique native restart ABI "
             f"({len(byte_orders)} fixed-header candidates); {detail}"
@@ -663,6 +677,8 @@ def read_restart_metadata_stream(
         metadata = _parse_layout(
             reader, file_size, parameter_end, parameters, byte_order, real_bytes
         )
+    except RestartTruncationError:
+        raise
     except (ValueError, struct.error) as exc:
         raise ValueError(
             f"restart metadata is invalid for the selected native ABI "

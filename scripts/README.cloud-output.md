@@ -40,7 +40,8 @@ python3 scripts/plan_athenak_segment.py \
   --binary /data/athenak/build/src/athena \
   --trajectory /data/athenak/trajectory/trajectory.dat \
   --root-steps 100 --root-dt 4.8 --tlim-guard-steps 2 --ranks 8 \
-  --launcher /opt/openmpi/bin/mpirun \
+  --target-max-nmb-per-rank 1280 \
+  --launcher /data/athenak-l4/opt/openmpi-5.0.9-cuda/bin/prterun \
   --state-dir /scratch/run/segment-0002/state \
   --staging-dir /scratch/run/segment-0002/staging \
   --evidence-dir /scratch/run/segment-0002/evidence \
@@ -63,6 +64,30 @@ filename is fixed to the direct evidence child `segment.plan.json`.  The planner
 proves that the sole runtime
 cadence override `output3/dt=4.8` produces one full-domain, ghost-free `divB` topology
 file on every root cycle; a serialized `output3/dcycle` is rejected.
+
+For this deployment, bind the absolute, regular PRRTE executable shown above directly.
+Do not pass an `mpirun` shell/personality wrapper that self-execs another program: that
+can change the live executable or argv after planning and invalidates the launch proof.
+The current transitional cloud control path (outside this v1 strict launcher contract)
+`/data/athenak-l4/opt/strict-prrte-5.0.9/prterun` is also a regular PRRTE ELF whose
+formal `argv[0]`/`prterun` exec probe has passed; its explicit launch environment uses
+`PRTE_MCA_schizo_proxy=ompi`.  A future launcher-contract revision will bind PRRTE
+personality/target identity separately; do not infer that stronger ABI from this v1
+example.
+
+`--target-max-nmb-per-rank` is the only authorized Mesh runtime transition.  Omit it
+to preserve the source restart value.  When present it must be a strict increase, may
+not exceed 16384, and produces exactly one
+`mesh_refinement/max_nmb_per_rank=<target>` token; equal, decreasing, duplicate, or
+additional Mesh overrides fail closed.  The plan binds a conservative fixed model of
+14.33 MiB per MeshBlock slot and requires the target capacity to consume no more than
+80% of every rank's reported `memory.total`; it also requires the observed
+`memory.used` plus the modeled requirement to fit within `memory.total`.  The launcher
+obtains both total and used GPU memory from the plan-bound `nvidia-smi` and applies both
+gates before spawning MPI, then repeats them immediately before process creation;
+the checker rebinds the source restart to the old capacity and every normal or recovered
+endpoint restart to the target capacity.  For an unchanged segment, omit the option
+rather than repeating the current value.
 
 `--planned-peak-output-gib` is a conservative peak for files newly created under the
 segment's state directory.  It does not include the staged source-restart and trajectory
@@ -122,6 +147,55 @@ subcycling restart contract, capacity headroom, event counters, GPU UUID/ECC sta
 stored endpoint-restart Real, every planned binary field, `divB`, histories, and per-step
 baryon-mass loss.  Publish and transfer the closed segment only after this qualification;
 do not let a launcher silently continue past a missing or failed report.
+
+### Interrupted-segment scheduled-prefix recovery
+
+Do not run the complete-segment checker against a partial run.  If a launched segment
+ends nonzero, or if its launcher is lost while the same Linux boot can still prove every
+recorded MPI/rank identity has ended, the separately plan-bound recovery tool may
+qualify a shorter prefix:
+
+```bash
+install -d -m 0700 /scratch/run/recovery-0002/state \
+  /scratch/run/recovery-0002/evidence
+python3 scripts/recover_athenak_segment_prefix.py \
+  --plan /scratch/run/segment-0002/evidence/segment.plan.json \
+  --state-dir /scratch/run/segment-0002/state \
+  --launch-record /scratch/run/segment-0002/evidence/segment.launch.ready \
+  --completion-record /scratch/run/segment-0002/evidence/segment.completion.ready \
+  --recovery-state-dir /scratch/run/recovery-0002/state \
+  --recovery-evidence-dir /scratch/run/recovery-0002/evidence \
+  --output /scratch/run/recovery-0002/evidence/segment.prefix.pass.ready
+```
+
+The optional `--completion-record` must be the original plan path and must contain a
+nonzero exit.  If it is absent, recovery is allowed only on the launch host during the
+same boot, after a bounded quiescence audit proves every recorded launcher/holder/rank
+identity gone, the entire managed MPI process group gone, the exact launch GPU identity
+set unchanged with zero volatile ECC errors, and no remaining compute contexts.  A boot
+change is a permanent recovery failure; use an earlier already-qualified segment
+instead.
+
+Recovery considers only restart writes whose original immutable plan labels
+`scheduled`.  It chooses the highest complete candidate.  An obviously truncated later
+write may be retained as suffix evidence while an older complete candidate is used, but
+a later structurally complete restart that fails cadence, restart-contract, or scientific
+checks forbids fallback.  Cadence is replayed through `Outputs::Execute` only—no
+`Finalize` write is invented.  Every numbered prefix output must exist, unknown files or
+directories fail the recovery, and planned post-prefix artifacts are SHA-256 inventoried.
+
+History and event outputs are never edited in place.  Their exact newline-terminated
+byte prefixes are copied into the new owner-only recovery state tree; discarded suffix
+bytes remain in the original read-only tree and are recorded by size and SHA-256.  The
+tool neither deletes nor modifies the original segment.  It first publishes an
+immutable `.recovery.ready` record with `status=prepared`; that record alone is not a
+qualification and is deliberately non-consumable.  The commit point is the later
+immutable `.pass.ready` in the same bound evidence directory, containing an
+`athenak_segment_pass` with the distinct
+`qualification_mode=scheduled_prefix_recovery_v1`.  The next planner and checker
+require both artifacts and explicitly revalidate this provenance.  A normal successful
+segment instead carries
+`qualification_mode=complete_segment_v1`; recovery does not weaken that checker.
 
 Each immutable pass also contains `scientific_advisories`.  These advisories do not
 weaken or replace the hard gate: they mark `yellow` only after three consecutive root

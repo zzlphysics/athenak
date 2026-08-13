@@ -41,8 +41,31 @@ def _write_restart(
         exact_costs: bool = True, capacity: int = 1024,
         root_dt_parameter: str = "4.8", last_dt: float = 4.8,
         output3_dt: str = "4.8", output3_last_time: str = "148.8",
-        output3_last_write_cycle: int = 31) -> None:
+        output3_last_write_cycle: int = 31, cycle: int = 31,
+        time_value: float = 148.8,
+        output_states: dict[str, dict[str, object]] | None = None,
+        nlim: int = -1, tlim: float = 628.8) -> None:
     real_code = "d" if real_bytes == 8 else "f"
+    states: dict[str, dict[str, object]] = {
+        "output1": {"file_number": 0, "last_time": -1,
+                    "last_write_cycle": 31},
+        "output2": {"file_number": 4, "last_time": 120,
+                    "last_write_cycle": 25},
+        "output3": {"file_number": 9, "last_time": output3_last_time,
+                    "last_write_cycle": output3_last_write_cycle},
+        "output4": {"file_number": 9, "last_time": 148.8,
+                    "last_write_cycle": 31},
+        "output5": {"file_number": 4, "last_time": 120,
+                    "last_write_cycle": 25},
+        "output6": {"file_number": 0, "last_time": -1,
+                    "last_write_cycle": 31},
+    }
+    if output_states is not None:
+        states = output_states
+
+    def output_value(block: str, name: str) -> object:
+        return states[block][name]
+
     parameters = f"""<job>
 basename = effective_bbh_4pn_V100Q
 <mesh>
@@ -74,54 +97,54 @@ subcycling = {subcycling}
 allow_legacy_subcycling_restart = {legacy_subcycling}
 allow_legacy_ghost_event_counters = {legacy_events}
 root_dt_max = {root_dt_parameter}
-nlim = -1
-tlim = 628.8
+nlim = {nlim}
+tlim = {tlim!r}
 restart_dt_growth = 4.8
 <problem>
 trajectory_file = {trajectory}
 <output1>
 file_type = hst
 dcycle = 1
-file_number = 0
-last_time = -1
-last_write_cycle = 31
+file_number = {output_value('output1', 'file_number')}
+last_time = {output_value('output1', 'last_time')}
+last_write_cycle = {output_value('output1', 'last_write_cycle')}
 <output2>
 file_type = bin
 variable = mhd_w_bcc
 dt = 48.0
-file_number = 4
-last_time = 120
-last_write_cycle = 25
+file_number = {output_value('output2', 'file_number')}
+last_time = {output_value('output2', 'last_time')}
+last_write_cycle = {output_value('output2', 'last_write_cycle')}
 ghost_zones = false
 <output3>
 file_type = bin
 variable = mhd_divb
 dt = {output3_dt}
-file_number = 9
-last_time = {output3_last_time}
-last_write_cycle = {output3_last_write_cycle}
+file_number = {output_value('output3', 'file_number')}
+last_time = {output_value('output3', 'last_time')}
+last_write_cycle = {output_value('output3', 'last_write_cycle')}
 ghost_zones = false
 <output4>
 file_type = rst
 dt = 19.2
-file_number = 9
-last_time = 148.8
-last_write_cycle = 31
+file_number = {output_value('output4', 'file_number')}
+last_time = {output_value('output4', 'last_time')}
+last_write_cycle = {output_value('output4', 'last_write_cycle')}
 single_file_per_rank = false
 <output5>
 file_type = bin
 variable = mhd_gr_diagnostics
 dt = 48.0
-file_number = 4
-last_time = 120
-last_write_cycle = 25
+file_number = {output_value('output5', 'file_number')}
+last_time = {output_value('output5', 'last_time')}
+last_write_cycle = {output_value('output5', 'last_write_cycle')}
 ghost_zones = false
 <output6>
 file_type = log
 dcycle = 1
-file_number = 0
-last_time = -1
-last_write_cycle = 31
+file_number = {output_value('output6', 'file_number')}
+last_time = {output_value('output6', 'last_time')}
+last_write_cycle = {output_value('output6', 'last_write_cycle')}
 <par_end>
 """.encode("utf-8")
     region_size = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0,
@@ -146,7 +169,8 @@ last_write_cycle = 31
     content.extend(struct.pack(f"<9{real_code}", *region_size))
     content.extend(struct.pack("<19i", *indices))
     content.extend(struct.pack("<19i", *indices))
-    content.extend(struct.pack(f"<{real_code}{real_code}i", 148.8, last_dt, 31))
+    content.extend(struct.pack(
+        f"<{real_code}{real_code}i", time_value, last_dt, cycle))
     for location in locations:
         content.extend(struct.pack("<4i", *location))
     for cost in costs:
@@ -237,7 +261,7 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         "planned_peak_output_gib": "200",
         **overrides,
     }
-    return [
+    command = [
         sys.executable,
         str(PLANNER),
         "--repo", str(campaign["repo"]),
@@ -261,6 +285,11 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         "--required-unnumbered", "effective_bbh_4pn_V100Q.log",
         "--output", str(campaign["output"]),
     ]
+    if "target_capacity" in overrides:
+        command.extend([
+            "--target-max-nmb-per-rank", values["target_capacity"],
+        ])
+    return command
 
 
 def _run(campaign: dict[str, Path], **overrides: str) -> subprocess.CompletedProcess[str]:
@@ -301,6 +330,10 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         "time/tlim": 638.3999999999996,
         "output3/dt": 4.8,
     }
+    assert plan["capacity_transition"]["kind"] == "unchanged_v1"
+    assert plan["capacity_transition"]["source_max_nmb_per_rank"] == 1024
+    assert plan["capacity_transition"]["target_max_nmb_per_rank"] == 1024
+    assert plan["capacity_transition"]["runtime_override"] is None
     assert plan["source_qualification"]["mode"] == "anchor_full_audit"
     assert plan["source_qualification"]["audit"]["valid"] is True
     assert plan["source_qualification"]["audit"]["stored_reals"][
@@ -366,6 +399,8 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
             },
         },
     }
+
+
     assert plan["launch_contract"]["executable_transport"] == {
         "kind": "linux_proc_holder_execfd_v1",
         "holder_pid_token": "{holder_pid}",
@@ -383,12 +418,25 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         },
     }
     environment = plan["launch_contract"]["environment"]
-    assert environment["kind"] == "explicit_values_v1"
+    assert environment["kind"] == "explicit_values_with_rank_projection_v2"
     assert environment["values"]["LANG"] == environment["values"]["LC_ALL"] == "C"
     assert environment["values"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert environment["values"]["PRTE_MCA_schizo_proxy"] == "ompi"
     assert environment["sha256"] == hashlib.sha256(json.dumps(
         environment["values"], sort_keys=True, separators=(",", ":"),
         ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
+    projection = environment["rank_projection"]
+    assert projection["kind"] == "prrte_consumed_projection_v1"
+    assert projection["inherited_values"] == {
+        key: environment["values"][key]
+        for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
+    }
+    assert projection["consumed_absent"] == ["PRTE_MCA_schizo_proxy"]
+    assert projection["sha256"] == hashlib.sha256(json.dumps({
+        "inherited_values": projection["inherited_values"],
+        "consumed_absent": projection["consumed_absent"],
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False).encode("utf-8")).hexdigest()
     assert plan["tools"]["nvidia_smi"]["path"] == str(
         campaign["nvidia_smi"].resolve())
     assert plan["policy"]["endpoint_time_ulp_tolerance"] == 0
@@ -435,6 +483,80 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         "effective_bbh_4pn_V100Q"
     )
     assert campaign["output"].stat().st_mode & 0o222 == 0
+
+
+def test_plan_binds_only_a_strict_capacity_increase(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    result = _run(campaign, target_capacity="1280")
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    transition = plan["capacity_transition"]
+    assert transition["kind"] == "increase_v1"
+    assert transition["source_max_nmb_per_rank"] == 1024
+    assert transition["target_max_nmb_per_rank"] == 1280
+    assert transition["runtime_override"] == \
+        "mesh_refinement/max_nmb_per_rank=1280"
+    assert transition["gpu_memory_model"] == {
+        "kind": "fixed_conservative_per_meshblock_slot_v1",
+        "mib_per_slot_numerator": 1433,
+        "mib_per_slot_denominator": 100,
+        "usable_fraction_numerator": 4,
+        "usable_fraction_denominator": 5,
+        "required_per_rank_memory_mib_ceiling": 18343,
+        "minimum_gpu_memory_total_mib": 22928,
+    }
+    assert plan["command_overrides"][
+        "mesh_refinement/max_nmb_per_rank"] == 1280
+    assert plan["launch_contract"]["athena_argv_template"][-1] == \
+        "mesh_refinement/max_nmb_per_rank=1280"
+    assert plan["policy"]["mutable_parameters"] == [
+        "time/nlim", "time/tlim", "time/restart_dt_growth",
+        "output*/file_number", "output*/last_time",
+        "output*/last_write_cycle",
+    ]
+
+
+@pytest.mark.parametrize("target", ("1024", "1000", "16385"))
+def test_plan_rejects_equal_decreasing_or_excess_capacity_target(
+        tmp_path: Path, target: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    result = _run(campaign, target_capacity=target)
+
+    assert result.returncode != 0
+    assert "target-max-nmb-per-rank" in result.stderr
+
+
+def test_plan_rejects_duplicate_capacity_target(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    command = _command(campaign, target_capacity="1280")
+    command.extend(["--target-max-nmb-per-rank", "1536"])
+    environment = dict(os.environ)
+    environment["PATH"] = (
+        f"{campaign['nvidia_smi'].parent}{os.pathsep}"
+        f"{environment.get('PATH', '')}"
+    )
+
+    result = subprocess.run(
+        command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment)
+
+    assert result.returncode != 0
+    assert "may be specified only once" in result.stderr
+
+
+def test_plan_capacity_increase_rescues_near_full_source(tmp_path: Path) -> None:
+    # Eight blocks over eight ranks exactly fill a serialized capacity of one.
+    campaign = _campaign(tmp_path, capacity=1)
+
+    result = _run(campaign, target_capacity="65")
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    assert plan["source"]["partition"]["minimum_capacity_headroom"] == 0
+    assert plan["capacity_transition"]["target_max_nmb_per_rank"] == 65
 
 
 def test_plan_output_must_be_canonical_direct_evidence_child(
@@ -602,6 +724,7 @@ def _make_parent_pass(campaign: dict[str, Path], tmp_path: Path,
         "schema": 1,
         "kind": "athenak_segment_pass",
         "status": "pass",
+        "qualification_mode": "complete_segment_v1",
         "expected": {"final_cycle": 31, "final_time": 148.8},
         "bindings": {
             "endpoint_restart": anchor["inputs"]["source_restart"],
@@ -609,6 +732,12 @@ def _make_parent_pass(campaign: dict[str, Path], tmp_path: Path,
         },
         "endpoint_restart_audit": anchor["source_qualification"]["audit"],
         "scientific_threshold_audit": {"baryon_mass": {"last": 100.0}},
+        "scientific_advisories": {
+            "schema": "athenak_scientific_advisories_v1",
+            "severity": "green",
+            "floor_rates": {},
+            "pass_fail_effect": "none_yellow_advisories_are_nonfatal",
+        },
         "output_inventory": [{
             **anchor["source_qualification"]["source_baryon_mass"]["evidence"],
             "history": {
@@ -652,6 +781,193 @@ def _run_with_parent(campaign: dict[str, Path], parent: Path
         text=True, env=environment)
 
 
+def _make_recovery_parent_pass(
+        campaign: dict[str, Path], tmp_path: Path, mutation=None) -> Path:
+    anchor_result = _run(campaign)
+    assert anchor_result.returncode == 0, anchor_result.stderr
+    anchor = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    recovery_state = tmp_path / "recovered-state"
+    recovery_evidence = tmp_path / "recovered-evidence"
+    recovery_state.mkdir(mode=0o700)
+    recovery_evidence.mkdir(mode=0o700)
+    recovery_state.chmod(0o700)
+    recovery_evidence.chmod(0o700)
+    derived_history = recovery_state / "effective_bbh_4pn_V100Q.user.hst"
+    derived_history.write_bytes(campaign["source_history"].read_bytes())
+    derived_history.chmod(0o444)
+
+    def record(path: Path) -> dict[str, object]:
+        return {
+            "path": str(path.resolve()), "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "closure_check": "linux_proc_fd",
+        }
+
+    endpoint = anchor["inputs"]["source_restart"]
+    selected = {
+        "block": "output4", "relative_path": "rst/run.00009.rst",
+        "expected_write": {"cycle": 31, "time": 148.8,
+                           "kind": "scheduled", "file_number": 9},
+        "binding": endpoint,
+    }
+    logical = {
+        "source_cycle": 1, "source_time": 4.8,
+        "final_cycle": 31, "final_time": 148.8, "root_steps": 30,
+        "execute_only": True, "expected_numbered_paths": [],
+        "required_unnumbered_paths": [],
+        "all_expected_prefix_artifacts_present": True,
+    }
+    lifecycle = {
+        "kind": "same_boot_closed_processes_v1",
+        "all_original_identities_gone": True,
+    }
+    run_log_prefix = {
+        "root_step_diagnostics": {
+            "cycle_max": 31,
+            "all_recovered_prefix_cycles_present": True,
+        },
+        "cache": {"solver_failures": 0, "nonfinite_proposed_values": 0},
+    }
+    history_binding = record(derived_history)
+    candidates = [{
+        "relative_path": "rst/run.00010.rst",
+        "expected_write": {"cycle": 40},
+        "classification": "incomplete_truncated",
+    }, {
+        "relative_path": selected["relative_path"],
+        "expected_write": selected["expected_write"],
+        "classification": "complete",
+    }]
+    original_plan = recovery_evidence / "segment.plan.json"
+    original_plan.write_text(json.dumps({
+        "policy": {"scheduled_prefix_recovery": {
+            "kind": "scheduled_prefix_recovery_v1",
+            "candidate_kind": "original_plan_scheduled_restart_only",
+            "selection": "highest_complete_candidate",
+            "later_complete_scientific_failure": "fatal_no_fallback",
+            "cadence_replay": "execute_only_binary64_v1",
+            "original_trees": "read_only_no_delete",
+            "derived_text": "exact_original_byte_prefix",
+            "unknown_state_nodes": "fatal",
+            "lifecycle": "nonzero_completion_or_same_boot_closed_processes",
+        }},
+        "outputs": [{
+            "block": "output4", "file_type": "rst",
+            "relative_path_template": "rst/run.{file_number:05d}.rst",
+            "expected_writes": [selected["expected_write"]],
+        }],
+    }), encoding="utf-8")
+    original_plan.chmod(0o444)
+    original_plan_binding = record(original_plan)
+    recovery_record_payload = {
+        "schema": 1, "kind": "athenak_segment_prefix_recovery",
+        "status": "pass", "qualification_mode":
+            "scheduled_prefix_recovery_v1",
+        "policy": {
+            "kind": "scheduled_prefix_recovery_v1",
+            "candidate_kind": "original_plan_scheduled_restart_only",
+            "selection": "highest_complete_candidate",
+            "later_complete_scientific_failure": "fatal_no_fallback",
+            "cadence_replay": "execute_only_binary64_v1",
+            "original_trees": "read_only_no_delete",
+            "derived_text": "exact_original_byte_prefix",
+            "unknown_state_nodes": "fatal",
+            "lifecycle": "nonzero_completion_or_same_boot_closed_processes",
+        },
+        "original_plan": original_plan_binding,
+        "selected_scheduled_restart": selected,
+        "logical_prefix": logical,
+        "lifecycle": lifecycle,
+        "run_log_prefix_audit": run_log_prefix,
+        "candidate_inventory": candidates,
+        "recovery_state_dir": str(recovery_state.resolve()),
+    }
+    recovery_record = recovery_evidence / "segment.prefix.recovery.ready"
+    recovery_record.write_text(json.dumps(recovery_record_payload), encoding="utf-8")
+    recovery_record.chmod(0o444)
+    recovery_record_binding = record(recovery_record)
+    parent = {
+        "schema": 1, "kind": "athenak_segment_pass", "status": "pass",
+        "qualification_mode": "scheduled_prefix_recovery_v1",
+        "expected": {"final_cycle": 31, "final_time": 148.8},
+        "bindings": {
+            "endpoint_restart": endpoint,
+            "trajectory": anchor["inputs"]["trajectory"],
+            "recovery_record": recovery_record_binding,
+            "original_plan": original_plan_binding,
+        },
+        "endpoint_restart_audit": anchor["source_qualification"]["audit"],
+        "scientific_threshold_audit": {"baryon_mass": {"last": 100.0}},
+        "scientific_advisories": {
+            "schema": "athenak_scientific_advisories_v1",
+            "severity": "green", "floor_rates": {},
+            "pass_fail_effect": "none_yellow_advisories_are_nonfatal",
+        },
+        "output_inventory": [{
+            **history_binding,
+            "history": {
+                "columns": ["time", "dt", "baryon_m"],
+                "column_last": {"time": 148.8, "dt": 4.8,
+                                "baryon_m": 100.0},
+            },
+        }],
+        "recovery_provenance": {
+            "kind": "scheduled_prefix_recovery_v1",
+            "policy": recovery_record_payload["policy"],
+            "record": recovery_record_binding,
+            "original_plan": original_plan_binding,
+            "selected_scheduled_restart": selected,
+            "logical_prefix": logical,
+            "lifecycle": lifecycle,
+            "run_log_prefix_audit": run_log_prefix,
+            "derived_text_prefixes": [{"derived": history_binding}],
+            "original_trees_unchanged": True,
+        },
+    }
+    if mutation is not None:
+        mutation(parent)
+    parent_path = recovery_evidence / "segment.prefix.pass.ready"
+    parent_path.write_text(json.dumps(parent), encoding="utf-8")
+    parent_path.chmod(0o444)
+    campaign["source_history"] = derived_history
+    next_state = tmp_path / "next-recovery-state"
+    next_staging = tmp_path / "next-recovery-staging"
+    next_evidence = tmp_path / "next-recovery-evidence"
+    for directory in (next_state, next_staging, next_evidence):
+        directory.mkdir()
+    campaign["state_dir"] = next_state
+    campaign["staging_dir"] = next_staging
+    campaign["evidence_dir"] = next_evidence
+    campaign["output"] = next_evidence / "segment.plan.json"
+    return parent_path
+
+
+def test_planner_rejects_handwritten_legacy_recovery_parent(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    parent = _make_recovery_parent_pass(campaign, tmp_path)
+
+    result = _run_with_parent(campaign, parent)
+
+    assert result.returncode != 0
+    assert "recovery parent strict provenance failed" in result.stderr
+
+
+def test_planner_rejects_recovery_parent_provenance_tamper(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    parent = _make_recovery_parent_pass(
+        campaign, tmp_path,
+        lambda report: report["recovery_provenance"][
+            "selected_scheduled_restart"]["expected_write"].__setitem__(
+                "kind", "forced_final"))
+
+    result = _run_with_parent(campaign, parent)
+
+    assert result.returncode != 0
+    assert "recovery parent" in result.stderr
+
+
 def test_parent_segment_pass_chains_endpoint_and_baryon_source(
         tmp_path: Path) -> None:
     campaign = _campaign(tmp_path)
@@ -665,6 +981,43 @@ def test_parent_segment_pass_chains_endpoint_and_baryon_source(
     assert qualification["source_baryon_mass"]["evidence"]["path"] == str(
         campaign["source_history"].resolve())
     assert qualification["source_baryon_mass"]["value"] == 100.0
+
+
+def test_legacy_complete_parent_without_mode_remains_chainable(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    parent = _make_parent_pass(
+        campaign, tmp_path,
+        lambda report: (
+            report.pop("qualification_mode"),
+            report.__setitem__("completion_record_audit", {"return_code": 0}),
+            report.__setitem__("run_log_audit", {"termination": "cycle_limit"}),
+        ))
+
+    result = _run_with_parent(campaign, parent)
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    assert plan["source_qualification"]["parent_qualification_mode"] == \
+        "legacy_complete_segment_v1"
+
+
+def test_missing_mode_cannot_disguise_recovery_as_legacy_complete(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    parent = _make_parent_pass(
+        campaign, tmp_path,
+        lambda report: (
+            report.pop("qualification_mode"),
+            report.__setitem__("completion_record_audit", {"return_code": 0}),
+            report.__setitem__("run_log_audit", {"termination": "cycle_limit"}),
+            report.__setitem__("recovery_provenance", {}),
+        ))
+
+    result = _run_with_parent(campaign, parent)
+
+    assert result.returncode != 0
+    assert "legacy parent" in result.stderr
 
 
 @pytest.mark.parametrize(

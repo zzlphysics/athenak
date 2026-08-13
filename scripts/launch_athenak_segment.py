@@ -62,6 +62,11 @@ from read_athenak_restart_metadata import (
 
 
 SCHEMA = 1
+MAX_NMB_PER_RANK = 16384
+CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
+CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
+CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
+CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR = 5
 GIB_BYTES = 1 << 30
 DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
 DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
@@ -72,9 +77,11 @@ DISK_PREFLIGHT_FORMULA = (
 )
 DEFAULT_PROOF_TIMEOUT_SECONDS = 120.0
 DEFAULT_PROOF_POLL_SECONDS = 0.25
+DEFAULT_QUIESCENCE_TIMEOUT_SECONDS = 10.0
+DEFAULT_QUIESCENCE_POLL_SECONDS = 0.1
 GPU_QUERY = (
     "index,uuid,pci.bus_id,ecc.errors.uncorrected.volatile.total,"
-    "ecc.errors.corrected.volatile.total,memory.used"
+    "ecc.errors.corrected.volatile.total,memory.total,memory.used"
 )
 GPU_APP_QUERY = "pid,gpu_uuid"
 MPI_ENVIRONMENT_KEYS = (
@@ -96,10 +103,16 @@ STAGING_DIRECTORY_PREFLIGHT_FD = 206
 HOLDER_PID_TOKEN = "{holder_pid}"
 DIRECTORY_TRANSPORT_KIND = "linux_proc_holder_dirfd_v1"
 EXECUTABLE_TRANSPORT_KIND = "linux_proc_holder_execfd_v1"
-LAUNCH_ENVIRONMENT_KIND = "explicit_values_v1"
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
+RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
 LAUNCH_ENVIRONMENT_KEYS = (
     "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+    "PRTE_MCA_schizo_proxy",
 )
+RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+)
+RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
 EVIDENCE_NAMES = (
     "launch_record", "completion_record", "run_log", "exit_status",
     "gpu_before", "gpu_after",
@@ -107,7 +120,7 @@ EVIDENCE_NAMES = (
 MANAGED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 FORBIDDEN_OVERRIDE = re.compile(
     r"^(?:output\d+/(?:dt|dcycle|file_number|last_time|last_write_cycle)|"
-    r"job/basename|problem/trajectory_file)="
+    r"job/basename|problem/trajectory_file|mesh(?:block|_refinement)?/[^=]+)="
 )
 
 
@@ -289,6 +302,68 @@ def _audit_repository(value: Any, git_plan: Any,
 def _integer(value: Any, label: str) -> int:
     _require(isinstance(value, int) and not isinstance(value, bool),
              f"{label} must be an integer")
+    return value
+
+
+def _ceil_ratio(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def _capacity_transition_contract(plan: Mapping[str, Any]) -> dict[str, Any]:
+    value = plan.get("capacity_transition")
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "parameter", "source_max_nmb_per_rank",
+        "target_max_nmb_per_rank", "maximum_target_max_nmb_per_rank",
+        "runtime_override", "gpu_memory_model",
+    }, "capacity_transition must be the exact strict object")
+    source = _integer(value.get("source_max_nmb_per_rank"),
+                      "capacity source")
+    target = _integer(value.get("target_max_nmb_per_rank"),
+                      "capacity target")
+    _require(1 <= source <= target <= MAX_NMB_PER_RANK and
+             value.get("maximum_target_max_nmb_per_rank") == MAX_NMB_PER_RANK and
+             value.get("parameter") ==
+             "mesh_refinement/max_nmb_per_rank",
+             "capacity transition bounds are invalid")
+    runtime_override = value.get("runtime_override")
+    if source == target:
+        _require(value.get("kind") == "unchanged_v1" and
+                 runtime_override is None,
+                 "unchanged capacity transition may not carry an override")
+    else:
+        _require(value.get("kind") == "increase_v1" and
+                 runtime_override ==
+                 f"mesh_refinement/max_nmb_per_rank={target}",
+                 "capacity increase lacks the canonical override")
+    required = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR)
+    minimum_total = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR *
+        CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR *
+        CAPACITY_GPU_USABLE_FRACTION_NUMERATOR)
+    _require(value.get("gpu_memory_model") == {
+        "kind": "fixed_conservative_per_meshblock_slot_v1",
+        "mib_per_slot_numerator":
+            CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+        "mib_per_slot_denominator":
+            CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR,
+        "usable_fraction_numerator":
+            CAPACITY_GPU_USABLE_FRACTION_NUMERATOR,
+        "usable_fraction_denominator":
+            CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+        "required_per_rank_memory_mib_ceiling": required,
+        "minimum_gpu_memory_total_mib": minimum_total,
+    }, "capacity GPU-memory model is not canonical")
+    source_record = plan.get("source")
+    _require(isinstance(source_record, Mapping),
+             "plan source must be an object for capacity transition")
+    source_parameters = source_record.get("parameters")
+    _require(isinstance(source_parameters, dict) and
+             source_parameters.get("mesh_refinement", {}).get(
+                 "max_nmb_per_rank") == str(source),
+             "source restart capacity differs from capacity transition")
     return value
 
 
@@ -598,19 +673,21 @@ def _validate_launch_environment(value: Any) -> dict[str, str]:
     """Return the exact, immutable environment permitted for MPI/AthenaK."""
 
     _require(isinstance(value, dict) and
+             set(value) == {"kind", "values", "sha256", "rank_projection"} and
              value.get("kind") == LAUNCH_ENVIRONMENT_KIND,
              f"launch environment kind must be {LAUNCH_ENVIRONMENT_KIND}")
     values = value.get("values")
     _require(isinstance(values, dict) and set(values) == set(LAUNCH_ENVIRONMENT_KEYS),
              "launch environment must contain exactly HOME/LANG/LC_ALL/"
-             "CUDA_DEVICE_ORDER")
+             "CUDA_DEVICE_ORDER/PRTE_MCA_schizo_proxy")
     _require(all(isinstance(key, str) and isinstance(item, str) and
                  key and "=" not in key and "\x00" not in key and
                  "\x00" not in item for key, item in values.items()),
              "launch environment contains an invalid name or value")
     _require(values["LANG"] == "C" and values["LC_ALL"] == "C" and
-             values["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID",
-             "launch environment locale/CUDA ordering is not canonical")
+             values["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" and
+             values["PRTE_MCA_schizo_proxy"] == "ompi",
+             "launch environment locale/CUDA/PRRTE personality is not canonical")
     home = _safe_directory(Path(values["HOME"]), "launch HOME")
     home_info = home.stat()
     _require(str(home) == values["HOME"] and home_info.st_uid == os.geteuid() and
@@ -620,6 +697,25 @@ def _validate_launch_environment(value: Any) -> dict[str, str]:
     canonical = {key: values[key] for key in LAUNCH_ENVIRONMENT_KEYS}
     _require(value.get("sha256") == _canonical_sha256(canonical),
              "launch environment SHA-256 is not canonical")
+    projection = value.get("rank_projection")
+    _require(isinstance(projection, dict) and
+             set(projection) == {
+                 "kind", "inherited_values", "consumed_absent", "sha256",
+             } and
+             projection.get("kind") == RANK_ENVIRONMENT_PROJECTION_KIND,
+             "rank environment projection kind is not canonical")
+    projection_payload = {
+        "inherited_values": {
+            key: canonical[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
+        },
+        "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
+    }
+    _require(projection.get("inherited_values") ==
+             projection_payload["inherited_values"] and
+             projection.get("consumed_absent") ==
+             projection_payload["consumed_absent"] and
+             projection.get("sha256") == _canonical_sha256(projection_payload),
+             "rank environment projection differs from the exact PRRTE contract")
     return canonical
 
 
@@ -1455,12 +1551,14 @@ class GPURecord:
     cuda_ordinal: int
     uncorrected_ecc: int
     corrected_ecc: int
-    memory_mib: int
+    memory_total_mib: int
+    memory_used_mib: int
 
     def csv_line(self) -> str:
         return (f"{self.index},{self.uuid},{self.pci_bus_id},{self.cuda_ordinal},"
                 f"{self.uncorrected_ecc},"
-                f"{self.corrected_ecc},{self.memory_mib}\n")
+                f"{self.corrected_ecc},{self.memory_total_mib},"
+                f"{self.memory_used_mib}\n")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1470,7 +1568,8 @@ class GPURecord:
             "cuda_ordinal": self.cuda_ordinal,
             "uncorrected_ecc": self.uncorrected_ecc,
             "corrected_ecc": self.corrected_ecc,
-            "memory_mib": self.memory_mib,
+            "memory_total_mib": self.memory_total_mib,
+            "memory_used_mib": self.memory_used_mib,
         }
 
 
@@ -1506,25 +1605,30 @@ def _pci_bus_key(value: str) -> tuple[int, int, int, int]:
 
 def query_gpu_inventory(runtime: "Runtime") -> list[GPURecord]:
     rows = _nvidia_query(GPU_QUERY, runtime)
-    parsed: list[tuple[int, str, str, int, int, int]] = []
+    parsed: list[tuple[int, str, str, int, int, int, int]] = []
     for row in rows:
-        _require(len(row) == 6, f"unexpected nvidia-smi GPU row: {row!r}")
+        _require(len(row) == 7, f"unexpected nvidia-smi GPU row: {row!r}")
         try:
             values = (
-                int(row[0]), row[1], row[2], int(row[3]), int(row[4]), int(row[5])
+                int(row[0]), row[1], row[2], int(row[3]), int(row[4]),
+                int(row[5]), int(row[6])
             )
         except ValueError as exc:
             raise LaunchFailure(f"non-integer nvidia-smi GPU row: {row!r}") from exc
-        index, uuid, pci_bus_id, uncorrected, corrected, memory = values
+        (index, uuid, pci_bus_id, uncorrected, corrected,
+         memory_total, memory) = values
         _pci_bus_key(pci_bus_id)
         _require(index >= 0 and uuid.startswith("GPU-") and
-                 uncorrected >= 0 and corrected >= 0 and memory >= 0,
+                 uncorrected >= 0 and corrected >= 0 and
+                 memory_total > 0 and 0 <= memory <= memory_total,
                  f"invalid nvidia-smi GPU row: {row!r}")
         parsed.append(values)
     parsed.sort(key=lambda item: _pci_bus_key(item[2]))
     result = [
-        GPURecord(index, uuid, pci_bus_id, ordinal, uncorrected, corrected, memory)
-        for ordinal, (index, uuid, pci_bus_id, uncorrected, corrected, memory)
+        GPURecord(index, uuid, pci_bus_id, ordinal, uncorrected, corrected,
+                  memory_total, memory)
+        for ordinal, (index, uuid, pci_bus_id, uncorrected, corrected,
+                      memory_total, memory)
         in enumerate(parsed)
     ]
     _require(len({item.index for item in result}) == len(result),
@@ -1534,6 +1638,34 @@ def query_gpu_inventory(runtime: "Runtime") -> list[GPURecord]:
     _require(len({item.pci_bus_id.lower() for item in result}) == len(result),
              "nvidia-smi returned duplicate GPU PCI bus ids")
     return result
+
+
+def _gpu_capacity_preflight(
+        gpus: Sequence[GPURecord],
+        capacity_transition: Mapping[str, Any]) -> dict[str, Any]:
+    model = capacity_transition["gpu_memory_model"]
+    minimum_total = int(model["minimum_gpu_memory_total_mib"])
+    required = int(model["required_per_rank_memory_mib_ceiling"])
+    _require(bool(gpus), "GPU capacity preflight requires at least one device")
+    _require(all(gpu.memory_total_mib >= minimum_total for gpu in gpus),
+             "preflight GPU total memory is below the plan-bound 80% capacity "
+             "model")
+    _require(all(gpu.memory_used_mib + required <= gpu.memory_total_mib
+                 for gpu in gpus),
+             "preflight GPU available memory is below the plan-bound capacity "
+             "requirement")
+    return {
+        "kind": "per_rank_memory_total_and_available_gate_v1",
+        "required_per_rank_memory_mib_ceiling": required,
+        "minimum_gpu_memory_total_mib": minimum_total,
+        "minimum_observed_gpu_memory_total_mib":
+            min(gpu.memory_total_mib for gpu in gpus),
+        "maximum_observed_gpu_memory_used_mib":
+            max(gpu.memory_used_mib for gpu in gpus),
+        "minimum_observed_gpu_memory_available_mib":
+            min(gpu.memory_total_mib - gpu.memory_used_mib for gpu in gpus),
+        "all_ranks_pass": True,
+    }
 
 
 def query_gpu_applications(runtime: "Runtime") -> list[GPUApplication]:
@@ -1736,6 +1868,7 @@ class PreparedLaunch:
     athena_argv: tuple[str, ...]
     launch_argv: tuple[str, ...]
     gpus: tuple[GPURecord, ...]
+    gpu_capacity_preflight: dict[str, Any]
     gpu_visibility_environment: dict[str, str | None]
 
     def close(self) -> None:
@@ -1899,12 +2032,19 @@ def prepare_launch(plan_path: Path, state_dir: Path,
     _require(final_cycle >= 0 and tlim > 0.0,
              "planned cycle/time limits must be nonnegative/positive")
     _require(root_dt > 0.0, "planned root_dt must be positive")
-    overrides = plan.get("command_overrides")
-    _require(overrides == {
+    capacity_transition = _capacity_transition_contract(plan)
+    expected_overrides = {
         "time/nlim": final_cycle,
         "time/tlim": tlim,
         "output3/dt": root_dt,
-    }, "plan command_overrides must contain exact nlim/tlim and output3/dt")
+    }
+    if capacity_transition["kind"] == "increase_v1":
+        expected_overrides["mesh_refinement/max_nmb_per_rank"] = \
+            capacity_transition["target_max_nmb_per_rank"]
+    overrides = plan.get("command_overrides")
+    _require(overrides == expected_overrides,
+             "plan command_overrides must contain only the exact limits, divB "
+             "cadence, and optional capacity increase")
 
     transport = contract.get("input_transport")
     _require(isinstance(transport, dict) and
@@ -1972,6 +2112,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
         f"time/nlim={final_cycle}", f"time/tlim={tlim!r}",
         f"problem/trajectory_file={trajectory_template}",
         divb_cadence_override,
+        *(() if capacity_transition["kind"] == "unchanged_v1" else
+          (capacity_transition["runtime_override"],)),
     )
     canonical_mpi = (
         launcher_plan["path"], "--allow-run-as-root", "--bind-to", "none",
@@ -1985,12 +2127,20 @@ def prepare_launch(plan_path: Path, state_dir: Path,
              "launch_contract.mpi_argv is not canonical")
     permitted_trajectory = f"problem/trajectory_file={trajectory_template}"
     permitted_overrides = {permitted_trajectory, divb_cadence_override}
+    if capacity_transition["kind"] == "increase_v1":
+        permitted_overrides.add(capacity_transition["runtime_override"])
     _require(not any(FORBIDDEN_OVERRIDE.match(token) and token not in permitted_overrides
                      for token in canonical_athena_template),
              "canonical Athena argv contains a forbidden output/provenance override")
     _require(canonical_athena_template.count(permitted_trajectory) == 1 and
              canonical_athena_template.count(divb_cadence_override) == 1,
              "canonical Athena argv must contain exact trajectory/divB overrides")
+    mesh_tokens = [token for token in canonical_athena_template
+                   if token.startswith(("mesh/", "meshblock/",
+                                        "mesh_refinement/"))]
+    _require(mesh_tokens == ([] if capacity_transition["kind"] == "unchanged_v1"
+                             else [capacity_transition["runtime_override"]]),
+             "canonical Athena argv contains an extra Mesh parameter")
 
     gpus = query_gpu_inventory(runtime)
     _require(len(gpus) == world_size,
@@ -2000,6 +2150,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
              "PCI-ordered CUDA ordinals must be contiguous from zero")
     _require(all(gpu.uncorrected_ecc == 0 and gpu.corrected_ecc == 0 for gpu in gpus),
              "preflight GPU ECC counters must all be zero")
+    gpu_capacity_preflight = _gpu_capacity_preflight(
+        gpus, capacity_transition)
     active = query_gpu_applications(runtime)
     _require(not active, f"GPU compute applications already active: {active!r}")
     _paths_separate(
@@ -2146,6 +2298,7 @@ def prepare_launch(plan_path: Path, state_dir: Path,
             launcher=launcher,
             mpi_argv=canonical_mpi, athena_argv=canonical_athena,
             launch_argv=canonical_mpi + canonical_athena, gpus=tuple(gpus),
+            gpu_capacity_preflight=gpu_capacity_preflight,
             gpu_visibility_environment={
                 "CUDA_VISIBLE_DEVICES": None,
                 "KOKKOS_VISIBLE_DEVICES": None,
@@ -2172,9 +2325,12 @@ def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
                             launch_environment: Mapping[str, str]) \
         -> tuple[int, int, dict[str, str]]:
     selected: dict[str, str] = {}
-    for key in (*MPI_ENVIRONMENT_KEYS, *LAUNCH_ENVIRONMENT_KEYS):
+    for key in (*MPI_ENVIRONMENT_KEYS, *RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS):
         _require(key in environment, f"rank pid {pid} lacks MPI environment {key}")
         selected[key] = environment[key]
+    for key in RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS:
+        _require(key not in environment,
+                 f"rank pid {pid} retained launcher-only environment {key}")
     for key in GPU_VISIBILITY_ENVIRONMENT_KEYS:
         if key in environment:
             selected[key] = environment[key]
@@ -2189,9 +2345,9 @@ def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
              f"rank pid {pid} is not in the planned single-node MPI world")
     _require(0 <= global_rank < world_size and 0 <= local_rank < world_size,
              f"rank pid {pid} has out-of-range MPI rank")
-    _require(all(selected.get(key) == value
-                 for key, value in launch_environment.items()),
-             f"rank pid {pid} launch environment differs from immutable plan")
+    _require(all(selected.get(key) == launch_environment[key]
+                 for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS),
+             f"rank pid {pid} inherited environment differs from immutable plan")
     return global_rank, local_rank, selected
 
 
@@ -2404,16 +2560,28 @@ def _gpu_csv(gpus: Sequence[GPURecord]) -> bytes:
     return "".join(gpu.csv_line() for gpu in gpus).encode("ascii")
 
 
-def _gpu_identity(gpus: Sequence[GPURecord]) -> list[tuple[int, str, str, int]]:
+def _gpu_identity(
+        gpus: Sequence[GPURecord]) -> list[tuple[int, str, str, int, int]]:
     return [
-        (gpu.index, gpu.uuid, gpu.pci_bus_id.lower(), gpu.cuda_ordinal)
+        (gpu.index, gpu.uuid, gpu.pci_bus_id.lower(), gpu.cuda_ordinal,
+         gpu.memory_total_mib)
         for gpu in gpus
     ]
 
 
 def prove_process_quiescence(proof: Mapping[str, Any],
-                             runtime: Runtime) -> dict[str, Any]:
-    """Prove every recorded process identity ended, accepting safe PID reuse."""
+                             managed_process_group: Mapping[str, Any],
+                             runtime: Runtime,
+                             timeout_seconds: float =
+                             DEFAULT_QUIESCENCE_TIMEOUT_SECONDS,
+                             poll_seconds: float =
+                             DEFAULT_QUIESCENCE_POLL_SECONDS) -> dict[str, Any]:
+    """Boundedly prove process/group/GPU quiescence after launcher exit."""
+
+    _require(math.isfinite(timeout_seconds) and timeout_seconds > 0.0,
+             "quiescence timeout must be finite and positive")
+    _require(math.isfinite(poll_seconds) and poll_seconds > 0.0,
+             "quiescence poll interval must be finite and positive")
 
     identities = [{
         "role": "mpirun",
@@ -2425,24 +2593,56 @@ def prove_process_quiescence(proof: Mapping[str, Any],
         "pid": rank["pid"],
         "recorded_start_time_ticks": rank["start_time_ticks"],
     } for rank in proof["ranks"])
+    managed_group = managed_process_group
+    _require(isinstance(managed_group, dict) and
+             managed_group.get("pgid") == proof["mpirun_pid"],
+             "launch proof lacks exact managed process group")
+    deadline = runtime.monotonic() + timeout_seconds
     observations: list[dict[str, Any]] = []
-    for identity in identities:
-        current = runtime.inspector.start_time_ticks(identity["pid"])
-        _require(current != identity["recorded_start_time_ticks"],
-                 f"recorded process identity is still live: {identity['role']}")
-        observations.append({
-            **identity,
-            "state": "disappeared" if current is None else "pid_reused",
-            "observed_start_time_ticks": current,
-            "original_identity_gone": True,
-        })
-    applications = query_gpu_applications(runtime)
-    _require(not applications,
-             f"GPU compute contexts remain after MPI exit: {applications!r}")
+    applications: list[dict[str, Any]] = []
+    group_exists = True
+    while True:
+        observations = []
+        identities_gone = True
+        for identity in identities:
+            current = runtime.inspector.start_time_ticks(identity["pid"])
+            gone = current != identity["recorded_start_time_ticks"]
+            identities_gone = identities_gone and gone
+            observations.append({
+                **identity,
+                "state": (
+                    "disappeared" if current is None else
+                    "pid_reused" if gone else "still_live"
+                ),
+                "observed_start_time_ticks": current,
+                "original_identity_gone": gone,
+            })
+        applications = query_gpu_applications(runtime)
+        group_exists = _process_group_exists(managed_group["pgid"], runtime)
+        if identities_gone and not applications and not group_exists:
+            break
+        if runtime.monotonic() >= deadline:
+            live_roles = [
+                row["role"] for row in observations
+                if not row["original_identity_gone"]
+            ]
+            if live_roles:
+                raise LaunchFailure(
+                    "recorded process identity is still live after bounded "
+                    f"quiescence wait: {live_roles!r}")
+            if applications:
+                raise LaunchFailure(
+                    "GPU compute contexts remain after bounded quiescence "
+                    f"wait: {applications!r}")
+            raise LaunchFailure(
+                "managed MPI process group remains after bounded quiescence wait")
+        runtime.sleep(min(poll_seconds, max(0.0, deadline - runtime.monotonic())))
     return {
         "gpu_compute_contexts_empty": True,
         "process_identities": observations,
         "all_original_identities_gone": True,
+        "managed_process_group": managed_group,
+        "managed_process_group_gone": True,
     }
 
 
@@ -2739,6 +2939,9 @@ def _run_segment_with_holder(
     _require(all(gpu.uncorrected_ecc == 0 and gpu.corrected_ecc == 0
                  for gpu in before),
              "GPU ECC counters changed after preflight")
+    capacity_transition = _capacity_transition_contract(prepared.plan)
+    gpu_capacity_preflight = _gpu_capacity_preflight(
+        before, capacity_transition)
     _require(not query_gpu_applications(runtime),
              "a GPU compute application appeared after preflight")
     prepared.input_holder.audit()
@@ -2875,11 +3078,8 @@ def _run_segment_with_holder(
             "mpi_argv": list(prepared.mpi_argv),
             "athena_argv": list(prepared.athena_argv),
             "launch_argv": list(prepared.launch_argv),
-            "launch_environment": {
-                "kind": LAUNCH_ENVIRONMENT_KIND,
-                "values": child_environment,
-                "sha256": prepared.launch_environment_sha256,
-            },
+            "launch_environment":
+                prepared.plan["launch_contract"]["environment"],
             "gpu_visibility_environment": {
                 name: child_environment.get(name)
                 for name in (*GPU_VISIBILITY_ENVIRONMENT_KEYS, "CUDA_DEVICE_ORDER")
@@ -2889,6 +3089,8 @@ def _run_segment_with_holder(
                 "sha256": before_binding["sha256"],
                 "devices": [gpu.as_dict() for gpu in before],
             },
+            "capacity_transition": capacity_transition,
+            "gpu_capacity_preflight": gpu_capacity_preflight,
             "launcher_tool": proof["execution_tools_at_launch"][
                 "segment_launcher"],
             "nvidia_smi": proof["execution_tools_at_launch"]["nvidia_smi"],
@@ -2909,12 +3111,13 @@ def _run_segment_with_holder(
             os.fsync(log_stream.fileno())
         finally:
             log_stream.close()
+        quiescence = prove_process_quiescence(
+            proof, record["managed_process_group"], runtime)
         after = query_gpu_inventory(runtime)
         _require(len(after) == prepared.world_size,
                  "GPU inventory changed before exit evidence capture")
         _require(_gpu_identity(after) == _gpu_identity(prepared.gpus),
                  "GPU PCI/UUID inventory changed during segment")
-        quiescence = prove_process_quiescence(proof, runtime)
         prepared.directory_holder.audit()
         after_binding = _install_evidence_bytes(
             prepared, normalized.gpu_after, _gpu_csv(after))
@@ -3000,6 +3203,7 @@ def run_segment(prepared: PreparedLaunch, plan_path: Path, outputs: OutputPaths,
 
 
 def _prepared_summary(prepared: PreparedLaunch) -> dict[str, Any]:
+    capacity_transition = _capacity_transition_contract(prepared.plan)
     return {
         "status": "prepared",
         "plan_path": prepared.plan_binding["path"],
@@ -3017,15 +3221,13 @@ def _prepared_summary(prepared: PreparedLaunch) -> dict[str, Any]:
         },
         "disk_preflight_before_staging": prepared.disk_preflight_before_staging,
         "gpu_visibility_environment": prepared.gpu_visibility_environment,
-        "launch_environment": {
-            "kind": LAUNCH_ENVIRONMENT_KIND,
-            "values": prepared.launch_environment,
-            "sha256": prepared.launch_environment_sha256,
-        },
+        "launch_environment": prepared.plan["launch_contract"]["environment"],
         "directory_transport": prepared.directory_holder.audit(),
         "executable_transport": prepared.executable_holder.audit(),
         "proc_access_probe": prepared.proc_access_probe,
         "gpus": [gpu.as_dict() for gpu in prepared.gpus],
+        "capacity_transition": capacity_transition,
+        "gpu_capacity_preflight": prepared.gpu_capacity_preflight,
     }
 
 

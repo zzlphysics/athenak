@@ -81,11 +81,24 @@ def _environment_contract() -> dict[str, object]:
     values = {
         "HOME": str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)),
         "LANG": "C", "LC_ALL": "C", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
+    }
+    rank_projection_payload = {
+        "inherited_values": {
+            key: values[key]
+            for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
+        },
+        "consumed_absent": ["PRTE_MCA_schizo_proxy"],
     }
     return {
         "kind": CHECKER.LAUNCH_ENVIRONMENT_KIND,
         "values": values,
         "sha256": CHECKER._canonical_json_sha256(values),
+        "rank_projection": {
+            "kind": CHECKER.RANK_ENVIRONMENT_PROJECTION_KIND,
+            **rank_projection_payload,
+            "sha256": CHECKER._canonical_json_sha256(rank_projection_payload),
+        },
     }
 
 
@@ -189,6 +202,23 @@ def _plan() -> dict[str, object]:
             "time/nlim": 13, "time/tlim": 67.19999999999999,
             "output3/dt": 4.8,
         },
+        "capacity_transition": {
+            "kind": "unchanged_v1",
+            "parameter": "mesh_refinement/max_nmb_per_rank",
+            "source_max_nmb_per_rank": 1024,
+            "target_max_nmb_per_rank": 1024,
+            "maximum_target_max_nmb_per_rank": 16384,
+            "runtime_override": None,
+            "gpu_memory_model": {
+                "kind": "fixed_conservative_per_meshblock_slot_v1",
+                "mib_per_slot_numerator": 1433,
+                "mib_per_slot_denominator": 100,
+                "usable_fraction_numerator": 4,
+                "usable_fraction_denominator": 5,
+                "required_per_rank_memory_mib_ceiling": 14674,
+                "minimum_gpu_memory_total_mib": 18343,
+            },
+        },
         "inputs": {
             "repo": {"path": "/campaign/repo", "commit": "a" * 40,
                      "clean": True},
@@ -222,6 +252,10 @@ def _plan() -> dict[str, object]:
             "restart_layout": {
                 "path": "/campaign/layout.py", "size": 1, "sha256": "a" * 64,
             },
+            "prefix_recovery": {
+                "path": "/campaign/recover.py", "size": 1,
+                "sha256": "e" * 64,
+            },
             "git": {"path": "/usr/bin/git", "size": 1,
                     "sha256": "c" * 64},
             "nvidia_smi": {"path": "/usr/bin/nvidia-smi", "size": 1,
@@ -243,6 +277,7 @@ def _plan() -> dict[str, object]:
             },
         },
         "policy": {
+            "scheduled_prefix_recovery": CHECKER.PREFIX_RECOVERY_POLICY,
             "ranks": 2, "endpoint_time_ulp_tolerance": 0,
             "segment_termination": {
                 "primary": "cycle_limit", "endpoint_time_max_ulps": 0,
@@ -427,7 +462,8 @@ def _plan() -> dict[str, object]:
                      "x2max": "1", "nx3": "4", "x3min": "-1",
                      "x3max": "1"},
             "meshblock": {"nx1": "2", "nx2": "2", "nx3": "2"},
-            "mesh_refinement": {"num_levels": "2"},
+            "mesh_refinement": {"num_levels": "2",
+                                "max_nmb_per_rank": "1024"},
             "mhd": {"eos": "ideal", "nscalars": "0"},
             "adm": {"dynamic": "true"},
             "problem": {"trajectory_file": "/campaign/trajectory.dat"},
@@ -656,6 +692,36 @@ def test_validate_plan_recomputes_binary64_endpoints(field: str) -> None:
         CHECKER.validate_plan(plan)
 
 
+def test_validate_plan_accepts_only_exact_capacity_increase_argv() -> None:
+    plan = _plan()
+    plan["capacity_transition"] = {
+        "kind": "increase_v1",
+        "parameter": "mesh_refinement/max_nmb_per_rank",
+        "source_max_nmb_per_rank": 1024,
+        "target_max_nmb_per_rank": 1280,
+        "maximum_target_max_nmb_per_rank": 16384,
+        "runtime_override": "mesh_refinement/max_nmb_per_rank=1280",
+        "gpu_memory_model": {
+            "kind": "fixed_conservative_per_meshblock_slot_v1",
+            "mib_per_slot_numerator": 1433,
+            "mib_per_slot_denominator": 100,
+            "usable_fraction_numerator": 4,
+            "usable_fraction_denominator": 5,
+            "required_per_rank_memory_mib_ceiling": 18343,
+            "minimum_gpu_memory_total_mib": 22928,
+        },
+    }
+    plan["command_overrides"]["mesh_refinement/max_nmb_per_rank"] = 1280
+    plan["launch_contract"]["athena_argv_template"].append(
+        "mesh_refinement/max_nmb_per_rank=1280")
+
+    assert CHECKER.validate_plan(plan)["ranks"] == 2
+
+    plan["launch_contract"]["athena_argv_template"].append("mesh/nx1=32")
+    with pytest.raises(CHECKER.CheckFailure, match="canonical"):
+        CHECKER.validate_plan(plan)
+
+
 def _restart_metadata(**changes):
     metadata = CHECKER.RestartMetadata(
         source="fixture.rst", file_size=4096, parameter_end=512,
@@ -682,6 +748,25 @@ def _contract_plan() -> dict[str, object]:
     plan = _plan()
     plan["policy"]["capacity"] = {
         "ranks": 2, "minimum_headroom_blocks_hard": 64,
+    }
+    plan["source"]["parameters"]["mesh_refinement"][
+        "max_nmb_per_rank"] = "65"
+    plan["capacity_transition"] = {
+        "kind": "unchanged_v1",
+        "parameter": "mesh_refinement/max_nmb_per_rank",
+        "source_max_nmb_per_rank": 65,
+        "target_max_nmb_per_rank": 65,
+        "maximum_target_max_nmb_per_rank": 16384,
+        "runtime_override": None,
+        "gpu_memory_model": {
+            "kind": "fixed_conservative_per_meshblock_slot_v1",
+            "mib_per_slot_numerator": 1433,
+            "mib_per_slot_denominator": 100,
+            "usable_fraction_numerator": 4,
+            "usable_fraction_denominator": 5,
+            "required_per_rank_memory_mib_ceiling": 932,
+            "minimum_gpu_memory_total_mib": 1165,
+        },
     }
     return plan
 
@@ -716,9 +801,97 @@ def test_restart_contract_rejects_insufficient_repartitioned_headroom() -> None:
         **_restart_metadata().parameters,
         "mesh_refinement": {"max_nmb_per_rank": "64"},
     })
+    plan = _contract_plan()
+    plan["source"]["parameters"]["mesh_refinement"][
+        "max_nmb_per_rank"] = "64"
+    plan["capacity_transition"].update({
+        "source_max_nmb_per_rank": 64,
+        "target_max_nmb_per_rank": 64,
+    })
+    plan["capacity_transition"]["gpu_memory_model"].update({
+        "required_per_rank_memory_mib_ceiling": 918,
+        "minimum_gpu_memory_total_mib": 1147,
+    })
     with pytest.raises(CHECKER.CheckFailure, match="headroom 63"):
         CHECKER.audit_restart_contract(
-            metadata, "endpoint", _contract_plan(), EXPECTED)
+            metadata, "endpoint", plan, EXPECTED)
+
+
+def _increase_contract_plan(source: int = 65, target: int = 1280) -> dict[str, object]:
+    plan = _contract_plan()
+    plan["capacity_transition"] = {
+        "kind": "increase_v1",
+        "parameter": "mesh_refinement/max_nmb_per_rank",
+        "source_max_nmb_per_rank": source,
+        "target_max_nmb_per_rank": target,
+        "maximum_target_max_nmb_per_rank": 16384,
+        "runtime_override": f"mesh_refinement/max_nmb_per_rank={target}",
+        "gpu_memory_model": {
+            "kind": "fixed_conservative_per_meshblock_slot_v1",
+            "mib_per_slot_numerator": 1433,
+            "mib_per_slot_denominator": 100,
+            "usable_fraction_numerator": 4,
+            "usable_fraction_denominator": 5,
+            "required_per_rank_memory_mib_ceiling":
+                (target * 1433 + 99) // 100,
+            "minimum_gpu_memory_total_mib":
+                (target * 1433 * 5 + 399) // 400,
+        },
+    }
+    plan["source"]["parameters"]["mesh_refinement"][
+        "max_nmb_per_rank"] = str(source)
+    return plan
+
+
+def test_restart_contract_binds_source_and_endpoint_capacities_separately() -> None:
+    plan = _increase_contract_plan()
+    source = _restart_metadata()
+    endpoint = replace(
+        _restart_metadata(), cycle=13, time=EXPECTED["final_time"],
+        parameters={
+            **_restart_metadata().parameters,
+            "mesh_refinement": {"max_nmb_per_rank": "1280"},
+        })
+
+    assert CHECKER.audit_restart_contract(
+        source, "source", plan, EXPECTED)["capacity_transition_role"] == "source"
+    assert CHECKER.audit_restart_contract(
+        endpoint, "endpoint", plan, EXPECTED)[
+            "capacity_transition_role"] == "target"
+
+
+def test_capacity_increase_rescues_near_full_source_partition() -> None:
+    plan = _increase_contract_plan(source=1, target=65)
+    source = _restart_metadata(parameters={
+        **_restart_metadata().parameters,
+        "mesh_refinement": {"max_nmb_per_rank": "1"},
+    })
+
+    result = CHECKER.audit_restart_contract(
+        source, "source", plan, EXPECTED)
+
+    assert result["serialized_capacity_headroom"] == 0
+    assert result["target_partition_capacity"] == 65
+    assert result["minimum_capacity_headroom"] == 64
+
+
+@pytest.mark.parametrize(("cycle", "capacity", "role"), (
+    (10, "64", "source"),
+    (13, "1279", "target"),
+))
+def test_restart_contract_rejects_capacity_source_or_endpoint_mismatch(
+        cycle: int, capacity: str, role: str) -> None:
+    metadata = replace(
+        _restart_metadata(), cycle=cycle,
+        parameters={
+            **_restart_metadata().parameters,
+            "mesh_refinement": {"max_nmb_per_rank": capacity},
+        })
+
+    with pytest.raises(CHECKER.CheckFailure,
+                       match=f"exact planned {role} capacity"):
+        CHECKER.audit_restart_contract(
+            metadata, role, _increase_contract_plan(), EXPECTED)
 
 
 def _event_row(cycle: int) -> str:
@@ -737,8 +910,8 @@ def _event_log(path: Path, cycles: list[int]) -> None:
 def _gpu(path: Path, *, uuid1: str = "GPU-b", ecc: int = 0,
          four_columns: bool = False) -> None:
     rows = [
-        f"0,GPU-a,0000:01:00.0,0,0,{ecc},5",
-        f"1,{uuid1},0000:02:00.0,1,0,0,7",
+        f"0,GPU-a,0000:01:00.0,0,0,{ecc},32768,5",
+        f"1,{uuid1},0000:02:00.0,1,0,0,32768,7",
     ]
     if four_columns:
         rows[0] = "0,GPU-a,0,5"
@@ -914,7 +1087,7 @@ def test_floor_rates_record_anchor_and_parent_normalized_trends() -> None:
 def test_four_column_gpu_snapshot_is_rejected(tmp_path: Path) -> None:
     snapshot = tmp_path / "gpu.csv"
     _gpu(snapshot, four_columns=True)
-    with pytest.raises(CHECKER.CheckFailure, match="exactly 7 columns"):
+    with pytest.raises(CHECKER.CheckFailure, match="exactly 8 columns"):
         CHECKER.parse_gpu_csv(snapshot)
 
 
@@ -1218,7 +1391,8 @@ def _launch_record_fixture(tmp_path: Path):
                 "OMPI_COMM_WORLD_SIZE": "2",
                 "OMPI_COMM_WORLD_LOCAL_RANK": str(rank),
                 "OMPI_COMM_WORLD_LOCAL_SIZE": "2",
-                **_environment_contract()["values"],
+                **_environment_contract()["rank_projection"]
+                ["inherited_values"],
             },
         } for rank in range(2)],
         "gpu_before": {
@@ -1228,8 +1402,19 @@ def _launch_record_fixture(tmp_path: Path):
                 "index": rank, "uuid": f"GPU-{rank}",
                 "pci_bus_id": f"00000000:{16 + rank:02x}:00.0",
                 "cuda_ordinal": rank,
-                "uncorrected_ecc": 0, "corrected_ecc": 0, "memory_mib": 5,
+                "uncorrected_ecc": 0, "corrected_ecc": 0,
+                "memory_total_mib": 32768, "memory_used_mib": 5,
             } for rank in range(2)],
+        },
+        "capacity_transition": plan["capacity_transition"],
+        "gpu_capacity_preflight": {
+            "kind": "per_rank_memory_total_and_available_gate_v1",
+            "required_per_rank_memory_mib_ceiling": 14674,
+            "minimum_gpu_memory_total_mib": 18343,
+            "minimum_observed_gpu_memory_total_mib": 32768,
+            "maximum_observed_gpu_memory_used_mib": 5,
+            "minimum_observed_gpu_memory_available_mib": 32763,
+            "all_ranks_pass": True,
         },
         "gpu_mapping_basis": (
             "kokkos_mpi_rank_token_plus_ompi_local_rank_plus_"
@@ -1296,6 +1481,10 @@ def test_launch_record_requires_bound_nvidia_smi_to_remain_executable(
             "binary"].__setitem__("unreviewed", True), "binary"),
         (lambda launch: launch["ranks"][0]["mpi_environment"].__setitem__(
             "LANG", "C.UTF-8"), "MPI environment"),
+        (lambda launch: launch["launch_environment"]["values"].__setitem__(
+            "PRTE_MCA_schizo_proxy", "prte"), "environment"),
+        (lambda launch: launch["launch_environment"]["rank_projection"]
+         ["consumed_absent"].clear(), "environment"),
         (lambda launch: launch["managed_process_group"].__setitem__(
             "pgid", 999), "managed process-group"),
         (lambda launch: launch["proc_access_probe"]["families"][
@@ -1827,6 +2016,10 @@ def test_completion_record_binds_all_artifacts_quiescence_and_holder_closure(
     }
     launch = {
         "mpirun_pid": 500, "mpirun_start_time_ticks": 600,
+        "managed_process_group": {
+            "pgid": 500, "new_session": True,
+            "failure_cleanup": "SIGTERM_then_SIGKILL_with_quiescence_proof",
+        },
         "ranks": [{"global_rank": 0, "pid": 700,
                    "start_time_ticks": 800}],
         "input_transport": holder,
@@ -1884,6 +2077,8 @@ def test_completion_record_binds_all_artifacts_quiescence_and_holder_closure(
         "quiescence": {
             "gpu_compute_contexts_empty": True,
             "all_original_identities_gone": True,
+            "managed_process_group": launch["managed_process_group"],
+            "managed_process_group_gone": True,
             "process_identities": [{
                 "role": "mpirun", "pid": 500,
                 "recorded_start_time_ticks": 600, "state": "disappeared",

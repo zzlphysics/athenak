@@ -43,12 +43,18 @@ from output_integrity import (
 )
 from read_athenak_restart_metadata import (
     RestartMetadata,
+    RestartTruncationError,
     load_balance,
     read_restart_metadata,
 )
 
 
 SCHEMA = 1
+MAX_NMB_PER_RANK = 16384
+CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
+CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
+CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
+CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR = 5
 GIB_BYTES = 1 << 30
 DISK_PREFLIGHT_KIND = "statvfs_unique_filesystem_budget_v1"
 DISK_PREFLIGHT_ACCOUNTING = "group_roles_by_st_dev_once_v1"
@@ -57,6 +63,19 @@ DISK_PREFLIGHT_FORMULA = (
     "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
     "source_restart_size_bytes)+sum(role_contribution_bytes))"
 )
+PREFIX_RECOVERY_POLICY = {
+    "kind": "scheduled_prefix_recovery_v1",
+    "candidate_kind": "original_plan_scheduled_restart_only",
+    "selection": "highest_complete_candidate",
+    "later_complete_scientific_failure": "fatal_no_fallback",
+    "cadence_replay": "execute_only_binary64_v1",
+    "original_trees": "read_only_no_delete",
+    "derived_text": "exact_original_byte_prefix",
+    "unknown_state_nodes": "fatal",
+    "lifecycle": "nonzero_completion_or_same_boot_closed_processes",
+}
+SAME_BOOT_QUIESCENCE_TIMEOUT_SECONDS = 10.0
+SAME_BOOT_QUIESCENCE_POLL_SECONDS = 0.1
 MIN_READY_AGE_SECONDS = 120.0
 RETRY_EXIT_STATUS = 75
 EVENT_COLUMNS = (
@@ -74,7 +93,8 @@ EVENT_COLUMNS = (
     "fofc_tests",
 )
 GPU_HEADER = (
-    "index", "uuid", "pci_bus_id", "cuda_ordinal", "uncorr", "corr", "memory",
+    "index", "uuid", "pci_bus_id", "cuda_ordinal", "uncorr", "corr",
+    "memory_total", "memory_used",
 )
 PCI_BUS_ID_RE = re.compile(
     r"^(?:[0-9A-Fa-f]{4}|[0-9A-Fa-f]{8}):"
@@ -97,6 +117,7 @@ PLANNED_TOOL_NAMES = (
     "output_integrity",
     "restart_auditor",
     "restart_layout",
+    "prefix_recovery",
     "git",
     "nvidia_smi",
 )
@@ -118,7 +139,12 @@ LAUNCHER_EXECUTABLE_FD = 204
 BINARY_EXECUTABLE_FD = 205
 DIRECTORY_TRANSPORT_KIND = "linux_proc_holder_dirfd_v1"
 EXECUTABLE_TRANSPORT_KIND = "linux_proc_holder_execfd_v1"
-LAUNCH_ENVIRONMENT_KIND = "explicit_values_v1"
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
+RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
+RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+)
+RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
 GIT_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -177,6 +203,107 @@ def _integer(value: Any, name: str) -> int:
     _require(isinstance(value, int) and not isinstance(value, bool),
              f"{name} must be an integer")
     return value
+
+
+def _ceil_ratio(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def _validate_capacity_transition(plan: dict[str, Any]) -> dict[str, Any]:
+    """Validate the exact, single-parameter capacity-transition contract."""
+
+    value = plan.get("capacity_transition")
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "parameter", "source_max_nmb_per_rank",
+        "target_max_nmb_per_rank", "maximum_target_max_nmb_per_rank",
+        "runtime_override", "gpu_memory_model",
+    }, "plan capacity_transition must be the exact strict object")
+    source = _integer(
+        value.get("source_max_nmb_per_rank"),
+        "capacity_transition.source_max_nmb_per_rank")
+    target = _integer(
+        value.get("target_max_nmb_per_rank"),
+        "capacity_transition.target_max_nmb_per_rank")
+    _require(1 <= source <= target <= MAX_NMB_PER_RANK and
+             value.get("maximum_target_max_nmb_per_rank") == MAX_NMB_PER_RANK and
+             value.get("parameter") ==
+             "mesh_refinement/max_nmb_per_rank",
+             "capacity transition source/target/bound is invalid")
+    if source == target:
+        _require(value.get("kind") == "unchanged_v1" and
+                 value.get("runtime_override") is None,
+                 "unchanged capacity transition may not carry an override")
+    else:
+        _require(value.get("kind") == "increase_v1" and
+                 value.get("runtime_override") ==
+                 f"mesh_refinement/max_nmb_per_rank={target}",
+                 "capacity increase lacks its sole canonical runtime override")
+
+    model = value.get("gpu_memory_model")
+    required_mib = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR)
+    minimum_total_mib = _ceil_ratio(
+        target * CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR *
+        CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+        CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR *
+        CAPACITY_GPU_USABLE_FRACTION_NUMERATOR)
+    _require(model == {
+        "kind": "fixed_conservative_per_meshblock_slot_v1",
+        "mib_per_slot_numerator":
+            CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR,
+        "mib_per_slot_denominator":
+            CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR,
+        "usable_fraction_numerator":
+            CAPACITY_GPU_USABLE_FRACTION_NUMERATOR,
+        "usable_fraction_denominator":
+            CAPACITY_GPU_USABLE_FRACTION_DENOMINATOR,
+        "required_per_rank_memory_mib_ceiling": required_mib,
+        "minimum_gpu_memory_total_mib": minimum_total_mib,
+    }, "capacity transition GPU-memory model is not canonical")
+    source_record = plan.get("source")
+    _require(isinstance(source_record, dict),
+             "plan source must be an object for capacity transition")
+    source_parameters = source_record.get("parameters")
+    _require(isinstance(source_parameters, dict),
+             "plan source parameters must be an object")
+    try:
+        serialized_source = source_parameters[
+            "mesh_refinement"]["max_nmb_per_rank"]
+    except (KeyError, TypeError) as exc:
+        raise CheckFailure(
+            "plan source lacks mesh_refinement/max_nmb_per_rank") from exc
+    _require(serialized_source == str(source),
+             "plan source capacity is not the canonical transition source")
+    return value
+
+
+def _gpu_capacity_preflight_evidence(
+        devices: list[dict[str, Any]],
+        transition: dict[str, Any]) -> dict[str, Any]:
+    _require(bool(devices), "GPU capacity preflight requires device evidence")
+    model = transition["gpu_memory_model"]
+    required = int(model["required_per_rank_memory_mib_ceiling"])
+    minimum_total = int(model["minimum_gpu_memory_total_mib"])
+    _require(all(device["memory_total_mib"] >= minimum_total
+                 for device in devices),
+             "GPU total memory is below the capacity-transition 80% gate")
+    _require(all(device["memory_used_mib"] + required <=
+                 device["memory_total_mib"] for device in devices),
+             "GPU available memory is below the capacity-transition gate")
+    return {
+        "kind": "per_rank_memory_total_and_available_gate_v1",
+        "required_per_rank_memory_mib_ceiling": required,
+        "minimum_gpu_memory_total_mib": minimum_total,
+        "minimum_observed_gpu_memory_total_mib":
+            min(device["memory_total_mib"] for device in devices),
+        "maximum_observed_gpu_memory_used_mib":
+            max(device["memory_used_mib"] for device in devices),
+        "minimum_observed_gpu_memory_available_mib":
+            min(device["memory_total_mib"] - device["memory_used_mib"]
+                for device in devices),
+        "all_ranks_pass": True,
+    }
 
 
 def _validate_disk_preflight_contract(value: Any,
@@ -547,11 +674,14 @@ def _canonical_json_sha256(value: Any) -> str:
 
 def _canonical_launch_environment(value: Any) -> dict[str, str]:
     _require(isinstance(value, dict) and
-             set(value) == {"kind", "values", "sha256"} and
+             set(value) == {"kind", "values", "sha256", "rank_projection"} and
              value.get("kind") == LAUNCH_ENVIRONMENT_KIND,
              f"launch environment kind must be {LAUNCH_ENVIRONMENT_KIND}")
     values = value.get("values")
-    expected_keys = {"HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER"}
+    expected_keys = {
+        "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+        "PRTE_MCA_schizo_proxy",
+    }
     _require(isinstance(values, dict) and set(values) == expected_keys and
              all(isinstance(item, str) and "\x00" not in item
                  for item in values.values()),
@@ -574,6 +704,7 @@ def _canonical_launch_environment(value: Any) -> dict[str, str]:
         "LANG": "C",
         "LC_ALL": "C",
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
     } and str(home) == passwd_home and home_absolute == home and
              stat.S_ISDIR(home_info.st_mode) and
              not stat.S_ISLNK(home_info.st_mode) and
@@ -583,9 +714,30 @@ def _canonical_launch_environment(value: Any) -> dict[str, str]:
     canonical = {
         "HOME": values["HOME"], "LANG": "C", "LC_ALL": "C",
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "PRTE_MCA_schizo_proxy": "ompi",
     }
     _require(value.get("sha256") == _canonical_json_sha256(canonical),
              "launch environment SHA-256 is not canonical")
+    projection = value.get("rank_projection")
+    _require(isinstance(projection, dict) and
+             set(projection) == {
+                 "kind", "inherited_values", "consumed_absent", "sha256",
+             } and
+             projection.get("kind") == RANK_ENVIRONMENT_PROJECTION_KIND,
+             "rank environment projection kind is not canonical")
+    projection_payload = {
+        "inherited_values": {
+            key: canonical[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
+        },
+        "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
+    }
+    _require(projection.get("inherited_values") ==
+             projection_payload["inherited_values"] and
+             projection.get("consumed_absent") ==
+             projection_payload["consumed_absent"] and
+             projection.get("sha256") ==
+             _canonical_json_sha256(projection_payload),
+             "rank environment projection differs from the exact PRRTE contract")
     return canonical
 
 
@@ -630,15 +782,23 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     _require(tlim == recomputed_tlim,
              "expected tlim is not the sequential binary64 guard endpoint")
     _require(tlim > final_time, "expected tlim must be a nonbinding upper guard")
-    _require(set(overrides) == {
-        "time/nlim", "time/tlim", "output3/dt",
-    } and overrides.get("time/nlim") == final_cycle and
+    capacity_transition = _validate_capacity_transition(plan)
+    expected_overrides = {
+        "time/nlim": final_cycle,
+        "time/tlim": tlim,
+        "output3/dt": root_dt,
+    }
+    if capacity_transition["kind"] == "increase_v1":
+        expected_overrides["mesh_refinement/max_nmb_per_rank"] = \
+            capacity_transition["target_max_nmb_per_rank"]
+    _require(overrides == expected_overrides and
+             overrides.get("time/nlim") == final_cycle and
              _number(overrides.get("time/tlim"),
                      "command_overrides.time/tlim") == tlim and
              _number(overrides.get("output3/dt"),
                      "command_overrides.output3/dt") == root_dt,
-             "command_overrides must be exactly nlim, tlim, and canonical "
-             "output3/dt=root_dt")
+             "command_overrides must be exactly the canonical limits, divB "
+             "cadence, and optional capacity increase")
 
     for name in ("binary", "trajectory", "source_restart"):
         _validate_planned_file_record(inputs.get(name), f"inputs.{name}")
@@ -675,9 +835,15 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if source_qualification["mode"] == "parent_segment_pass":
         parent = source_qualification.get("parent_segment_pass")
         _validate_planned_file_record(parent, "source_qualification.parent_segment_pass")
+        _require(source_qualification.get("parent_qualification_mode") in
+                 ("complete_segment_v1", "legacy_complete_segment_v1",
+                  "scheduled_prefix_recovery_v1"),
+                 "parent source qualification lacks an explicit supported mode")
     else:
         _require("parent_segment_pass" not in source_qualification,
                  "anchor source qualification may not contain a parent pass")
+        _require("parent_qualification_mode" not in source_qualification,
+                 "anchor source qualification may not contain a parent mode")
     source_baryon = source_qualification.get("source_baryon_mass")
     _require(isinstance(source_baryon, dict) and
              _number(source_baryon.get("value"), "source_baryon_mass.value") > 0.0 and
@@ -843,6 +1009,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         f"problem/trajectory_file={trajectory_template}",
         f"output3/dt={root_dt!r}",
     ]
+    if capacity_transition["kind"] == "increase_v1":
+        expected_athena.append(capacity_transition["runtime_override"])
     _require(launch_contract.get("world_size") == ranks and
              launch_contract.get("gpu_count") == ranks and
              launch_contract.get("mpi_argv") == expected_mpi and
@@ -890,6 +1058,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     }, "absolute event policy differs from the exact strict thresholds")
     _require(policy.get("nonfinite_count_max") == 0,
              "policy.nonfinite_count_max must be exactly zero")
+    _require(policy.get("scheduled_prefix_recovery") == PREFIX_RECOVERY_POLICY,
+             "scheduled-prefix recovery policy differs from the exact contract")
     divb_policy = policy.get("divb_max_abs")
     mass_policy = policy.get("baryon_mass_fractional_loss")
     _require(isinstance(divb_policy, dict), "policy.divb_max_abs must be an object")
@@ -1633,8 +1803,10 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
                  PCI_BUS_ID_RE.fullmatch(device["pci_bus_id"]) is not None and
                  device.get("uncorrected_ecc") == 0 and
                  device.get("corrected_ecc") == 0 and
-                 isinstance(device.get("memory_mib"), int) and
-                 device["memory_mib"] >= 0,
+                 isinstance(device.get("memory_total_mib"), int) and
+                 device["memory_total_mib"] > 0 and
+                 isinstance(device.get("memory_used_mib"), int) and
+                 0 <= device["memory_used_mib"] <= device["memory_total_mib"],
                  "launch record GPU-before device proof is invalid")
         device_by_ordinal[ordinal] = device
     _require(len({device["index"] for device in devices}) == world_size and
@@ -1645,6 +1817,12 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
              sorted(_pci_bus_sort_key(device["pci_bus_id"])
                     for device in devices),
              "launch GPU inventory is not PCI ordered")
+    capacity_transition = _validate_capacity_transition(plan)
+    capacity_preflight = _gpu_capacity_preflight_evidence(
+        devices, capacity_transition)
+    _require(record.get("capacity_transition") == capacity_transition and
+             record.get("gpu_capacity_preflight") == capacity_preflight,
+             "launch record does not prove the plan-bound GPU capacity gate")
     seen_pids: set[int] = set()
     seen_uuids: set[str] = set()
     seen_local_ranks: set[int] = set()
@@ -1677,7 +1855,8 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
             "OMPI_COMM_WORLD_SIZE": str(world_size),
             "OMPI_COMM_WORLD_LOCAL_RANK": str(local_rank),
             "OMPI_COMM_WORLD_LOCAL_SIZE": str(world_size),
-            **launch_contract["environment"]["values"],
+            **launch_contract["environment"]["rank_projection"]
+            ["inherited_values"],
         },
                  f"launch record rank {global_rank} MPI environment proof is invalid")
         seen_pids.add(pid)
@@ -1743,15 +1922,24 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
     }, "launch record GPU visibility environment is not canonical")
     forbidden = re.compile(
         r"^(?:output\d+/(?:dt|dcycle|file_number|last_time|last_write_cycle)|"
-        r"job/basename|problem/trajectory_file)="
+        r"job/basename|problem/trajectory_file|mesh(?:block|_refinement)?/[^=]+)="
     )
     permitted = {
         f"problem/trajectory_file=/proc/{holder_pid}/fd/{TRAJECTORY_FD}",
         f"output3/dt={plan['expected']['root_dt']!r}",
     }
+    capacity_transition = _validate_capacity_transition(plan)
+    if capacity_transition["kind"] == "increase_v1":
+        permitted.add(capacity_transition["runtime_override"])
     _require(not any(forbidden.match(token) and token not in permitted
                      for token in [*mpi_argv, *athena_argv]),
              "launch record contains a forbidden output/provenance override")
+    mesh_tokens = [token for token in athena_argv
+                   if token.startswith(("mesh/", "meshblock/",
+                                        "mesh_refinement/"))]
+    _require(mesh_tokens == ([] if capacity_transition["kind"] == "unchanged_v1"
+                             else [capacity_transition["runtime_override"]]),
+             "launch record contains an extra Mesh parameter")
     return {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "athena_argv": athena_argv,
@@ -1769,6 +1957,8 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
         "hostname": hostname,
         "ranks": ranks,
         "gpu_before": gpu_proof,
+        "capacity_transition": capacity_transition,
+        "gpu_capacity_preflight": record["gpu_capacity_preflight"],
         "launcher_tool": launcher_tool_binding,
         "input_transport": launch_transport,
         "original_inputs": original_inputs,
@@ -2062,13 +2252,16 @@ def parse_gpu_csv(path: Path) -> list[dict[str, Any]]:
                  f"{path}: GPU row {line_number} must have exactly "
                  f"{len(GPU_HEADER)} columns")
         try:
-            index, cuda_ordinal, uncorrected, corrected, memory = (
-                int(row[0]), int(row[3]), int(row[4]), int(row[5]), int(row[6])
+            (index, cuda_ordinal, uncorrected, corrected,
+             memory_total, memory_used) = (
+                int(row[0]), int(row[3]), int(row[4]), int(row[5]),
+                int(row[6]), int(row[7])
             )
         except ValueError as exc:
             raise CheckFailure(f"{path}: GPU row {line_number} has a non-integer field") from exc
         _require(index >= 0 and cuda_ordinal >= 0 and uncorrected >= 0 and
-                 corrected >= 0 and memory >= 0,
+                 corrected >= 0 and memory_total > 0 and
+                 0 <= memory_used <= memory_total,
                  f"{path}: GPU row {line_number} contains a negative value")
         _require(row[1].startswith("GPU-") and
                  PCI_BUS_ID_RE.fullmatch(row[2]) is not None,
@@ -2080,7 +2273,8 @@ def parse_gpu_csv(path: Path) -> list[dict[str, Any]]:
             "cuda_ordinal": cuda_ordinal,
             "uncorrected_ecc": uncorrected,
             "corrected_ecc": corrected,
-            "memory_mib": memory,
+            "memory_total_mib": memory_total,
+            "memory_used_mib": memory_used,
         })
     _require(len({row["index"] for row in result}) == len(result),
              f"{path}: duplicate GPU index")
@@ -2108,11 +2302,14 @@ def audit_gpus(before_path: Path, after_path: Path, ranks: int,
     _require([row["cuda_ordinal"] for row in before] == list(range(ranks)) and
              [row["cuda_ordinal"] for row in after] == list(range(ranks)),
              "CUDA ordinals must be contiguous 0..ranks-1")
-    _require([(row["uuid"], row["pci_bus_id"], row["cuda_ordinal"])
+    _require([(row["uuid"], row["pci_bus_id"], row["cuda_ordinal"],
+               row["memory_total_mib"])
               for row in before] ==
-             [(row["uuid"], row["pci_bus_id"], row["cuda_ordinal"])
+             [(row["uuid"], row["pci_bus_id"], row["cuda_ordinal"],
+               row["memory_total_mib"])
               for row in after],
-             "GPU UUID/PCI/CUDA identities changed between preflight and exit")
+             "GPU UUID/PCI/CUDA/total-memory identities changed between "
+             "preflight and exit")
     if ecc_policy is None:
         ecc_policy = {
             "uncorrected_before_max": 0, "corrected_before_max": 0,
@@ -2130,10 +2327,86 @@ def audit_gpus(before_path: Path, after_path: Path, ranks: int,
     _require(all(row["uncorrected_ecc"] <= ecc_policy["uncorrected_after_max"] and
                  row["corrected_ecc"] <= ecc_policy["corrected_after_max"]
                  for row in after), "exit GPU ECC count exceeds policy")
-    _require(all(row["memory_mib"] <= exit_memory_mib_max for row in after),
+    _require(all(row["memory_used_mib"] <= exit_memory_mib_max for row in after),
              "exit GPU memory exceeds the planned quiescent threshold")
     return {"before": before, "after": after, "ecc_policy": ecc_policy,
             "exit_memory_mib_max": exit_memory_mib_max}
+
+
+def audit_live_gpu_quiescence(plan: dict[str, Any], before_path: Path) \
+        -> dict[str, Any]:
+    """Query the plan-bound NVIDIA tool and prove identities/ECC/apps are quiet."""
+
+    planned = plan["tools"]["nvidia_smi"]
+    live_tool = _verify_planned_file(planned, "plan-bound nvidia-smi")
+    executable = live_tool["path"]
+    _require(os.access(executable, os.X_OK),
+             "plan-bound nvidia-smi is not executable")
+    values = plan["launch_contract"]["environment"]["values"]
+    environment = {name: values[name] for name in ("HOME", "LANG", "LC_ALL")}
+
+    def query(argument: str) -> list[list[str]]:
+        try:
+            result = subprocess.run(
+                [executable, argument, "--format=csv,noheader,nounits"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=environment)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            raise CheckFailure(
+                f"cannot query live GPU quiescence: {detail.strip()}") from exc
+        return [[field.strip() for field in line.split(",")]
+                for line in result.stdout.splitlines() if line.strip()]
+
+    gpu_rows = query(
+        "--query-gpu=index,uuid,pci.bus_id,"
+        "ecc.errors.uncorrected.volatile.total,"
+        "ecc.errors.corrected.volatile.total,memory.total,memory.used")
+    parsed: list[dict[str, Any]] = []
+    for row in gpu_rows:
+        _require(len(row) == 7, "live GPU query returned a malformed row")
+        try:
+            index, uncorr, corr, total, used = map(
+                int, (row[0], row[3], row[4], row[5], row[6]))
+        except ValueError as exc:
+            raise CheckFailure("live GPU query returned a non-integer field") from exc
+        pci = row[2].upper()
+        _require(index >= 0 and row[1].startswith("GPU-") and
+                 PCI_BUS_ID_RE.fullmatch(pci) is not None and
+                 uncorr == 0 and corr == 0 and total > 0 and
+                 0 <= used <= total,
+                 "live GPU identity/ECC/memory row is invalid")
+        parsed.append({
+            "index": index, "uuid": row[1], "pci_bus_id": pci,
+            "uncorrected_ecc": uncorr, "corrected_ecc": corr,
+            "memory_total_mib": total, "memory_used_mib": used,
+        })
+    parsed.sort(key=lambda row: _pci_bus_sort_key(row["pci_bus_id"]))
+    for ordinal, row in enumerate(parsed):
+        row["cuda_ordinal"] = ordinal
+    before = parse_gpu_csv(before_path)
+    _require(len(parsed) == plan["policy"]["ranks"] and
+             [(row["index"], row["uuid"], row["pci_bus_id"],
+               row["cuda_ordinal"], row["memory_total_mib"])
+              for row in parsed] ==
+             [(row["index"], row["uuid"], row["pci_bus_id"],
+               row["cuda_ordinal"], row["memory_total_mib"])
+              for row in before],
+             "live GPU inventory differs from launch preflight")
+    _require(all(row["memory_used_mib"] <=
+                 plan["policy"]["gpu_exit_memory_mib_max"] for row in parsed),
+             "live GPU memory exceeds the quiescent threshold")
+    applications = query("--query-compute-apps=pid,gpu_uuid")
+    _require(not applications,
+             "live GPU compute contexts are not empty after segment closure")
+    return {
+        "nvidia_smi": live_tool,
+        "inventory": parsed,
+        "launch_inventory": before,
+        "compute_contexts": [],
+        "compute_contexts_empty": True,
+        "ecc_all_zero": True,
+    }
 
 
 def _pending_events_zero(metadata: RestartMetadata, label: str) -> None:
@@ -2200,23 +2473,42 @@ def audit_restart_contract(metadata: RestartMetadata, label: str,
              metadata.costs == expected_costs,
              f"{label} restart MeshBlock costs are not exact level costs")
     try:
-        capacity = int(metadata.parameters["mesh_refinement"]["max_nmb_per_rank"])
+        serialized_capacity = metadata.parameters[
+            "mesh_refinement"]["max_nmb_per_rank"]
+        capacity = int(serialized_capacity)
     except (KeyError, ValueError) as exc:
         raise CheckFailure(
             f"{label} restart has invalid max_nmb_per_rank") from exc
+    _require(serialized_capacity == str(capacity),
+             f"{label} restart max_nmb_per_rank is not canonical decimal")
+    capacity_transition = _validate_capacity_transition(plan)
+    is_source = metadata.cycle == expected["source_cycle"]
+    required_capacity = capacity_transition[
+        "source_max_nmb_per_rank" if is_source else
+        "target_max_nmb_per_rank"]
+    _require(capacity == required_capacity,
+             f"{label} restart max_nmb_per_rank {capacity} differs from exact "
+             f"planned {'source' if is_source else 'target'} capacity "
+             f"{required_capacity}")
     ranks = _integer(policy.get("ranks"), "policy.ranks")
     hard_headroom = _integer(
         capacity_policy.get("minimum_headroom_blocks_hard"),
         "capacity.minimum_headroom_blocks_hard")
     _require(capacity > 0 and hard_headroom >= 0,
              "capacity and hard headroom must be nonnegative")
+    partition_capacity = capacity_transition["target_max_nmb_per_rank"]
     try:
-        partitions = load_balance(metadata.costs, ranks, capacity)
+        serialized_partitions = load_balance(metadata.costs, ranks, capacity)
+        target_partitions = load_balance(
+            metadata.costs, ranks, partition_capacity)
     except ValueError as exc:
         raise CheckFailure(f"{label} restart cannot be partitioned: {exc}") from exc
-    headroom = min(capacity - row.blocks for row in partitions)
-    _require(headroom >= hard_headroom,
-             f"{label} restart partition headroom {headroom} is below hard "
+    serialized_headroom = min(
+        capacity - row.blocks for row in serialized_partitions)
+    target_headroom = min(
+        partition_capacity - row.blocks for row in target_partitions)
+    _require(target_headroom >= hard_headroom,
+             f"{label} restart target partition headroom {target_headroom} is below hard "
              f"minimum {hard_headroom}")
     return {
         "real_bytes": metadata.real_bytes,
@@ -2229,8 +2521,12 @@ def audit_restart_contract(metadata: RestartMetadata, label: str,
         "level_subcycling_costs_exact": True,
         "ranks": ranks,
         "max_nmb_per_rank": capacity,
-        "minimum_capacity_headroom": headroom,
+        "serialized_capacity_headroom": serialized_headroom,
+        "target_partition_capacity": partition_capacity,
+        "minimum_capacity_headroom": target_headroom,
         "hard_capacity_headroom": hard_headroom,
+        "capacity_transition_role": "source" if is_source else "target",
+        "capacity_transition": capacity_transition,
     }
 
 
@@ -2862,6 +3158,1095 @@ def audit_source_baryon_evidence(source_qualification: dict[str, Any],
     _require(math.isfinite(observed) and observed > 0.0 and observed == planned_mass,
              "planned source baryon mass differs from independently checked evidence")
     return observed
+
+
+def classify_recovery_restart(path: Path) -> dict[str, Any]:
+    """Independently distinguish a truncated write from a complete invalid one."""
+
+    if not os.path.lexists(path):
+        return {"classification": "absent"}
+    binding = _hash_record(path)
+    try:
+        metadata = read_restart_metadata(path)
+    except RestartTruncationError as exc:
+        return {"classification": "incomplete_truncated", "binding": binding,
+                "failure": str(exc)}
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"classification": "complete_invalid", "binding": binding,
+                "failure": str(exc)}
+    try:
+        auditor_module = sys.modules[audit_restart.__module__]
+        layout = auditor_module._derive_layout(metadata)
+        expected_size = metadata.metadata_end + struct.calcsize("Q") + \
+            metadata.nmb_total * layout.data_size
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return {"classification": "complete_invalid", "binding": binding,
+                "failure": "restart layout cannot be derived"}
+    if binding["size"] < expected_size:
+        return {"classification": "incomplete_truncated", "binding": binding,
+                "expected_size": expected_size}
+    if binding["size"] > expected_size:
+        return {"classification": "complete_invalid", "binding": binding,
+                "expected_size": expected_size,
+                "failure": "restart contains trailing bytes"}
+    try:
+        audited = audit_restart(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"classification": "complete_invalid", "binding": binding,
+                "failure": str(exc)}
+    return {"classification": "complete", "binding": binding,
+            "audit": audited}
+
+
+def _audit_recovery_candidates(original_plan: dict[str, Any], record: dict[str, Any],
+                               selected: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the complete scheduled-restart candidate set from original plan."""
+
+    validate_plan(original_plan)
+    restarts = [row for row in original_plan["outputs"]
+                if row.get("file_type") == "rst"]
+    _require(len(restarts) == 1, "recovery original plan lacks one restart stream")
+    restart = restarts[0]
+    scheduled = [row for row in restart["expected_writes"]
+                 if row.get("kind") == "scheduled"]
+    _require(scheduled, "recovery original plan has no scheduled restart")
+    expected_rows: dict[str, dict[str, Any]] = {}
+    for write in scheduled:
+        relative = restart["relative_path_template"].format(
+            file_number=write["file_number"])
+        _require(relative not in expected_rows,
+                 "recovery original plan has duplicate scheduled restart path")
+        expected_rows[relative] = write
+    candidates = record.get("candidate_inventory")
+    _require(isinstance(candidates, list) and len(candidates) == len(expected_rows),
+             "recovery candidate inventory is not the complete scheduled set")
+    actual_rows: dict[str, dict[str, Any]] = {}
+    for row in candidates:
+        _require(isinstance(row, dict) and
+                 isinstance(row.get("relative_path"), str) and
+                 row["relative_path"] not in actual_rows and
+                 row["relative_path"] in expected_rows and
+                 row.get("expected_write") == expected_rows[row["relative_path"]],
+                 "recovery candidate key/write differs from original plan")
+        actual_rows[row["relative_path"]] = row
+    _require(set(actual_rows) == set(expected_rows),
+             "recovery candidate inventory omits a scheduled restart")
+    state_dir = Path(original_plan["launch_contract"]["state_dir"]).resolve(
+        strict=True)
+    live_rows: list[dict[str, Any]] = []
+    for relative, write in expected_rows.items():
+        rel = Path(relative)
+        _require(not rel.is_absolute() and relative == rel.as_posix() and
+                 all(part not in ("", ".", "..") for part in rel.parts),
+                 "recovery candidate relative path is not canonical")
+        candidate_path = state_dir / rel
+        current = candidate_path
+        while current != state_dir:
+            _require(not current.is_symlink(),
+                     f"recovery candidate path traverses symlink: {current}")
+            parent = current.parent
+            _require(parent != current,
+                     "recovery candidate path does not descend from state root")
+            current = parent
+        classified = classify_recovery_restart(candidate_path)
+        classification = classified["classification"]
+        binding = classified.get("binding")
+        reported = actual_rows[relative]
+        _require(reported.get("classification") == classification,
+                 f"recovery candidate live classification changed: {relative}")
+        if binding is None:
+            _require("binding" not in reported,
+                     f"absent recovery candidate has a binding: {relative}")
+        else:
+            _require(_same_full_binding(reported.get("binding"), binding),
+                     f"recovery candidate binding changed: {relative}")
+        live_rows.append({"relative_path": relative, "expected_write": write,
+                          "classification": classification,
+                          "binding": binding})
+    ordered = sorted(live_rows,
+                     key=lambda row: row["expected_write"]["cycle"], reverse=True)
+    highest_complete = next((row for row in ordered
+                             if row["classification"] == "complete"), None)
+    _require(highest_complete is not None,
+             "recovery no longer has a complete scheduled restart")
+    higher = ordered[:ordered.index(highest_complete)]
+    _require(all(row["classification"] in ("absent", "incomplete_truncated")
+                 for row in higher),
+             "a later complete-invalid restart forbids recovery fallback")
+    _require(selected.get("block") == restart["block"] and
+             selected.get("relative_path") == highest_complete["relative_path"] and
+             selected.get("expected_write") == highest_complete["expected_write"] and
+             _same_full_binding(selected.get("binding"),
+                                highest_complete["binding"]),
+             "recovery did not select the live highest complete scheduled restart")
+    return {"scheduled_candidates": len(live_rows),
+            "selected_relative_path": highest_complete["relative_path"],
+            "live_reclassification": live_rows}
+
+
+def _replay_recovery_execute_prefix(
+        plan: dict[str, Any], final_cycle: int
+        ) -> tuple[dict[str, list[dict[str, Any]]],
+                   dict[str, dict[str, Any]], float]:
+    """Replay only AthenaK's Execute output loop through a scheduled restart."""
+
+    expected = plan["expected"]
+    _require(expected["source_cycle"] < final_cycle <= expected["final_cycle"],
+             "recovery endpoint cycle is outside the original plan")
+    states: dict[str, dict[str, Any]] = {}
+    schedules: dict[str, list[dict[str, Any]]] = {}
+    for output in plan["outputs"]:
+        block = output["block"]
+        parameters = output["parameters"]
+        try:
+            file_number = int(parameters.get("file_number", "0"))
+            last_time = float(parameters.get("last_time", "-1"))
+            last_write_cycle = int(parameters.get("last_write_cycle", "-1"))
+        except ValueError as exc:
+            raise CheckFailure(
+                f"{block}: invalid recovery source cadence state") from exc
+        cadence = _number(output.get("cadence"), f"{block}.cadence")
+        if output.get("cadence_mode") == "dt":
+            dt, dcycle = cadence, 0
+        else:
+            _require(cadence.is_integer(),
+                     f"{block}: recovery dcycle is not integral")
+            dt, dcycle = 0.0, int(cadence)
+        states[block] = {
+            "file_number": file_number, "last_time": last_time,
+            "last_write_cycle": last_write_cycle, "dt": dt,
+            "dcycle": dcycle,
+        }
+        schedules[block] = []
+
+    current_time = expected["source_time"]
+    for cycle in range(expected["source_cycle"] + 1, final_cycle + 1):
+        current_time += expected["root_dt"]
+        for output in plan["outputs"]:
+            state = states[output["block"]]
+            due = ((state["dt"] > 0.0 and
+                    _float32(current_time) >=
+                    _float32(state["last_time"] + state["dt"]) and
+                    _float32(current_time) < _float32(expected["tlim"])) or
+                   (state["dcycle"] > 0 and cycle % state["dcycle"] == 0))
+            if not due:
+                continue
+            write: dict[str, Any] = {
+                "cycle": cycle, "time": current_time, "kind": "scheduled",
+            }
+            if output["numbered"]:
+                write["file_number"] = state["file_number"]
+                state["file_number"] += 1
+            schedules[output["block"]].append(write)
+            state["last_time"] = (current_time if state["last_time"] < 0.0
+                                  else state["last_time"] + state["dt"])
+            state["last_write_cycle"] = cycle
+    return schedules, states, current_time
+
+
+def _audit_recovery_derived_prefixes(
+        original_plan: dict[str, Any], record: dict[str, Any],
+        parent: dict[str, Any]) -> dict[str, Any]:
+    """Reopen every original/derived text and prove the exact byte split."""
+
+    selected = record.get("selected_scheduled_restart")
+    _require(isinstance(selected, dict) and
+             isinstance(selected.get("expected_write"), dict),
+             "recovery record lacks its selected scheduled restart")
+    selected_write = selected["expected_write"]
+    final_cycle = _integer(selected_write.get("cycle"), "recovery final cycle")
+    schedules, _, final_time = _replay_recovery_execute_prefix(
+        original_plan, final_cycle)
+    source_metadata = read_restart_metadata(
+        Path(original_plan["inputs"]["source_restart"]["path"]))
+    endpoint_metadata = read_restart_metadata(
+        Path(selected["binding"]["path"]))
+    root_steps = final_cycle - original_plan["expected"]["source_cycle"]
+    expected_relatives = set(original_plan.get("required_files", []))
+    expected_numbered_rows: dict[str, dict[str, Any]] = {}
+    output_for_required: dict[str, dict[str, Any]] = {}
+    for output in original_plan["outputs"]:
+        if output["numbered"]:
+            for write in schedules[output["block"]]:
+                relative = output["relative_path_template"].format(
+                    file_number=write["file_number"])
+                _require(relative not in expected_numbered_rows,
+                         "recovery Execute replay maps duplicate numbered path")
+                expected_numbered_rows[relative] = {
+                    "block": output["block"], "file_type": output["file_type"],
+                    "file_number": write["file_number"],
+                    "expected_write": write,
+                }
+        else:
+            for relative in output["required_unnumbered_paths"]:
+                _require(relative not in output_for_required,
+                         "original plan maps duplicate required output")
+                output_for_required[relative] = output
+    _require(set(output_for_required) == expected_relatives,
+             "original required-files/output mapping is not exact")
+    expected_logical = {
+        "source_cycle": original_plan["expected"]["source_cycle"],
+        "source_time": original_plan["expected"]["source_time"],
+        "final_cycle": final_cycle, "final_time": final_time,
+        "root_steps": root_steps, "execute_only": True,
+        "expected_numbered_paths": sorted(expected_numbered_rows),
+        "required_unnumbered_paths": sorted(expected_relatives),
+        "all_expected_prefix_artifacts_present": True,
+    }
+    _require(record.get("logical_prefix") == expected_logical,
+             "recovery logical prefix differs from independent Execute replay")
+    _require(selected_write.get("time") == final_time and
+             selected.get("block") in schedules and
+             selected_write in schedules[selected["block"]],
+             "recovery selected restart is not an Execute-scheduled write")
+
+    rows = record.get("derived_text_prefixes")
+    _require(isinstance(rows, list) and len(rows) == len(expected_relatives),
+             "recovery derived-prefix inventory is not exact")
+    by_relative: dict[str, dict[str, Any]] = {}
+    original_state = Path(original_plan["launch_contract"]["state_dir"]).resolve(
+        strict=True)
+    recovery_state = Path(record["recovery_state_dir"]).resolve(strict=True)
+    for row in rows:
+        _require(isinstance(row, dict) and
+                 isinstance(row.get("relative_path"), str) and
+                 row["relative_path"] in expected_relatives and
+                 row["relative_path"] not in by_relative,
+                 "recovery derived-prefix relative path is invalid")
+        relative = row["relative_path"]
+        source_path = _safe_output_path(original_state, relative)
+        derived_path = _safe_output_path(recovery_state, relative)
+        source_binding = _verify_planned_file(
+            row.get("source"), f"recovery original text {relative}")
+        derived_binding = _verify_planned_file(
+            row.get("derived"), f"recovery derived text {relative}")
+        _require(source_binding["path"] == str(source_path) and
+                 derived_binding["path"] == str(derived_path),
+                 "recovery text prefix binding uses the wrong tree/path")
+        source_raw = _read_stable_bytes(source_path)
+        derived_raw = _read_stable_bytes(derived_path)
+        prefix_size = _integer(row.get("prefix_size"), "recovery prefix_size")
+        suffix_size = _integer(row.get("suffix_size"), "recovery suffix_size")
+        _require(prefix_size == len(derived_raw) and
+                 prefix_size + suffix_size == len(source_raw) and
+                 source_raw[:prefix_size] == derived_raw and
+                 row.get("prefix_sha256") == hashlib.sha256(derived_raw).hexdigest() and
+                 row.get("suffix_sha256") ==
+                 hashlib.sha256(source_raw[prefix_size:]).hexdigest() and
+                 derived_raw.endswith(b"\n"),
+                 "recovery derived text is not the exact newline-closed source prefix")
+        output = output_for_required[relative]
+        if output["file_type"] == "hst":
+            semantic = audit_history(
+                derived_path, original_plan["expected"]["source_cycle"],
+                final_cycle, original_plan["expected"]["source_time"],
+                original_plan["expected"]["root_dt"], final_time,
+                original_plan["policy"]["endpoint_time_ulp_tolerance"])
+            persisted_semantic = dict(semantic)
+            persisted_semantic.pop("_row_values", None)
+        elif output["file_type"] == "log":
+            semantic = audit_event_log(
+                derived_path, original_plan["expected"]["source_cycle"],
+                final_cycle, original_plan["policy"]["event_thresholds"],
+                original_plan["policy"]["event_absolute_thresholds"])
+            persisted_semantic = dict(semantic)
+            persisted_semantic.pop("_rows", None)
+        else:
+            raise CheckFailure(
+                f"unsupported recovery unnumbered type: {output['file_type']}")
+        by_relative[relative] = {"source": source_binding,
+                                 "derived": derived_binding,
+                                 "prefix_size": prefix_size,
+                                 "suffix_size": suffix_size,
+                                 "block": output["block"],
+                                 "file_type": output["file_type"],
+                                 "semantic": semantic,
+                                 "persisted_semantic": persisted_semantic}
+    _require(set(by_relative) == expected_relatives,
+             "recovery derived-prefix inventory omits required text")
+    unnumbered = [row for row in parent.get("output_inventory", [])
+                  if isinstance(row, dict) and row.get("file_number") is None]
+    inventory_by_path = {row.get("path"): row for row in unnumbered}
+    _require(len(inventory_by_path) == len(unnumbered) == len(by_relative),
+             "recovery output inventory has duplicate/extra unnumbered entries")
+    for evidence in by_relative.values():
+        derived = evidence["derived"]
+        inventory = inventory_by_path.get(derived["path"])
+        _require(isinstance(inventory, dict) and
+                 _same_full_binding(inventory, derived) and
+                 inventory.get("block") == evidence["block"] and
+                 inventory.get("file_type") == evidence["file_type"] and
+                 inventory.get("file_number") is None and
+                 inventory.get("expected_write") is None and
+                 ((evidence["file_type"] == "hst" and
+                   inventory.get("history") == evidence["persisted_semantic"]) or
+                  (evidence["file_type"] == "log" and
+                   inventory.get("event_log") ==
+                   evidence["persisted_semantic"])),
+                 "recovery output inventory does not bind every derived prefix")
+    expected_numbered = set(expected_numbered_rows)
+    numbered_rows = [row for row in parent.get("output_inventory", [])
+                     if isinstance(row, dict) and row.get("file_number") is not None]
+    state_rows: dict[str, dict[str, Any]] = {}
+    binary_by_block: dict[str, list[dict[str, Any]]] = {}
+    divb_rows: list[dict[str, Any]] = []
+    full_by_cycle: dict[int, dict[str, Any]] = {}
+    for row in numbered_rows:
+        path_value = row.get("path")
+        _require(isinstance(path_value, str),
+                 "recovery numbered output lacks an absolute path")
+        path = Path(path_value).resolve(strict=True)
+        try:
+            relative = path.relative_to(original_state).as_posix()
+        except ValueError as exc:
+            raise CheckFailure(
+                "recovery numbered output is outside original state") from exc
+        _require(relative in expected_numbered and relative not in state_rows,
+                 "recovery numbered output is duplicate or outside logical prefix")
+        live = _verify_planned_file(row, f"recovery numbered output {relative}")
+        _require(_same_full_binding(row, live),
+                 f"recovery numbered output binding changed: {relative}")
+        expected_row = expected_numbered_rows[relative]
+        _require(all(row.get(name) == expected_row[name] for name in (
+                     "block", "file_type", "file_number", "expected_write")),
+                 f"recovery numbered output metadata differs from replay: {relative}")
+        output = next(item for item in original_plan["outputs"]
+                      if item["block"] == expected_row["block"])
+        if output["file_type"] == "rst":
+            audited_restart = audit_restart(path)
+            _require(audited_restart.get("valid") is True and
+                     audited_restart.get("metadata", {}).get("cycle") ==
+                     expected_row["expected_write"]["cycle"] and
+                     audited_restart.get("metadata", {}).get("time") ==
+                     expected_row["expected_write"]["time"] and
+                     row.get("restart_audit") == audited_restart,
+                     f"recovery prefix restart is scientifically invalid: {relative}")
+        elif output["file_type"] == "bin":
+            audited_binary = audit_binary(
+                path, original_plan["expected"]["source_cycle"], final_cycle,
+                original_plan["expected"]["source_time"], final_time,
+                output["parameters"], endpoint_metadata,
+                source_metadata.parameters, output["block"],
+                output["expected_binary_variables"])
+            _require(audited_binary["cycle"] ==
+                     expected_row["expected_write"]["cycle"] and
+                     audited_binary["time"] ==
+                     expected_row["expected_write"]["time"],
+                     f"recovery prefix binary differs from replay: {relative}")
+            binary_by_block.setdefault(output["block"], []).append(audited_binary)
+            if audited_binary["topology"]["scope"] == "full_domain":
+                previous = full_by_cycle.get(audited_binary["cycle"])
+                _require(previous is None or
+                         (previous["time"] == audited_binary["time"] and
+                          previous["_topology_records"] ==
+                          audited_binary["_topology_records"]),
+                         "recovery full-domain binary topologies disagree")
+                full_by_cycle.setdefault(audited_binary["cycle"], audited_binary)
+            for variable, maximum in audited_binary["variable_max_abs"].items():
+                if variable.lower() == "divb":
+                    divb_rows.append({
+                        "path": str(path), "cycle": audited_binary["cycle"],
+                        "time": audited_binary["time"], "max_abs": maximum,
+                    })
+        state_rows[relative] = live
+    _require(set(state_rows) == expected_numbered,
+             "recovery output inventory does not exactly cover numbered prefix")
+    audit_binary_pairs(original_plan, binary_by_block)
+    bbh_histories = [evidence["semantic"] for evidence in by_relative.values()
+                     if evidence["file_type"] == "hst" and
+                     {"bh1_x", "bh2_x", "bh1_mass", "bh2_mass"}.issubset(
+                         evidence["semantic"].get("columns", []))]
+    _require(len(bbh_histories) == 1,
+             "recovery prefix lacks exactly one BBH center history")
+    centers = _bbh_history_centers(bbh_histories[0])
+    reported_coverage = parent.get("binary_selection_coverage_audit")
+    _require(isinstance(reported_coverage, list),
+             "recovery pass lacks binary selection coverage audit")
+    coverage: list[dict[str, Any]] = []
+    for block, audited_rows in binary_by_block.items():
+        parameters = next(output["parameters"] for output in original_plan["outputs"]
+                          if output["block"] == block)
+        for audited in audited_rows:
+            result = audit_selected_binary_coverage(
+                audited, parameters, centers.get(audited["cycle"]),
+                full_by_cycle.get(audited["cycle"]))
+            coverage.append({"path": audited["path"], "cycle": audited["cycle"],
+                             **result})
+    _require(reported_coverage == coverage,
+             "recovery pass binary selection coverage differs from live audit")
+    _require(divb_rows and
+             max(row["max_abs"] for row in divb_rows) <=
+             original_plan["policy"]["divb_max_abs"]["hard"],
+             "recovery prefix divB exceeds hard threshold")
+    reported_divb = parent.get("scientific_threshold_audit", {}).get("divb")
+    _require(isinstance(reported_divb, dict) and
+             reported_divb.get("files") == divb_rows and
+             reported_divb.get("observed_max_abs") ==
+             max(row["max_abs"] for row in divb_rows) and
+             reported_divb.get("hard_max_abs") ==
+             original_plan["policy"]["divb_max_abs"]["hard"],
+             "recovery pass divB audit differs from live binary audit")
+
+    known_numbered: set[str] = set()
+    for output in original_plan["outputs"]:
+        if not output.get("numbered"):
+            continue
+        for write in output["expected_writes"]:
+            known_numbered.add(output["relative_path_template"].format(
+                file_number=write["file_number"]))
+    suffix_rows = record.get("suffix_forensics")
+    _require(isinstance(suffix_rows, list),
+             "recovery record lacks suffix forensics")
+    suffix_by_relative: dict[str, dict[str, Any]] = {}
+    for row in suffix_rows:
+        _require(isinstance(row, dict) and
+                 isinstance(row.get("relative_path"), str) and
+                 row["relative_path"] in known_numbered - expected_numbered and
+                 row["relative_path"] not in suffix_by_relative and
+                 row.get("classification") == "planned_post_prefix_artifact",
+                 "recovery suffix forensic row is invalid")
+        relative = row["relative_path"]
+        expected_path = _safe_output_path(original_state, relative)
+        binding = _verify_planned_file(
+            row.get("binding"), f"recovery suffix artifact {relative}")
+        _require(binding["path"] == str(expected_path) and
+                 _same_full_binding(row.get("binding"), binding),
+                 f"recovery suffix binding changed: {relative}")
+        suffix_by_relative[relative] = binding
+
+    actual_original: set[str] = set()
+    actual_directories: set[str] = {"."}
+    for directory, directories, files in os.walk(original_state, followlinks=False):
+        directory_path = Path(directory)
+        for name in directories:
+            child = directory_path / name
+            _require(not child.is_symlink(),
+                     "recovery original state contains a symlink directory")
+            actual_directories.add(child.relative_to(original_state).as_posix())
+        for name in files:
+            path = directory_path / name
+            info = path.lstat()
+            _require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+                     "recovery original state contains a non-regular node")
+            actual_original.add(path.relative_to(original_state).as_posix())
+    expected_original = expected_numbered | set(suffix_by_relative) | \
+        expected_relatives
+    _require(actual_original == expected_original,
+             "recovery original state tree differs from prefix/suffix provenance")
+    expected_directories = {"."}
+    for relative in expected_original:
+        parent_path = Path(relative).parent
+        while parent_path.as_posix() != ".":
+            expected_directories.add(parent_path.as_posix())
+            parent_path = parent_path.parent
+    _require(actual_directories == expected_directories,
+             "recovery original state contains an unknown directory")
+    return {
+        "derived_prefixes": len(by_relative),
+        "relative_paths": sorted(by_relative),
+        "numbered_prefixes": len(state_rows),
+        "suffix_artifacts": len(suffix_by_relative),
+        "original_state_exact": True,
+    }
+
+
+def _audit_recovery_original_launch(
+        parent: dict[str, Any], provenance: dict[str, Any],
+        record: dict[str, Any], original_plan: dict[str, Any],
+        original_plan_path: Path) -> dict[str, Any]:
+    """Revalidate the complete original plan/launch/tool trust anchor."""
+
+    validate_plan(original_plan)
+    _require(original_plan.get("policy", {}).get(
+                 "scheduled_prefix_recovery") == PREFIX_RECOVERY_POLICY,
+             "recovery original plan lacks the exact recovery policy")
+    _require(original_plan_path.resolve(strict=True) == Path(
+                 original_plan["launch_contract"]["plan_path"]).resolve(strict=True),
+             "recovery original plan path differs from its launch contract")
+    state_dir = Path(original_plan["launch_contract"]["state_dir"]).resolve(
+        strict=True)
+    original_launch = provenance.get("original_launch_record")
+    _validate_planned_file_record(
+        original_launch, "recovery_provenance.original_launch_record")
+    _require(_same_full_binding(
+        original_launch, parent.get("bindings", {}).get("original_launch_record")) and
+             _same_full_binding(original_launch,
+                                record.get("original_launch_record")),
+             "recovery original-launch bindings disagree")
+    launch_binding = _verify_planned_file(
+        original_launch, "recovery original launch record")
+    launch_path = Path(launch_binding["path"])
+    _require_immutable_ready(
+        launch_path, ".launch.ready", "recovery original launch record")
+    planned_launch_path = Path(
+        original_plan["launch_contract"]["evidence"]["launch_record"])
+    _require(launch_path.resolve(strict=True) == planned_launch_path.resolve(strict=True),
+             "recovery launch record path differs from original plan")
+    gpu_before_path = Path(
+        original_plan["launch_contract"]["evidence"]["gpu_before"])
+    gpu_before = _hash_record(gpu_before_path)
+    launch_audit = audit_launch_record(
+        launch_path, original_plan, original_plan_path, state_dir, gpu_before)
+    _require(launch_audit["sha256"] == launch_binding["sha256"],
+             "recovery launch record changed during canonical audit")
+
+    record_tools = record.get("tools")
+    parent_tools = parent.get("bindings", {}).get("tools")
+    _require(isinstance(record_tools, dict) and isinstance(parent_tools, dict),
+             "recovery record/pass lacks tool bindings")
+    live_tools = {
+        name: _verify_planned_file(original_plan["tools"][name],
+                                   f"recovery original-plan tool {name}")
+        for name in PLANNED_TOOL_NAMES
+    }
+    for name, live in live_tools.items():
+        _require(_same_planned_file(record_tools.get(name),
+                                    original_plan["tools"][name]) and
+                 _same_full_binding(record_tools.get(name), live) and
+                 _same_full_binding(parent_tools.get(name), live),
+                 f"recovery {name} tool does not match original plan/live bytes")
+    _verify_planned_repository(
+        original_plan["inputs"]["repo"], original_plan["tools"]["git"])
+    launch_payload, _ = _load_json(launch_path)
+    return {
+        "original_plan_validated": True,
+        "original_launch_record": launch_binding,
+        "launch_audit": launch_audit,
+        "launch_record_payload": launch_payload,
+        "plan_bound_tools": live_tools,
+        "state_dir": str(state_dir),
+    }
+
+
+def _audit_recovery_directories(
+        record: dict[str, Any], original_plan: dict[str, Any],
+        record_path: Path, parent_path: Path | None) -> dict[str, Any]:
+    """Rebind all four recovery directories and their canonical artifact paths."""
+
+    def live(path: Path, label: str, *, owner_only: bool) -> dict[str, Any]:
+        absolute = path.expanduser().absolute()
+        info = absolute.lstat()
+        _require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                 absolute == absolute.resolve(strict=True) and
+                 info.st_uid == os.geteuid() and
+                 (not owner_only or stat.S_IMODE(info.st_mode) == 0o700),
+                 f"{label} is not a canonical owner-owned directory")
+        return {
+            "path": str(absolute), "device": info.st_dev, "inode": info.st_ino,
+            "owner_uid": info.st_uid, "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+            "descriptor_bound": True,
+        }
+
+    original_state = Path(original_plan["launch_contract"]["state_dir"])
+    original_evidence = Path(original_plan["launch_contract"]["evidence_dir"])
+    recovery_state_value = record.get("recovery_state_dir")
+    recovery_evidence_value = record.get("recovery_evidence_dir")
+    _require(isinstance(recovery_state_value, str) and
+             isinstance(recovery_evidence_value, str),
+             "recovery record lacks canonical recovery directories")
+    recovery_state = Path(recovery_state_value)
+    recovery_evidence = Path(recovery_evidence_value)
+    checks = {
+        "original_state": (
+            live(original_state, "recovery original state", owner_only=False),
+            record.get("original_state_tree", {}).get("directory_binding")),
+        "original_evidence": (
+            live(original_evidence, "recovery original evidence", owner_only=False),
+            record.get("original_evidence_directory_binding")),
+        "recovery_state": (
+            live(recovery_state, "recovery derived state", owner_only=True),
+            record.get("recovery_state_directory_binding")),
+        "recovery_evidence": (
+            live(recovery_evidence, "recovery evidence", owner_only=True),
+            record.get("recovery_evidence_directory_binding")),
+    }
+    for label, (observed, planned) in checks.items():
+        _require(observed == planned,
+                 f"{label} directory identity differs from recovery record")
+    _require(record_path.resolve(strict=True) ==
+             (recovery_evidence / "segment.prefix.recovery.ready").resolve(
+                 strict=True),
+             "recovery record is outside its exact recovery evidence path")
+    _require(parent_path is not None and parent_path.resolve(strict=True) ==
+             (recovery_evidence / "segment.prefix.pass.ready").resolve(strict=True),
+             "recovery parent pass is outside its exact recovery evidence path")
+    actual_evidence = {entry.name for entry in os.scandir(recovery_evidence)}
+    _require(actual_evidence == {
+        "segment.prefix.recovery.ready", "segment.prefix.pass.ready"},
+        "recovery evidence directory contains an unknown node")
+    return {name: observed for name, (observed, _) in checks.items()}
+
+
+def _audit_stored_live_gpu(value: Any, plan: dict[str, Any],
+                           before_path: Path) -> dict[str, Any]:
+    tool = _verify_planned_file(
+        plan["tools"]["nvidia_smi"], "recovery plan-bound nvidia-smi")
+    before = parse_gpu_csv(before_path)
+    _require(isinstance(value, dict) and
+             value.get("compute_contexts") == [] and
+             value.get("compute_contexts_empty") is True and
+             value.get("ecc_all_zero") is True and
+             _same_full_binding(value.get("nvidia_smi"),
+                                tool) and
+             value.get("launch_inventory") == before,
+             "stored recovery live-GPU quiescence proof is invalid")
+    inventory = value.get("inventory")
+    _require(isinstance(inventory, list) and
+             len(inventory) == plan["policy"]["ranks"] and
+             [(row.get("index"), row.get("uuid"), row.get("pci_bus_id"),
+              row.get("cuda_ordinal"), row.get("memory_total_mib"))
+              for row in inventory] ==
+             [(row["index"], row["uuid"], row["pci_bus_id"],
+               row["cuda_ordinal"], row["memory_total_mib"])
+              for row in before] and
+             all(row.get("uncorrected_ecc") == 0 and
+                 row.get("corrected_ecc") == 0 and
+                 isinstance(row.get("memory_used_mib"), int) and
+                 not isinstance(row.get("memory_used_mib"), bool) and
+                 0 <= row["memory_used_mib"] <= row.get("memory_total_mib", -1) and
+                 row["memory_used_mib"] <=
+                 plan["policy"]["gpu_exit_memory_mib_max"]
+                 for row in inventory),
+             "stored recovery GPU identity/ECC/memory proof is invalid")
+    return {"nvidia_smi": tool, "launch_inventory": before,
+            "producer_inventory": inventory,
+            "compute_contexts_empty": True, "ecc_all_zero": True}
+
+
+def _audit_recovery_lifecycle(
+        lifecycle: dict[str, Any], record: dict[str, Any],
+        plan: dict[str, Any], anchor: dict[str, Any]) -> dict[str, Any]:
+    """Re-prove lifecycle closure from the canonically audited original launch."""
+
+    launch = anchor["launch_record_payload"]
+    launch_audit = anchor["launch_audit"]
+    evidence = plan["launch_contract"]["evidence"]
+    expected_identities = [{
+        "role": "mpirun", "pid": launch_audit["mpirun_pid"],
+        "recorded_start_time_ticks": launch_audit["mpirun_start_time_ticks"],
+    }, {
+        "role": "launcher_holder",
+        "pid": launch_audit["input_transport"]["holder_pid"],
+        "recorded_start_time_ticks":
+            launch_audit["input_transport"]["holder_start_time_ticks"],
+    }]
+    expected_identities.extend({
+        "role": f"rank:{rank['global_rank']}", "pid": rank["pid"],
+        "recorded_start_time_ticks": rank["start_time_ticks"],
+    } for rank in launch_audit["ranks"])
+
+    reported_identities = (lifecycle.get("process_identities")
+                           if lifecycle["kind"] ==
+                           "same_boot_closed_processes_v1"
+                           else lifecycle.get("live_identity_recheck"))
+    _require(isinstance(reported_identities, list) and
+             len(reported_identities) == len(expected_identities),
+             "recovery lifecycle process identity set is incomplete")
+    for reported, expected in zip(reported_identities, expected_identities):
+        _require(isinstance(reported, dict) and
+                 all(reported.get(name) == expected[name]
+                     for name in ("role", "pid", "recorded_start_time_ticks")) and
+                 reported.get("original_identity_gone") is True and
+                 reported.get("state") in ("disappeared", "pid_reused") and
+                 ((reported.get("state") == "disappeared" and
+                   reported.get("observed_start_time_ticks") is None) or
+                  (reported.get("state") == "pid_reused" and
+                   isinstance(reported.get("observed_start_time_ticks"), int) and
+                   reported["observed_start_time_ticks"] !=
+                   reported["recorded_start_time_ticks"])),
+                 "recovery lifecycle identity differs from original launch")
+
+    gpu_before = Path(evidence["gpu_before"])
+    producer_gpu = _audit_stored_live_gpu(
+        lifecycle.get("live_gpu_quiescence"), plan, gpu_before)
+
+    evidence_bindings: dict[str, dict[str, Any]] = {
+        "plan": record["original_plan"],
+        "launch_record": record["original_launch_record"],
+    }
+    expected_paths = {
+        "plan": plan["launch_contract"]["plan_path"],
+        **evidence,
+    }
+    if lifecycle["kind"] == "nonzero_completion_v1":
+        return_code = lifecycle.get("return_code")
+        _require(isinstance(return_code, int) and
+                 not isinstance(return_code, bool) and return_code != 0,
+                 "recovery nonzero return code is invalid")
+        artifacts = lifecycle.get("artifacts")
+        _require(isinstance(artifacts, dict) and set(artifacts) == {
+            "plan", "launch_record", "run_log", "exit_status",
+            "gpu_before", "gpu_after",
+        }, "recovery nonzero lifecycle artifact set is not exact")
+        _require(_same_full_binding(artifacts.get("plan"),
+                                    record["original_plan"]) and
+                 _same_full_binding(artifacts.get("launch_record"),
+                                    record["original_launch_record"]),
+                 "recovery completion overwrites trusted plan/launch binding")
+        evidence_bindings.update(artifacts)
+        completion = lifecycle.get("completion_record")
+        _validate_planned_file_record(
+            completion, "recovery lifecycle completion_record")
+        completion_live = _verify_planned_file(
+            completion, "recovery lifecycle completion_record")
+        completion_path = Path(completion_live["path"])
+        _require(completion_path.resolve(strict=True) ==
+                 Path(evidence["completion_record"]).resolve(strict=True),
+                 "recovery completion path differs from original plan")
+        try:
+            exit_value = int(Path(artifacts["exit_status"]["path"]).read_text(
+                encoding="ascii").strip())
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise CheckFailure("recovery exit.status is invalid") from exc
+        _require(exit_value == return_code,
+                 "recovery completion return code differs from exit.status")
+        canonical = audit_completion_record(
+            completion_path, plan,
+            Path(plan["launch_contract"]["state_dir"]), launch_audit,
+            artifacts, expected_return_code=return_code)
+        gpu_audit = audit_gpus(
+            Path(artifacts["gpu_before"]["path"]),
+            Path(artifacts["gpu_after"]["path"]), plan["policy"]["ranks"],
+            plan["policy"]["gpu_exit_memory_mib_max"],
+            plan["policy"]["gpu_ecc"])
+        _require(lifecycle.get("canonical_completion_audit") == canonical and
+                 lifecycle.get("gpu_audit") == gpu_audit,
+                 "recovery canonical completion/GPU audit differs from live replay")
+        evidence_bindings["completion_record"] = completion_live
+    else:
+        bounded = lifecycle.get("bounded_quiescence")
+        _require(lifecycle.get("hostname") == launch.get("hostname") and
+                 lifecycle.get("all_original_identities_gone") is True and
+                 lifecycle.get("managed_process_group") ==
+                 launch_audit.get("managed_process_group") and
+                 lifecycle.get("managed_process_group_gone") is True and
+                 isinstance(bounded, dict) and
+                 bounded.get("kind") ==
+                 "poll_all_identities_group_and_gpu_v1" and
+                 bounded.get("timeout_seconds") ==
+                 SAME_BOOT_QUIESCENCE_TIMEOUT_SECONDS and
+                 bounded.get("poll_seconds") ==
+                 SAME_BOOT_QUIESCENCE_POLL_SECONDS and
+                 isinstance(bounded.get("attempts"), int) and
+                 not isinstance(bounded.get("attempts"), bool) and
+                 bounded["attempts"] > 0 and
+                 bounded.get("all_quiet") is True and
+                 not os.path.lexists(evidence["completion_record"]),
+                 "recovery same-boot lifecycle host/completion proof is invalid")
+        try:
+            launch_epoch = __import__("datetime").datetime.fromisoformat(
+                launch["created_utc"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckFailure("cannot parse original launch timestamp") from exc
+        _require(isinstance(lifecycle.get("boot_id"), str) and
+                 re.fullmatch(r"[0-9a-f-]{36}", lifecycle["boot_id"]) is not None and
+                 isinstance(lifecycle.get("boot_epoch"), int) and
+                 lifecycle.get("launch_epoch") == launch_epoch and
+                 isinstance(lifecycle.get("launch_epoch"), (int, float)) and
+                 lifecycle["boot_epoch"] <= lifecycle["launch_epoch"],
+                 "recovery same-boot epoch/ID proof is invalid")
+        closed = lifecycle.get("closed_evidence_artifacts")
+        _require(isinstance(closed, dict) and
+                 {"run_log", "gpu_before"}.issubset(closed) and
+                 set(closed).issubset({
+                     "run_log", "gpu_before", "exit_status", "gpu_after"}),
+                 "recovery same-boot closed-evidence set is invalid")
+        evidence_bindings.update(closed)
+
+    expected_by_name: dict[str, dict[str, Any]] = {}
+    for role, binding in evidence_bindings.items():
+        _validate_planned_file_record(binding, "recovery original evidence")
+        _require(role in expected_paths and
+                 Path(binding["path"]).resolve(strict=True) ==
+                 Path(expected_paths[role]).resolve(strict=True),
+                 f"recovery {role} path differs from original plan")
+        name = Path(binding["path"]).name
+        _require(name not in expected_by_name or
+                 _same_full_binding(expected_by_name[name], binding),
+                 "recovery original evidence basename collision")
+        expected_by_name[name] = binding
+    evidence_dir = Path(plan["launch_contract"]["evidence_dir"]).resolve(strict=True)
+    _require(all(Path(binding["path"]).resolve(strict=True).parent == evidence_dir
+                 for binding in evidence_bindings.values()),
+             "recovery lifecycle evidence is outside original evidence_dir")
+    actual_names: set[str] = set()
+    for entry in os.scandir(evidence_dir):
+        info = entry.stat(follow_symlinks=False)
+        _require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+                 "recovery original evidence contains a non-regular node")
+        actual_names.add(entry.name)
+    _require(actual_names == set(expected_by_name),
+             "recovery original evidence directory set is not exact")
+    for name, binding in expected_by_name.items():
+        live = _verify_planned_file(binding, f"recovery evidence {name}")
+        _require(_same_full_binding(live, binding),
+                 f"recovery original evidence binding changed: {name}")
+    return {
+        "kind": lifecycle["kind"],
+        "launch_identity_set_exact": True,
+        "producer_gpu_quiescence": producer_gpu,
+        "portable_static_revalidation": True,
+        "original_evidence_exact": True,
+    }
+
+
+def _audit_recovery_source_chain(
+        record: dict[str, Any], plan: dict[str, Any],
+        seen: set[tuple[str, str]], depth: int) -> dict[str, Any]:
+    """Rebuild and recursively qualify the original segment's source chain."""
+
+    _require(depth <= 64, "recovery source chain exceeds maximum depth")
+    qualification = plan["source_qualification"]
+    source_path = Path(plan["inputs"]["source_restart"]["path"])
+    source_audit = _verify_endpoint_audit(audit_restart(source_path), source_path)
+    source_binding = {
+        "path": source_audit["path"], **source_audit["signature"],
+        "sha256": source_audit["sha256"],
+        "closure_check": source_audit["closure_check"],
+    }
+    _require(_same_planned_file(source_binding,
+                                plan["inputs"]["source_restart"]),
+             "recovery original source differs from original plan")
+    audit_restart_contract(
+        read_restart_metadata(source_path), "recovery original source",
+        plan, plan["expected"])
+    _require(source_audit["layout"] == qualification["audit"]["layout"] and
+             source_audit["stored_reals"] ==
+             qualification["audit"]["stored_reals"] and
+             source_audit["topology"] == qualification["audit"]["topology"],
+             "recovery original source audit differs from original plan")
+    mass = _verify_planned_file(
+        qualification["source_baryon_mass"]["evidence"],
+        "recovery original source baryon evidence")
+    if qualification["mode"] == "anchor_full_audit":
+        audit_source_baryon_evidence(
+            qualification, plan["expected"]["source_time"])
+        expected = {
+            "mode": "anchor_full_audit",
+            "source_baryon_mass_evidence": mass,
+        }
+        _require(record.get("source_chain") == expected,
+                 "recovery anchor source_chain differs from live evidence")
+        return expected
+
+    parent_binding = _verify_planned_file(
+        qualification["parent_segment_pass"],
+        "recovery original source parent pass")
+    identity = (parent_binding["path"], parent_binding["sha256"])
+    _require(identity not in seen,
+             "recovery source qualification chain contains a cycle")
+    parent_path = Path(parent_binding["path"])
+    _require_immutable_ready(parent_path, ".pass.ready",
+                             "recovery source parent pass")
+    parent, _ = _load_json(parent_path)
+    audit_source_baryon_evidence(
+        qualification, plan["expected"]["source_time"], parent)
+    endpoint = parent.get("bindings", {}).get("endpoint_restart")
+    trajectory = parent.get("bindings", {}).get("trajectory")
+    _require(_same_full_binding(endpoint, source_binding) and
+             _same_planned_file(trajectory, plan["inputs"]["trajectory"]),
+             "recovery source parent does not bind original source/trajectory")
+    histories = [row for row in parent.get("output_inventory", [])
+                 if isinstance(row, dict) and
+                 isinstance(row.get("history"), dict) and
+                 "baryon_m" in row["history"].get("columns", [])]
+    _require(len(histories) == 1 and _same_full_binding(histories[0], mass),
+             "recovery source parent does not bind baryon evidence")
+    provenance = audit_parent_qualification_provenance(
+        parent, qualification, source_binding, mass,
+        plan["expected"]["source_cycle"], plan["expected"]["source_time"],
+        parent_path, _chain_seen=seen | {identity}, _chain_depth=depth + 1)
+    expected = {
+        "mode": "parent_segment_pass", "parent_pass": parent_binding,
+        "source_baryon_mass_evidence": mass,
+        "parent_qualification": provenance,
+    }
+    _require(record.get("source_chain") == expected,
+             "recovery source_chain differs from recursive live qualification")
+    return expected
+
+
+def audit_parent_qualification_provenance(
+        parent: dict[str, Any], source_qualification: dict[str, Any],
+        source_binding: dict[str, Any], source_mass_evidence: dict[str, Any],
+        source_cycle: int, source_time: float,
+        parent_path: Path | None = None, *,
+        _chain_seen: set[tuple[str, str]] | None = None,
+        _chain_depth: int = 0) -> dict[str, Any]:
+    """Re-prove the explicit complete/recovery mode of an immutable parent pass."""
+
+    mode = parent.get("qualification_mode")
+    if mode is None:
+        _require("recovery_provenance" not in parent and
+                 parent.get("completion_record_audit", {}).get("return_code") == 0 and
+                 parent.get("run_log_audit", {}).get("termination") == "cycle_limit",
+                 "legacy parent without qualification_mode lacks a complete "
+                 "zero-exit cycle-limit lifecycle")
+        mode = "legacy_complete_segment_v1"
+    _require(mode == source_qualification.get("parent_qualification_mode") and
+             mode in ("complete_segment_v1", "legacy_complete_segment_v1",
+                      "scheduled_prefix_recovery_v1"),
+             "parent pass qualification mode differs from the source plan")
+    if mode in ("complete_segment_v1", "legacy_complete_segment_v1"):
+        _require("recovery_provenance" not in parent,
+                 "complete parent pass may not contain recovery provenance")
+        return {"qualification_mode": mode}
+
+    provenance = parent.get("recovery_provenance")
+    advisories = parent.get("scientific_advisories")
+    _require(isinstance(provenance, dict) and
+             provenance.get("kind") == "scheduled_prefix_recovery_v1" and
+             provenance.get("policy") == PREFIX_RECOVERY_POLICY and
+             provenance.get("original_trees_unchanged") is True,
+             "recovery parent policy/provenance is invalid")
+    _require(isinstance(advisories, dict) and
+             advisories.get("schema") == "athenak_scientific_advisories_v1" and
+             advisories.get("severity") in ("green", "yellow") and
+             advisories.get("pass_fail_effect") ==
+             "none_yellow_advisories_are_nonfatal" and
+             isinstance(advisories.get("floor_rates"), dict),
+             "recovery parent lacks explicit scientific advisories")
+    selected = provenance.get("selected_scheduled_restart")
+    logical = provenance.get("logical_prefix")
+    lifecycle = provenance.get("lifecycle")
+    run_log_prefix = provenance.get("run_log_prefix_audit")
+    _require(isinstance(selected, dict) and
+             selected.get("expected_write", {}).get("kind") == "scheduled" and
+             selected.get("expected_write", {}).get("cycle") == source_cycle and
+             selected.get("expected_write", {}).get("time") == source_time and
+             isinstance(logical, dict) and
+             logical.get("final_cycle") == source_cycle and
+             logical.get("final_time") == source_time and
+             logical.get("execute_only") is True and
+             logical.get("all_expected_prefix_artifacts_present") is True,
+             "recovery parent scheduled endpoint/logical-prefix proof is invalid")
+    _require(isinstance(run_log_prefix, dict) and
+             run_log_prefix.get("root_step_diagnostics", {}).get("cycle_max") ==
+             source_cycle and
+             run_log_prefix.get("root_step_diagnostics", {}).get(
+                 "all_recovered_prefix_cycles_present") is True and
+             run_log_prefix.get("cache", {}).get("solver_failures") == 0 and
+             run_log_prefix.get("cache", {}).get(
+                 "nonfinite_proposed_values") == 0,
+             "recovery parent run-log/cache prefix proof is invalid")
+    _require(_same_full_binding(selected.get("binding"), source_binding),
+             "recovery selected restart differs from the live source restart")
+    _require(isinstance(lifecycle, dict) and lifecycle.get("kind") in
+             ("nonzero_completion_v1", "same_boot_closed_processes_v1"),
+             "recovery parent lifecycle proof is invalid")
+    if lifecycle["kind"] == "nonzero_completion_v1":
+        _require(isinstance(lifecycle.get("return_code"), int) and
+                 not isinstance(lifecycle.get("return_code"), bool) and
+                 lifecycle["return_code"] != 0 and
+                 isinstance(lifecycle.get("completion_record"), dict),
+                 "recovery parent nonzero-completion proof is invalid")
+    else:
+        _require(lifecycle.get("all_original_identities_gone") is True and
+                 isinstance(lifecycle.get("boot_id"), str) and
+                 isinstance(lifecycle.get("process_identities"), list) and
+                 all(isinstance(row, dict) and
+                     row.get("original_identity_gone") is True
+                     for row in lifecycle["process_identities"]),
+                 "recovery parent same-boot closure proof is invalid")
+
+    recovery_record = provenance.get("record")
+    _validate_planned_file_record(recovery_record, "recovery_provenance.record")
+    _require(_same_full_binding(
+        recovery_record, parent.get("bindings", {}).get("recovery_record")),
+        "recovery record bindings disagree inside parent pass")
+    record_binding = _verify_planned_file(recovery_record, "recovery record")
+    record_path = Path(record_binding["path"])
+    _require_immutable_ready(record_path, ".recovery.ready", "recovery record")
+    record, _ = _load_json(record_path)
+    original_plan = provenance.get("original_plan")
+    _validate_planned_file_record(
+        original_plan, "recovery_provenance.original_plan")
+    _require(_same_full_binding(
+        original_plan, parent.get("bindings", {}).get("original_plan")),
+        "recovery original-plan bindings disagree inside parent pass")
+    original_plan_binding = _verify_planned_file(
+        original_plan, "recovery original plan")
+    original_plan_path = Path(original_plan_binding["path"])
+    _require_immutable_ready(
+        original_plan_path, "segment.plan.json", "recovery original plan")
+    original_plan_payload, _ = _load_json(original_plan_path)
+    _require(record.get("schema") == SCHEMA and
+             record.get("kind") == "athenak_segment_prefix_recovery" and
+             record.get("status") == "prepared" and
+             record.get("publication_transaction") == {
+                 "kind": "prepared_record_then_pass_commit_v1",
+                 "commit_filename": "segment.prefix.pass.ready",
+                 "prepared_record_alone_is_not_consumable": True,
+             } and
+             record.get("qualification_mode") == mode and
+             record.get("policy") == PREFIX_RECOVERY_POLICY and
+             record.get("original_plan") == original_plan and
+             record.get("original_launch_record") ==
+             provenance.get("original_launch_record") and
+             record.get("selected_scheduled_restart") == selected and
+             record.get("logical_prefix") == logical and
+             record.get("run_log_prefix_audit") == run_log_prefix and
+             record.get("lifecycle") == lifecycle and
+             record.get("derived_text_prefixes") ==
+             provenance.get("derived_text_prefixes") and
+             record.get("suffix_forensics") ==
+             provenance.get("suffix_forensics"),
+             "immutable recovery record differs from parent provenance")
+    original_anchor_audit = _audit_recovery_original_launch(
+        parent, provenance, record, original_plan_payload, original_plan_path)
+    directory_audit = _audit_recovery_directories(
+        record, original_plan_payload, record_path, parent_path)
+    lifecycle_audit = _audit_recovery_lifecycle(
+        lifecycle, record, original_plan_payload, original_anchor_audit)
+    source_chain_audit = _audit_recovery_source_chain(
+        record, original_plan_payload, _chain_seen or set(), _chain_depth)
+    original_anchor_audit = {
+        name: value for name, value in original_anchor_audit.items()
+        if name != "launch_record_payload"
+    }
+    candidate_audit = _audit_recovery_candidates(
+        original_plan_payload, record, selected)
+    prefix_audit = _audit_recovery_derived_prefixes(
+        original_plan_payload, record, parent)
+    derived = provenance.get("derived_text_prefixes")
+    _require(isinstance(derived, list) and any(
+        isinstance(row, dict) and
+        _same_full_binding(row.get("derived"), source_mass_evidence)
+        for row in derived),
+        "source baryon history is not a recovery-derived byte prefix")
+    history_path = Path(source_mass_evidence["path"])
+    history_info = history_path.lstat()
+    recovery_state_value = record.get("recovery_state_dir")
+    _require(isinstance(recovery_state_value, str),
+             "recovery record lacks recovery_state_dir")
+    recovery_state = Path(recovery_state_value).resolve(strict=True)
+    recovery_state_info = recovery_state.lstat()
+    try:
+        history_path.resolve(strict=True).relative_to(recovery_state)
+    except ValueError as exc:
+        raise CheckFailure(
+            "recovery baryon prefix is outside recovery state") from exc
+    _require(stat.S_ISREG(history_info.st_mode) and
+             not stat.S_ISLNK(history_info.st_mode) and
+             not (stat.S_IMODE(history_info.st_mode) & 0o222) and
+             stat.S_ISDIR(recovery_state_info.st_mode) and
+             not stat.S_ISLNK(recovery_state_info.st_mode) and
+             recovery_state_info.st_uid == os.geteuid() and
+             stat.S_IMODE(recovery_state_info.st_mode) == 0o700,
+             "recovery state/history must remain owner-only and immutable")
+    return {
+        "qualification_mode": mode,
+        "recovery_record": record_binding,
+        "selected_scheduled_restart": selected,
+        "logical_prefix": logical,
+        "lifecycle": lifecycle,
+        "original_anchor_audit": original_anchor_audit,
+        "directory_audit": directory_audit,
+        "lifecycle_audit": lifecycle_audit,
+        "source_chain_audit": source_chain_audit,
+        "candidate_audit": candidate_audit,
+        "prefix_audit": prefix_audit,
+    }
 
 
 def _read_exact(stream: Any, size: int, path: Path, description: str) -> bytes:
@@ -3617,7 +5002,8 @@ def _same_full_binding(actual: Any, expected: dict[str, Any]) -> bool:
 
 def audit_completion_record(
         path: Path, plan: dict[str, Any], state_dir: Path,
-        launch: dict[str, Any], artifact_bindings: dict[str, dict[str, Any]]) \
+        launch: dict[str, Any], artifact_bindings: dict[str, dict[str, Any]],
+        expected_return_code: int = 0) \
         -> dict[str, Any]:
     """Consume the sole marker that proves the launcher lifecycle is complete."""
 
@@ -3627,10 +5013,13 @@ def audit_completion_record(
         "plan", "launch_record", "run_log", "exit_status",
         "gpu_before", "gpu_after",
     }, "checker completion artifact binding set is incomplete")
+    _require(isinstance(expected_return_code, int) and
+             not isinstance(expected_return_code, bool),
+             "expected completion return code must be an integer")
     _require(record.get("schema") == SCHEMA and
              record.get("kind") == "athenak_segment_completion" and
              record.get("status") == "ready" and
-             record.get("return_code") == 0 and
+             record.get("return_code") == expected_return_code and
              record.get("state_dir") == str(state_dir.resolve(strict=True)) and
              record.get("world_size") == plan["policy"]["ranks"],
              "completion record schema/status/exit/state/world binding is invalid")
@@ -3655,7 +5044,10 @@ def audit_completion_record(
     quiescence = record.get("quiescence")
     _require(isinstance(quiescence, dict) and
              quiescence.get("gpu_compute_contexts_empty") is True and
-             quiescence.get("all_original_identities_gone") is True,
+             quiescence.get("all_original_identities_gone") is True and
+             quiescence.get("managed_process_group") ==
+             launch["managed_process_group"] and
+             quiescence.get("managed_process_group_gone") is True,
              "completion record does not prove process/GPU quiescence")
     identities = quiescence.get("process_identities")
     _require(isinstance(identities, list),
@@ -3752,7 +5144,7 @@ def audit_completion_record(
         "directory_transport": completion_directories,
         "executable_transport": completion_executables,
         "publication_contract": publication,
-        "return_code": 0,
+        "return_code": expected_return_code,
     }
 
 
@@ -3880,6 +5272,7 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "source baryon mass evidence")
     parent: dict[str, Any] | None = None
     parent_binding: dict[str, Any] | None = None
+    parent_qualification_audit: dict[str, Any] | None = None
     if source_qualification["mode"] == "parent_segment_pass":
         parent_record = source_qualification["parent_segment_pass"]
         parent_path = Path(parent_record["path"])
@@ -3928,6 +5321,9 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
             parent_histories[0].get(name) == source_mass_evidence.get(name)
             for name in ("path", "size", "sha256")),
             "source history evidence is not the unique parent-audited baryon history")
+        parent_qualification_audit = audit_parent_qualification_provenance(
+            parent, source_qualification, source_binding, source_mass_evidence,
+            expected["source_cycle"], expected["source_time"], parent_path)
     source_baryon_mass = audit_source_baryon_evidence(
         source_qualification, expected["source_time"], parent)
     if parent is not None:
@@ -3986,9 +5382,7 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "problem", {}).get("trajectory_file")
     _require(isinstance(source_trajectory, str) and bool(source_trajectory),
              "source restart lacks serialized trajectory provenance")
-    parameters = compare_parameters(
-        source_metadata, endpoint_metadata, plan["policy"]["mutable_parameters"],
-        {
+    exact_rebindings = {
             "output3/dt": {
                 "source": [source_metadata.parameters["output3"]["dt"]],
                 "endpoint": repr(expected["root_dt"]),
@@ -3996,7 +5390,16 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
             "problem/trajectory_file": {
                 "source": [source_trajectory], "endpoint": runtime_trajectory,
             },
-        })
+        }
+    capacity_transition = _validate_capacity_transition(plan)
+    if capacity_transition["kind"] == "increase_v1":
+        exact_rebindings["mesh_refinement/max_nmb_per_rank"] = {
+            "source": [str(capacity_transition["source_max_nmb_per_rank"])],
+            "endpoint": str(capacity_transition["target_max_nmb_per_rank"]),
+        }
+    parameters = compare_parameters(
+        source_metadata, endpoint_metadata, plan["policy"]["mutable_parameters"],
+        exact_rebindings)
 
     run = audit_run_log(args.run_log, expected)
     events = audit_event_log(args.event_log, expected["source_cycle"],
@@ -4006,6 +5409,13 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     gpus = audit_gpus(args.gpu_before, args.gpu_after, expected["ranks"],
                       expected["gpu_exit_memory_mib_max"],
                       plan["policy"].get("gpu_ecc"))
+    capacity_transition = _validate_capacity_transition(plan)
+    capacity_preflight = _gpu_capacity_preflight_evidence(
+        gpus["before"], capacity_transition)
+    gpus["capacity_preflight"] = {
+        "capacity_transition": capacity_transition,
+        "evidence": capacity_preflight,
+    }
     completion = audit_completion_record(
         args.completion_record, plan, state_resolved, launch, {
             "plan": plan_binding,
@@ -4293,10 +5703,12 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "schema": SCHEMA,
         "kind": "athenak_segment_pass",
         "status": "pass",
+        "qualification_mode": "complete_segment_v1",
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "expected": expected,
         "bindings": bindings,
         "source_restart_audit": source_audit,
+        "parent_qualification_audit": parent_qualification_audit,
         "endpoint_restart_audit": endpoint_audit,
         "restart_contract_audit": {
             "source": source_contract,
