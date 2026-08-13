@@ -41,7 +41,8 @@ python3 scripts/plan_athenak_segment.py \
   --trajectory /data/athenak/trajectory/trajectory.dat \
   --root-steps 100 --root-dt 4.8 --tlim-guard-steps 2 --ranks 8 \
   --target-max-nmb-per-rank 1280 \
-  --launcher /data/athenak-l4/opt/openmpi-5.0.9-cuda/bin/prterun \
+  --launcher /data/athenak-l4/opt/strict-prrte-5.0.9/prterun \
+  --mca-prefix /data/athenak-l4/opt/openmpi-5.0.9-cuda \
   --state-dir /scratch/run/segment-0002/state \
   --staging-dir /scratch/run/segment-0002/staging \
   --evidence-dir /scratch/run/segment-0002/evidence \
@@ -60,20 +61,24 @@ commit, executable and tool hashes, source history/restart, trajectory, director
 MPI launcher, the exact `nvidia-smi` executable, GPU/rank count, and wall limit.  It also
 binds a minimal explicit child environment and fixed directory descriptors, so inherited
 `LD_*`, `OMPI_MCA_*`, `PATH`, and other ambient variables cannot alter the run.  The plan
+also binds the explicit, canonical `--mca-prefix` directory plus existence or absence
+of the six Open MPI 5 default MCA files under
+`$HOME/.{openmpi,prte,pmix}/mca-params.conf` and the explicit installation prefix's
+`etc/{openmpi,prte,pmix}-mca-params.conf`.  Present files are bound by canonical path,
+device/inode, owner/mode, timestamps, size, and SHA-256.  Do not create, remove, chmod,
+or edit any of those paths between planning, launch qualification, and checking.  The
 filename is fixed to the direct evidence child `segment.plan.json`.  The planner also
 proves that the sole runtime
 cadence override `output3/dt=4.8` produces one full-domain, ghost-free `divB` topology
 file on every root cycle; a serialized `output3/dcycle` is rejected.
 
-For this deployment, bind the absolute, regular PRRTE executable shown above directly.
-Do not pass an `mpirun` shell/personality wrapper that self-execs another program: that
-can change the live executable or argv after planning and invalidates the launch proof.
-The current transitional cloud control path (outside this v1 strict launcher contract)
-`/data/athenak-l4/opt/strict-prrte-5.0.9/prterun` is also a regular PRRTE ELF whose
-formal `argv[0]`/`prterun` exec probe has passed; its explicit launch environment uses
-`PRTE_MCA_schizo_proxy=ompi`.  A future launcher-contract revision will bind PRRTE
-personality/target identity separately; do not infer that stronger ABI from this v1
-example.
+For this deployment, bind the absolute, regular copied PRRTE executable shown above
+directly and bind its actual Open MPI installation/configuration tree separately with
+`--mca-prefix /data/athenak-l4/opt/openmpi-5.0.9-cuda`.  Never derive the prefix from
+the copied launcher's parent directory.  Do not pass an `mpirun` shell/personality
+wrapper that self-execs another program: that can change the live executable or argv
+after planning and invalidates the launch proof.  The strict launch environment uses
+`PRTE_MCA_schizo_proxy=ompi`.
 
 `--target-max-nmb-per-rank` is the only authorized Mesh runtime transition.  Omit it
 to preserve the source restart value.  When present it must be a strict increase, may
@@ -120,6 +125,15 @@ python3 scripts/launch_athenak_segment.py \
   --gpu-before /scratch/run/segment-0002/evidence/gpu-before.csv \
   --gpu-after /scratch/run/segment-0002/evidence/gpu-after.csv
 ```
+
+Launch qualification rechecks the MCA snapshot before staging completes, immediately
+before process creation, and after all ranks are live.  It reads every rank's complete
+environment from `/proc` and requires the exact 39-key Open MPI/PRRTE/PMIx 5.0.9 V100
+profile: fixed values are plan-bound, rank/world/PID/hostname/state/argv values are
+independently derived, and all five PMIx URI aliases must name the same loopback server
+and agree across ranks.  Any additional key, including an unreviewed `OMPI_*`, `PMIX_*`,
+or `PRTE_*` variable, fails the proof.  The checker repeats these derivations and
+rehashes the live MCA paths independently.
 
 After a clean process exit and a 120-second settling interval, qualify the entire closed
 segment:

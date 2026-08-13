@@ -84,12 +84,6 @@ GPU_QUERY = (
     "ecc.errors.corrected.volatile.total,memory.total,memory.used"
 )
 GPU_APP_QUERY = "pid,gpu_uuid"
-MPI_ENVIRONMENT_KEYS = (
-    "OMPI_COMM_WORLD_RANK",
-    "OMPI_COMM_WORLD_SIZE",
-    "OMPI_COMM_WORLD_LOCAL_RANK",
-    "OMPI_COMM_WORLD_LOCAL_SIZE",
-)
 GPU_VISIBILITY_ENVIRONMENT_KEYS = ("CUDA_VISIBLE_DEVICES", "KOKKOS_VISIBLE_DEVICES")
 KOKKOS_GPU_MAP_TOKEN = "--kokkos-map-device-id-by=mpi_rank"
 INPUT_TRANSPORT_KIND = "linux_proc_holder_fd_v1"
@@ -103,8 +97,10 @@ STAGING_DIRECTORY_PREFLIGHT_FD = 206
 HOLDER_PID_TOKEN = "{holder_pid}"
 DIRECTORY_TRANSPORT_KIND = "linux_proc_holder_dirfd_v1"
 EXECUTABLE_TRANSPORT_KIND = "linux_proc_holder_execfd_v1"
-LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
-RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v3"
+RANK_ENVIRONMENT_PROJECTION_KIND = \
+    "prrte_openmpi_pmix_single_node_projection_v2"
+MCA_CONFIGURATION_KIND = "openmpi_prrte_pmix_default_files_v1"
 LAUNCH_ENVIRONMENT_KEYS = (
     "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
     "PRTE_MCA_schizo_proxy",
@@ -113,6 +109,66 @@ RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
     "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
 )
 RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
+RANK_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+    "OMPI_ARGV", "OMPI_COMMAND",
+    "OMPI_COMM_WORLD_LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "OMPI_COMM_WORLD_NODE_RANK", "OMPI_COMM_WORLD_RANK",
+    "OMPI_COMM_WORLD_SIZE", "OMPI_FILE_LOCATION",
+    "OMPI_MCA_cpu_type", "OMPI_MCA_initial_wdir", "OMPI_MCA_num_procs",
+    "OMPI_NUM_APP_CTX", "OMPI_UNIVERSE_SIZE", "OMPI_WORLD_LOCAL_SIZE",
+    "OMPI_WORLD_SIZE", "PMIX_BFROP_BUFFER_TYPE", "PMIX_GDS_MODULE",
+    "PMIX_HOSTNAME", "PMIX_NAMESPACE", "PMIX_PARAM_FILE_PASSED",
+    "PMIX_RANK", "PMIX_SECURITY_MODE", "PMIX_SERVER_TMPDIR",
+    "PMIX_SERVER_URI21", "PMIX_SERVER_URI2", "PMIX_SERVER_URI3",
+    "PMIX_SERVER_URI41", "PMIX_SERVER_URI4", "PMIX_SYSTEM_TMPDIR",
+    "PMIX_VERSION", "PRTE_LAUNCHED", "PRTE_SHARED_FS",
+    "OPAL_USER_PARAMS_GIVEN", "PWD", "ZES_ENABLE_SYSMAN",
+)
+RANK_FIXED_ENVIRONMENT_VALUES = {
+    "OMPI_MCA_cpu_type": "x86_64", "OMPI_NUM_APP_CTX": "1",
+    "OMPI_UNIVERSE_SIZE": "32",
+    "PMIX_BFROP_BUFFER_TYPE": "PMIX_BFROP_BUFFER_NON_DESC",
+    "PMIX_GDS_MODULE": "shmem2,hash", "PMIX_PARAM_FILE_PASSED": "1",
+    "PMIX_SECURITY_MODE": "native", "PMIX_SYSTEM_TMPDIR": "/tmp",
+    "PMIX_VERSION": "5.0.9a1", "PRTE_LAUNCHED": "1",
+    "PRTE_SHARED_FS": "FALSE", "OPAL_USER_PARAMS_GIVEN": "1",
+    "ZES_ENABLE_SYSMAN": "1",
+}
+RANK_DERIVED_ENVIRONMENT_VALUES = {
+    "OMPI_COMMAND": "athena_argv[0]",
+    "OMPI_ARGV": "space_join(athena_argv[1:])",
+    "OMPI_COMM_WORLD_RANK": "global_rank",
+    "OMPI_COMM_WORLD_SIZE": "world_size",
+    "OMPI_COMM_WORLD_LOCAL_RANK": "local_rank",
+    "OMPI_COMM_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_COMM_WORLD_NODE_RANK": "local_rank_single_node",
+    "OMPI_FILE_LOCATION": "/tmp/ompi.<launcher_pid>/1/<global_rank>",
+    "OMPI_MCA_initial_wdir": "state_dir", "OMPI_MCA_num_procs": "world_size",
+    "OMPI_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_WORLD_SIZE": "world_size", "PMIX_HOSTNAME": "launcher_hostname",
+    "PMIX_NAMESPACE": "prterun-<hostname>-<launcher_pid>@1",
+    "PMIX_RANK": "global_rank",
+    "PMIX_SERVER_TMPDIR": "/tmp/ompi.<launcher_pid>",
+    "PMIX_SERVER_URI21": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI2": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI3": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI41": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI4": "shared_namespace_tcp4_loopback_uri",
+    "PWD": "state_dir",
+}
+RANK_URI_ENVIRONMENT_KEYS = (
+    "PMIX_SERVER_URI21", "PMIX_SERVER_URI2", "PMIX_SERVER_URI3",
+    "PMIX_SERVER_URI41", "PMIX_SERVER_URI4",
+)
+MCA_CONFIGURATION_LAYOUT = (
+    ("home", "openmpi", ".openmpi/mca-params.conf"),
+    ("home", "prte", ".prte/mca-params.conf"),
+    ("home", "pmix", ".pmix/mca-params.conf"),
+    ("prefix", "openmpi", "etc/openmpi-mca-params.conf"),
+    ("prefix", "prte", "etc/prte-mca-params.conf"),
+    ("prefix", "pmix", "etc/pmix-mca-params.conf"),
+)
 EVIDENCE_NAMES = (
     "launch_record", "completion_record", "run_log", "exit_status",
     "gpu_before", "gpu_after",
@@ -700,7 +756,8 @@ def _validate_launch_environment(value: Any) -> dict[str, str]:
     projection = value.get("rank_projection")
     _require(isinstance(projection, dict) and
              set(projection) == {
-                 "kind", "inherited_values", "consumed_absent", "sha256",
+                 "kind", "inherited_values", "consumed_absent", "exact_keys",
+                 "fixed_values", "derived_values", "sha256",
              } and
              projection.get("kind") == RANK_ENVIRONMENT_PROJECTION_KIND,
              "rank environment projection kind is not canonical")
@@ -709,6 +766,9 @@ def _validate_launch_environment(value: Any) -> dict[str, str]:
             key: canonical[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
         },
         "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
+        "exact_keys": list(RANK_ENVIRONMENT_KEYS),
+        "fixed_values": dict(RANK_FIXED_ENVIRONMENT_VALUES),
+        "derived_values": dict(RANK_DERIVED_ENVIRONMENT_VALUES),
     }
     _require(projection.get("inherited_values") ==
              projection_payload["inherited_values"] and
@@ -717,6 +777,106 @@ def _validate_launch_environment(value: Any) -> dict[str, str]:
              projection.get("sha256") == _canonical_sha256(projection_payload),
              "rank environment projection differs from the exact PRRTE contract")
     return canonical
+
+
+def _snapshot_mca_configuration_file(scope: str, project: str,
+                                     path: Path) -> dict[str, Any]:
+    """Independently snapshot one default MCA path, including absence."""
+
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+    except FileNotFoundError:
+        _require(not os.path.lexists(absolute),
+                 f"MCA configuration path is not safely absent: {absolute}")
+        return {
+            "scope": scope, "project": project,
+            "path": str(absolute), "state": "absent",
+        }
+    except OSError as exc:
+        raise LaunchFailure(f"cannot inspect MCA configuration {absolute}: {exc}") \
+            from exc
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as exc:
+        raise LaunchFailure(f"cannot resolve MCA configuration {absolute}: {exc}") \
+            from exc
+    mode = stat.S_IMODE(info.st_mode)
+    _require(resolved == absolute and not stat.S_ISLNK(info.st_mode) and
+             stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.geteuid()) and
+             not (mode & 0o022),
+             f"MCA configuration is not canonical, regular, safely owned/mode: "
+             f"{absolute}")
+    try:
+        binding = stable_sha256(absolute)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise LaunchFailure(f"cannot audit MCA configuration {absolute}: {exc}") \
+            from exc
+    return {
+        "scope": scope, "project": project, "path": str(absolute),
+        "state": "present", "device": binding["device"],
+        "inode": binding["inode"], "owner_uid": info.st_uid,
+        "mode": f"{mode:04o}", "size": binding["size"],
+        "mtime_ns": binding["mtime_ns"], "ctime_ns": binding["ctime_ns"],
+        "sha256": binding["sha256"],
+        "closure_check": binding["closure_check"],
+    }
+
+
+def _snapshot_mca_prefix_directory(path: Path) -> dict[str, Any]:
+    absolute = path.absolute()
+    try:
+        resolved = absolute.resolve(strict=True)
+        info = absolute.lstat()
+    except OSError as exc:
+        raise LaunchFailure(f"cannot bind MCA prefix {absolute}: {exc}") from exc
+    mode = stat.S_IMODE(info.st_mode)
+    _require(resolved == absolute and not stat.S_ISLNK(info.st_mode) and
+             stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.geteuid()) and
+             not (mode & 0o022),
+             "MCA prefix must be canonical, non-symlink, safely owned/mode")
+    return {
+        "path": str(absolute), "device": info.st_dev, "inode": info.st_ino,
+        "owner_uid": info.st_uid, "mode": f"{mode:04o}",
+    }
+
+
+def _audit_mca_configuration(value: Any, home: str) -> dict[str, Any]:
+    """Validate the plan binding and return a fresh six-path snapshot."""
+
+    _require(isinstance(value, dict) and
+             set(value) == {"kind", "home", "prefix", "prefix_directory",
+                            "files", "sha256"} and
+             value.get("kind") == MCA_CONFIGURATION_KIND,
+             f"MCA configuration contract must be {MCA_CONFIGURATION_KIND}")
+    prefix_value = value.get("prefix")
+    _require(isinstance(prefix_value, str) and Path(prefix_value).is_absolute(),
+             "MCA configuration prefix must be absolute")
+    prefix_directory = _snapshot_mca_prefix_directory(Path(prefix_value))
+    prefix = Path(prefix_directory["path"])
+    _require(value.get("home") == home and
+             value.get("prefix_directory") == prefix_directory,
+             "MCA configuration HOME/prefix directory differs from plan")
+    planned_files = value.get("files")
+    _require(isinstance(planned_files, list) and
+             len(planned_files) == len(MCA_CONFIGURATION_LAYOUT),
+             "MCA configuration file set is not exact")
+    current_files: list[dict[str, Any]] = []
+    for index, (scope, project, relative) in enumerate(MCA_CONFIGURATION_LAYOUT):
+        expected_path = (Path(home) if scope == "home" else prefix) / relative
+        current = _snapshot_mca_configuration_file(
+            scope, project, expected_path)
+        _require(planned_files[index] == current,
+                 f"MCA configuration {expected_path} differs from immutable plan")
+        current_files.append(current)
+    payload = {
+        "kind": MCA_CONFIGURATION_KIND,
+        "home": home, "prefix": str(prefix),
+        "prefix_directory": prefix_directory, "files": current_files,
+    }
+    _require(value.get("sha256") == _canonical_sha256(payload),
+             "MCA configuration contract SHA-256 is not canonical")
+    return {**payload, "sha256": value["sha256"]}
 
 
 def _directory_signature(info: os.stat_result) -> tuple[int, int, int, int]:
@@ -1850,6 +2010,7 @@ class PreparedLaunch:
     proc_access_probe: dict[str, Any]
     launch_environment: dict[str, str]
     launch_environment_sha256: str
+    mca_configuration_preflight: dict[str, Any]
     execution_tools: dict[str, dict[str, Any]]
     repository: dict[str, Any]
     binary: dict[str, Any]
@@ -2026,6 +2187,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
     launcher_plan = contract.get("launcher")
     launcher = _audit_planned_file(launcher_plan, "launch_contract.launcher",
                                    executable=True)
+    mca_configuration_preflight = _audit_mca_configuration(
+        contract.get("mca_configuration"), launch_environment["HOME"])
     final_cycle = _integer(expected.get("final_cycle"), "expected.final_cycle")
     tlim = _finite(expected.get("tlim"), "expected.tlim")
     root_dt = _finite(expected.get("root_dt"), "expected.root_dt")
@@ -2287,6 +2450,7 @@ def prepare_launch(plan_path: Path, state_dir: Path,
             proc_access_probe=proc_access_probe,
             launch_environment=launch_environment,
             launch_environment_sha256=launch_environment_sha256,
+            mca_configuration_preflight=mca_configuration_preflight,
             execution_tools=execution_tools,
             repository=repository, binary=binary, source_restart=source,
             trajectory=trajectory, staging_directory=staging_record,
@@ -2321,19 +2485,21 @@ def _same_executable(actual: Mapping[str, Any],
 
 
 def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
-                            pid: int,
-                            launch_environment: Mapping[str, str]) \
+                            pid: int, launch_environment: Mapping[str, str],
+                            *, launcher_pid: int, hostname: str,
+                            state_dir: Path,
+                            athena_argv: Sequence[str]) \
         -> tuple[int, int, dict[str, str]]:
-    selected: dict[str, str] = {}
-    for key in (*MPI_ENVIRONMENT_KEYS, *RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS):
-        _require(key in environment, f"rank pid {pid} lacks MPI environment {key}")
-        selected[key] = environment[key]
-    for key in RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS:
-        _require(key not in environment,
-                 f"rank pid {pid} retained launcher-only environment {key}")
-    for key in GPU_VISIBILITY_ENVIRONMENT_KEYS:
-        if key in environment:
-            selected[key] = environment[key]
+    _require(all(isinstance(key, str) and isinstance(item, str)
+                 for key, item in environment.items()),
+             f"rank pid {pid} environment is not a string mapping")
+    actual_keys = set(environment)
+    expected_keys = set(RANK_ENVIRONMENT_KEYS)
+    _require(actual_keys == expected_keys,
+             f"rank pid {pid} runtime environment key closure differs: "
+             f"missing={sorted(expected_keys - actual_keys)!r}, "
+             f"unexpected={sorted(actual_keys - expected_keys)!r}")
+    selected = {key: environment[key] for key in RANK_ENVIRONMENT_KEYS}
     try:
         global_rank = int(selected["OMPI_COMM_WORLD_RANK"])
         global_size = int(selected["OMPI_COMM_WORLD_SIZE"])
@@ -2345,9 +2511,40 @@ def _parse_rank_environment(environment: Mapping[str, str], world_size: int,
              f"rank pid {pid} is not in the planned single-node MPI world")
     _require(0 <= global_rank < world_size and 0 <= local_rank < world_size,
              f"rank pid {pid} has out-of-range MPI rank")
-    _require(all(selected.get(key) == launch_environment[key]
-                 for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS),
-             f"rank pid {pid} inherited environment differs from immutable plan")
+    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    expected = {
+        **{key: launch_environment[key]
+           for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS},
+        **RANK_FIXED_ENVIRONMENT_VALUES,
+        "OMPI_COMMAND": str(athena_argv[0]),
+        "OMPI_ARGV": " ".join(athena_argv[1:]),
+        "OMPI_COMM_WORLD_RANK": str(global_rank),
+        "OMPI_COMM_WORLD_SIZE": str(world_size),
+        "OMPI_COMM_WORLD_LOCAL_RANK": str(local_rank),
+        "OMPI_COMM_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_COMM_WORLD_NODE_RANK": str(local_rank),
+        "OMPI_FILE_LOCATION": f"/tmp/ompi.{launcher_pid}/1/{global_rank}",
+        "OMPI_MCA_initial_wdir": str(state_dir),
+        "OMPI_MCA_num_procs": str(world_size),
+        "OMPI_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_WORLD_SIZE": str(world_size),
+        "PMIX_HOSTNAME": hostname,
+        "PMIX_NAMESPACE": namespace,
+        "PMIX_RANK": str(global_rank),
+        "PMIX_SERVER_TMPDIR": f"/tmp/ompi.{launcher_pid}",
+        "PWD": str(state_dir),
+    }
+    for key, expected_value in expected.items():
+        _require(selected.get(key) == expected_value,
+                 f"rank pid {pid} environment {key} differs from derived contract")
+    uri_values = {selected[key] for key in RANK_URI_ENVIRONMENT_KEYS}
+    _require(len(uri_values) == 1,
+             f"rank pid {pid} PMIx server URI aliases differ")
+    uri = next(iter(uri_values))
+    uri_match = re.fullmatch(
+        rf"{re.escape(namespace)}@0\.0;tcp4://127\.0\.0\.1:(\d+)", uri)
+    _require(uri_match is not None and 1 <= int(uri_match.group(1)) <= 65535,
+             f"rank pid {pid} PMIx server URI is not the derived loopback URI")
     return global_rank, local_rank, selected
 
 
@@ -2409,7 +2606,10 @@ def prove_running_launch(process: Any, prepared: PreparedLaunch,
                 global_rank, local_rank, selected_environment = \
                     _parse_rank_environment(
                         environment, prepared.world_size, pid,
-                        prepared.launch_environment)
+                        prepared.launch_environment,
+                        launcher_pid=process.pid, hostname=hostname,
+                        state_dir=prepared.state_dir,
+                        athena_argv=prepared.athena_argv)
                 _require(all(not selected_environment.get(name)
                              for name in GPU_VISIBILITY_ENVIRONMENT_KEYS),
                          f"rank pid {pid} has a forbidden GPU visibility override")
@@ -2450,6 +2650,9 @@ def prove_running_launch(process: Any, prepared: PreparedLaunch,
                      "Athena rank PIDs are not unique")
             _require(len({row["gpu_uuid"] for row in ranks}) == prepared.world_size,
                      "Athena ranks are not mapped one-to-one onto GPUs")
+            _require(len({row["mpi_environment"]["PMIX_SERVER_URI21"]
+                          for row in ranks}) == 1,
+                     "Athena ranks do not share one PMIx server URI")
             input_transport = prepared.input_holder.audit()
             directory_transport = prepared.directory_holder.audit()
             executable_transport = prepared.executable_holder.audit()
@@ -2466,6 +2669,9 @@ def prove_running_launch(process: Any, prepared: PreparedLaunch,
                          prepared.execution_tools[name], binding)
                          for name, binding in execution_tools_at_launch.items()),
                      "plan-bound launcher execution tools changed after preflight")
+            mca_configuration_at_rank_proof = _audit_mca_configuration(
+                prepared.plan["launch_contract"].get("mca_configuration"),
+                prepared.launch_environment["HOME"])
             if plan_path is not None:
                 current_plan, current_binding = _read_immutable_plan(plan_path)
                 _require(current_plan == prepared.plan and
@@ -2506,6 +2712,8 @@ def prove_running_launch(process: Any, prepared: PreparedLaunch,
                 "executable_transport": executable_transport,
                 "repository_at_launch": repository,
                 "execution_tools_at_launch": execution_tools_at_launch,
+                "mca_configuration_at_rank_proof":
+                    mca_configuration_at_rank_proof,
                 "gpu_mapping_basis": (
                     "kokkos_mpi_rank_token_plus_ompi_local_rank_plus_"
                     "nvidia_compute_context_uuid"
@@ -3004,6 +3212,9 @@ def _run_segment_with_holder(
         _require(_canonical_sha256(child_environment) ==
                  prepared.launch_environment_sha256,
                  "prepared launch environment identity changed")
+        mca_configuration_before_spawn = _audit_mca_configuration(
+            prepared.plan["launch_contract"].get("mca_configuration"),
+            child_environment["HOME"])
         prepared.directory_holder.audit()
         prepared.executable_holder.audit()
         process = runtime.popen(
@@ -3080,6 +3291,13 @@ def _run_segment_with_holder(
             "launch_argv": list(prepared.launch_argv),
             "launch_environment":
                 prepared.plan["launch_contract"]["environment"],
+            "mca_configuration_contract":
+                prepared.plan["launch_contract"]["mca_configuration"],
+            "mca_configuration": {
+                "preflight": prepared.mca_configuration_preflight,
+                "before_spawn": mca_configuration_before_spawn,
+                "at_rank_proof": proof["mca_configuration_at_rank_proof"],
+            },
             "gpu_visibility_environment": {
                 name: child_environment.get(name)
                 for name in (*GPU_VISIBILITY_ENVIRONMENT_KEYS, "CUDA_DEVICE_ORDER")

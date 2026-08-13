@@ -89,6 +89,9 @@ def _environment_contract() -> dict[str, object]:
             for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
         },
         "consumed_absent": ["PRTE_MCA_schizo_proxy"],
+        "exact_keys": list(CHECKER.RANK_ENVIRONMENT_KEYS),
+        "fixed_values": dict(CHECKER.RANK_FIXED_ENVIRONMENT_VALUES),
+        "derived_values": dict(CHECKER.RANK_DERIVED_ENVIRONMENT_VALUES),
     }
     return {
         "kind": CHECKER.LAUNCH_ENVIRONMENT_KIND,
@@ -102,6 +105,76 @@ def _environment_contract() -> dict[str, object]:
     }
 
 
+def _mca_contract(home: str, prefix: Path) -> dict[str, object]:
+    prefix_directory = CHECKER._snapshot_mca_prefix_directory(prefix)
+    prefix = Path(prefix_directory["path"])
+    files = [
+        CHECKER._snapshot_mca_configuration_file(
+            scope, project,
+            (Path(home) if scope == "home" else prefix) / relative)
+        for scope, project, relative in CHECKER.MCA_CONFIGURATION_LAYOUT
+    ]
+    payload = {
+        "kind": CHECKER.MCA_CONFIGURATION_KIND,
+        "home": home, "prefix": str(prefix),
+        "prefix_directory": prefix_directory, "files": files,
+    }
+    return {**payload, "sha256": CHECKER._canonical_json_sha256(payload)}
+
+
+def _absent_mca_contract(home: str, prefix_value: str) -> dict[str, object]:
+    prefix = Path(prefix_value)
+    files = [{
+        "scope": scope, "project": project,
+        "path": str((Path(home) if scope == "home" else prefix) / relative),
+        "state": "absent",
+    } for scope, project, relative in CHECKER.MCA_CONFIGURATION_LAYOUT]
+    payload = {
+        "kind": CHECKER.MCA_CONFIGURATION_KIND,
+        "home": home, "prefix": str(prefix),
+        "prefix_directory": {
+            "path": str(prefix), "device": 1, "inode": 2,
+            "owner_uid": os.geteuid(), "mode": "0755",
+        },
+        "files": files,
+    }
+    return {**payload, "sha256": CHECKER._canonical_json_sha256(payload)}
+
+
+def _rank_environment(*, rank: int, world_size: int, launcher_pid: int,
+                      hostname: str, state_dir: Path,
+                      athena_argv: list[str]) -> dict[str, str]:
+    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    uri = f"{namespace}@0.0;tcp4://127.0.0.1:43210"
+    state = str(state_dir.resolve(strict=True))
+    home = str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True))
+    return {
+        "HOME": home, "LANG": "C", "LC_ALL": "C",
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "OMPI_ARGV": " ".join(athena_argv[1:]),
+        "OMPI_COMMAND": athena_argv[0],
+        "OMPI_COMM_WORLD_LOCAL_RANK": str(rank),
+        "OMPI_COMM_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_COMM_WORLD_NODE_RANK": str(rank),
+        "OMPI_COMM_WORLD_RANK": str(rank),
+        "OMPI_COMM_WORLD_SIZE": str(world_size),
+        "OMPI_FILE_LOCATION": f"/tmp/ompi.{launcher_pid}/1/{rank}",
+        "OMPI_MCA_cpu_type": "x86_64", "OMPI_MCA_initial_wdir": state,
+        "OMPI_MCA_num_procs": str(world_size), "OMPI_NUM_APP_CTX": "1",
+        "OMPI_UNIVERSE_SIZE": "32", "OMPI_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_WORLD_SIZE": str(world_size),
+        "PMIX_BFROP_BUFFER_TYPE": "PMIX_BFROP_BUFFER_NON_DESC",
+        "PMIX_GDS_MODULE": "shmem2,hash", "PMIX_HOSTNAME": hostname,
+        "PMIX_NAMESPACE": namespace, "PMIX_PARAM_FILE_PASSED": "1",
+        "PMIX_RANK": str(rank), "PMIX_SECURITY_MODE": "native",
+        "PMIX_SERVER_TMPDIR": f"/tmp/ompi.{launcher_pid}",
+        "PMIX_SERVER_URI21": uri, "PMIX_SERVER_URI2": uri,
+        "PMIX_SERVER_URI3": uri, "PMIX_SERVER_URI41": uri,
+        "PMIX_SERVER_URI4": uri, "PMIX_SYSTEM_TMPDIR": "/tmp",
+        "PMIX_VERSION": "5.0.9a1", "PRTE_LAUNCHED": "1",
+        "PRTE_SHARED_FS": "FALSE", "OPAL_USER_PARAMS_GIVEN": "1",
+        "PWD": state, "ZES_ENABLE_SYSMAN": "1",
+    }
 def _disk_contract(source_size: int = 1, trajectory_size: int = 1,
                    peak_gib: int = 200) \
         -> dict[str, object]:
@@ -190,7 +263,7 @@ def _disk_snapshot(contract: dict[str, object], phase: str, device: int,
         "status": "pass",
     }
 def _plan() -> dict[str, object]:
-    return {
+    plan = {
         "schema": 1,
         "expected": {
             "source_cycle": 10, "source_time": 48.0, "root_steps": 3,
@@ -576,6 +649,11 @@ def _plan() -> dict[str, object]:
         }],
         "required_files": ["run.user.hst", "events.log"],
     }
+    environment = plan["launch_contract"]["environment"]
+    plan["launch_contract"]["mca_configuration"] = _absent_mca_contract(
+        str(environment["values"]["HOME"]),
+        "/campaign/openmpi-prefix")
+    return plan
 
 
 def _run_log(path: Path, termination: str = "cycle") -> None:
@@ -1109,6 +1187,8 @@ def test_changed_gpu_uuid_is_rejected(tmp_path: Path) -> None:
 
 def _launch_record_fixture(tmp_path: Path):
     plan = _plan()
+    mca_prefix = tmp_path / "openmpi-prefix"
+    mca_prefix.mkdir()
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     evidence_dir = tmp_path / "evidence"
@@ -1232,6 +1312,7 @@ def _launch_record_fixture(tmp_path: Path):
             },
         },
     }
+    environment_contract = _environment_contract()
     plan["launch_contract"] = {
         "wall_time_seconds": 3600, "launcher": launcher_record,
         "mpi_argv": mpi_argv,
@@ -1242,7 +1323,9 @@ def _launch_record_fixture(tmp_path: Path):
         "input_transport": plan["launch_contract"]["input_transport"],
         "evidence_dir": str(evidence_dir.resolve()),
         "plan_path": str(plan_path.resolve()),
-        "environment": _environment_contract(),
+        "environment": environment_contract,
+        "mca_configuration": _mca_contract(
+            str(environment_contract["values"]["HOME"]), mca_prefix),
         "directory_transport": directory_contract,
         "executable_transport": executable_contract,
             "disk_preflight": _disk_contract(
@@ -1386,14 +1469,10 @@ def _launch_record_fixture(tmp_path: Path):
             "gpu_cuda_ordinal": rank,
             "executable": CHECKER.stable_sha256(binary),
             "cmdline": athena_argv,
-            "mpi_environment": {
-                "OMPI_COMM_WORLD_RANK": str(rank),
-                "OMPI_COMM_WORLD_SIZE": "2",
-                "OMPI_COMM_WORLD_LOCAL_RANK": str(rank),
-                "OMPI_COMM_WORLD_LOCAL_SIZE": "2",
-                **_environment_contract()["rank_projection"]
-                ["inherited_values"],
-            },
+            "mpi_environment": _rank_environment(
+                rank=rank, world_size=2, launcher_pid=500,
+                hostname="gpu-node", state_dir=state_dir,
+                athena_argv=athena_argv),
         } for rank in range(2)],
         "gpu_before": {
             "path": str((tmp_path / "gpu-before.csv").resolve()),
@@ -1422,6 +1501,12 @@ def _launch_record_fixture(tmp_path: Path):
         ),
         "launcher_tool": launcher_tool,
         "launch_environment": _environment_contract(),
+        "mca_configuration_contract":
+            plan["launch_contract"]["mca_configuration"],
+        "mca_configuration": {
+            stage: copy.deepcopy(plan["launch_contract"]["mca_configuration"])
+            for stage in ("preflight", "before_spawn", "at_rank_proof")
+        },
         "nvidia_smi": plan["tools"]["nvidia_smi"],
         "execution_tools_at_launch": {
             name: plan["tools"][name] for name in (
@@ -1480,11 +1565,17 @@ def test_launch_record_requires_bound_nvidia_smi_to_remain_executable(
         (lambda launch: launch["executable_transport"]["roles"][
             "binary"].__setitem__("unreviewed", True), "binary"),
         (lambda launch: launch["ranks"][0]["mpi_environment"].__setitem__(
-            "LANG", "C.UTF-8"), "MPI environment"),
+            "LANG", "C.UTF-8"), "environment LANG"),
+        (lambda launch: launch["ranks"][0]["mpi_environment"].__setitem__(
+            "PMIX_MCA_unreviewed", "1"), "environment key closure"),
+        (lambda launch: launch["ranks"][0]["mpi_environment"].__setitem__(
+            "PMIX_NAMESPACE", "attacker"), "PMIX_NAMESPACE"),
         (lambda launch: launch["launch_environment"]["values"].__setitem__(
             "PRTE_MCA_schizo_proxy", "prte"), "environment"),
         (lambda launch: launch["launch_environment"]["rank_projection"]
          ["consumed_absent"].clear(), "environment"),
+        (lambda launch: launch["mca_configuration"]["before_spawn"].__setitem__(
+            "sha256", "f" * 64), "MCA configuration"),
         (lambda launch: launch["managed_process_group"].__setitem__(
             "pgid", 999), "managed process-group"),
         (lambda launch: launch["proc_access_probe"]["families"][

@@ -23,7 +23,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 sys.dont_write_bytecode = True
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -139,12 +139,74 @@ LAUNCHER_EXECUTABLE_FD = 204
 BINARY_EXECUTABLE_FD = 205
 DIRECTORY_TRANSPORT_KIND = "linux_proc_holder_dirfd_v1"
 EXECUTABLE_TRANSPORT_KIND = "linux_proc_holder_execfd_v1"
-LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
-RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v3"
+RANK_ENVIRONMENT_PROJECTION_KIND = \
+    "prrte_openmpi_pmix_single_node_projection_v2"
+MCA_CONFIGURATION_KIND = "openmpi_prrte_pmix_default_files_v1"
 RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
     "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
 )
 RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
+RANK_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+    "OMPI_ARGV", "OMPI_COMMAND",
+    "OMPI_COMM_WORLD_LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "OMPI_COMM_WORLD_NODE_RANK", "OMPI_COMM_WORLD_RANK",
+    "OMPI_COMM_WORLD_SIZE", "OMPI_FILE_LOCATION",
+    "OMPI_MCA_cpu_type", "OMPI_MCA_initial_wdir", "OMPI_MCA_num_procs",
+    "OMPI_NUM_APP_CTX", "OMPI_UNIVERSE_SIZE", "OMPI_WORLD_LOCAL_SIZE",
+    "OMPI_WORLD_SIZE", "PMIX_BFROP_BUFFER_TYPE", "PMIX_GDS_MODULE",
+    "PMIX_HOSTNAME", "PMIX_NAMESPACE", "PMIX_PARAM_FILE_PASSED",
+    "PMIX_RANK", "PMIX_SECURITY_MODE", "PMIX_SERVER_TMPDIR",
+    "PMIX_SERVER_URI21", "PMIX_SERVER_URI2", "PMIX_SERVER_URI3",
+    "PMIX_SERVER_URI41", "PMIX_SERVER_URI4", "PMIX_SYSTEM_TMPDIR",
+    "PMIX_VERSION", "PRTE_LAUNCHED", "PRTE_SHARED_FS",
+    "OPAL_USER_PARAMS_GIVEN", "PWD", "ZES_ENABLE_SYSMAN",
+)
+RANK_FIXED_ENVIRONMENT_VALUES = {
+    "OMPI_MCA_cpu_type": "x86_64", "OMPI_NUM_APP_CTX": "1",
+    "OMPI_UNIVERSE_SIZE": "32",
+    "PMIX_BFROP_BUFFER_TYPE": "PMIX_BFROP_BUFFER_NON_DESC",
+    "PMIX_GDS_MODULE": "shmem2,hash", "PMIX_PARAM_FILE_PASSED": "1",
+    "PMIX_SECURITY_MODE": "native", "PMIX_SYSTEM_TMPDIR": "/tmp",
+    "PMIX_VERSION": "5.0.9a1", "PRTE_LAUNCHED": "1",
+    "PRTE_SHARED_FS": "FALSE", "OPAL_USER_PARAMS_GIVEN": "1",
+    "ZES_ENABLE_SYSMAN": "1",
+}
+RANK_DERIVED_ENVIRONMENT_VALUES = {
+    "OMPI_COMMAND": "athena_argv[0]",
+    "OMPI_ARGV": "space_join(athena_argv[1:])",
+    "OMPI_COMM_WORLD_RANK": "global_rank",
+    "OMPI_COMM_WORLD_SIZE": "world_size",
+    "OMPI_COMM_WORLD_LOCAL_RANK": "local_rank",
+    "OMPI_COMM_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_COMM_WORLD_NODE_RANK": "local_rank_single_node",
+    "OMPI_FILE_LOCATION": "/tmp/ompi.<launcher_pid>/1/<global_rank>",
+    "OMPI_MCA_initial_wdir": "state_dir", "OMPI_MCA_num_procs": "world_size",
+    "OMPI_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_WORLD_SIZE": "world_size", "PMIX_HOSTNAME": "launcher_hostname",
+    "PMIX_NAMESPACE": "prterun-<hostname>-<launcher_pid>@1",
+    "PMIX_RANK": "global_rank",
+    "PMIX_SERVER_TMPDIR": "/tmp/ompi.<launcher_pid>",
+    "PMIX_SERVER_URI21": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI2": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI3": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI41": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI4": "shared_namespace_tcp4_loopback_uri",
+    "PWD": "state_dir",
+}
+RANK_URI_ENVIRONMENT_KEYS = (
+    "PMIX_SERVER_URI21", "PMIX_SERVER_URI2", "PMIX_SERVER_URI3",
+    "PMIX_SERVER_URI41", "PMIX_SERVER_URI4",
+)
+MCA_CONFIGURATION_LAYOUT = (
+    ("home", "openmpi", ".openmpi/mca-params.conf"),
+    ("home", "prte", ".prte/mca-params.conf"),
+    ("home", "pmix", ".pmix/mca-params.conf"),
+    ("prefix", "openmpi", "etc/openmpi-mca-params.conf"),
+    ("prefix", "prte", "etc/prte-mca-params.conf"),
+    ("prefix", "pmix", "etc/pmix-mca-params.conf"),
+)
 GIT_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -721,7 +783,8 @@ def _canonical_launch_environment(value: Any) -> dict[str, str]:
     projection = value.get("rank_projection")
     _require(isinstance(projection, dict) and
              set(projection) == {
-                 "kind", "inherited_values", "consumed_absent", "sha256",
+                 "kind", "inherited_values", "consumed_absent", "exact_keys",
+                 "fixed_values", "derived_values", "sha256",
              } and
              projection.get("kind") == RANK_ENVIRONMENT_PROJECTION_KIND,
              "rank environment projection kind is not canonical")
@@ -730,6 +793,9 @@ def _canonical_launch_environment(value: Any) -> dict[str, str]:
             key: canonical[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
         },
         "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
+        "exact_keys": list(RANK_ENVIRONMENT_KEYS),
+        "fixed_values": dict(RANK_FIXED_ENVIRONMENT_VALUES),
+        "derived_values": dict(RANK_DERIVED_ENVIRONMENT_VALUES),
     }
     _require(projection.get("inherited_values") ==
              projection_payload["inherited_values"] and
@@ -741,11 +807,227 @@ def _canonical_launch_environment(value: Any) -> dict[str, str]:
     return canonical
 
 
+def _snapshot_mca_configuration_file(scope: str, project: str,
+                                     path: Path) -> dict[str, Any]:
+    """Checker-owned re-observation of one default MCA parameter path."""
+
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+    except FileNotFoundError:
+        _require(not os.path.lexists(absolute),
+                 f"MCA configuration path is not safely absent: {absolute}")
+        return {
+            "scope": scope, "project": project,
+            "path": str(absolute), "state": "absent",
+        }
+    except OSError as exc:
+        raise CheckFailure(f"cannot inspect MCA configuration {absolute}: {exc}") \
+            from exc
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as exc:
+        raise CheckFailure(f"cannot resolve MCA configuration {absolute}: {exc}") \
+            from exc
+    mode = stat.S_IMODE(info.st_mode)
+    _require(resolved == absolute and not stat.S_ISLNK(info.st_mode) and
+             stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.geteuid()) and
+             not (mode & 0o022),
+             f"MCA configuration is not canonical, regular, safely owned/mode: "
+             f"{absolute}")
+    try:
+        binding = stable_sha256(absolute)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise CheckFailure(f"cannot audit MCA configuration {absolute}: {exc}") \
+            from exc
+    return {
+        "scope": scope, "project": project, "path": str(absolute),
+        "state": "present", "device": binding["device"],
+        "inode": binding["inode"], "owner_uid": info.st_uid,
+        "mode": f"{mode:04o}", "size": binding["size"],
+        "mtime_ns": binding["mtime_ns"], "ctime_ns": binding["ctime_ns"],
+        "sha256": binding["sha256"],
+        "closure_check": binding["closure_check"],
+    }
+
+
+def _snapshot_mca_prefix_directory(path: Path) -> dict[str, Any]:
+    absolute = path.absolute()
+    try:
+        resolved = absolute.resolve(strict=True)
+        info = absolute.lstat()
+    except OSError as exc:
+        raise CheckFailure(f"cannot bind MCA prefix {absolute}: {exc}") from exc
+    mode = stat.S_IMODE(info.st_mode)
+    _require(resolved == absolute and not stat.S_ISLNK(info.st_mode) and
+             stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.geteuid()) and
+             not (mode & 0o022),
+             "MCA prefix must be canonical, non-symlink, safely owned/mode")
+    return {
+        "path": str(absolute), "device": info.st_dev, "inode": info.st_ino,
+        "owner_uid": info.st_uid, "mode": f"{mode:04o}",
+    }
+
+
+def _audit_mca_configuration(value: Any, home: str) -> dict[str, Any]:
+    _validate_mca_configuration_contract(value, home)
+    _require(isinstance(value, dict) and
+             set(value) == {"kind", "home", "prefix", "prefix_directory",
+                            "files", "sha256"} and
+             value.get("kind") == MCA_CONFIGURATION_KIND,
+             f"MCA configuration contract must be {MCA_CONFIGURATION_KIND}")
+    prefix_directory = _snapshot_mca_prefix_directory(Path(value["prefix"]))
+    prefix = Path(prefix_directory["path"])
+    _require(value.get("home") == home and
+             value.get("prefix_directory") == prefix_directory,
+             "MCA configuration HOME/prefix directory differs from plan")
+    planned_files = value.get("files")
+    _require(isinstance(planned_files, list) and
+             len(planned_files) == len(MCA_CONFIGURATION_LAYOUT),
+             "MCA configuration file set is not exact")
+    current_files: list[dict[str, Any]] = []
+    for index, (scope, project, relative) in enumerate(MCA_CONFIGURATION_LAYOUT):
+        expected_path = (Path(home) if scope == "home" else prefix) / relative
+        current = _snapshot_mca_configuration_file(scope, project, expected_path)
+        _require(planned_files[index] == current,
+                 f"MCA configuration {expected_path} differs from immutable plan")
+        current_files.append(current)
+    payload = {
+        "kind": MCA_CONFIGURATION_KIND,
+        "home": home, "prefix": str(prefix),
+        "prefix_directory": prefix_directory, "files": current_files,
+    }
+    _require(value.get("sha256") == _canonical_json_sha256(payload),
+             "MCA configuration contract SHA-256 is not canonical")
+    return {**payload, "sha256": value["sha256"]}
+
+
+def _validate_mca_configuration_contract(value: Any,
+                                         home: str) -> dict[str, Any]:
+    """Validate the immutable six-path contract without trusting live files."""
+
+    _require(isinstance(value, dict) and
+             set(value) == {"kind", "home", "prefix", "prefix_directory",
+                            "files", "sha256"} and
+             value.get("kind") == MCA_CONFIGURATION_KIND,
+             f"MCA configuration contract must be {MCA_CONFIGURATION_KIND}")
+    prefix_value = value.get("prefix")
+    prefix_directory = value.get("prefix_directory")
+    _require(isinstance(prefix_value, str) and Path(prefix_value).is_absolute() and
+             isinstance(prefix_directory, dict) and
+             set(prefix_directory) == {
+                 "path", "device", "inode", "owner_uid", "mode",
+             } and prefix_directory.get("path") == prefix_value and
+             all(isinstance(prefix_directory.get(name), int) and
+                 prefix_directory[name] >= 0
+                 for name in ("device", "inode", "owner_uid")) and
+             prefix_directory["owner_uid"] in (0, os.geteuid()) and
+             isinstance(prefix_directory.get("mode"), str) and
+             re.fullmatch(r"0[0-7]{3}", prefix_directory["mode"]) is not None and
+             not (int(prefix_directory["mode"], 8) & 0o022) and
+             value.get("home") == home,
+             "MCA configuration HOME/prefix directory contract is invalid")
+    prefix = Path(prefix_value)
+    files = value.get("files")
+    _require(isinstance(files, list) and len(files) == len(MCA_CONFIGURATION_LAYOUT),
+             "MCA configuration file set is not exact")
+    for index, (scope, project, relative) in enumerate(MCA_CONFIGURATION_LAYOUT):
+        record = files[index]
+        expected_path = (Path(home) if scope == "home" else prefix) / relative
+        _require(isinstance(record, dict) and
+                 record.get("scope") == scope and
+                 record.get("project") == project and
+                 record.get("path") == str(expected_path) and
+                 record.get("state") in ("absent", "present"),
+                 f"MCA configuration record {index} is not canonical")
+        if record.get("state") == "absent":
+            _require(set(record) == {"scope", "project", "path", "state"},
+                     f"absent MCA configuration record {index} is not exact")
+        else:
+            _require(set(record) == {
+                "scope", "project", "path", "state", "device", "inode",
+                "owner_uid", "mode", "size", "mtime_ns", "ctime_ns", "sha256",
+                "closure_check",
+            } and all(isinstance(record[name], int) and record[name] >= 0
+                      for name in ("device", "inode", "owner_uid", "size",
+                                   "mtime_ns", "ctime_ns")) and
+                     record["owner_uid"] in (0, os.geteuid()) and
+                     isinstance(record["mode"], str) and
+                     re.fullmatch(r"0[0-7]{3}", record["mode"]) is not None and
+                     not (int(record["mode"], 8) & 0o022) and
+                     isinstance(record["sha256"], str) and
+                     re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None and
+                     record["closure_check"] == "linux_proc_fd",
+                     f"present MCA configuration record {index} is not exact/safe")
+    payload = {
+        "kind": MCA_CONFIGURATION_KIND, "home": home,
+        "prefix": str(prefix), "prefix_directory": prefix_directory,
+        "files": files,
+    }
+    _require(value.get("sha256") == _canonical_json_sha256(payload),
+             "MCA configuration contract SHA-256 is not canonical")
+    return value
+
+
 def _wall_time_token(seconds: int) -> str:
     _require(seconds > 0, "launch wall time must be positive")
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds_part = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds_part:02d}"
+
+
+def _validate_rank_environment(value: Any, *, global_rank: int,
+                               local_rank: int, world_size: int,
+                               launcher_pid: int, hostname: str,
+                               state_dir: str,
+                               athena_argv: Sequence[str]) -> dict[str, str]:
+    """Independently re-derive the complete observed 5.0.9 rank environment."""
+
+    _require(isinstance(value, dict) and
+             all(isinstance(key, str) and isinstance(item, str)
+                 for key, item in value.items()),
+             f"launch rank {global_rank} environment is not a string mapping")
+    actual_keys = set(value)
+    expected_keys = set(RANK_ENVIRONMENT_KEYS)
+    _require(actual_keys == expected_keys,
+             f"launch rank {global_rank} environment key closure differs: "
+             f"missing={sorted(expected_keys - actual_keys)!r}, "
+             f"unexpected={sorted(actual_keys - expected_keys)!r}")
+    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    inherited = {
+        "HOME": str(Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)),
+        "LANG": "C", "LC_ALL": "C", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    }
+    expected = {
+        **inherited, **RANK_FIXED_ENVIRONMENT_VALUES,
+        "OMPI_COMMAND": str(athena_argv[0]),
+        "OMPI_ARGV": " ".join(athena_argv[1:]),
+        "OMPI_COMM_WORLD_RANK": str(global_rank),
+        "OMPI_COMM_WORLD_SIZE": str(world_size),
+        "OMPI_COMM_WORLD_LOCAL_RANK": str(local_rank),
+        "OMPI_COMM_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_COMM_WORLD_NODE_RANK": str(local_rank),
+        "OMPI_FILE_LOCATION": f"/tmp/ompi.{launcher_pid}/1/{global_rank}",
+        "OMPI_MCA_initial_wdir": state_dir,
+        "OMPI_MCA_num_procs": str(world_size),
+        "OMPI_WORLD_LOCAL_SIZE": str(world_size),
+        "OMPI_WORLD_SIZE": str(world_size), "PMIX_HOSTNAME": hostname,
+        "PMIX_NAMESPACE": namespace, "PMIX_RANK": str(global_rank),
+        "PMIX_SERVER_TMPDIR": f"/tmp/ompi.{launcher_pid}", "PWD": state_dir,
+    }
+    for key, expected_value in expected.items():
+        _require(value.get(key) == expected_value,
+                 f"launch rank {global_rank} environment {key} differs from "
+                 "derived contract")
+    uri_values = {value[key] for key in RANK_URI_ENVIRONMENT_KEYS}
+    _require(len(uri_values) == 1,
+             f"launch rank {global_rank} PMIx server URI aliases differ")
+    uri = next(iter(uri_values))
+    match = re.fullmatch(
+        rf"{re.escape(namespace)}@0\.0;tcp4://127\.0\.0\.1:(\d+)", uri)
+    _require(match is not None and 1 <= int(match.group(1)) <= 65535,
+             f"launch rank {global_rank} PMIx server URI is invalid")
+    return {key: value[key] for key in RANK_ENVIRONMENT_KEYS}
 
 
 def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
@@ -903,6 +1185,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
              "launch_contract.plan_path must be the canonical direct evidence plan")
     launch_environment = _canonical_launch_environment(
         launch_contract.get("environment"))
+    _validate_mca_configuration_contract(
+        launch_contract.get("mca_configuration"), launch_environment["HOME"])
     directory_transport = launch_contract.get("directory_transport")
     _require(isinstance(directory_transport, dict) and
              set(directory_transport) == {"kind", "holder_pid_token", "roles"} and
@@ -1850,15 +2134,11 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
                  rank.get("cmdline") == athena_argv and
                  _same_file_content(rank.get("executable"), inputs["binary"]),
                  f"launch record rank {global_rank} process/GPU proof is invalid")
-        _require(environment == {
-            "OMPI_COMM_WORLD_RANK": str(global_rank),
-            "OMPI_COMM_WORLD_SIZE": str(world_size),
-            "OMPI_COMM_WORLD_LOCAL_RANK": str(local_rank),
-            "OMPI_COMM_WORLD_LOCAL_SIZE": str(world_size),
-            **launch_contract["environment"]["rank_projection"]
-            ["inherited_values"],
-        },
-                 f"launch record rank {global_rank} MPI environment proof is invalid")
+        _validate_rank_environment(
+            environment, global_rank=global_rank, local_rank=local_rank,
+            world_size=world_size, launcher_pid=mpirun_pid, hostname=hostname,
+            state_dir=str(state_dir.resolve(strict=True)),
+            athena_argv=athena_argv)
         seen_pids.add(pid)
         seen_uuids.add(rank["gpu_uuid"])
         seen_local_ranks.add(local_rank)
@@ -1866,6 +2146,9 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
              "launch record local MPI ranks are not exactly 0..world_size-1")
     _require(seen_uuids == {device["uuid"] for device in devices},
              "launch record rank GPU contexts do not cover the planned inventory")
+    _require(len({rank["mpi_environment"]["PMIX_SERVER_URI21"]
+                  for rank in ranks}) == 1,
+             "launch record ranks do not share one PMIx server URI")
     _require(record.get("gpu_mapping_basis") ==
              "kokkos_mpi_rank_token_plus_ompi_local_rank_plus_"
              "nvidia_compute_context_uuid",
@@ -1890,6 +2173,18 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
              _canonical_launch_environment(launch_environment) ==
              launch_contract["environment"]["values"],
              "launch environment evidence differs from the exact plan contract")
+    mca_contract = launch_contract.get("mca_configuration")
+    mca_current = _audit_mca_configuration(
+        mca_contract, launch_contract["environment"]["values"]["HOME"])
+    _require(record.get("mca_configuration_contract") == mca_contract,
+             "launch MCA configuration contract differs from the plan")
+    mca_evidence = record.get("mca_configuration")
+    _require(isinstance(mca_evidence, dict) and
+             set(mca_evidence) == {"preflight", "before_spawn", "at_rank_proof"}
+             and all(mca_evidence[stage] == mca_contract
+                     for stage in ("preflight", "before_spawn", "at_rank_proof"))
+             and mca_current == mca_contract,
+             "launch MCA configuration snapshots do not close the plan binding")
     execution_tools_at_launch = record.get("execution_tools_at_launch")
     _require(isinstance(execution_tools_at_launch, dict) and
              set(execution_tools_at_launch) == {

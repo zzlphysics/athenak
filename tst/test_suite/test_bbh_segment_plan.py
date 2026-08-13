@@ -236,6 +236,8 @@ def _campaign(tmp_path: Path, **restart_options: object) -> dict[str, Path]:
     staging_dir.mkdir()
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
+    mca_prefix = tmp_path / "openmpi-prefix"
+    mca_prefix.mkdir()
     return {
         "repo": repo,
         "binary": binary,
@@ -247,6 +249,7 @@ def _campaign(tmp_path: Path, **restart_options: object) -> dict[str, Path]:
         "state_dir": state_dir,
         "staging_dir": staging_dir,
         "evidence_dir": evidence_dir,
+        "mca_prefix": mca_prefix,
         "output": evidence_dir / "segment.plan.json",
     }
 
@@ -275,6 +278,7 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         "--tlim-guard-steps", values["guard_steps"],
         "--ranks", values["ranks"],
         "--launcher", str(campaign["launcher"]),
+        "--mca-prefix", str(campaign["mca_prefix"]),
         "--state-dir", str(campaign["state_dir"]),
         "--staging-dir", str(campaign["staging_dir"]),
         "--evidence-dir", str(campaign["evidence_dir"]),
@@ -418,7 +422,7 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         },
     }
     environment = plan["launch_contract"]["environment"]
-    assert environment["kind"] == "explicit_values_with_rank_projection_v2"
+    assert environment["kind"] == "explicit_values_with_rank_projection_v3"
     assert environment["values"]["LANG"] == environment["values"]["LC_ALL"] == "C"
     assert environment["values"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
     assert environment["values"]["PRTE_MCA_schizo_proxy"] == "ompi"
@@ -426,17 +430,42 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         environment["values"], sort_keys=True, separators=(",", ":"),
         ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
     projection = environment["rank_projection"]
-    assert projection["kind"] == "prrte_consumed_projection_v1"
+    assert projection["kind"] == \
+        "prrte_openmpi_pmix_single_node_projection_v2"
     assert projection["inherited_values"] == {
         key: environment["values"][key]
         for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
     }
     assert projection["consumed_absent"] == ["PRTE_MCA_schizo_proxy"]
+    assert len(projection["exact_keys"]) == 39
+    assert set(projection["exact_keys"]) >= {
+        "OMPI_ARGV", "OMPI_COMMAND", "PMIX_NAMESPACE",
+        "PMIX_SERVER_URI41", "PRTE_LAUNCHED", "PRTE_SHARED_FS",
+    }
+    assert projection["fixed_values"]["PMIX_VERSION"] == "5.0.9a1"
+    assert projection["fixed_values"]["OMPI_UNIVERSE_SIZE"] == "32"
+    assert projection["derived_values"]["OMPI_ARGV"] == \
+        "space_join(athena_argv[1:])"
     assert projection["sha256"] == hashlib.sha256(json.dumps({
         "inherited_values": projection["inherited_values"],
         "consumed_absent": projection["consumed_absent"],
+        "exact_keys": projection["exact_keys"],
+        "fixed_values": projection["fixed_values"],
+        "derived_values": projection["derived_values"],
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         allow_nan=False).encode("utf-8")).hexdigest()
+    mca = plan["launch_contract"]["mca_configuration"]
+    assert mca["kind"] == "openmpi_prrte_pmix_default_files_v1"
+    assert mca["home"] == environment["values"]["HOME"]
+    assert mca["prefix"] == str(campaign["mca_prefix"].resolve())
+    assert mca["prefix_directory"]["path"] == mca["prefix"]
+    assert [(item["scope"], item["project"], item["state"])
+            for item in mca["files"]] == [
+        (scope, project, "absent") for scope, project in (
+            ("home", "openmpi"), ("home", "prte"), ("home", "pmix"),
+            ("prefix", "openmpi"), ("prefix", "prte"), ("prefix", "pmix"),
+        )
+    ]
     assert plan["tools"]["nvidia_smi"]["path"] == str(
         campaign["nvidia_smi"].resolve())
     assert plan["policy"]["endpoint_time_ulp_tolerance"] == 0
@@ -483,6 +512,28 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
         "effective_bbh_4pn_V100Q"
     )
     assert campaign["output"].stat().st_mode & 0o222 == 0
+
+
+def test_plan_binds_present_prefix_mca_file_content_identity(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    config = campaign["mca_prefix"] / "etc" / "openmpi-mca-params.conf"
+    config.parent.mkdir()
+    config.write_text("btl = self,vader,tcp\n", encoding="ascii")
+    config.chmod(0o644)
+
+    result = _run(campaign)
+
+    assert result.returncode == 0, result.stderr
+    contract = json.loads(campaign["output"].read_text(
+        encoding="utf-8"))["launch_contract"]["mca_configuration"]
+    record = next(item for item in contract["files"]
+                  if item["scope"] == "prefix" and
+                  item["project"] == "openmpi")
+    assert record["state"] == "present"
+    assert record["path"] == str(config.resolve())
+    assert record["mode"] == "0644"
+    assert record["size"] == len(config.read_bytes())
+    assert record["sha256"] == hashlib.sha256(config.read_bytes()).hexdigest()
 
 
 def test_plan_binds_only_a_strict_capacity_increase(tmp_path: Path) -> None:

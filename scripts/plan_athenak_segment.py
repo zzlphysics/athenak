@@ -70,12 +70,77 @@ DISK_PREFLIGHT_FORMULA = (
     "max(minimum_reserve_bytes,minimum_reserve_restart_multiples*"
     "source_restart_size_bytes)+sum(role_contribution_bytes))"
 )
-LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v2"
-RANK_ENVIRONMENT_PROJECTION_KIND = "prrte_consumed_projection_v1"
+LAUNCH_ENVIRONMENT_KIND = "explicit_values_with_rank_projection_v3"
+RANK_ENVIRONMENT_PROJECTION_KIND = \
+    "prrte_openmpi_pmix_single_node_projection_v2"
+MCA_CONFIGURATION_KIND = "openmpi_prrte_pmix_default_files_v1"
 RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS = (
     "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
 )
 RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS = ("PRTE_MCA_schizo_proxy",)
+RANK_ENVIRONMENT_KEYS = (
+    "HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER",
+    "OMPI_ARGV", "OMPI_COMMAND",
+    "OMPI_COMM_WORLD_LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "OMPI_COMM_WORLD_NODE_RANK", "OMPI_COMM_WORLD_RANK",
+    "OMPI_COMM_WORLD_SIZE", "OMPI_FILE_LOCATION",
+    "OMPI_MCA_cpu_type", "OMPI_MCA_initial_wdir", "OMPI_MCA_num_procs",
+    "OMPI_NUM_APP_CTX", "OMPI_UNIVERSE_SIZE", "OMPI_WORLD_LOCAL_SIZE",
+    "OMPI_WORLD_SIZE", "PMIX_BFROP_BUFFER_TYPE", "PMIX_GDS_MODULE",
+    "PMIX_HOSTNAME", "PMIX_NAMESPACE", "PMIX_PARAM_FILE_PASSED",
+    "PMIX_RANK", "PMIX_SECURITY_MODE", "PMIX_SERVER_TMPDIR",
+    "PMIX_SERVER_URI21", "PMIX_SERVER_URI2", "PMIX_SERVER_URI3",
+    "PMIX_SERVER_URI41", "PMIX_SERVER_URI4", "PMIX_SYSTEM_TMPDIR",
+    "PMIX_VERSION", "PRTE_LAUNCHED", "PRTE_SHARED_FS",
+    "OPAL_USER_PARAMS_GIVEN", "PWD", "ZES_ENABLE_SYSMAN",
+)
+RANK_FIXED_ENVIRONMENT_VALUES = {
+    "OMPI_MCA_cpu_type": "x86_64",
+    "OMPI_NUM_APP_CTX": "1",
+    "OMPI_UNIVERSE_SIZE": "32",
+    "PMIX_BFROP_BUFFER_TYPE": "PMIX_BFROP_BUFFER_NON_DESC",
+    "PMIX_GDS_MODULE": "shmem2,hash",
+    "PMIX_PARAM_FILE_PASSED": "1",
+    "PMIX_SECURITY_MODE": "native",
+    "PMIX_SYSTEM_TMPDIR": "/tmp",
+    "PMIX_VERSION": "5.0.9a1",
+    "PRTE_LAUNCHED": "1",
+    "PRTE_SHARED_FS": "FALSE",
+    "OPAL_USER_PARAMS_GIVEN": "1",
+    "ZES_ENABLE_SYSMAN": "1",
+}
+RANK_DERIVED_ENVIRONMENT_VALUES = {
+    "OMPI_COMMAND": "athena_argv[0]",
+    "OMPI_ARGV": "space_join(athena_argv[1:])",
+    "OMPI_COMM_WORLD_RANK": "global_rank",
+    "OMPI_COMM_WORLD_SIZE": "world_size",
+    "OMPI_COMM_WORLD_LOCAL_RANK": "local_rank",
+    "OMPI_COMM_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_COMM_WORLD_NODE_RANK": "local_rank_single_node",
+    "OMPI_FILE_LOCATION": "/tmp/ompi.<launcher_pid>/1/<global_rank>",
+    "OMPI_MCA_initial_wdir": "state_dir",
+    "OMPI_MCA_num_procs": "world_size",
+    "OMPI_WORLD_LOCAL_SIZE": "world_size_single_node",
+    "OMPI_WORLD_SIZE": "world_size",
+    "PMIX_HOSTNAME": "launcher_hostname",
+    "PMIX_NAMESPACE": "prterun-<hostname>-<launcher_pid>@1",
+    "PMIX_RANK": "global_rank",
+    "PMIX_SERVER_TMPDIR": "/tmp/ompi.<launcher_pid>",
+    "PMIX_SERVER_URI21": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI2": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI3": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI41": "shared_namespace_tcp4_loopback_uri",
+    "PMIX_SERVER_URI4": "shared_namespace_tcp4_loopback_uri",
+    "PWD": "state_dir",
+}
+MCA_CONFIGURATION_LAYOUT = (
+    ("home", "openmpi", ".openmpi/mca-params.conf"),
+    ("home", "prte", ".prte/mca-params.conf"),
+    ("home", "pmix", ".pmix/mca-params.conf"),
+    ("prefix", "openmpi", "etc/openmpi-mca-params.conf"),
+    ("prefix", "prte", "etc/prte-mca-params.conf"),
+    ("prefix", "pmix", "etc/pmix-mca-params.conf"),
+)
 PREFIX_RECOVERY_POLICY = {
     "kind": "scheduled_prefix_recovery_v1",
     "candidate_kind": "original_plan_scheduled_restart_only",
@@ -207,6 +272,9 @@ def _launch_environment() -> dict[str, Any]:
             key: values[key] for key in RANK_INHERITED_LAUNCH_ENVIRONMENT_KEYS
         },
         "consumed_absent": list(RANK_CONSUMED_LAUNCH_ENVIRONMENT_KEYS),
+        "exact_keys": list(RANK_ENVIRONMENT_KEYS),
+        "fixed_values": dict(RANK_FIXED_ENVIRONMENT_VALUES),
+        "derived_values": dict(RANK_DERIVED_ENVIRONMENT_VALUES),
     }
     return {
         "kind": LAUNCH_ENVIRONMENT_KIND,
@@ -218,6 +286,96 @@ def _launch_environment() -> dict[str, Any]:
             "sha256": _canonical_sha256(rank_projection_payload),
         },
     }
+
+
+def _mca_configuration_file(scope: str, project: str,
+                            path: Path) -> dict[str, Any]:
+    """Bind one default MCA parameter path, including proven absence."""
+
+    absolute = path.absolute()
+    try:
+        info = absolute.lstat()
+    except FileNotFoundError:
+        if os.path.lexists(absolute):
+            raise ValueError(f"MCA configuration path is not safely absent: {absolute}")
+        return {
+            "scope": scope, "project": project,
+            "path": str(absolute), "state": "absent",
+        }
+    except OSError as exc:
+        raise ValueError(f"cannot inspect MCA configuration {absolute}: {exc}") \
+            from exc
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve MCA configuration {absolute}: {exc}") \
+            from exc
+    mode = stat.S_IMODE(info.st_mode)
+    if (resolved != absolute or stat.S_ISLNK(info.st_mode) or
+            not stat.S_ISREG(info.st_mode) or
+            info.st_uid not in (0, os.geteuid()) or mode & 0o022):
+        raise ValueError(
+            f"MCA configuration must be canonical, regular, root/launcher-owned, "
+            f"and not group/other writable: {absolute}")
+    try:
+        binding = stable_sha256(absolute)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"cannot bind MCA configuration {absolute}: {exc}") from exc
+    return {
+        "scope": scope, "project": project, "path": str(absolute),
+        "state": "present", "device": binding["device"],
+        "inode": binding["inode"], "owner_uid": info.st_uid,
+        "mode": f"{mode:04o}", "size": binding["size"],
+        "mtime_ns": binding["mtime_ns"], "ctime_ns": binding["ctime_ns"],
+        "sha256": binding["sha256"],
+        "closure_check": binding["closure_check"],
+    }
+
+
+def _mca_prefix_directory(path: Path) -> dict[str, Any]:
+    """Bind the explicit Open MPI installation prefix without symlink traversal."""
+
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        raise ValueError("--mca-prefix must be absolute")
+    absolute = expanded.absolute()
+    try:
+        resolved = absolute.resolve(strict=True)
+        info = absolute.lstat()
+    except OSError as exc:
+        raise ValueError(f"cannot bind --mca-prefix {absolute}: {exc}") from exc
+    mode = stat.S_IMODE(info.st_mode)
+    if (resolved != absolute or stat.S_ISLNK(info.st_mode) or
+            not stat.S_ISDIR(info.st_mode) or
+            info.st_uid not in (0, os.geteuid()) or mode & 0o022):
+        raise ValueError(
+            "--mca-prefix must be canonical, non-symlink, root/launcher-owned, "
+            "and not group/other writable")
+    return {
+        "path": str(absolute), "device": info.st_dev, "inode": info.st_ino,
+        "owner_uid": info.st_uid, "mode": f"{mode:04o}",
+    }
+
+
+def _mca_configuration(home: str, prefix_path: Path) -> dict[str, Any]:
+    """Bind the Open MPI 5 default HOME and installation-prefix MCA files."""
+
+    home_path = Path(home)
+    prefix_directory = _mca_prefix_directory(prefix_path)
+    prefix = Path(prefix_directory["path"])
+    files = [
+        _mca_configuration_file(
+            scope, project,
+            (home_path if scope == "home" else prefix) / relative,
+        )
+        for scope, project, relative in MCA_CONFIGURATION_LAYOUT
+    ]
+    payload = {
+        "kind": MCA_CONFIGURATION_KIND,
+        "home": str(home_path), "prefix": str(prefix),
+        "prefix_directory": prefix_directory, "files": files,
+    }
+    return {**payload, "sha256": _canonical_sha256(payload)}
 
 
 def _strict_false(parameters: dict[str, dict[str, str]], block: str, key: str) -> None:
@@ -1240,6 +1398,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_before": str(evidence_dir / "gpu-before.csv"),
         "gpu_after": str(evidence_dir / "gpu-after.csv"),
     }
+    launch_environment = _launch_environment()
 
     return {
         "schema": SCHEMA_VERSION,
@@ -1296,7 +1455,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "athena_argv_template": athena_argv_template,
             "state_dir": str(state_dir),
             "plan_path": str(plan_path),
-            "environment": _launch_environment(),
+            "environment": launch_environment,
+            "mca_configuration": _mca_configuration(
+                launch_environment["values"]["HOME"], args.mca_prefix),
             "directory_transport": {
                 "kind": "linux_proc_holder_dirfd_v1",
                 "holder_pid_token": holder_pid_token,
@@ -1410,6 +1571,10 @@ def main() -> int:
               "preserve the source capacity (maximum: 16384)"),
     )
     parser.add_argument("--launcher", required=True, type=Path)
+    parser.add_argument(
+        "--mca-prefix", required=True, type=Path, action=_StoreOnce,
+        help="canonical Open MPI installation prefix used by PRRTE/PMIx",
+    )
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--staging-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)

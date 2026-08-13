@@ -67,6 +67,23 @@ def _record(path: Path) -> dict[str, Any]:
     }
 
 
+def _mca_contract(home: str, prefix: Path) -> dict[str, Any]:
+    prefix_directory = LAUNCHER._snapshot_mca_prefix_directory(prefix)
+    prefix = Path(prefix_directory["path"])
+    files = [
+        LAUNCHER._snapshot_mca_configuration_file(
+            scope, project,
+            (Path(home) if scope == "home" else prefix) / relative)
+        for scope, project, relative in LAUNCHER.MCA_CONFIGURATION_LAYOUT
+    ]
+    payload = {
+        "kind": LAUNCHER.MCA_CONFIGURATION_KIND,
+        "home": home, "prefix": str(prefix),
+        "prefix_directory": prefix_directory, "files": files,
+    }
+    return {**payload, "sha256": LAUNCHER._canonical_sha256(payload)}
+
+
 def _ample_statvfs(_target: Any) -> Any:
     return SimpleNamespace(
         f_frsize=1 << 30, f_blocks=1000, f_bfree=900, f_bavail=900)
@@ -181,6 +198,8 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
     staging.mkdir(mode=0o700)
     evidence = tmp_path / "evidence"
     evidence.mkdir(mode=0o700)
+    mca_prefix = tmp_path / "openmpi-prefix"
+    mca_prefix.mkdir()
     staged_source = staging / "source.rst"
     staged_trajectory = staging / "trajectory.dat"
     source_record = _record(source)
@@ -226,6 +245,9 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
             for key in ("HOME", "LANG", "LC_ALL", "CUDA_DEVICE_ORDER")
         },
         "consumed_absent": ["PRTE_MCA_schizo_proxy"],
+        "exact_keys": list(LAUNCHER.RANK_ENVIRONMENT_KEYS),
+        "fixed_values": dict(LAUNCHER.RANK_FIXED_ENVIRONMENT_VALUES),
+        "derived_values": dict(LAUNCHER.RANK_DERIVED_ENVIRONMENT_VALUES),
     }
     plan = {
         "schema": 1,
@@ -290,16 +312,18 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
             "evidence_dir": str(evidence.resolve()),
             "evidence": evidence_paths,
             "environment": {
-                "kind": "explicit_values_with_rank_projection_v2",
+                "kind": LAUNCHER.LAUNCH_ENVIRONMENT_KIND,
                 "values": launch_environment,
                 "sha256": LAUNCHER._canonical_sha256(launch_environment),
                 "rank_projection": {
-                    "kind": "prrte_consumed_projection_v1",
+                    "kind": LAUNCHER.RANK_ENVIRONMENT_PROJECTION_KIND,
                     **rank_projection_payload,
                     "sha256": LAUNCHER._canonical_sha256(
                         rank_projection_payload),
                 },
             },
+            "mca_configuration": _mca_contract(
+                launch_environment["HOME"], mca_prefix),
             "directory_transport": {
                 "kind": "linux_proc_holder_dirfd_v1",
                 "holder_pid_token": holder,
@@ -383,6 +407,7 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
         "staging": staging, "staged_source": staged_source,
         "staged_trajectory": staged_trajectory,
         "evidence": evidence,
+        "mca_prefix": mca_prefix,
         "plan": plan, "plan_path": plan_path, "run": fake_run,
         "runtime": runtime,
     }
@@ -437,6 +462,9 @@ def test_prepare_derives_only_the_canonical_token_arrays(tmp_path: Path) -> None
     )
     assert prepared.launch_argv == prepared.mpi_argv + prepared.athena_argv
     assert [gpu.uuid for gpu in prepared.gpus] == ["GPU-0", "GPU-1"]
+    assert prepared.plan["launch_contract"]["mca_configuration"]["prefix"] == \
+        str(campaign["mca_prefix"].resolve())
+    assert campaign["mpirun"].parent != campaign["mca_prefix"] / "bin"
     assert prepared.staged_source_restart["path"] == str(
         campaign["staged_source"].resolve())
     assert campaign["staged_source"].read_bytes() == campaign["source"].read_bytes()
@@ -1032,6 +1060,42 @@ class FakeProcess:
         self.fake_run.launched = False
 
 
+def _rank_environment(prepared: Any, rank: int, *, launcher_pid: int = 500,
+                      hostname: str = "v100-node", port: int = 43210) \
+        -> dict[str, str]:
+    namespace = f"prterun-{hostname}-{launcher_pid}@1"
+    uri = f"{namespace}@0.0;tcp4://127.0.0.1:{port}"
+    state = str(prepared.state_dir)
+    return {
+        "HOME": prepared.launch_environment["HOME"],
+        "LANG": "C", "LC_ALL": "C", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "OMPI_ARGV": " ".join(prepared.athena_argv[1:]),
+        "OMPI_COMMAND": prepared.athena_argv[0],
+        "OMPI_COMM_WORLD_LOCAL_RANK": str(rank),
+        "OMPI_COMM_WORLD_LOCAL_SIZE": str(prepared.world_size),
+        "OMPI_COMM_WORLD_NODE_RANK": str(rank),
+        "OMPI_COMM_WORLD_RANK": str(rank),
+        "OMPI_COMM_WORLD_SIZE": str(prepared.world_size),
+        "OMPI_FILE_LOCATION": f"/tmp/ompi.{launcher_pid}/1/{rank}",
+        "OMPI_MCA_cpu_type": "x86_64", "OMPI_MCA_initial_wdir": state,
+        "OMPI_MCA_num_procs": str(prepared.world_size),
+        "OMPI_NUM_APP_CTX": "1", "OMPI_UNIVERSE_SIZE": "32",
+        "OMPI_WORLD_LOCAL_SIZE": str(prepared.world_size),
+        "OMPI_WORLD_SIZE": str(prepared.world_size),
+        "PMIX_BFROP_BUFFER_TYPE": "PMIX_BFROP_BUFFER_NON_DESC",
+        "PMIX_GDS_MODULE": "shmem2,hash", "PMIX_HOSTNAME": hostname,
+        "PMIX_NAMESPACE": namespace, "PMIX_PARAM_FILE_PASSED": "1",
+        "PMIX_RANK": str(rank), "PMIX_SECURITY_MODE": "native",
+        "PMIX_SERVER_TMPDIR": f"/tmp/ompi.{launcher_pid}",
+        "PMIX_SERVER_URI21": uri, "PMIX_SERVER_URI2": uri,
+        "PMIX_SERVER_URI3": uri, "PMIX_SERVER_URI41": uri,
+        "PMIX_SERVER_URI4": uri, "PMIX_SYSTEM_TMPDIR": "/tmp",
+        "PMIX_VERSION": "5.0.9a1", "PRTE_LAUNCHED": "1",
+        "PRTE_SHARED_FS": "FALSE", "OPAL_USER_PARAMS_GIVEN": "1",
+        "PWD": state, "ZES_ENABLE_SYSMAN": "1",
+    }
+
+
 class FakeInspector:
     def __init__(self, prepared, fake_run: FakeRun,
                  *, bad_cmdline: bool = False,
@@ -1057,16 +1121,7 @@ class FakeInspector:
 
     def environment(self, pid: int) -> dict[str, str]:
         index = self.fake_run.rank_pids.index(pid)
-        result = {
-            "OMPI_COMM_WORLD_RANK": str(index),
-            "OMPI_COMM_WORLD_SIZE": str(self.prepared.world_size),
-            "OMPI_COMM_WORLD_LOCAL_RANK": str(index),
-            "OMPI_COMM_WORLD_LOCAL_SIZE": str(self.prepared.world_size),
-            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "HOME": self.prepared.launch_environment["HOME"],
-            "LANG": "C",
-            "LC_ALL": "C",
-        }
+        result = _rank_environment(self.prepared, index)
         if self.gpu_visibility is not None:
             result["CUDA_VISIBLE_DEVICES"] = self.gpu_visibility
         return result
@@ -1267,11 +1322,13 @@ def test_live_proof_rejects_an_unrelated_gpu_process(tmp_path: Path) -> None:
 
 
 def test_missing_openmpi_rank_environment_is_rejected() -> None:
-    with pytest.raises(LAUNCHER.LaunchFailure, match="lacks MPI environment"):
+    with pytest.raises(LAUNCHER.LaunchFailure, match="key closure differs"):
         LAUNCHER._parse_rank_environment({}, 2, 600, {
             "HOME": "/root", "LANG": "C", "LC_ALL": "C",
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-        })
+            "PRTE_MCA_schizo_proxy": "ompi",
+        }, launcher_pid=500, hostname="v100-node", state_dir=Path("/state"),
+            athena_argv=("/proc/1/fd/205", "arg"))
 
 
 def test_rank_projection_requires_prrte_personality_to_be_consumed() -> None:
@@ -1284,13 +1341,70 @@ def test_rank_projection_requires_prrte_personality_to_be_consumed() -> None:
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "PRTE_MCA_schizo_proxy": "ompi",
     }
-    with pytest.raises(LAUNCHER.LaunchFailure,
-                       match="retained launcher-only environment"):
+    with pytest.raises(LAUNCHER.LaunchFailure, match="key closure differs"):
         LAUNCHER._parse_rank_environment(environment, 1, 600, {
             "HOME": "/root", "LANG": "C", "LC_ALL": "C",
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "PRTE_MCA_schizo_proxy": "ompi",
-        })
+        }, launcher_pid=500, hostname="v100-node", state_dir=Path("/state"),
+            athena_argv=("/proc/1/fd/205", "arg"))
+
+
+@pytest.mark.parametrize("name", [
+    "OMPI_MCA_pml", "PMIX_MCA_gds", "PRTE_MCA_unreviewed",
+])
+def test_rank_environment_rejects_every_unknown_runtime_prefix_key(
+        tmp_path: Path, name: str) -> None:
+    campaign = _campaign(tmp_path, world_size=1)
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        environment = _rank_environment(prepared, 0)
+        environment[name] = "attacker"
+        with pytest.raises(LAUNCHER.LaunchFailure, match="key closure differs"):
+            LAUNCHER._parse_rank_environment(
+                environment, 1, 600, prepared.launch_environment,
+                launcher_pid=500, hostname="v100-node",
+                state_dir=prepared.state_dir,
+                athena_argv=prepared.athena_argv)
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize(("key", "value", "message"), [
+    ("OMPI_ARGV", "attacker", "OMPI_ARGV"),
+    ("PMIX_NAMESPACE", "attacker", "PMIX_NAMESPACE"),
+    ("PMIX_SERVER_URI4", "bad", "URI aliases"),
+])
+def test_rank_environment_rejects_tampered_derived_values(
+        tmp_path: Path, key: str, value: str, message: str) -> None:
+    campaign = _campaign(tmp_path, world_size=1)
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        environment = _rank_environment(prepared, 0)
+        environment[key] = value
+        with pytest.raises(LAUNCHER.LaunchFailure, match=message):
+            LAUNCHER._parse_rank_environment(
+                environment, 1, 600, prepared.launch_environment,
+                launcher_pid=500, hostname="v100-node",
+                state_dir=prepared.state_dir,
+                athena_argv=prepared.athena_argv)
+    finally:
+        prepared.close()
+
+
+def test_prepare_rejects_mca_file_created_after_plan(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    config = campaign["mca_prefix"] / "etc" / "openmpi-mca-params.conf"
+    config.parent.mkdir()
+    config.write_text("pml = attacker\n", encoding="ascii")
+    config.chmod(0o644)
+
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="MCA configuration.*differs"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
 
 
 def test_live_proof_rejects_rank_specific_cuda_visibility(tmp_path: Path) -> None:
@@ -1302,7 +1416,7 @@ def test_live_proof_rejects_rank_specific_cuda_visibility(tmp_path: Path) -> Non
     ticks = iter((0.0, 2.0))
     runtime.monotonic = lambda: next(ticks)
 
-    with pytest.raises(LAUNCHER.LaunchFailure, match="timed out.*visibility"):
+    with pytest.raises(LAUNCHER.LaunchFailure, match="timed out.*key closure"):
         LAUNCHER.prove_running_launch(
             FakeProcess(campaign["run"]), prepared, runtime,
             timeout_seconds=1, poll_seconds=0)
