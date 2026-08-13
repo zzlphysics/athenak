@@ -372,7 +372,7 @@ def test_final_verification_hashes_installed_path_and_fsyncs(tmp_path: Path) -> 
 
     PULLER.verify_final_files(destination, records, seal_read_only=False)
     final.write_bytes(b"damage")
-    with pytest.raises(RuntimeError, match="final NAS verification failed"):
+    with pytest.raises(RuntimeError, match="manifest verification failed"):
         PULLER.verify_final_files(destination, records, seal_read_only=False)
 
 
@@ -392,6 +392,84 @@ def test_final_verification_seals_payload_read_only(tmp_path: Path) -> None:
     assert "state/closed.bin" in proofs
     with pytest.raises(PermissionError):
         final.write_bytes(b"damage")
+
+
+def test_partial_creation_normalizes_mode_despite_umask(tmp_path: Path) -> None:
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    previous = os.umask(0o777)
+    try:
+        stream, size = PULLER.open_append_nofollow_at(parent, "payload.part")
+    finally:
+        os.umask(previous)
+    try:
+        assert size == 0
+        assert stat.S_IMODE(os.fstat(stream.fileno()).st_mode) == 0o600
+    finally:
+        stream.close()
+        os.close(parent)
+
+
+def test_final_seal_retains_owner_read_for_write_only_payload(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "destination"
+    final = destination / "state" / "closed.bin"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"closed")
+    records = [{
+        "path": PULLER.PurePosixPath("state/closed.bin"),
+        "size": 6,
+        "sha256": PULLER.hashlib.sha256(b"closed").hexdigest(),
+    }]
+    # Exercise the production manifest-aware recovery for legacy finals that
+    # the previous sealing code accidentally made mode 000.
+    os.chmod(final, 0o000)
+    PULLER.verify_final_files(destination, records)
+    assert stat.S_IMODE(final.stat().st_mode) == 0o400
+    assert final.read_bytes() == b"closed"
+
+
+def test_mode_zero_recovery_refuses_wrong_size_hardlink_and_nonzero_mode(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "closed.bin"
+    final.write_bytes(b"closed")
+    digest = PULLER.hashlib.sha256(b"closed").hexdigest()
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.chmod(final, 0o000)
+        with pytest.raises(RuntimeError, match="unsafe legacy"):
+            PULLER.hash_manifest_final_at(parent, final.name, 7, digest)
+        assert stat.S_IMODE(final.stat().st_mode) == 0o000
+
+        hardlink = tmp_path / "alias.bin"
+        os.link(final, hardlink)
+        with pytest.raises(RuntimeError, match="one-link"):
+            PULLER.hash_manifest_final_at(parent, final.name, 6, digest)
+        assert stat.S_IMODE(final.stat().st_mode) == 0o000
+        hardlink.unlink()
+
+        os.chmod(final, 0o200)
+        with pytest.raises(PermissionError):
+            PULLER.hash_manifest_final_at(parent, final.name, 6, digest)
+        assert stat.S_IMODE(final.stat().st_mode) == 0o200
+    finally:
+        os.chmod(final, 0o600)
+        os.close(parent)
+
+
+def test_mode_zero_wrong_digest_is_retained_read_only(tmp_path: Path) -> None:
+    final = tmp_path / "closed.bin"
+    final.write_bytes(b"closed")
+    final.chmod(0o000)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(RuntimeError, match="manifest verification failed"):
+            PULLER.hash_manifest_final_at(parent, final.name, 6, "0" * 64)
+    finally:
+        os.close(parent)
+    assert final.read_bytes() == b"closed"
+    assert stat.S_IMODE(final.stat().st_mode) == 0o400
 
 
 def test_preopened_writer_can_invalidate_payload_but_not_authorize_cleanup(
@@ -463,6 +541,17 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
     piece1.write_bytes(b"b")
     (tmp_path / f"{partial_name}.assembling").write_bytes(b"stale")
     monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+    monkeypatch.setattr(
+        PULLER,
+        "download_verified_piece",
+        lambda _config, _remote, descriptor, name, start, end, number,
+               _validation, _identity: (
+                   lambda result: PULLER.RangeProof(
+                       number, start, end, name, result[1],
+                       PULLER._identity(result[0]),
+                   )
+               )(PULLER.sha256_regular_at(descriptor, name)),
+    )
     try:
         PULLER.parallel_download(
             object(),
@@ -475,6 +564,165 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
         os.close(parent)
     assert (tmp_path / partial_name).read_bytes() == b"a" * PULLER.CHUNK + b"b"
     assert not (tmp_path / f"{partial_name}.assembling").exists()
+    assert piece0.exists() and piece1.exists()
+
+
+def test_parallel_ranges_are_ordered_and_uneven(monkeypatch) -> None:
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+
+    assert PULLER.parallel_ranges(13, "payload.part") == [
+        (0, 0, 8, "payload.part.piece00"),
+        (1, 8, 13, "payload.part.piece01"),
+    ]
+
+
+def test_cleanup_parallel_pieces_rejects_same_size_replacement(tmp_path: Path) -> None:
+    piece = tmp_path / "payload.part.piece00"
+    piece.write_bytes(b"good")
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        info, digest = PULLER.sha256_regular_at(parent, piece.name)
+        proof = PULLER.RangeProof(
+            0, 0, 4, piece.name, digest, PULLER._identity(info)
+        )
+        piece.unlink()
+        piece.write_bytes(b"evil")
+        with pytest.raises(RuntimeError, match="changed before cleanup"):
+            PULLER.cleanup_parallel_pieces(parent, [proof])
+    finally:
+        os.close(parent)
+    assert piece.read_bytes() == b"evil"
+
+
+def test_quarantine_is_read_only_and_idempotent_after_link_crash(
+    tmp_path: Path,
+) -> None:
+    active = tmp_path / "payload.part"
+    evidence = tmp_path / "payload.bad"
+    active.write_bytes(b"bad-payload")
+    digest = PULLER.hashlib.sha256(b"bad-payload").hexdigest()
+    active.chmod(0o400)
+    os.link(active, evidence)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert PULLER.quarantine_regular_at(
+            parent, active.name, evidence.name, len(b"bad-payload"), digest
+        ) == evidence.name
+    finally:
+        os.close(parent)
+    assert not active.exists()
+    assert evidence.read_bytes() == b"bad-payload"
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o400
+    assert evidence.stat().st_nlink == 1
+
+
+def test_remote_range_hash_uses_exact_pinned_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"abcdefghijklm"
+    attributes = _DownloadAttributes(len(payload))
+
+    class Sftp:
+        def lstat(self, _path: str):
+            return attributes
+
+    class Session:
+        def remote_call(self, _label: str, operation):
+            return operation(object(), Sftp())
+
+    captured: list[list[str]] = []
+
+    def capture(_client, argv, **_kwargs):
+        captured.append(argv)
+        return PULLER.hashlib.sha256(payload[8:13]).hexdigest().encode() + b"  -\n", b""
+
+    monkeypatch.setattr(PULLER, "exec_capture_checked", capture)
+    digest = PULLER.remote_range_sha256(
+        Session(),
+        "/remote/payload with space",
+        PULLER._remote_identity(attributes),
+        8,
+        13,
+        "range 1",
+    )
+
+    assert digest == PULLER.hashlib.sha256(payload[8:13]).hexdigest()
+    assert captured[0][:4] == ["/bin/bash", "-o", "pipefail", "-c"]
+    assert "skip=8 count=5" in captured[0][4]
+    assert "'/remote/payload with space'" in captured[0][4]
+
+
+def test_range_hash_mismatch_quarantines_only_bad_piece(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"local-range"
+    piece = tmp_path / "payload.part.piece01"
+    piece.write_bytes(payload)
+    validation = _DownloadValidation([_DownloadClient(payload)], len(payload))
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda *_args: PULLER.hashlib.sha256(b"remote-range").hexdigest(),
+    )
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(PULLER.RangeHashMismatch, match="range 1"):
+            PULLER.download_verified_piece(
+                object(),
+                "/remote/payload",
+                os.dup(parent),
+                piece.name,
+                0,
+                len(payload),
+                1,
+                validation,
+                _remote_download_identity(len(payload)),
+            )
+    finally:
+        os.close(parent)
+
+    assert not piece.exists()
+    evidence = list(tmp_path.glob("range-*.bad"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == payload
+    assert stat.S_IMODE(evidence[0].stat().st_mode) == 0o400
+
+
+def test_prove_existing_parallel_pieces_only_proves_present_ranges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+    payload = b"abcdefghijklm"
+    piece0 = tmp_path / "payload.part.piece00"
+    piece0.write_bytes(payload[:8])
+    validation = _DownloadValidation([_DownloadClient(payload)], len(payload))
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda _session, _path, _identity, start, end, _label:
+            PULLER.hashlib.sha256(payload[start:end]).hexdigest(),
+    )
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        proofs = PULLER.prove_existing_parallel_pieces(
+            "/remote/payload",
+            parent,
+            "payload.part",
+            len(payload),
+            validation,
+            _remote_download_identity(len(payload)),
+        )
+    finally:
+        os.close(parent)
+
+    assert len(proofs) == 1
+    assert proofs[0].number == 0
+    assert proofs[0].start == 0 and proofs[0].end == 8
+    assert stat.S_IMODE(piece0.stat().st_mode) == 0o400
 
 
 def test_install_no_replace_refuses_existing_final(tmp_path: Path) -> None:
@@ -738,6 +986,9 @@ def test_remote_command_exit_status_has_hard_deadline(
         def recv_stderr_ready(self) -> bool:
             return False
 
+        def recv_ready(self) -> bool:
+            return False
+
     channel = Channel()
 
     class Client:
@@ -794,11 +1045,18 @@ def test_parallel_download_resumes_its_piece_after_rekey(
     clients = [
         _DownloadClient(payload, fail_after=4),
         _DownloadClient(payload),
+        _DownloadClient(payload),
     ]
     validation = _DownloadValidation(clients, len(payload))
     monkeypatch.setattr(PULLER.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(PULLER, "STREAM_WINDOW_BYTES", len(payload))
     monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 1)
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda _session, _path, _identity, start, end, _label:
+            PULLER.hashlib.sha256(payload[start:end]).hexdigest(),
+    )
     parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         PULLER.parallel_download(
@@ -814,10 +1072,10 @@ def test_parallel_download_resumes_its_piece_after_rekey(
         os.close(parent)
 
     assert (tmp_path / "payload.part").read_bytes() == payload
-    assert validation.opens == 2
+    assert validation.opens == 3
     assert "skip=0" in clients[0].commands[0]
     assert "skip=4" in clients[1].commands[0]
-    assert not list(tmp_path.glob("*.piece*"))
+    assert (tmp_path / "payload.part.piece00").read_bytes() == payload
 
 
 def test_local_fsync_failure_is_not_misclassified_as_remote_rekey(

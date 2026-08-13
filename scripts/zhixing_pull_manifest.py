@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
+import re
 import secrets
 import shlex
 import shutil
@@ -48,10 +49,13 @@ STREAM_RECONNECT_BACKOFF_SECONDS = 2.0
 STREAM_WINDOW_BYTES = 256 * 1024 * 1024
 CHANNEL_IO_TIMEOUT_SECONDS = 120.0
 CHANNEL_STATUS_POLL_SECONDS = 0.1
+REMOTE_COMMAND_OUTPUT_LIMIT = 4096
+REMOTE_RANGE_HASH_MIN_RATE = 16 * 1024 * 1024
 RESERVED_DESTINATION_COMPONENTS = frozenset({
     ".acks", ".incoming", ".locks", ".manifests",
 })
 PRINT_LOCK = threading.Lock()
+RANGE_HASH_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,16 @@ class ConnectionConfig:
     username: str
     password: str
     host_key_sha256: str
+
+
+@dataclass(frozen=True)
+class RangeProof:
+    number: int
+    start: int
+    end: int
+    name: str
+    sha256: str
+    identity: tuple[int, int, int, int, int, int]
 
 
 def key_sha256(key: paramiko.PKey) -> str:
@@ -435,8 +449,17 @@ def sha256_regular_at(
         before = os.fstat(descriptor)
         if _identity(before) != _identity(before_path):
             raise RuntimeError(f"file changed while opening: {name}")
-        if seal_read_only and before.st_mode & 0o222:
-            os.fchmod(descriptor, stat.S_IMODE(before.st_mode) & ~0o222)
+        if seal_read_only:
+            # NFSv3 servers may apply inherited ACL masks or a process umask to
+            # the creation mode.  A write-only payload would become mode 000 if
+            # sealing merely removed write bits, making a verified transfer
+            # impossible to resume.  Always retain owner-read while removing
+            # every write bit from an immutable payload.
+            sealed_mode = (stat.S_IMODE(before.st_mode) & ~0o222) | 0o400
+        else:
+            sealed_mode = stat.S_IMODE(before.st_mode)
+        if sealed_mode != stat.S_IMODE(before.st_mode):
+            os.fchmod(descriptor, sealed_mode)
             os.fsync(descriptor)
             before = os.fstat(descriptor)
             sealed_path = stat_regular_at(
@@ -466,6 +489,92 @@ def sha256_regular_at(
     if _identity(before) != _identity(after) or _identity(after) != _identity(after_path):
         raise RuntimeError(f"file changed while hashing: {name}")
     return after, digest.hexdigest()
+
+
+def _mode_recovery_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Fields that must not change while a pinned mode-000 inode is repaired."""
+
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_nlink,
+        info.st_size,
+        info.st_uid,
+        info.st_gid,
+        info.st_mtime_ns,
+    )
+
+
+def hash_manifest_final_at(
+    parent_descriptor: int,
+    name: str,
+    expected_size: int,
+    expected_digest: str,
+    *,
+    sync: bool = False,
+    seal_read_only: bool = False,
+    require_single_link: bool = True,
+) -> tuple[os.stat_result, str]:
+    """Hash a final payload, narrowly recovering legacy mode-000 files.
+
+    An earlier receiver could seal an owner-write-only NFS inode to mode 000.
+    Recovery is deliberately manifest-aware and pins the exact inode before
+    granting owner-read; it never changes payload bytes or removes a file.
+    """
+
+    visible = stat_regular_at(
+        parent_descriptor,
+        name,
+        require_single_link=require_single_link,
+    )
+    if stat.S_IMODE(visible.st_mode) == 0:
+        if (
+            visible.st_nlink != 1
+            or visible.st_uid != os.geteuid()
+            or visible.st_size != expected_size
+        ):
+            raise RuntimeError(f"unsafe legacy mode-000 final file: {name}")
+        path_flag = getattr(os, "O_PATH", None)
+        if path_flag is None or not Path("/proc/self/fd").is_dir():
+            raise RuntimeError("mode-000 recovery requires Linux O_PATH and /proc")
+        descriptor = os.open(
+            name,
+            path_flag | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            pinned = os.fstat(descriptor)
+            if _mode_recovery_identity(pinned) != _mode_recovery_identity(visible):
+                raise RuntimeError(f"mode-000 final changed while pinning: {name}")
+            os.chmod(f"/proc/self/fd/{descriptor}", 0o400)
+            repaired = os.fstat(descriptor)
+            if (
+                _mode_recovery_identity(repaired)
+                != _mode_recovery_identity(pinned)
+                or stat.S_IMODE(repaired.st_mode) != 0o400
+            ):
+                raise RuntimeError(f"mode-000 final changed while repairing: {name}")
+            visible_after = stat_regular_at(parent_descriptor, name)
+            if (
+                (visible_after.st_dev, visible_after.st_ino)
+                != (repaired.st_dev, repaired.st_ino)
+                or stat.S_IMODE(visible_after.st_mode) != 0o400
+            ):
+                raise RuntimeError(f"mode-000 final path changed while repairing: {name}")
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(descriptor)
+
+    info, digest = sha256_regular_at(
+        parent_descriptor,
+        name,
+        sync=sync,
+        seal_read_only=seal_read_only,
+        require_single_link=require_single_link,
+    )
+    if info.st_size != expected_size or digest != expected_digest:
+        raise RuntimeError(f"manifest verification failed for final file: {name}")
+    return info, digest
 
 
 def recover_local_ready_aliases_at(
@@ -927,6 +1036,10 @@ class RetryableRemoteTransport(RuntimeError):
     """A failure known to originate in remote SSH/SFTP transport I/O."""
 
 
+class RangeHashMismatch(RuntimeError):
+    """A completed local range differs from the same pinned remote range."""
+
+
 REMOTE_RETRYABLE_ERRORS = (
     EOFError,
     socket.timeout,
@@ -1109,27 +1222,58 @@ def remote_mkdirs(sftp: paramiko.SFTPClient, path: str) -> None:
             raise RuntimeError(f"remote ACK ancestor is not a directory: {current}")
 
 
-def exec_checked(client: paramiko.SSHClient, argv: list[str]) -> None:
+def exec_capture_checked(
+    client: paramiko.SSHClient,
+    argv: list[str],
+    *,
+    timeout: float = CHANNEL_IO_TIMEOUT_SECONDS,
+    output_limit: int = REMOTE_COMMAND_OUTPUT_LIMIT,
+) -> tuple[bytes, bytes]:
     command = shlex.join(argv)
-    _, stdout, _ = client.exec_command(command, timeout=CHANNEL_IO_TIMEOUT_SECONDS)
+    _, stdout, _ = retryable_remote_io(
+        lambda: client.exec_command(command, timeout=timeout)
+    )
     channel = stdout.channel
-    channel.settimeout(CHANNEL_IO_TIMEOUT_SECONDS)
-    deadline = time.monotonic() + CHANNEL_IO_TIMEOUT_SECONDS
+    retryable_remote_io(lambda: channel.settimeout(timeout))
+    deadline = time.monotonic() + timeout
+    output_chunks: list[bytes] = []
     error_chunks: list[bytes] = []
-    while not retryable_remote_io(channel.exit_status_ready):
+    output_size = 0
+    error_size = 0
+    while True:
+        while retryable_remote_io(channel.recv_ready):
+            chunk = retryable_remote_io(lambda: channel.recv(CHUNK))
+            output_size += len(chunk)
+            if output_size > output_limit:
+                raise RuntimeError(f"remote command stdout exceeds limit: {command}")
+            output_chunks.append(chunk)
         while retryable_remote_io(channel.recv_stderr_ready):
-            error_chunks.append(retryable_remote_io(lambda: channel.recv_stderr(CHUNK)))
+            chunk = retryable_remote_io(lambda: channel.recv_stderr(CHUNK))
+            error_size += len(chunk)
+            if error_size > output_limit:
+                raise RuntimeError(f"remote command stderr exceeds limit: {command}")
+            error_chunks.append(chunk)
+        if retryable_remote_io(channel.exit_status_ready):
+            if not retryable_remote_io(channel.recv_ready) and not retryable_remote_io(
+                channel.recv_stderr_ready
+            ):
+                break
         if time.monotonic() >= deadline:
             raise RetryableRemoteTransport(
                 f"timed out waiting for remote command: {command}"
             )
         time.sleep(CHANNEL_STATUS_POLL_SECONDS)
-    while retryable_remote_io(channel.recv_stderr_ready):
-        error_chunks.append(retryable_remote_io(lambda: channel.recv_stderr(CHUNK)))
     status = retryable_remote_io(channel.recv_exit_status)
-    error = b"".join(error_chunks).decode("utf-8", errors="replace").strip()
+    output = b"".join(output_chunks)
+    error_bytes = b"".join(error_chunks)
+    error = error_bytes.decode("utf-8", errors="replace").strip()
     if status != 0:
         raise RuntimeError(f"remote command failed ({status}): {command}: {error}")
+    return output, error_bytes
+
+
+def exec_checked(client: paramiko.SSHClient, argv: list[str]) -> None:
+    exec_capture_checked(client, argv)
 
 
 def remote_fsync(
@@ -1280,7 +1424,14 @@ def open_append_nofollow_at(
         0o600,
         dir_fd=parent_descriptor,
     )
-    info = os.fstat(descriptor)
+    try:
+        # Do not trust the effective create mode on NFS.  Normalize through the
+        # opened inode so later hashing and restart verification stays readable.
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(descriptor)
         raise RuntimeError(f"partial is not a one-link regular file: {name}")
@@ -1390,6 +1541,163 @@ def _append_validated_window(
     session.remote_call(label, operation)
 
 
+def remote_range_sha256(
+    session: ValidatedRemoteSession,
+    remote_path: str,
+    expected_remote_identity: tuple[int, int, int, int],
+    start: int,
+    end: int,
+    label: str,
+) -> str:
+    """Hash one immutable source range without sending its bytes over SSH."""
+
+    if start < 0 or end < start:
+        raise ValueError("invalid remote hash range")
+    length = end - start
+    timeout = max(
+        CHANNEL_IO_TIMEOUT_SECONDS,
+        60.0 + length / REMOTE_RANGE_HASH_MIN_RATE,
+    )
+    pipeline = (
+        f"LC_ALL=C dd if={shlex.quote(remote_path)} "
+        "iflag=skip_bytes,count_bytes "
+        f"skip={start} count={length} status=none | LC_ALL=C sha256sum"
+    )
+
+    def operation(client: paramiko.SSHClient, sftp: paramiko.SFTPClient) -> str:
+        before = retryable_remote_io(
+            lambda: remote_regular_attributes(sftp, remote_path)
+        )
+        if _remote_identity(before) != expected_remote_identity:
+            raise TrustBoundaryViolation(
+                f"remote source identity changed before range hash: {remote_path}"
+            )
+        output, error = exec_capture_checked(
+            client,
+            ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+            timeout=timeout,
+        )
+        if error:
+            raise RuntimeError(f"remote range hash produced stderr: {label}")
+        match = re.fullmatch(rb"([0-9a-f]{64})  -\n", output)
+        if match is None:
+            raise RuntimeError(f"malformed remote range hash output: {label}")
+        after = retryable_remote_io(
+            lambda: remote_regular_attributes(sftp, remote_path)
+        )
+        if _remote_identity(after) != expected_remote_identity:
+            raise TrustBoundaryViolation(
+                f"remote source identity changed during range hash: {remote_path}"
+            )
+        return match.group(1).decode("ascii")
+
+    return session.remote_call(label, operation)
+
+
+def quarantine_regular_at(
+    parent_descriptor: int,
+    name: str,
+    evidence_name: str,
+    expected_size: int,
+    expected_digest: str,
+) -> str:
+    """Move one exact temporary inode to immutable evidence without replacement."""
+
+    safe_directory_component(evidence_name)
+    # Seal before creating or removing any name.  Thus a crash can leave two
+    # read-only links or one read-only evidence link, never mutable evidence.
+    source, digest = sha256_regular_at(
+        parent_descriptor,
+        name,
+        sync=True,
+        seal_read_only=True,
+        require_single_link=False,
+    )
+    if source.st_size != expected_size or digest != expected_digest:
+        raise RuntimeError(f"temporary changed before quarantine: {name}")
+    if source.st_nlink not in (1, 2):
+        raise RuntimeError(f"unexpected quarantine source link count: {name}")
+    if source.st_nlink == 2:
+        try:
+            evidence = stat_regular_at(
+                parent_descriptor,
+                evidence_name,
+                require_single_link=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"quarantine source has an unowned hard-link alias: {name}"
+            ) from exc
+        if (
+            (evidence.st_dev, evidence.st_ino) != (source.st_dev, source.st_ino)
+            or evidence.st_nlink != 2
+        ):
+            raise RuntimeError(f"quarantine alias identity mismatch: {name}")
+        os.unlink(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        sealed, sealed_digest = sha256_regular_at(
+            parent_descriptor,
+            evidence_name,
+            sync=True,
+            seal_read_only=True,
+        )
+        if sealed.st_size != expected_size or sealed_digest != expected_digest:
+            raise RuntimeError(f"quarantine evidence changed: {evidence_name}")
+        return evidence_name
+    try:
+        os.link(
+            name,
+            evidence_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        evidence, evidence_digest = sha256_regular_at(
+            parent_descriptor,
+            evidence_name,
+            sync=True,
+            seal_read_only=True,
+            require_single_link=True,
+        )
+        if evidence.st_size != expected_size or evidence_digest != expected_digest:
+            raise RuntimeError(f"conflicting quarantine evidence: {evidence_name}")
+        os.unlink(name, dir_fd=parent_descriptor)
+    else:
+        linked = stat_regular_at(
+            parent_descriptor,
+            evidence_name,
+            require_single_link=False,
+        )
+        if (
+            (linked.st_dev, linked.st_ino) != (source.st_dev, source.st_ino)
+            or linked.st_nlink != 2
+        ):
+            raise RuntimeError(f"quarantine link identity mismatch: {name}")
+        os.unlink(name, dir_fd=parent_descriptor)
+    sealed, sealed_digest = sha256_regular_at(
+        parent_descriptor,
+        evidence_name,
+        sync=True,
+        seal_read_only=True,
+    )
+    if sealed.st_size != expected_size or sealed_digest != expected_digest:
+        raise RuntimeError(f"quarantine evidence changed: {evidence_name}")
+    os.fsync(parent_descriptor)
+    return evidence_name
+
+
+def parallel_ranges(expected_size: int, partial_name: str) -> list[tuple[int, int, int, str]]:
+    piece_span = (expected_size + PARALLEL_STREAMS - 1) // PARALLEL_STREAMS
+    piece_span = ((piece_span + CHUNK - 1) // CHUNK) * CHUNK
+    return [
+        (number, start, min(expected_size, start + piece_span),
+         f"{partial_name}.piece{number:02d}")
+        for number in range(PARALLEL_STREAMS)
+        if (start := number * piece_span) < expected_size
+    ]
+
+
 def download_range(
     config: ConnectionConfig,
     remote_path: str,
@@ -1449,6 +1757,141 @@ def download_range(
         os.close(parent_descriptor)
 
 
+def download_verified_piece(
+    config: ConnectionConfig,
+    remote_path: str,
+    parent_descriptor: int,
+    piece_name: str,
+    start: int,
+    end: int,
+    number: int,
+    validation: ReconnectValidation,
+    expected_remote_identity: tuple[int, int, int, int],
+) -> RangeProof:
+    """Download/resume, then independently prove one local/remote range pair."""
+
+    try:
+        download_range(
+            config,
+            remote_path,
+            os.dup(parent_descriptor),
+            piece_name,
+            start,
+            end,
+            number,
+            validation,
+            expected_remote_identity,
+        )
+        return verify_completed_piece(
+            remote_path,
+            parent_descriptor,
+            piece_name,
+            start,
+            end,
+            number,
+            validation,
+            expected_remote_identity,
+        )
+    finally:
+        os.close(parent_descriptor)
+
+
+def verify_completed_piece(
+    remote_path: str,
+    parent_descriptor: int,
+    piece_name: str,
+    start: int,
+    end: int,
+    number: int,
+    validation: ReconnectValidation,
+    expected_remote_identity: tuple[int, int, int, int],
+) -> RangeProof:
+    """Bind an already complete piece to the same pinned remote byte range."""
+
+    info, local_digest = sha256_regular_at(
+        parent_descriptor,
+        piece_name,
+        sync=True,
+        seal_read_only=True,
+    )
+    if info.st_size != end - start:
+        raise RuntimeError(f"range {number} size mismatch before proof")
+    # Serialize source-side range hashing to avoid competing reads with the
+    # running simulation and with the other transfer stream.
+    with RANGE_HASH_LOCK:
+        with ValidatedRemoteSession(validation) as session:
+            remote_digest = remote_range_sha256(
+                session,
+                remote_path,
+                expected_remote_identity,
+                start,
+                end,
+                f"range hash {number} {piece_name}",
+            )
+    if local_digest != remote_digest:
+        key = hashlib.sha256(piece_name.encode("utf-8")).hexdigest()[:12]
+        evidence = (
+            f"range-{key}-{number:02d}-{start}-{end}-"
+            f"{local_digest[:12]}-{remote_digest[:12]}.bad"
+        )
+        quarantine_regular_at(
+            parent_descriptor,
+            piece_name,
+            evidence,
+            end - start,
+            local_digest,
+        )
+        raise RangeHashMismatch(
+            f"range {number} [{start},{end}) local={local_digest} "
+            f"remote={remote_digest}; evidence={evidence}"
+        )
+    return RangeProof(
+        number,
+        start,
+        end,
+        piece_name,
+        local_digest,
+        _identity(info),
+    )
+
+
+def prove_existing_parallel_pieces(
+    remote_path: str,
+    parent_descriptor: int,
+    partial_name: str,
+    expected_size: int,
+    validation: ReconnectValidation,
+    expected_remote_identity: tuple[int, int, int, int],
+) -> list[RangeProof]:
+    """Recover proofs after a crash left a complete part plus range files."""
+
+    proofs: list[RangeProof] = []
+    for number, start, end, piece_name in parallel_ranges(
+        expected_size, partial_name
+    ):
+        try:
+            info = stat_regular_at(parent_descriptor, piece_name)
+        except FileNotFoundError:
+            continue
+        if info.st_size != end - start:
+            raise RuntimeError(
+                f"incomplete orphan range beside verified partial: {piece_name}"
+            )
+        proofs.append(
+            verify_completed_piece(
+                remote_path,
+                parent_descriptor,
+                piece_name,
+                start,
+                end,
+                number,
+                validation,
+                expected_remote_identity,
+            )
+        )
+    return proofs
+
+
 def parallel_download(
     config: ConnectionConfig,
     remote_path: str,
@@ -1457,15 +1900,8 @@ def parallel_download(
     expected_size: int,
     validation: ReconnectValidation | None = None,
     expected_remote_identity: tuple[int, int, int, int] | None = None,
-) -> None:
-    piece_span = (expected_size + PARALLEL_STREAMS - 1) // PARALLEL_STREAMS
-    piece_span = ((piece_span + CHUNK - 1) // CHUNK) * CHUNK
-    ranges = []
-    for number in range(PARALLEL_STREAMS):
-        start = number * piece_span
-        end = min(expected_size, start + piece_span)
-        if start < end:
-            ranges.append((number, start, end, f"{partial_name}.piece{number:02d}"))
+) -> list[RangeProof]:
+    ranges = parallel_ranges(expected_size, partial_name)
     try:
         partial_info = stat_regular_at(parent_descriptor, partial_name)
     except FileNotFoundError:
@@ -1489,7 +1925,7 @@ def parallel_download(
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as executor:
         futures = [
             executor.submit(
-                download_range,
+                download_verified_piece,
                 config,
                 remote_path,
                 os.dup(parent_descriptor),
@@ -1502,8 +1938,8 @@ def parallel_download(
             )
             for number, start, end, piece_name in ranges
         ]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
+        proofs = [future.result() for future in concurrent.futures.as_completed(futures)]
+    proofs.sort(key=lambda proof: proof.number)
 
     assembling_name = f"{partial_name}.assembling"
     try:
@@ -1523,13 +1959,18 @@ def parallel_download(
         dir_fd=parent_descriptor,
     )
     try:
+        # Match the per-range partial contract even if an NFS ACL or umask
+        # altered the requested create mode.
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=False) as output:
-            for number, start, end, piece_name in ranges:
-                info, _ = sha256_regular_at(parent_descriptor, piece_name)
-                if info.st_size != end - start:
-                    raise RuntimeError(f"range {number} changed before assembly")
+            for proof in proofs:
+                info, digest = sha256_regular_at(parent_descriptor, proof.name)
+                if info.st_size != proof.end - proof.start or digest != proof.sha256:
+                    raise RuntimeError(
+                        f"range {proof.number} changed before assembly"
+                    )
                 source_descriptor = os.open(
-                    piece_name,
+                    proof.name,
                     os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=parent_descriptor,
                 )
@@ -1547,9 +1988,34 @@ def parallel_download(
         src_dir_fd=parent_descriptor,
         dst_dir_fd=parent_descriptor,
     )
-    for _, _, _, piece_name in ranges:
-        os.unlink(piece_name, dir_fd=parent_descriptor)
     os.fsync(parent_descriptor)
+    return proofs
+
+
+def cleanup_parallel_pieces(
+    parent_descriptor: int,
+    proofs: list[RangeProof],
+) -> None:
+    """Remove only deterministic range temporaries after full verification."""
+
+    changed = False
+    for proof in sorted(proofs, key=lambda item: item.number):
+        try:
+            info, digest = sha256_regular_at(parent_descriptor, proof.name)
+        except FileNotFoundError:
+            continue
+        if (
+            info.st_size != proof.end - proof.start
+            or digest != proof.sha256
+            or _identity(info) != proof.identity
+        ):
+            raise RuntimeError(
+                f"range {proof.number} changed before cleanup"
+            )
+        os.unlink(proof.name, dir_fd=parent_descriptor)
+        changed = True
+    if changed:
+        os.fsync(parent_descriptor)
 
 
 def install_no_replace_at(
@@ -1642,9 +2108,11 @@ def transfer_file(
     partial_name = f"{relative.name}.part"
     try:
         try:
-            final_info, digest = sha256_regular_at(
+            final_info, digest = hash_manifest_final_at(
                 final_parent,
                 final_name,
+                expected_size,
+                expected_digest,
                 require_single_link=False,
             )
         except FileNotFoundError:
@@ -1715,8 +2183,10 @@ def transfer_file(
                 stream.close()
                 if opened_size != 0:
                     raise RuntimeError(f"new empty partial is not empty: {relative}")
-        if expected_size >= PARALLEL_THRESHOLD and offset < expected_size:
-            parallel_download(
+        used_parallel = expected_size >= PARALLEL_THRESHOLD
+        range_proofs: list[RangeProof] = []
+        if used_parallel and offset < expected_size:
+            range_proofs = parallel_download(
                 config,
                 remote_path,
                 partial_parent,
@@ -1745,11 +2215,28 @@ def transfer_file(
             sync=True,
         )
         if partial_info.st_size != expected_size or digest != expected_digest:
-            os.unlink(partial_name, dir_fd=partial_parent)
-            os.fsync(partial_parent)
+            key = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()[:12]
+            evidence = f"full-{key}-{digest[:16]}.bad"
+            quarantine_regular_at(
+                partial_parent,
+                partial_name,
+                evidence,
+                partial_info.st_size,
+                digest,
+            )
             raise RuntimeError(
-                f"local verification failed and corrupt partial was discarded for "
-                f"{relative}: size={partial_info.st_size}, sha256={digest}"
+                f"local verification failed; immutable evidence retained as "
+                f"{evidence} for {relative}: size={partial_info.st_size}, "
+                f"sha256={digest}"
+            )
+        if used_parallel and not range_proofs:
+            range_proofs = prove_existing_parallel_pieces(
+                remote_path,
+                partial_parent,
+                partial_name,
+                expected_size,
+                validation,
+                _remote_identity(remote_before),
             )
         with ValidatedRemoteSession(validation) as source_session:
             remote_after = source_session.remote_call(
@@ -1763,6 +2250,11 @@ def transfer_file(
             )
         if _remote_identity(remote_before) != _remote_identity(remote_after):
             raise RuntimeError(f"remote source changed while transferring: {relative}")
+        if range_proofs:
+            cleanup_parallel_pieces(
+                partial_parent,
+                range_proofs,
+            )
         install_no_replace_at(
             partial_parent,
             partial_name,
@@ -1794,14 +2286,14 @@ def verify_final_files(
         assert isinstance(relative, PurePosixPath)
         parent, name = destination.open_relative_parent(relative)
         try:
-            info, digest = sha256_regular_at(
+            info, digest = hash_manifest_final_at(
                 parent,
                 name,
+                int(record["size"]),
+                str(record["sha256"]),
                 sync=True,
                 seal_read_only=seal_read_only,
             )
-            if info.st_size != record["size"] or digest != record["sha256"]:
-                raise RuntimeError(f"final NAS verification failed: {relative}")
             proofs[relative.as_posix()] = _identity(info)
             os.fsync(parent)
         finally:
@@ -2125,21 +2617,17 @@ def main() -> int:
                     )
                     try:
                         try:
-                            info, digest = sha256_regular_at(
+                            info, digest = hash_manifest_final_at(
                                 parent,
                                 name,
+                                int(record["size"]),
+                                str(record["sha256"]),
                                 require_single_link=False,
                             )
                         except FileNotFoundError:
                             unverified_sizes.append(int(record["size"]))
                         else:
-                            if (
-                                info.st_size != record["size"]
-                                or digest != record["sha256"]
-                            ):
-                                raise RuntimeError(
-                                    f"mismatched pre-existing final file: {relative}"
-                                )
+                            del info, digest
                     finally:
                         os.close(parent)
                 extra_assembly = max(
