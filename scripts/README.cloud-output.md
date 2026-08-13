@@ -6,13 +6,17 @@ run.  The intended protocol is:
 1. Run AthenaK for a 2--4 hour segment and stop at a synchronized restart point.
 2. On the compute host, publish every closed file in that segment with
    `mark_output_ready.py`.  The script refuses files younger than 120 seconds, scans
-   `/proc/*/fd` before and after hashing to prove that no process has the file open,
-   verifies size/mtime stability while computing SHA256, and atomically creates
-   an immutable `SEGMENT.manifest.ready`.  A segment identifier can never replace an
-   existing ready manifest, so receivers cannot ACK one payload and later observe another.
-3. On the workstation, run `pull_ready_outputs.py`.  It resumes partial `rsync` transfers,
-   verifies size and SHA256 in a hidden incoming directory, atomically installs each
-   verified file, and writes matching local and remote ACK records.
+   `/proc/*/fd` and writable mappings before and after hashing, fails closed on a process
+   visibility gap, and hashes through one `O_NOFOLLOW` descriptor while binding the
+   file's device, inode, link count, size, mtime, and ctime.  It atomically creates a
+   read-only `SEGMENT.manifest.ready`; a segment identifier can never replace an existing
+   ready manifest.
+3. On a Zhixing workstation/transfer host, run `zhixing_pull_manifest.py`.  It requires
+   an independently pinned manifest SHA256 and SSH host-key SHA256, resumes partial
+   transfers, verifies every final NAS path, fsyncs the files and directories, rereads the
+   remote manifest, and create-no-replace publishes matching local and remote ACKs.  The
+   generic `pull_ready_outputs.py` remains useful for non-destructive legacy pulls, but
+   its ACK is not sufficient authorization for cloud deletion.
 4. Delete cloud files only after their ACK exists.  Keep at least the two newest restart
    files on the compute host.  Remote deletion is intentionally not implemented by the
    puller, so a transfer failure cannot destroy the only copy.
@@ -237,7 +241,29 @@ The generic and user history files and the event log are append-only and must be
 published only after the segment process exits.  Keep all three in the same immutable
 segment manifest so post-processing can align physics diagnostics with numerical events.
 
-Example on the workstation:
+Deletion-enabled Zhixing workflow on the workstation (the manifest SHA and SSH host-key
+fingerprint must come from independent trusted channels, not from this SSH session):
+
+```bash
+python3 scripts/zhixing_pull_manifest.py \
+  --ssh-state /tmp/zhixing_l4_ssh.private.json \
+  --host-key-sha256 SHA256:PINNED_GATEWAY_FINGERPRINT \
+  --remote-root /data/athenak/run01 \
+  --remote-manifest /data/athenak/run01/manifests/segment-0001.manifest.ready \
+  --expected-manifest-sha256 PINNED_MANIFEST_SHA256 \
+  --segment segment-0001 \
+  --destination ~/UGreenNAS/Projects/GRMHD_AthenaK/run01/segments/segment-0001 \
+  --expected-mount-source 192.168.99.198:/volume1/Projects \
+  --expected-mount-fstype nfs
+```
+
+The receiver requires the ready manifest to be non-writable and creates a dedicated
+segment lock.  Re-running the same transaction is safe: an existing manifest or ACK is
+accepted only when its immutable bytes match exactly.  If only one ACK was committed
+before a network interruption, its original `verified_unix` and bytes are reused to
+complete the other side.  Neither transfer program deletes cloud files.
+
+Legacy/non-destructive example on the workstation:
 
 ```bash
 python3 scripts/pull_ready_outputs.py \
