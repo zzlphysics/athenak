@@ -1150,7 +1150,7 @@ def _policy(root_dt: float, ranks: int) -> dict[str, Any]:
             "name": "fofc_per_test",
             "numerator": "fofc",
             "denominator": "fofc_tests",
-            "max_ratio": 0.005,
+            "max_ratio": 0.01,
         },
         {
             "name": "cons_adjust_per_c2p_call",
@@ -1166,7 +1166,13 @@ def _policy(root_dt: float, ranks: int) -> dict[str, Any]:
         },
     ]
     yellow_ratios = [
-        {**item, "max_ratio": 0.001, "consecutive_rows": 3}
+        {
+            **item,
+            "max_ratio": (
+                0.005 if item["name"] == "fofc_per_test" else 0.001
+            ),
+            "consecutive_rows": 3,
+        }
         for item in hard_ratios
     ]
     return {

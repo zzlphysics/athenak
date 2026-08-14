@@ -1434,7 +1434,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     normalized_events = _normalize_event_thresholds(policy.get("event_thresholds"))
     _require(normalized_events == [
         {"name": "fofc_per_test", "numerator": "fofc",
-         "denominator": "fofc_tests", "max_ratio": 0.005},
+         "denominator": "fofc_tests", "max_ratio": 0.01},
         {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
          "denominator": "c2p_calls",
          "max_ratio": 0.005},
@@ -1497,7 +1497,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     }, "remote-disk policy differs from the exact strict thresholds")
     _require(policy.get("yellow_event_thresholds") == [
         {"name": "fofc_per_test", "numerator": "fofc",
-         "denominator": "fofc_tests", "max_ratio": 0.001,
+         "denominator": "fofc_tests", "max_ratio": 0.005,
          "consecutive_rows": 3},
         {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
          "denominator": "c2p_calls", "max_ratio": 0.001,

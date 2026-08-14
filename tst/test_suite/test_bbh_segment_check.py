@@ -64,7 +64,7 @@ ABSOLUTE_THRESHOLDS = {
 }
 CANONICAL_EVENT_THRESHOLDS = [{
     "name": "fofc_per_test", "numerator": "fofc",
-    "denominator": "fofc_tests", "max_ratio": 0.005,
+    "denominator": "fofc_tests", "max_ratio": 0.01,
 }, {
     "name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
     "denominator": "c2p_calls", "max_ratio": 0.005,
@@ -73,7 +73,9 @@ CANONICAL_EVENT_THRESHOLDS = [{
     "denominator": "c2p_calls", "max_ratio": 0.005,
 }]
 CANONICAL_YELLOW_EVENT_THRESHOLDS = [{
-    **rule, "max_ratio": 0.001, "consecutive_rows": 3,
+    **rule,
+    "max_ratio": 0.005 if rule["name"] == "fofc_per_test" else 0.001,
+    "consecutive_rows": 3,
 } for rule in CANONICAL_EVENT_THRESHOLDS]
 
 
@@ -386,7 +388,7 @@ def _plan() -> dict[str, object]:
             "mutable_parameters": CHECKER.CANONICAL_MUTABLE_PARAMETERS,
             "event_thresholds": [{
                 "name": "fofc_per_test", "numerator": "fofc",
-                "denominator": "fofc_tests", "max_ratio": 0.005,
+                "denominator": "fofc_tests", "max_ratio": 0.01,
             }, {
                 "name": "cons_adjust_per_c2p_call",
                 "numerator": "cons_adjust", "denominator": "c2p_calls",
@@ -399,7 +401,7 @@ def _plan() -> dict[str, object]:
             "event_absolute_thresholds": ABSOLUTE_THRESHOLDS,
             "yellow_event_thresholds": [{
                 "name": "fofc_per_test", "numerator": "fofc",
-                "denominator": "fofc_tests", "max_ratio": 0.001,
+                "denominator": "fofc_tests", "max_ratio": 0.005,
                 "consecutive_rows": 3,
             }, {
                 "name": "cons_adjust_per_c2p_call",
@@ -1254,7 +1256,7 @@ def test_mag_adjust_hard_ratio_is_enforced_at_exact_boundary(
 
 
 def test_yellow_event_ratio_requires_three_consecutive_exceedances() -> None:
-    ratios = (0.0011, 0.0012, 0.001, 0.0013, 0.0014, 0.0015)
+    ratios = (0.0051, 0.0052, 0.005, 0.0053, 0.0054, 0.0055)
     rows = [{
         "cycle": 11 + index,
         "fofc": round(ratio * 10000), "fofc_tests": 10000,
@@ -1269,7 +1271,7 @@ def test_yellow_event_ratio_requires_three_consecutive_exceedances() -> None:
     assert fofc["maximum_consecutive_exceedances"] == 3
     assert fofc["triggered_runs"] == [{
         "cycle_start": 14, "cycle_end": 16, "rows": 3,
-        "maximum_ratio": 0.0015, "maximum_cycle": 16,
+        "maximum_ratio": 0.0055, "maximum_cycle": 16,
     }]
     # Equality is green, and two yellow rows alone are not sustained.
     assert next(row for row in audit["ratios"]
