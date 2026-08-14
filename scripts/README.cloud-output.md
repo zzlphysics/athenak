@@ -199,6 +199,17 @@ set unchanged with zero volatile ECC errors, and no remaining compute contexts. 
 change is a permanent recovery failure; use an earlier already-qualified segment
 instead.
 
+An interrupted run need not contain the `tlim=... nlim=...` line printed only at the end
+of Driver finalization.  For a canonically audited nonzero completion or the same-boot
+closed-process case above, prefix recovery may replace that absent line only with the
+immutable plan's `expected.final_cycle`/`expected.tlim` and the actual launch record's
+single, byte-exact `time/nlim=...` and `time/tlim=...` argv tokens.  The recovery record
+preserves that alternate binding as `run_log_prefix_audit.original_limit_evidence`.
+If any Driver limit-state line is present, it remains authoritative: a contradictory
+line or more than one line is fatal and cannot fall back to argv evidence.  This exception
+is confined to scheduled-prefix recovery; the complete-segment checker still requires
+its normal unique limit-state and cycle-limit termination evidence.
+
 Recovery considers only restart writes whose original immutable plan labels
 `scheduled`.  It chooses the highest complete candidate.  An obviously truncated later
 write may be retained as suffix evidence while an older complete candidate is used, but

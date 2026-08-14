@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import socket
 import struct
 from types import SimpleNamespace
@@ -193,6 +194,12 @@ def test_run_log_prefix_replays_cache_and_fixed_root_steps(tmp_path: Path) -> No
 
     assert result["root_step_diagnostics"]["cycle_max"] == 32
     assert result["cache"]["solver_failures"] == 0
+    assert result["original_limit_evidence"] == {
+        "kind": "driver_limit_state_v1",
+        "driver_limit_state_rows": 1,
+        "nlim": 40,
+        "tlim": 240.0,
+    }
 
 
 def test_unknown_extra_file_and_directory_are_rejected(tmp_path: Path) -> None:
@@ -351,6 +358,25 @@ def test_recovery_directories_must_be_owner_only_and_empty(tmp_path: Path) -> No
         RECOVERY._private_empty_directory(directory, "recovery")
 
 
+def test_zero_completion_cannot_fall_back_to_same_boot_recovery(
+        tmp_path: Path) -> None:
+    completion = tmp_path / "segment.completion.ready"
+    completion.write_text(json.dumps({
+        "schema": RECOVERY.SCHEMA,
+        "kind": "athenak_segment_completion",
+        "status": "ready",
+        "return_code": 0,
+    }), encoding="utf-8")
+    completion.chmod(0o400)
+    plan = {"launch_contract": {"evidence": {
+        "completion_record": str(completion.absolute()),
+    }}}
+
+    with pytest.raises(RECOVERY.RecoveryFailure,
+                       match="requires a nonzero completion"):
+        RECOVERY._lifecycle(plan, {}, completion)
+
+
 def _write_live_nvidia_smi(path: Path, ranks: int) -> None:
     gpu_lines = "\n".join(
         f"{rank}, GPU-{rank}, 00000000:{16 + rank:02X}:00.0, 0, 0, "
@@ -423,7 +449,9 @@ def _write_planned_binary(path: Path, metadata: Any,
     path.chmod(0o400)
 
 
-def _run_log_bytes(expected: dict[str, Any]) -> bytes:
+def _run_log_bytes(expected: dict[str, Any], *,
+                   include_driver_limit_state: bool = True,
+                   limit_state: str | None = None) -> bytes:
     current = float(expected["source_time"])
     rows = []
     for cycle in range(expected["source_cycle"], expected["final_cycle"] + 1):
@@ -439,16 +467,119 @@ def _run_log_bytes(expected: dict[str, Any]) -> bytes:
         "change=1.0e-13, maximum absolute proposed change=1.0e-16, maximum "
         "mixed-scale proposed change=1.0e-14, mixed-scale acceptance "
         "tolerance=1.0e-12.")
-    return (f"tlim={expected['tlim']:.6e} nlim={expected['final_cycle']}\n"
-            f"{cache}\n" + "\n".join(rows) + "\n").encode("ascii")
+    limit = (limit_state if limit_state is not None else
+             f"tlim={expected['tlim']:.6e} nlim={expected['final_cycle']}")
+    prefix = f"{limit}\n" if include_driver_limit_state else ""
+    return (prefix + f"{cache}\n" + "\n".join(rows) + "\n").encode("ascii")
 
 
-@pytest.fixture(scope="module")
-def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
+def _interrupted_limit_context(expected: dict[str, Any], lifecycle_kind: str,
+                               *, nlim: int | None = None,
+                               tlim: float | None = None) \
+        -> tuple[dict[str, Any], dict[str, Any]]:
+    launch_binding = {
+        "path": "/evidence/segment.launch.ready",
+        "device": 1, "inode": 2, "size": 3, "mtime_ns": 4, "ctime_ns": 5,
+        "sha256": "a" * 64, "closure_check": "linux_proc_fd",
+    }
+    launch_audit = {
+        "sha256": launch_binding["sha256"],
+        "athena_argv": [
+            "/proc/123/fd/205", "-r", "/proc/123/fd/200",
+            f"time/nlim={expected['final_cycle'] if nlim is None else nlim}",
+            f"time/tlim={expected['tlim'] if tlim is None else tlim!r}",
+        ],
+    }
+    if lifecycle_kind == "same_boot_closed_processes_v1":
+        lifecycle = {
+            "kind": lifecycle_kind,
+            "all_original_identities_gone": True,
+            "managed_process_group_gone": True,
+            "bounded_quiescence": {"all_quiet": True},
+        }
+    else:
+        lifecycle = {
+            "kind": "nonzero_completion_v1", "return_code": 9,
+            "completion_record": {"path": "/evidence/segment.completion.ready"},
+            "canonical_completion_audit": {"return_code": 9},
+            "artifacts": {"launch_record": launch_binding},
+        }
+    return lifecycle, {"launch_audit": launch_audit,
+                       "launch_binding": launch_binding}
+
+
+@pytest.mark.parametrize("lifecycle_kind", [
+    "same_boot_closed_processes_v1", "nonzero_completion_v1",
+])
+def test_interrupted_run_log_without_driver_limit_uses_exact_launch_argv(
+        tmp_path: Path, lifecycle_kind: str) -> None:
+    expected = {
+        "source_cycle": 30, "source_time": 144.0, "root_dt": 4.8,
+        "final_cycle": 40, "tlim": 240.0, "recovery_final_cycle": 32,
+    }
+    path = tmp_path / f"{lifecycle_kind}.log"
+    _write_closed(path, _run_log_bytes(
+        expected, include_driver_limit_state=False))
+    lifecycle, launch = _interrupted_limit_context(expected, lifecycle_kind)
+
+    result = RECOVERY._audit_run_log_prefix(
+        path, expected, lifecycle=lifecycle, **launch)
+
+    evidence = result["original_limit_evidence"]
+    assert evidence["kind"] == "immutable_plan_launch_argv_v1"
+    assert evidence["lifecycle_kind"] == lifecycle_kind
+    assert evidence["plan_expected"] == {"final_cycle": 40, "tlim": 240.0}
+    assert evidence["exact_plan_limit_token_match"] is True
+
+
+def test_missing_driver_limit_rejects_launch_argv_plan_mismatch(
+        tmp_path: Path) -> None:
+    expected = {
+        "source_cycle": 30, "source_time": 144.0, "root_dt": 4.8,
+        "final_cycle": 40, "tlim": 240.0, "recovery_final_cycle": 32,
+    }
+    path = tmp_path / "run.log"
+    _write_closed(path, _run_log_bytes(
+        expected, include_driver_limit_state=False))
+    lifecycle, launch = _interrupted_limit_context(
+        expected, "same_boot_closed_processes_v1", nlim=41)
+
+    with pytest.raises(RECOVERY.RecoveryFailure,
+                       match="actual launch argv does not exactly bind"):
+        RECOVERY._audit_run_log_prefix(
+            path, expected, lifecycle=lifecycle, **launch)
+
+
+@pytest.mark.parametrize("limit_state, message", [
+    ("tlim=2.400000e+02 nlim=41", "contradicts"),
+    ("tlim=2.400000e+02 nlim=40\ntlim=2.400000e+02 nlim=40", "multiple"),
+])
+def test_present_wrong_or_duplicate_driver_limit_never_uses_fallback(
+        tmp_path: Path, limit_state: str, message: str) -> None:
+    expected = {
+        "source_cycle": 30, "source_time": 144.0, "root_dt": 4.8,
+        "final_cycle": 40, "tlim": 240.0, "recovery_final_cycle": 32,
+    }
+    path = tmp_path / f"{message}.log"
+    _write_closed(path, _run_log_bytes(expected, limit_state=limit_state))
+    lifecycle, launch = _interrupted_limit_context(
+        expected, "same_boot_closed_processes_v1")
+
+    with pytest.raises(RECOVERY.RecoveryFailure, match=message):
+        RECOVERY._audit_run_log_prefix(
+            path, expected, lifecycle=lifecycle, **launch)
+
+
+@pytest.fixture(scope="module", params=(
+    "nonzero_completion", "same_boot_sigterm",
+))
+def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory,
+                          request: pytest.FixtureRequest):
     import test_suite.test_bbh_segment_launch as launch_tests
     import test_suite.test_bbh_segment_plan as plan_tests
 
-    tmp_path = tmp_path_factory.mktemp("strict-prefix-recovery")
+    lifecycle_mode = str(request.param)
+    tmp_path = tmp_path_factory.mktemp(f"strict-prefix-recovery-{lifecycle_mode}")
     campaign = plan_tests._campaign(tmp_path)
     _write_live_nvidia_smi(campaign["nvidia_smi"], 8)
     planned = plan_tests._run(campaign, root_steps="8")
@@ -468,9 +599,40 @@ def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
     runtime = launch_tests._proof_runtime({"run": fake_run}, prepared)
     process = launch_tests.FakeProcess(fake_run, return_code=9)
 
+    signal_handlers: dict[int, Any] | None = None
+    if lifecycle_mode == "same_boot_sigterm":
+        launch_hostname = socket.gethostname()
+        runtime.hostname = lambda: launch_hostname
+        runtime.inspector.environment = lambda pid: launch_tests._rank_environment(
+            prepared, fake_run.rank_pids.index(pid), hostname=launch_hostname)
+        signal_handlers = {
+            number: object()
+            for number in launch_tests.LAUNCHER.MANAGED_TERMINATION_SIGNALS
+        }
+        runtime.get_signal_handler = lambda number: signal_handlers[number]
+
+        def set_signal_handler(number: int, handler: Any) -> Any:
+            old = signal_handlers[number]
+            signal_handlers[number] = handler
+            return old
+
+        runtime.set_signal_handler = set_signal_handler
+        original_wait = process.wait
+        injected = False
+
+        def sigterm_wait(timeout=None):
+            nonlocal injected
+            if not injected and timeout is None:
+                injected = True
+                signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return original_wait(timeout=timeout)
+
+        process.wait = sigterm_wait
+
     def fake_popen(argv, **kwargs):
         fake_run.launched = True
-        kwargs["stdout"].write(_run_log_bytes(expected))
+        kwargs["stdout"].write(_run_log_bytes(
+            expected, include_driver_limit_state=False))
         return process
 
     runtime.popen = fake_popen
@@ -478,9 +640,19 @@ def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
                 plan["launch_contract"]["evidence"].items()}
     launch_paths = launch_tests.LAUNCHER.OutputPaths(*(
         evidence[name] for name in launch_tests.LAUNCHER.EVIDENCE_NAMES))
-    assert launch_tests.LAUNCHER.run_segment(
-        prepared, plan_path, launch_paths, runtime,
-        proof_timeout_seconds=1) == 9
+    if lifecycle_mode == "nonzero_completion":
+        assert launch_tests.LAUNCHER.run_segment(
+            prepared, plan_path, launch_paths, runtime,
+            proof_timeout_seconds=1) == 9
+    else:
+        with pytest.raises(launch_tests.LAUNCHER.LaunchFailure,
+                           match="managed termination signal SIGTERM"):
+            launch_tests.LAUNCHER.run_segment(
+                prepared, plan_path, launch_paths, runtime,
+                proof_timeout_seconds=1)
+        assert signal_handlers is not None
+        assert all(not callable(handler) for handler in signal_handlers.values())
+        assert not evidence["completion_record"].exists()
 
     recovery_cycle = expected["source_cycle"] + 4
     schedules, states, recovery_time = RECOVERY.replay_execute_prefix(
@@ -563,11 +735,17 @@ def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
     original_time = RECOVERY.time.time
     RECOVERY.time.time = lambda: original_time() + 1000.0
     original_identity = RECOVERY._process_identity_gone
+    original_observation = RECOVERY._process_identity_observation
+    original_killpg = RECOVERY.os.killpg
     RECOVERY._process_identity_gone = lambda pid, ticks: {
         "pid": pid, "recorded_start_time_ticks": ticks,
         "observed_start_time_ticks": None,
         "state": "disappeared", "original_identity_gone": True,
     }
+    if lifecycle_mode == "same_boot_sigterm":
+        RECOVERY._process_identity_observation = RECOVERY._process_identity_gone
+        RECOVERY.os.killpg = lambda pgid, number: (
+            (_ for _ in ()).throw(ProcessLookupError(pgid)))
     try:
         report = RECOVERY.recover(SimpleNamespace(
             plan=plan_path, state_dir=campaign["state_dir"],
@@ -584,6 +762,8 @@ def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
             bound.close()
         status = 0
     finally:
+        RECOVERY.os.killpg = original_killpg
+        RECOVERY._process_identity_observation = original_observation
         RECOVERY._process_identity_gone = original_identity
         RECOVERY.time.time = original_time
     assert status == 0
@@ -600,8 +780,22 @@ def strict_recovery_chain(tmp_path_factory: pytest.TempPathFactory):
         "record_path": record_path, "selected_path": selected_path,
         "later_path": later_path, "recovery_cycle": recovery_cycle,
         "recovery_time": recovery_time, "history": history,
-        "recovery_state": recovery_state,
+        "recovery_state": recovery_state, "lifecycle_mode": lifecycle_mode,
     }
+
+
+def test_full_interrupted_recovery_without_finalize_limit_state(
+        strict_recovery_chain) -> None:
+    chain = strict_recovery_chain
+    evidence = chain["record"]["run_log_prefix_audit"][
+        "original_limit_evidence"]
+
+    assert evidence["kind"] == "immutable_plan_launch_argv_v1"
+    assert evidence["driver_limit_state_rows"] == 0
+    assert evidence["lifecycle_kind"] == (
+        "nonzero_completion_v1"
+        if chain["lifecycle_mode"] == "nonzero_completion"
+        else "same_boot_closed_processes_v1")
 
 
 def test_real_recovery_producer_commit_checker_and_planner_consumer(

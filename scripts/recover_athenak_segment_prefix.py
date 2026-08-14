@@ -949,16 +949,108 @@ def _lifecycle(plan: dict[str, Any], launch: dict[str, Any],
     return _same_boot_closure(launch, plan)
 
 
-def _audit_run_log_prefix(path: Path, expected: dict[str, Any]) -> dict[str, Any]:
+def _audit_interrupted_launch_limits(
+        expected: dict[str, Any], lifecycle: dict[str, Any] | None,
+        launch_audit: dict[str, Any] | None,
+        launch_binding: dict[str, Any] | None) -> dict[str, Any]:
+    """Replace a missing Finalize limit row with immutable launch evidence."""
+
+    _require(isinstance(lifecycle, dict),
+             "missing Driver limit state requires an audited interrupted lifecycle")
+    lifecycle_kind = lifecycle.get("kind")
+    if lifecycle_kind == "nonzero_completion_v1":
+        return_code = lifecycle.get("return_code")
+        artifacts = lifecycle.get("artifacts")
+        _require(isinstance(return_code, int) and
+                 not isinstance(return_code, bool) and return_code != 0 and
+                 isinstance(lifecycle.get("completion_record"), dict) and
+                 isinstance(lifecycle.get("canonical_completion_audit"), dict) and
+                 isinstance(artifacts, dict) and
+                 _same_binding(artifacts.get("launch_record"), launch_binding),
+                 "missing Driver limit state lacks a proven nonzero completion")
+    elif lifecycle_kind == "same_boot_closed_processes_v1":
+        bounded = lifecycle.get("bounded_quiescence")
+        _require(lifecycle.get("all_original_identities_gone") is True and
+                 lifecycle.get("managed_process_group_gone") is True and
+                 isinstance(bounded, dict) and
+                 bounded.get("all_quiet") is True,
+                 "missing Driver limit state lacks proven same-boot process closure")
+    else:
+        raise RecoveryFailure(
+            "missing Driver limit state is not an interrupted recovery lifecycle")
+
+    _require(isinstance(launch_audit, dict) and
+             isinstance(launch_binding, dict) and
+             launch_audit.get("sha256") == launch_binding.get("sha256"),
+             "missing Driver limit state lacks its immutable launch-record binding")
+    athena_argv = launch_audit.get("athena_argv")
+    _require(isinstance(athena_argv, list) and athena_argv and
+             all(isinstance(token, str) and token for token in athena_argv),
+             "audited launch record lacks the actual Athena argv")
+    final_cycle = expected.get("final_cycle")
+    tlim = expected.get("tlim")
+    _require(isinstance(final_cycle, int) and not isinstance(final_cycle, bool) and
+             isinstance(tlim, (int, float)) and not isinstance(tlim, bool) and
+             math.isfinite(float(tlim)),
+             "original plan limits are invalid")
+    expected_nlim_token = f"time/nlim={final_cycle}"
+    expected_tlim_token = f"time/tlim={tlim!r}"
+    actual_nlim_tokens = [token for token in athena_argv
+                          if token.startswith("time/nlim=")]
+    actual_tlim_tokens = [token for token in athena_argv
+                          if token.startswith("time/tlim=")]
+    _require(actual_nlim_tokens == [expected_nlim_token] and
+             actual_tlim_tokens == [expected_tlim_token],
+             "actual launch argv does not exactly bind the original plan limits")
+    return {
+        "kind": "immutable_plan_launch_argv_v1",
+        "driver_limit_state_rows": 0,
+        "lifecycle_kind": lifecycle_kind,
+        "plan_expected": {
+            "final_cycle": final_cycle,
+            "tlim": tlim,
+        },
+        "actual_launch_tokens": {
+            "time_nlim": expected_nlim_token,
+            "time_tlim": expected_tlim_token,
+        },
+        "athena_argv_sha256": _canonical_json_sha256(athena_argv),
+        "launch_record": launch_binding,
+        "exact_plan_limit_token_match": True,
+    }
+
+
+def _audit_run_log_prefix(
+        path: Path, expected: dict[str, Any], *,
+        lifecycle: dict[str, Any] | None = None,
+        launch_audit: dict[str, Any] | None = None,
+        launch_binding: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         lines = CHECKER._read_stable_bytes(path).decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
         raise RecoveryFailure("run log is not UTF-8") from exc
     limits = [match for line in lines
               if (match := CHECKER.LIMIT_STATE_RE.fullmatch(line.strip()))]
-    _require(len(limits) == 1 and int(limits[0].group(2)) == expected["final_cycle"] and
-             float(limits[0].group(1)) == float(f"{expected['tlim']:.6e}"),
-             "run log does not bind the original plan limits")
+    _require(len(limits) <= 1,
+             "run log contains multiple Driver limit-state rows")
+    if limits:
+        original_nlim = int(limits[0].group(2))
+        original_tlim = float(limits[0].group(1))
+        _require(original_nlim == expected["final_cycle"] and
+                 original_tlim == float(f"{expected['tlim']:.6e}"),
+                 "run log contains a Driver limit state that contradicts the "
+                 "original plan")
+        original_limit_evidence = {
+            "kind": "driver_limit_state_v1",
+            "driver_limit_state_rows": 1,
+            "nlim": original_nlim,
+            "tlim": original_tlim,
+        }
+    else:
+        original_limit_evidence = _audit_interrupted_launch_limits(
+            expected, lifecycle, launch_audit, launch_binding)
+        original_nlim = int(expected["final_cycle"])
+        original_tlim = float(expected["tlim"])
     diagnostics = [match for line in lines
                    if (match := CHECKER.DIAGNOSTIC_RE.fullmatch(line.strip()))]
     observed_cycles = [int(match.group(2)) for match in diagnostics]
@@ -996,8 +1088,9 @@ def _audit_run_log_prefix(path: Path, expected: dict[str, Any]) -> dict[str, Any
              tolerance > 0.0 and mixed <= tolerance,
              "run-log restart-cache qualification failed")
     return {
-        "original_nlim": int(limits[0].group(2)),
-        "original_tlim": float(limits[0].group(1)),
+        "original_nlim": original_nlim,
+        "original_tlim": original_tlim,
+        "original_limit_evidence": original_limit_evidence,
         "root_step_diagnostics": {
             "rows": len(prefix), "cycle_min": prefix_cycles[0],
             "cycle_max": prefix_cycles[-1], "fixed_dt": expected["root_dt"],
@@ -1328,8 +1421,8 @@ def recover(args: argparse.Namespace) -> dict[str, Any]:
              "plan/launch binding differs from bound original evidence tree")
     gpu_before = _binding(Path(plan["launch_contract"]["evidence"]["gpu_before"]))
     try:
-        CHECKER.audit_launch_record(args.launch_record, plan, args.plan,
-                                    original_state, gpu_before)
+        launch_audit = CHECKER.audit_launch_record(
+            args.launch_record, plan, args.plan, original_state, gpu_before)
     except Exception as exc:
         raise RecoveryFailure(f"original launch record is invalid: {exc}") from exc
     completion = (args.completion_record if args.completion_record is not None else
@@ -1409,7 +1502,8 @@ def recover(args: argparse.Namespace) -> dict[str, Any]:
     run_log_expected["recovery_final_cycle"] = final_cycle
     run_log_prefix_audit = _audit_run_log_prefix(
         Path(plan["launch_contract"]["evidence"]["run_log"]),
-        run_log_expected)
+        run_log_expected, lifecycle=lifecycle, launch_audit=launch_audit,
+        launch_binding=launch_binding)
     run_log_name = Path(plan["launch_contract"]["evidence"]["run_log"]).name
     _require(_same_binding(
         _binding(Path(plan["launch_contract"]["evidence"]["run_log"])),
