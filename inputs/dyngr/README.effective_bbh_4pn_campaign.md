@@ -178,8 +178,16 @@ every `48M`, the strict full-domain `divB` topology reference every root endpoin
 long segment, the strict planner may make the one-time audited `48M -> 19.2M` restart
 transition with `--target-restart-dt 19.2`; it preserves the serialized `last_time`
 phase, records the exact `output4/dt=19.2` runtime token, and serializes `19.2M` into the
-new checkpoints.  Later segments omit the option and inherit that tighter cadence
-without another override.  The event log writes a row even when
+new checkpoints.  The same plan may make the paired `48M -> 10M` full-domain 3-D
+transition with `--target-global-dt 10`; this atomically emits
+`output2/dt=10.0` for `mhd_w_bcc` and `output5/dt=10.0` for
+`mhd_gr_diagnostics`, preserves their common serialized phase, and binds both old and
+new schedules and endpoint counters.  Their optional `id` fields must equal their own
+variables, all numbered output path templates must remain disjoint, and every planned
+write plus the endpoint's next counter must fit AthenaK's five-digit filename range
+(`<100000`).  A mismatch, alias, collision, or exhausted counter is fatal before
+launch.  Later segments omit both one-time options and inherit the serialized tighter
+cadences without another override.  The event log writes a row even when
 all fault counters are zero and records 64-bit totals for conserved/primitive floors,
 C2P failures and actual iteration maxima, conserved and magnetization adjustments,
 non-excision FOFC corrections, normal C2P calls, and FOFC trial solves.  Detailed C2P

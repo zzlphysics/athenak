@@ -50,6 +50,7 @@ python3 scripts/plan_athenak_segment.py \
   --trajectory /data/athenak/trajectory/trajectory.dat \
   --root-steps 100 --root-dt 4.8 --tlim-guard-steps 2 --ranks 8 \
   --target-restart-dt 19.2 \
+  --target-global-dt 10 \
   --target-max-nmb-per-rank 1280 \
   --launcher /data/athenak-l4/opt/strict-prrte-5.0.9/prterun \
   --mca-prefix /data/athenak-l4/opt/openmpi-5.0.9-cuda \
@@ -117,6 +118,32 @@ restart has serialized `dt=19.2`, omit the option on subsequent segments: the de
 preserves that value and emits no restart override.  An explicit equal target is also
 unchanged; increasing, non-finite, non-root-step-multiple, duplicate, multi-restart, or
 `dcycle` requests fail closed.
+
+`--target-global-dt` is the only authorized full-domain 3-D cadence transition.
+It applies atomically to exactly the ghost-free binary pair
+`output2=mhd_w_bcc` and `output5=mhd_gr_diagnostics`; the source restart must
+serialize identical positive `dt`, `file_number`, `last_time`, and
+`last_write_cycle` values for both streams.  Each stream may omit `id`, or set it
+exactly equal to its own `variable`; aliases are rejected so that the pair cannot
+silently overwrite one another.  When present, the requested value
+must be strictly smaller than the serialized interval.  For example, `48M ->
+10M` adds the two ordered tokens `output2/dt=10.0` and
+`output5/dt=10.0`; it does not require an integer root-step multiple because
+Athena's float32 output-due comparison can legitimately alternate the number of
+root steps between writes.  The immutable plan records the old and new schedules
+and endpoint phase for each stream, and both the launcher and endpoint checker
+independently replay and require the exact paired result.  Omit the option once
+the endpoint restart has serialized the tighter cadence.  Equal, increasing,
+non-positive, non-finite, duplicate, unpaired, regional/sliced, ghost-zone, or
+noncanonical-variable requests fail closed.  Schema-1 plans created before this
+field existed remain valid, but authorize no `output2/dt` or `output5/dt`
+override.
+
+Every planned numbered `bin`/`rst` pathname is also checked for uniqueness by
+the planner, launcher, and checker.  AthenaK formats these counters through its
+five-digit C++ filename buffer, so every write number and the endpoint's next
+`file_number` must be below `100000`.  A segment is rejected before launch if it
+would consume that continuation headroom or make any numbered output collide.
 
 `--planned-peak-output-gib` is a conservative peak for files newly created under the
 segment's state directory.  It does not include the staged source-restart and trajectory

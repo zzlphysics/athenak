@@ -60,6 +60,12 @@ GIB_BYTES = 1 << 30
 DEFAULT_PLANNED_PEAK_OUTPUT_GIB = 200
 MAX_NMB_PER_RANK = 16384
 CADENCE_MULTIPLE_MAX_ULPS = 2
+NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX = 100000
+NUMBERED_FILE_NUMBER_MARKER = "{file_number:05d}"
+GLOBAL_CADENCE_STREAMS = (
+    ("output2", "mhd_w_bcc"),
+    ("output5", "mhd_gr_diagnostics"),
+)
 CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
 CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
 CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
@@ -540,6 +546,89 @@ def _restart_cadence_transition(
     }
 
 
+def _global_cadence_transition(
+        parameters: dict[str, dict[str, str]],
+        requested_target: float | None) -> dict[str, Any]:
+    """Bind the paired full-domain MHD/GR 3-D cadence transition."""
+
+    streams: list[dict[str, Any]] = []
+    for block_name, variable in GLOBAL_CADENCE_STREAMS:
+        block = parameters.get(block_name)
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"--target-global-dt requires canonical <{block_name}>")
+        try:
+            gid = int(block.get("gid", "-1"))
+            source_dt = float(block["dt"])
+            phase = {
+                "file_number": int(block.get("file_number", "0")),
+                "last_time": float(block.get("last_time", "-1")),
+                "last_write_cycle": int(block.get("last_write_cycle", "-1")),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"<{block_name}> has invalid global-output cadence state") from exc
+        file_id = block.get("id", variable)
+        if (block.get("file_type", "").strip() != "bin" or
+                block.get("variable", "").strip() != variable or
+                not isinstance(file_id, str) or file_id != variable or
+                "dcycle" in block or gid >= 0 or
+                "region_center" in block or "region_half_width" in block or
+                any(f"region_half_width{axis}" in block
+                    for axis in (1, 2, 3)) or
+                "region_slice_axis" in block or "region_slice_offset" in block or
+                any(f"slice_x{axis}" in block for axis in (1, 2, 3)) or
+                block.get("ghost_zones", "false").strip().lower() not in
+                ("false", "0")):
+            raise ValueError(
+                f"<{block_name}> must be the ghost-free full-domain {variable} "
+                "binary stream")
+        source_dt = _positive_finite(
+            source_dt, f"source <{block_name}>/dt")
+        if (phase["file_number"] < 0 or
+                not math.isfinite(phase["last_time"])):
+            raise ValueError(
+                f"<{block_name}> has invalid global-output cadence phase")
+        streams.append({
+            "block": block_name,
+            "parameter": f"{block_name}/dt",
+            "file_type": "bin",
+            "variable": variable,
+            "source_dt": source_dt,
+            "phase": phase,
+        })
+
+    if (streams[0]["source_dt"] != streams[1]["source_dt"] or
+            streams[0]["phase"] != streams[1]["phase"]):
+        raise ValueError(
+            "paired output2/output5 global streams must serialize identical "
+            "dt, file_number, last_time, and last_write_cycle")
+    source_dt = streams[0]["source_dt"]
+    if requested_target is None:
+        target_dt = source_dt
+        changed = False
+    else:
+        target_dt = _positive_finite(requested_target, "--target-global-dt")
+        if target_dt >= source_dt:
+            raise ValueError(
+                "--target-global-dt must strictly tighten the paired source "
+                "global-output cadence")
+        changed = True
+    runtime_overrides: list[str] = []
+    for stream in streams:
+        stream["target_dt"] = target_dt
+        stream["runtime_override"] = (
+            f"{stream['parameter']}={target_dt!r}" if changed else None)
+        if stream["runtime_override"] is not None:
+            runtime_overrides.append(stream["runtime_override"])
+    return {
+        "kind": "tighten_pair_v1" if changed else "unchanged_pair_v1",
+        "target_dt": target_dt,
+        "streams": streams,
+        "runtime_overrides": runtime_overrides,
+    }
+
+
 def _disk_preflight_contract(source_restart_size: int, trajectory_size: int,
                              planned_peak_output_gib: int) -> dict[str, Any]:
     """Bind the conservative, per-filesystem launch capacity budget."""
@@ -958,6 +1047,7 @@ def _output_blocks(
 def _runtime_parameters_with_output_overrides(
         source: dict[str, dict[str, str]], root_dt: float,
         restart_transition: dict[str, Any],
+        global_transition: dict[str, Any],
         *, anchor: bool) -> dict[str, dict[str, str]]:
     """Apply the exact, plan-bound output cadence overrides."""
 
@@ -995,6 +1085,13 @@ def _runtime_parameters_with_output_overrides(
         if not isinstance(restart_block, dict):  # pragma: no cover - prevalidated
             raise ValueError("planned restart output disappeared")
         restart_block["dt"] = repr(restart_transition["target_dt"])
+    for stream in global_transition["streams"]:
+        if stream["runtime_override"] is None:
+            continue
+        global_block = runtime.get(stream["block"])
+        if not isinstance(global_block, dict):  # pragma: no cover - prevalidated
+            raise ValueError("planned global output disappeared")
+        global_block["dt"] = repr(stream["target_dt"])
     return runtime
 
 
@@ -1033,6 +1130,85 @@ def _float32(value: float) -> float:
         return struct.unpack("=f", struct.pack("=f", value))[0]
     except (OverflowError, struct.error) as exc:
         raise ValueError(f"output time is not representable as float32: {value}") from exc
+
+
+def _replay_global_stream_schedule(
+        phase: dict[str, Any], dt: float, source_time: float, source_cycle: int,
+        final_time: float, final_cycle: int, root_dt: float,
+        tlim: float) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Replay one numbered non-restart dt stream through Execute/Finalize."""
+
+    state = {
+        "file_number": phase["file_number"],
+        "last_time": phase["last_time"],
+        "last_write_cycle": phase["last_write_cycle"],
+        "wrote_this_run": False,
+    }
+    writes: list[dict[str, Any]] = []
+
+    def due(output_time: float, enforce_time_limit: bool) -> bool:
+        return (_float32(output_time) >=
+                _float32(state["last_time"] + dt) and
+                (not enforce_time_limit or
+                 _float32(output_time) < _float32(tlim)))
+
+    def write(cycle: int, output_time: float, kind: str,
+              advance: bool) -> None:
+        writes.append({
+            "cycle": cycle,
+            "time": output_time,
+            "kind": kind,
+            "file_number": state["file_number"],
+        })
+        state["file_number"] += 1
+        if advance:
+            state["last_time"] = (output_time if state["last_time"] < 0.0
+                                  else state["last_time"] + dt)
+        state["last_write_cycle"] = cycle
+        state["wrote_this_run"] = True
+
+    output_time = source_time
+    for cycle in range(source_cycle + 1, final_cycle + 1):
+        output_time += root_dt
+        if due(output_time, True):
+            write(cycle, output_time, "scheduled", True)
+    wrote_current = (state["wrote_this_run"] and
+                     state["last_write_cycle"] == final_cycle)
+    if not wrote_current:
+        advance = (state["last_write_cycle"] != final_cycle and
+                   due(final_time, False))
+        write(final_cycle, final_time, "forced_final", advance)
+    return writes, {
+        "file_number": state["file_number"],
+        "last_time": state["last_time"],
+        "last_write_cycle": state["last_write_cycle"],
+    }
+
+
+def _bind_global_cadence_schedules(
+        transition: dict[str, Any], source_time: float, source_cycle: int,
+        final_time: float, final_cycle: int, root_dt: float,
+        tlim: float) -> dict[str, Any]:
+    """Seal each paired stream's old and new schedule into the plan."""
+
+    bound = copy.deepcopy(transition)
+    for stream in bound["streams"]:
+        source_schedule, source_endpoint = _replay_global_stream_schedule(
+            stream["phase"], stream["source_dt"], source_time, source_cycle,
+            final_time, final_cycle, root_dt, tlim)
+        target_schedule, target_endpoint = _replay_global_stream_schedule(
+            stream["phase"], stream["target_dt"], source_time, source_cycle,
+            final_time, final_cycle, root_dt, tlim)
+        stream["source_schedule"] = source_schedule
+        stream["target_schedule"] = target_schedule
+        stream["source_endpoint_state"] = source_endpoint
+        stream["target_endpoint_state"] = target_endpoint
+    if (bound["streams"][0]["source_schedule"] !=
+            bound["streams"][1]["source_schedule"] or
+            bound["streams"][0]["target_schedule"] !=
+            bound["streams"][1]["target_schedule"]):
+        raise ValueError("paired global-output schedules are not identical")
+    return bound
 
 
 def _replay_output_contract(outputs: list[dict[str, Any]], source_time: float,
@@ -1125,6 +1301,63 @@ def _replay_output_contract(outputs: list[dict[str, Any]], source_time: float,
             "last_time": state["last_time"],
             "last_write_cycle": state["last_write_cycle"],
         }
+
+
+def _validate_numbered_output_contract(outputs: list[dict[str, Any]]) -> None:
+    """Reject colliding names and exhaustion of Athena's five-digit counter."""
+
+    template_owners: dict[str, str] = {}
+    path_owners: dict[str, str] = {}
+    for output in outputs:
+        if not output["numbered"]:
+            continue
+        block = output["block"]
+        file_type = output["file_type"]
+        if file_type not in ("bin", "rst"):
+            raise ValueError(
+                f"<{block}> numbered file_type must be bin or rst")
+        template = output["relative_path_template"]
+        if not isinstance(template, str):  # pragma: no cover - generated above
+            raise ValueError(f"<{block}> numbered output has no filename template")
+        fields = re.findall(r"\{([^{}]+)\}", template)
+        if fields != ["file_number:05d"]:
+            raise ValueError(
+                f"<{block}> numbered filename template is not canonical")
+        try:
+            probe = template.format(file_number=0)
+        except (IndexError, KeyError, ValueError) as exc:
+            raise ValueError(
+                f"<{block}> numbered filename template is invalid") from exc
+        path = PurePosixPath(probe)
+        if (path.is_absolute() or any(part in ("", ".", "..")
+                                      for part in path.parts)):
+            raise ValueError(
+                f"<{block}> numbered filename template is not a safe relative path")
+        previous = template_owners.get(template)
+        if previous is not None:
+            raise ValueError(
+                f"<{block}> numbered filename template collides with <{previous}>")
+        template_owners[template] = block
+
+        writes = output["expected_writes"]
+        for write in writes:
+            file_number = write["file_number"]
+            if not (0 <= file_number < NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX):
+                raise ValueError(
+                    f"<{block}> expected file_number {file_number} exceeds the "
+                    "C++ five-digit filename limit")
+            relative = template.format(file_number=file_number)
+            previous = path_owners.get(relative)
+            if previous is not None:
+                raise ValueError(
+                    f"<{block}> planned numbered path {relative} collides with "
+                    f"<{previous}>")
+            path_owners[relative] = block
+        next_file_number = output["expected_endpoint_state"]["file_number"]
+        if not (0 <= next_file_number < NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX):
+            raise ValueError(
+                f"<{block}> endpoint next file_number {next_file_number} cannot "
+                "continue within the C++ five-digit filename limit")
 
 
 def _required_paths(values: list[str]) -> list[str]:
@@ -1359,6 +1592,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         capacity, getattr(args, "target_max_nmb_per_rank", None))
     restart_cadence_transition = _restart_cadence_transition(
         parameters, root_dt, getattr(args, "target_restart_dt", None))
+    global_cadence_transition = _global_cadence_transition(
+        parameters, getattr(args, "target_global_dt", None))
     READER.load_balance(metadata.costs, ranks, capacity)
     target_capacity = capacity_transition["target_max_nmb_per_rank"]
     target_partitions = READER.load_balance(
@@ -1433,8 +1668,12 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if not math.isfinite(final_time) or not math.isfinite(tlim) or tlim <= final_time:
         raise ValueError("planned endpoint/tlim is non-finite or non-increasing")
 
+    global_cadence_transition = _bind_global_cadence_schedules(
+        global_cadence_transition, metadata.time, metadata.cycle,
+        final_time, final_cycle, root_dt, tlim)
     runtime_parameters = _runtime_parameters_with_output_overrides(
-        parameters, root_dt, restart_cadence_transition, anchor=anchor)
+        parameters, root_dt, restart_cadence_transition,
+        global_cadence_transition, anchor=anchor)
     outputs = _output_blocks(runtime_parameters, required)
     for output in outputs:
         if output["inspect_binary"]:
@@ -1443,6 +1682,16 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 variable, parameters)
     _replay_output_contract(
         outputs, metadata.time, metadata.cycle, final_time, final_cycle, root_dt, tlim)
+    _validate_numbered_output_contract(outputs)
+    for stream in global_cadence_transition["streams"]:
+        output = next(row for row in outputs
+                      if row["block"] == stream["block"])
+        if (output["expected_writes"] != stream["target_schedule"] or
+                output["expected_endpoint_state"] !=
+                stream["target_endpoint_state"]):
+            raise ValueError(
+                f"<{stream['block']}> target cadence schedule differs from the "
+                "paired transition replay")
     output3 = next((output for output in outputs
                     if output["block"] == "output3"), None)
     if (output3 is None or output3["cadence_mode"] != "dt" or
@@ -1487,6 +1736,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if restart_cadence_transition["runtime_override"] is not None:
         athena_argv_template.append(
             restart_cadence_transition["runtime_override"])
+    athena_argv_template.extend(global_cadence_transition["runtime_overrides"])
     if capacity_transition["runtime_override"] is not None:
         athena_argv_template.append(capacity_transition["runtime_override"])
     evidence = {
@@ -1531,6 +1781,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "source": source_summary,
         "capacity_transition": capacity_transition,
         "restart_cadence_transition": restart_cadence_transition,
+        "global_cadence_transition": global_cadence_transition,
         "expected": {
             "source_cycle": metadata.cycle,
             "source_time": metadata.time,
@@ -1549,6 +1800,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 restart_cadence_transition["target_dt"]}
                if restart_cadence_transition["runtime_override"] is not None
                else {}),
+            **({stream["parameter"]: stream["target_dt"]
+                for stream in global_cadence_transition["streams"]
+                if stream["runtime_override"] is not None}),
             **({"mesh_refinement/max_nmb_per_rank":
                 capacity_transition["target_max_nmb_per_rank"]}
                if capacity_transition["runtime_override"] is not None else {}),
@@ -1679,6 +1933,12 @@ def main() -> int:
         help=("tighten the sole restart output cadence for this segment; the "
               "value must be a positive root-dt multiple no larger than the "
               "serialized source cadence; omit to preserve it"),
+    )
+    parser.add_argument(
+        "--target-global-dt", type=float, action=_StoreOnce,
+        help=("strictly tighten the paired full-domain output2=mhd_w_bcc and "
+              "output5=mhd_gr_diagnostics time cadence; omit to preserve their "
+              "identical serialized cadence"),
     )
     parser.add_argument("--launcher", required=True, type=Path)
     parser.add_argument(

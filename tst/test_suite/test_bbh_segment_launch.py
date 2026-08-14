@@ -479,6 +479,73 @@ def _set_restart_cadence_tightening(plan: dict[str, Any]) -> None:
         "output4/dt=19.2")
 
 
+def _set_global_cadence_tightening(plan: dict[str, Any]) -> None:
+    expected = plan["expected"]
+    expected.update({
+        "source_cycle": 10, "source_time": 48.0,
+        "final_time": 62.39999999999999,
+    })
+    phase = {"file_number": 4, "last_time": 48.0,
+             "last_write_cycle": 10}
+    source_schedule = [{
+        "cycle": 13, "time": 62.39999999999999,
+        "kind": "forced_final", "file_number": 4,
+    }]
+    source_endpoint = {
+        "file_number": 5, "last_time": 48.0, "last_write_cycle": 13,
+    }
+    target_schedule = [{
+        "cycle": 13, "time": 62.39999999999999,
+        "kind": "scheduled", "file_number": 4,
+    }]
+    target_endpoint = {
+        "file_number": 5, "last_time": 58.0, "last_write_cycle": 13,
+    }
+    plan["source"]["parameters"]["job"] = {"basename": "run"}
+    streams = []
+    plan["outputs"] = []
+    for block, variable in LAUNCHER.GLOBAL_CADENCE_STREAMS:
+        source_parameters = {
+            "file_type": "bin", "variable": variable, "dt": "48.0",
+            "file_number": "4", "last_time": "48.0",
+            "last_write_cycle": "10", "ghost_zones": "false",
+        }
+        plan["source"]["parameters"][block] = source_parameters
+        runtime_parameters = {**source_parameters, "dt": "10.0"}
+        streams.append({
+            "block": block, "parameter": f"{block}/dt",
+            "file_type": "bin", "variable": variable,
+            "source_dt": 48.0, "target_dt": 10.0,
+            "phase": dict(phase),
+            "runtime_override": f"{block}/dt=10.0",
+            "source_schedule": [dict(row) for row in source_schedule],
+            "target_schedule": [dict(row) for row in target_schedule],
+            "source_endpoint_state": dict(source_endpoint),
+            "target_endpoint_state": dict(target_endpoint),
+        })
+        plan["outputs"].append({
+            "block": block, "file_type": "bin", "cadence_mode": "dt",
+            "cadence": 10.0, "numbered": True,
+            "relative_path_template":
+                f"bin/run.{variable}.{{file_number:05d}}.bin",
+            "parameters": runtime_parameters,
+            "parameters_sha256": LAUNCHER._canonical_sha256(
+                runtime_parameters),
+            "expected_writes": [dict(row) for row in target_schedule],
+            "expected_endpoint_state": dict(target_endpoint),
+        })
+    plan["global_cadence_transition"] = {
+        "kind": "tighten_pair_v1", "target_dt": 10.0,
+        "streams": streams,
+        "runtime_overrides": ["output2/dt=10.0", "output5/dt=10.0"],
+    }
+    plan["command_overrides"].update({
+        "output2/dt": 10.0, "output5/dt": 10.0,
+    })
+    plan["launch_contract"]["athena_argv_template"].extend(
+        ["output2/dt=10.0", "output5/dt=10.0"])
+
+
 def test_prepare_derives_only_the_canonical_token_arrays(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path)
 
@@ -707,6 +774,199 @@ def test_prepare_accepts_exact_restart_cadence_tightening(
         assert prepared.athena_argv.count("output4/dt=19.2") == 1
     finally:
         prepared.close()
+
+
+def test_prepare_accepts_exact_paired_global_cadence_tightening(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(campaign, _set_global_cadence_tightening)
+
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert prepared.athena_argv[-2:] == (
+            "output2/dt=10.0", "output5/dt=10.0")
+        assert prepared.athena_argv.count("output2/dt=10.0") == 1
+        assert prepared.athena_argv.count("output5/dt=10.0") == 1
+    finally:
+        prepared.close()
+
+
+def test_launcher_prelaunch_rejects_duplicate_numbered_filename_templates(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_global_cadence_tightening(plan)
+        source = plan["source"]["parameters"]["output5"]
+        source["id"] = "mhd_w_bcc"
+        output = next(row for row in plan["outputs"]
+                      if row["block"] == "output5")
+        output["parameters"]["id"] = "mhd_w_bcc"
+        output["parameters_sha256"] = LAUNCHER._canonical_sha256(
+            output["parameters"])
+        output["relative_path_template"] = \
+            "bin/run.mhd_w_bcc.{file_number:05d}.bin"
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match="template collides"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+@pytest.mark.parametrize("file_id", (
+    "unique-but-noncanonical", " mhd_w_bcc "))
+def test_launcher_rejects_noncanonical_global_pair_id(
+        tmp_path: Path, file_id: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_global_cadence_tightening(plan)
+        source = plan["source"]["parameters"]["output2"]
+        source["id"] = file_id
+        output = next(row for row in plan["outputs"]
+                      if row["block"] == "output2")
+        output["parameters"]["id"] = file_id
+        output["parameters_sha256"] = LAUNCHER._canonical_sha256(
+            output["parameters"])
+        output["relative_path_template"] = (
+            f"bin/run.{file_id.strip()}.{{file_number:05d}}.bin")
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="global cadence source/target/phase"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+@pytest.mark.parametrize(
+    ("write_number", "endpoint_number", "message"),
+    (
+        (100000, 100001, "expected file_number 100000"),
+        (99999, 100000, "endpoint next file_number 100000"),
+    ),
+)
+def test_launcher_prelaunch_rejects_numbered_filename_counter_exhaustion(
+        tmp_path: Path, write_number: int, endpoint_number: int,
+        message: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_global_cadence_tightening(plan)
+        output = next(row for row in plan["outputs"]
+                      if row["block"] == "output2")
+        output["expected_writes"][0]["file_number"] = write_number
+        output["expected_endpoint_state"]["file_number"] = endpoint_number
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match=message):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("command", "argv", "phase", "source_schedule", "target_schedule",
+     "endpoint", "pair", "one_override", "output_schedule",
+     "output_endpoint", "output_parameters"),
+)
+def test_prepare_rejects_paired_global_cadence_transition_tamper(
+        tmp_path: Path, tamper: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_global_cadence_tightening(plan)
+        transition = plan["global_cadence_transition"]
+        if tamper == "command":
+            plan["command_overrides"]["output2/dt"] = 9.6
+        elif tamper == "argv":
+            plan["launch_contract"]["athena_argv_template"][-2] = \
+                "output2/dt=9.6"
+        elif tamper == "phase":
+            transition["streams"][0]["phase"]["last_time"] = 43.2
+        elif tamper == "source_schedule":
+            transition["streams"][0]["source_schedule"][0]["kind"] = \
+                "scheduled"
+        elif tamper == "target_schedule":
+            transition["streams"][1]["target_schedule"][0]["cycle"] = 12
+        elif tamper == "endpoint":
+            transition["streams"][0]["target_endpoint_state"][
+                "file_number"] += 1
+        elif tamper == "pair":
+            plan["source"]["parameters"]["output5"]["last_time"] = "43.2"
+        elif tamper == "one_override":
+            transition["runtime_overrides"].pop()
+        elif tamper == "output_schedule":
+            plan["outputs"][0]["expected_writes"][0]["cycle"] = 12
+        elif tamper == "output_endpoint":
+            plan["outputs"][1]["expected_endpoint_state"]["file_number"] += 1
+        else:
+            plan["outputs"][0]["parameters"]["dt"] = "9.6"
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+def test_launcher_rejects_present_null_global_cadence_extension(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(
+        campaign,
+        lambda plan: plan.__setitem__("global_cadence_transition", None))
+
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="global_cadence_transition"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda transition: transition.__setitem__("target_dt", 10),
+        lambda transition: transition["streams"][0].__setitem__(
+            "source_dt", 48),
+        lambda transition: transition["streams"][1].__setitem__(
+            "target_dt", 10),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "file_number", 4.0),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "last_time", 48),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "last_write_cycle", 10.0),
+        lambda transition: transition["streams"][0]["source_schedule"][0].
+            __setitem__("file_number", 4.0),
+        lambda transition: transition["streams"][1]["target_schedule"][0].
+            __setitem__("time", 62),
+        lambda transition: transition["streams"][0]["source_endpoint_state"].
+            __setitem__("file_number", 5.0),
+        lambda transition: transition["streams"][1]["target_endpoint_state"].
+            __setitem__("last_time", 58),
+    ),
+    ids=("integer-target", "integer-source", "integer-stream-target",
+         "float-file-number", "integer-last-time", "float-last-cycle",
+         "float-write-number", "integer-write-time",
+         "float-endpoint-number", "integer-endpoint-time"),
+)
+def test_launcher_rejects_noncanonical_global_cadence_numeric_types(
+        tmp_path: Path, mutation) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_global_cadence_tightening(plan)
+        mutation(plan["global_cadence_transition"])
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match="numeric types|numeric type"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
 
 
 def test_prepare_accepts_decimal_restart_multiple_with_division_roundoff(
@@ -2165,6 +2425,36 @@ def test_real_planner_artifact_is_accepted_by_launcher_prepare(
         prepared.input_holder.close()
 
 
+def test_real_planner_global_cadence_transition_crosses_checker_and_launcher(
+        tmp_path: Path) -> None:
+    """Exercise the real 48M -> 10M paired contract across all three tools."""
+
+    import check_athenak_segment as checker
+    import test_suite.test_bbh_segment_plan as plan_tests
+
+    campaign = plan_tests._campaign(tmp_path)
+    result = plan_tests._run(
+        campaign, root_steps="20", target_global_dt="10")
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    assert checker.validate_plan(plan)["final_cycle"] == 51
+
+    fake_run = FakeRun(plan["policy"]["ranks"])
+    runtime = LAUNCHER.Runtime(
+        run=fake_run, statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
+    prepared = LAUNCHER.prepare_launch(
+        campaign["output"], campaign["state_dir"], runtime)
+    try:
+        assert prepared.athena_argv[-2:] == (
+            "output2/dt=10.0", "output5/dt=10.0")
+        transition = prepared.plan["global_cadence_transition"]
+        assert transition["kind"] == "tighten_pair_v1"
+        assert transition["streams"][0]["target_schedule"] == \
+            transition["streams"][1]["target_schedule"]
+    finally:
+        prepared.close()
+
+
 def test_real_planner_mocked_eight_rank_lifecycle_passes_checker_consumers(
         tmp_path: Path) -> None:
     """Exercise planner -> launcher -> launch/completion checker as one chain."""
@@ -2232,7 +2522,7 @@ def test_real_planner_mocked_eight_rank_lifecycle_passes_checker_consumers(
         (
             lambda plan: plan["outputs"][2]["expected_endpoint_state"].update(
                 {"file_number": 999999}),
-            "strict plan validation failed.*output3 endpoint cadence state",
+            "strict plan validation failed.*output3.*file_number",
         ),
         (
             lambda plan: plan["parameter_snapshots"].update(

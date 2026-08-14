@@ -46,6 +46,13 @@ def _write_restart(
         output4_dt: str | None = "19.2", output4_dcycle: int | None = None,
         output4_file_number: int = 9, output4_last_time: str = "148.8",
         output4_last_write_cycle: int = 31,
+        output2_dt: str = "48.0", output5_dt: str = "48.0",
+        output2_variable: str = "mhd_w_bcc",
+        output5_variable: str = "mhd_gr_diagnostics",
+        output2_id: str | None = None, output3_id: str | None = None,
+        output5_id: str | None = None,
+        output2_ghost_zones: str = "false", output5_ghost_zones: str = "false",
+        output2_extra: str = "", output5_extra: str = "",
         output5_file_type: str = "bin",
         output_states: dict[str, dict[str, object]] | None = None,
         nlim: int = -1, tlim: float = 628.8) -> None:
@@ -79,6 +86,9 @@ def _write_restart(
         output4_cadence = f"dt = {output4_dt}"
     else:
         output4_cadence = ""
+    output2_id_line = "" if output2_id is None else f"id = {output2_id}"
+    output3_id_line = "" if output3_id is None else f"id = {output3_id}"
+    output5_id_line = "" if output5_id is None else f"id = {output5_id}"
 
     parameters = f"""<job>
 basename = effective_bbh_4pn_V100Q
@@ -124,15 +134,18 @@ last_time = {output_value('output1', 'last_time')}
 last_write_cycle = {output_value('output1', 'last_write_cycle')}
 <output2>
 file_type = bin
-variable = mhd_w_bcc
-dt = 48.0
+variable = {output2_variable}
+{output2_id_line}
+dt = {output2_dt}
 file_number = {output_value('output2', 'file_number')}
 last_time = {output_value('output2', 'last_time')}
 last_write_cycle = {output_value('output2', 'last_write_cycle')}
-ghost_zones = false
+ghost_zones = {output2_ghost_zones}
+{output2_extra}
 <output3>
 file_type = bin
 variable = mhd_divb
+{output3_id_line}
 dt = {output3_dt}
 file_number = {output_value('output3', 'file_number')}
 last_time = {output_value('output3', 'last_time')}
@@ -147,12 +160,14 @@ last_write_cycle = {output_value('output4', 'last_write_cycle')}
 single_file_per_rank = false
 <output5>
 file_type = {output5_file_type}
-variable = mhd_gr_diagnostics
-dt = 48.0
+variable = {output5_variable}
+{output5_id_line}
+dt = {output5_dt}
 file_number = {output_value('output5', 'file_number')}
 last_time = {output_value('output5', 'last_time')}
 last_write_cycle = {output_value('output5', 'last_write_cycle')}
-ghost_zones = false
+ghost_zones = {output5_ghost_zones}
+{output5_extra}
 <output6>
 file_type = log
 dcycle = 1
@@ -312,6 +327,10 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         command.extend([
             "--target-restart-dt", values["target_restart_dt"],
         ])
+    if "target_global_dt" in overrides:
+        command.extend([
+            "--target-global-dt", values["target_global_dt"],
+        ])
     return command
 
 
@@ -366,6 +385,17 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
                   "last_write_cycle": 31},
         "runtime_override": None,
     }
+    global_transition = plan["global_cadence_transition"]
+    assert global_transition["kind"] == "unchanged_pair_v1"
+    assert global_transition["target_dt"] == 48.0
+    assert global_transition["runtime_overrides"] == []
+    assert [(stream["block"], stream["variable"])
+            for stream in global_transition["streams"]] == [
+        ("output2", "mhd_w_bcc"),
+        ("output5", "mhd_gr_diagnostics"),
+    ]
+    assert all(stream["runtime_override"] is None
+               for stream in global_transition["streams"])
     assert plan["source_qualification"]["mode"] == "anchor_full_audit"
     assert plan["source_qualification"]["audit"]["valid"] is True
     assert plan["source_qualification"]["audit"]["stored_reals"][
@@ -911,6 +941,258 @@ def test_plan_rejects_duplicate_restart_cadence_target(tmp_path: Path) -> None:
     campaign = _campaign(tmp_path, output4_dt="48.0")
     command = _command(campaign, target_restart_dt="19.2")
     command.extend(["--target-restart-dt", "9.6"])
+    environment = dict(os.environ)
+    environment["PATH"] = (
+        f"{campaign['nvidia_smi'].parent}{os.pathsep}"
+        f"{environment.get('PATH', '')}")
+
+    result = subprocess.run(
+        command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment)
+
+    assert result.returncode != 0
+    assert "may be specified only once" in result.stderr
+
+
+def test_global_cadence_tightening_binds_paired_schedules_c322_to_c372(
+        tmp_path: Path) -> None:
+    phase = {"file_number": 40, "last_time": 1536.0,
+             "last_write_cycle": 320}
+    campaign = _campaign(
+        tmp_path, cycle=322, time_value=1545.599999999991,
+        output_states={
+            "output1": {"file_number": 0, "last_time": -1.0,
+                        "last_write_cycle": 322},
+            "output2": dict(phase),
+            "output3": {"file_number": 323,
+                        "last_time": 1545.599999999991,
+                        "last_write_cycle": 322},
+            "output4": {"file_number": 45,
+                        "last_time": 1540.8000000000002,
+                        "last_write_cycle": 322},
+            "output5": dict(phase),
+            "output6": {"file_number": 0, "last_time": -1.0,
+                        "last_write_cycle": 322},
+        })
+
+    result = _run(campaign, root_steps="50", target_global_dt="10")
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    transition = plan["global_cadence_transition"]
+    assert transition["kind"] == "tighten_pair_v1"
+    assert transition["target_dt"] == 10.0
+    assert transition["runtime_overrides"] == [
+        "output2/dt=10.0", "output5/dt=10.0",
+    ]
+    assert plan["command_overrides"]["output2/dt"] == 10.0
+    assert plan["command_overrides"]["output5/dt"] == 10.0
+    assert plan["launch_contract"]["athena_argv_template"][-2:] == [
+        "output2/dt=10.0", "output5/dt=10.0",
+    ]
+
+    streams = transition["streams"]
+    assert [(stream["block"], stream["variable"], stream["source_dt"],
+             stream["target_dt"], stream["phase"])
+            for stream in streams] == [
+        ("output2", "mhd_w_bcc", 48.0, 10.0, phase),
+        ("output5", "mhd_gr_diagnostics", 48.0, 10.0, phase),
+    ]
+    assert streams[0]["source_schedule"] == streams[1]["source_schedule"]
+    assert streams[0]["target_schedule"] == streams[1]["target_schedule"]
+    assert [write["cycle"] for write in streams[0]["source_schedule"]] == [
+        330, 340, 350, 360, 370, 372,
+    ]
+    assert streams[0]["source_schedule"][-1]["kind"] == "forced_final"
+    assert streams[0]["source_endpoint_state"] == {
+        "file_number": 46, "last_time": 1776.0, "last_write_cycle": 372,
+    }
+    assert [write["cycle"] for write in streams[0]["target_schedule"]] == [
+        323, 325, 327, 329, 331, 333, 335, 337, 339, 341, 343, 345,
+        348, 350, 352, 354, 356, 358, 360, 362, 364, 366, 368, 370, 372,
+    ]
+    assert streams[0]["target_schedule"][-1]["kind"] == "forced_final"
+    assert streams[0]["target_endpoint_state"] == {
+        "file_number": 65, "last_time": 1776.0, "last_write_cycle": 372,
+    }
+    outputs = {output["block"]: output for output in plan["outputs"]}
+    for block in ("output2", "output5"):
+        stream = next(row for row in streams if row["block"] == block)
+        assert outputs[block]["parameters"]["dt"] == "10.0"
+        assert outputs[block]["expected_writes"] == stream["target_schedule"]
+        assert outputs[block]["expected_endpoint_state"] == \
+            stream["target_endpoint_state"]
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    (
+        ("48", "strictly tighten"),
+        ("96", "strictly tighten"),
+        ("0", "finite and positive"),
+        ("nan", "finite and positive"),
+        ("inf", "finite and positive"),
+    ),
+)
+def test_global_cadence_rejects_non_tightening_or_invalid_target(
+        tmp_path: Path, target: str, message: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    result = _run(campaign, target_global_dt=target)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not campaign["output"].exists()
+
+
+@pytest.mark.parametrize("mismatch", ("dt", "file_number", "last_time", "cycle"))
+def test_global_cadence_requires_identical_serialized_pair_phase(
+        tmp_path: Path, mismatch: str) -> None:
+    options: dict[str, object] = {}
+    if mismatch == "dt":
+        options["output5_dt"] = "24.0"
+    else:
+        states = {
+            "output1": {"file_number": 0, "last_time": -1,
+                        "last_write_cycle": 31},
+            "output2": {"file_number": 4, "last_time": 120,
+                        "last_write_cycle": 25},
+            "output3": {"file_number": 9, "last_time": "148.8",
+                        "last_write_cycle": 31},
+            "output4": {"file_number": 9, "last_time": "148.8",
+                        "last_write_cycle": 31},
+            "output5": {"file_number": 4, "last_time": 120,
+                        "last_write_cycle": 25},
+            "output6": {"file_number": 0, "last_time": -1,
+                        "last_write_cycle": 31},
+        }
+        key = {"file_number": "file_number", "last_time": "last_time",
+               "cycle": "last_write_cycle"}[mismatch]
+        states["output5"][key] = (
+            float(states["output5"][key]) + 1.0
+            if key == "last_time" else int(states["output5"][key]) + 1)
+        options["output_states"] = states
+    campaign = _campaign(tmp_path, **options)
+
+    result = _run(campaign, target_global_dt="10")
+
+    assert result.returncode != 0
+    assert "must serialize identical" in result.stderr
+    assert not campaign["output"].exists()
+
+
+@pytest.mark.parametrize(
+    "restart_options",
+    (
+        {"output2_variable": "mhd_gr_diagnostics"},
+        {"output5_variable": "mhd_w_bcc"},
+        {"output5_file_type": "log"},
+        {"output2_ghost_zones": "true"},
+        {"output2_extra": "gid = 0"},
+        {"output5_extra": "slice_x1 = 0"},
+        {"output2_extra": "region_half_width1 = 10"},
+    ),
+)
+def test_global_cadence_requires_exact_full_domain_binary_pair(
+        tmp_path: Path, restart_options: dict[str, object]) -> None:
+    campaign = _campaign(tmp_path, **restart_options)
+
+    result = _run(campaign, target_global_dt="10")
+
+    assert result.returncode != 0
+    assert "must be the ghost-free full-domain" in result.stderr
+    assert not campaign["output"].exists()
+
+
+@pytest.mark.parametrize(
+    "restart_options",
+    (
+        {"output2_id": "shared-global"},
+        {"output5_id": "shared-global"},
+        {"output2_id": "shared-global", "output5_id": "shared-global"},
+    ),
+)
+def test_global_cadence_rejects_noncanonical_or_shared_file_ids(
+        tmp_path: Path, restart_options: dict[str, object]) -> None:
+    campaign = _campaign(tmp_path, **restart_options)
+
+    result = _run(campaign, target_global_dt="10")
+
+    assert result.returncode != 0
+    assert "ghost-free full-domain" in result.stderr
+    assert not campaign["output"].exists()
+
+
+def test_global_cadence_accepts_explicit_ids_equal_to_each_variable(
+        tmp_path: Path) -> None:
+    campaign = _campaign(
+        tmp_path, output2_id="mhd_w_bcc",
+        output5_id="mhd_gr_diagnostics")
+
+    result = _run(campaign, target_global_dt="10", root_steps="3")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plan_rejects_duplicate_numbered_filename_templates(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output3_id="mhd_w_bcc")
+
+    result = _run(campaign)
+
+    assert result.returncode != 0
+    assert "filename template collides" in result.stderr
+    assert not campaign["output"].exists()
+
+
+def test_global_pair_rejects_file_number_exhaustion_from_99999(
+        tmp_path: Path) -> None:
+    global_phase = {"file_number": 99999, "last_time": 120,
+                    "last_write_cycle": 25}
+    campaign = _campaign(tmp_path, output_states={
+        "output1": {"file_number": 0, "last_time": -1,
+                    "last_write_cycle": 31},
+        "output2": dict(global_phase),
+        "output3": {"file_number": 9, "last_time": "148.8",
+                    "last_write_cycle": 31},
+        "output4": {"file_number": 9, "last_time": "148.8",
+                    "last_write_cycle": 31},
+        "output5": dict(global_phase),
+        "output6": {"file_number": 0, "last_time": -1,
+                    "last_write_cycle": 31},
+    })
+
+    result = _run(campaign, target_global_dt="10", root_steps="3")
+
+    assert result.returncode != 0
+    assert "five-digit filename limit" in result.stderr
+    assert not campaign["output"].exists()
+
+
+def test_restart_endpoint_next_file_number_must_remain_continuable(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_file_number=99999)
+
+    result = _run(campaign, root_steps="1")
+
+    assert result.returncode != 0
+    assert "endpoint next file_number 100000" in result.stderr
+    assert "cannot continue" in result.stderr
+
+
+def test_endpoint_next_file_number_99999_is_still_allowed(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_file_number=99998)
+
+    result = _run(campaign, root_steps="1")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plan_rejects_duplicate_global_cadence_target(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    command = _command(campaign, target_global_dt="10")
+    command.extend(["--target-global-dt", "5"])
     environment = dict(os.environ)
     environment["PATH"] = (
         f"{campaign['nvidia_smi'].parent}{os.pathsep}"

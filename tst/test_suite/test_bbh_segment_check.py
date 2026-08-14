@@ -555,8 +555,10 @@ def _plan() -> dict[str, object]:
             "problem": {"trajectory_file": "/campaign/trajectory.dat"},
             "output1": {"file_type": "hst", "dcycle": "1"},
             "output2": {"file_type": "bin", "variable": "mhd_divb",
+                        "id": "divB",
                         "dt": "4.8", "ghost_zones": "false"},
             "output3": {"file_type": "bin", "variable": "mhd_divb",
+                        "id": "topology",
                         "dt": "4.8", "ghost_zones": "false"},
             "output4": {"file_type": "rst", "dt": "4.8"},
             "output5": {"file_type": "log", "dcycle": "1"},
@@ -586,6 +588,7 @@ def _plan() -> dict[str, object]:
             "relative_path_template": "bin/run.divB.{file_number:05d}.bin",
             "required_unnumbered_paths": [], "inspect_binary": True,
             "parameters": {"file_type": "bin", "variable": "mhd_divb",
+                           "id": "divB",
                            "dt": "4.8", "ghost_zones": "false"},
             "expected_binary_variables": ["divb"],
             "expected_writes": [
@@ -607,6 +610,7 @@ def _plan() -> dict[str, object]:
             "relative_path_template": "bin/run.topology.{file_number:05d}.bin",
             "required_unnumbered_paths": [], "inspect_binary": True,
             "parameters": {"file_type": "bin", "variable": "mhd_divb",
+                           "id": "topology",
                            "dt": "4.8", "ghost_zones": "false"},
             "expected_binary_variables": ["divb"],
             "expected_writes": [
@@ -690,6 +694,38 @@ def test_checker_consumes_planner_contract_schema() -> None:
     assert CHECKER.validate_plan(_plan()) == EXPECTED
 
 
+def test_checker_rejects_duplicate_numbered_filename_templates() -> None:
+    plan = _plan()
+    plan["source"]["parameters"]["output3"]["id"] = "divB"
+    output3 = next(output for output in plan["outputs"]
+                   if output["block"] == "output3")
+    output3["parameters"]["id"] = "divB"
+    output3["relative_path_template"] = \
+        "bin/run.divB.{file_number:05d}.bin"
+
+    with pytest.raises(CHECKER.CheckFailure, match="template collides"):
+        CHECKER.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    ("write_number", "endpoint_number", "message"),
+    (
+        (100000, 100001, "expected file_number 100000"),
+        (99999, 100000, "endpoint next file_number 100000"),
+    ),
+)
+def test_checker_rejects_numbered_filename_counter_exhaustion(
+        write_number: int, endpoint_number: int, message: str) -> None:
+    plan = _plan()
+    output2 = next(output for output in plan["outputs"]
+                   if output["block"] == "output2")
+    output2["expected_writes"][0]["file_number"] = write_number
+    output2["expected_endpoint_state"]["file_number"] = endpoint_number
+
+    with pytest.raises(CHECKER.CheckFailure, match=message):
+        CHECKER.validate_plan(plan)
+
+
 def _set_restart_cadence_tightening(plan: dict[str, object]) -> None:
     plan["source"]["parameters"]["output4"]["dt"] = "48.0"
     plan["restart_cadence_transition"] = {
@@ -720,11 +756,177 @@ def _set_restart_cadence_tightening(plan: dict[str, object]) -> None:
     }
 
 
+def _set_global_cadence_tightening(plan: dict[str, object]) -> None:
+    phase = {"file_number": 4, "last_time": 48.0,
+             "last_write_cycle": 10}
+    source_schedule = [{
+        "cycle": 13, "time": 62.39999999999999,
+        "kind": "forced_final", "file_number": 4,
+    }]
+    source_endpoint = {
+        "file_number": 5, "last_time": 48.0, "last_write_cycle": 13,
+    }
+    target_schedule = [{
+        "cycle": 13, "time": 62.39999999999999,
+        "kind": "scheduled", "file_number": 4,
+    }]
+    target_endpoint = {
+        "file_number": 5, "last_time": 58.0, "last_write_cycle": 13,
+    }
+    streams = []
+    for block, variable in CHECKER.GLOBAL_CADENCE_STREAMS:
+        source_parameters = {
+            "file_type": "bin", "variable": variable, "dt": "48.0",
+            "file_number": "4", "last_time": "48.0",
+            "last_write_cycle": "10", "ghost_zones": "false",
+        }
+        plan["source"]["parameters"][block] = source_parameters
+        streams.append({
+            "block": block, "parameter": f"{block}/dt",
+            "file_type": "bin", "variable": variable,
+            "source_dt": 48.0, "target_dt": 10.0,
+            "phase": dict(phase),
+            "runtime_override": f"{block}/dt=10.0",
+            "source_schedule": [dict(row) for row in source_schedule],
+            "target_schedule": [dict(row) for row in target_schedule],
+            "source_endpoint_state": dict(source_endpoint),
+            "target_endpoint_state": dict(target_endpoint),
+        })
+        output = next(row for row in plan["outputs"]
+                      if row["block"] == block)
+        output.update({
+            "file_type": "bin", "cadence_mode": "dt", "cadence": 10.0,
+            "numbered": True,
+            "relative_path_template":
+                f"bin/run.{variable}.{{file_number:05d}}.bin",
+            "required_unnumbered_paths": [], "inspect_binary": True,
+            "parameters": {**source_parameters, "dt": "10.0"},
+            "expected_binary_variables": CHECKER._expected_binary_variables(
+                variable, plan["source"]["parameters"]),
+            "expected_writes": [dict(row) for row in target_schedule],
+            "expected_endpoint_state": dict(target_endpoint),
+        })
+    plan["global_cadence_transition"] = {
+        "kind": "tighten_pair_v1", "target_dt": 10.0,
+        "streams": streams,
+        "runtime_overrides": ["output2/dt=10.0", "output5/dt=10.0"],
+    }
+    plan["command_overrides"].update({
+        "output2/dt": 10.0, "output5/dt": 10.0,
+    })
+    plan["launch_contract"]["athena_argv_template"].extend(
+        ["output2/dt=10.0", "output5/dt=10.0"])
+    plan["required_files"] = ["run.user.hst"]
+
+
 def test_validate_plan_accepts_exact_restart_cadence_tightening() -> None:
     plan = _plan()
     _set_restart_cadence_tightening(plan)
 
     assert CHECKER.validate_plan(plan) == EXPECTED
+
+
+def test_validate_plan_accepts_exact_paired_global_cadence_tightening() -> None:
+    plan = _plan()
+    _set_global_cadence_tightening(plan)
+
+    assert CHECKER.validate_plan(plan) == EXPECTED
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("command", "argv", "phase", "source_schedule", "target_schedule",
+     "source_endpoint", "target_endpoint", "pair", "one_override",
+     "output_schedule", "output_endpoint", "id"),
+)
+def test_validate_plan_rejects_paired_global_cadence_transition_tamper(
+        tamper: str) -> None:
+    plan = _plan()
+    _set_global_cadence_tightening(plan)
+    transition = plan["global_cadence_transition"]
+    if tamper == "command":
+        plan["command_overrides"]["output2/dt"] = 9.6
+    elif tamper == "argv":
+        plan["launch_contract"]["athena_argv_template"][-1] = \
+            "output5/dt=9.6"
+    elif tamper == "phase":
+        transition["streams"][0]["phase"]["last_time"] = 43.2
+    elif tamper == "source_schedule":
+        transition["streams"][0]["source_schedule"][0]["kind"] = \
+            "scheduled"
+    elif tamper == "target_schedule":
+        transition["streams"][1]["target_schedule"][0]["cycle"] = 12
+    elif tamper == "source_endpoint":
+        transition["streams"][0]["source_endpoint_state"][
+            "file_number"] += 1
+    elif tamper == "target_endpoint":
+        transition["streams"][1]["target_endpoint_state"][
+            "file_number"] += 1
+    elif tamper == "pair":
+        plan["source"]["parameters"]["output5"]["last_time"] = "43.2"
+    elif tamper == "one_override":
+        transition["runtime_overrides"].pop()
+    elif tamper == "output_schedule":
+        output2 = next(row for row in plan["outputs"]
+                       if row["block"] == "output2")
+        output2["expected_writes"][0]["cycle"] = 12
+    elif tamper == "output_endpoint":
+        output5 = next(row for row in plan["outputs"]
+                       if row["block"] == "output5")
+        output5["expected_endpoint_state"]["file_number"] += 1
+    else:
+        plan["source"]["parameters"]["output2"]["id"] = " mhd_w_bcc "
+
+    with pytest.raises(CHECKER.CheckFailure):
+        CHECKER.validate_plan(plan)
+
+
+def test_checker_rejects_present_null_global_cadence_extension() -> None:
+    plan = _plan()
+    plan["global_cadence_transition"] = None
+
+    with pytest.raises(CHECKER.CheckFailure,
+                       match="global_cadence_transition"):
+        CHECKER.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda transition: transition.__setitem__("target_dt", 10),
+        lambda transition: transition["streams"][0].__setitem__(
+            "source_dt", 48),
+        lambda transition: transition["streams"][1].__setitem__(
+            "target_dt", 10),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "file_number", 4.0),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "last_time", 48),
+        lambda transition: transition["streams"][0]["phase"].__setitem__(
+            "last_write_cycle", 10.0),
+        lambda transition: transition["streams"][0]["source_schedule"][0].
+            __setitem__("file_number", 4.0),
+        lambda transition: transition["streams"][1]["target_schedule"][0].
+            __setitem__("time", 62),
+        lambda transition: transition["streams"][0]["source_endpoint_state"].
+            __setitem__("file_number", 5.0),
+        lambda transition: transition["streams"][1]["target_endpoint_state"].
+            __setitem__("last_time", 58),
+    ),
+    ids=("integer-target", "integer-source", "integer-stream-target",
+         "float-file-number", "integer-last-time", "float-last-cycle",
+         "float-write-number", "integer-write-time",
+         "float-endpoint-number", "integer-endpoint-time"),
+)
+def test_checker_rejects_noncanonical_global_cadence_numeric_types(
+        mutation) -> None:
+    plan = _plan()
+    _set_global_cadence_tightening(plan)
+    mutation(plan["global_cadence_transition"])
+
+    with pytest.raises(CHECKER.CheckFailure,
+                       match="numeric types|numeric type"):
+        CHECKER.validate_plan(plan)
 
 
 def test_checker_accepts_decimal_restart_multiple_with_division_roundoff() -> None:

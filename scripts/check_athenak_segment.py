@@ -52,6 +52,12 @@ from read_athenak_restart_metadata import (
 SCHEMA = 1
 MAX_NMB_PER_RANK = 16384
 CADENCE_MULTIPLE_MAX_ULPS = 2
+NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX = 100000
+NUMBERED_FILE_NUMBER_MARKER = "{file_number:05d}"
+GLOBAL_CADENCE_STREAMS = (
+    ("output2", "mhd_w_bcc"),
+    ("output5", "mhd_gr_diagnostics"),
+)
 CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
 CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
 CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
@@ -434,6 +440,147 @@ def _validate_restart_cadence_transition(
                  value.get("runtime_override") ==
                  f"{block_name}/dt={target_dt!r}",
                  "restart cadence tightening lacks its canonical override")
+    return value
+
+
+def _validate_global_cadence_transition(
+        plan: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+    """Validate the optional paired global-output cadence plan extension."""
+
+    if "global_cadence_transition" not in plan:
+        # Schema-1 plans created before this extension remain valid and authorize no
+        # global-output runtime override.
+        return {
+            "kind": "legacy_absent_v1",
+            "target_dt": None,
+            "streams": [],
+            "runtime_overrides": [],
+        }
+    value = plan["global_cadence_transition"]
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "target_dt", "streams", "runtime_overrides",
+    }, "plan global_cadence_transition must be the exact strict object")
+    _require(type(value.get("target_dt")) is float,
+             "global cadence target numeric type is not canonical")
+    target_dt = _number(
+        value.get("target_dt"), "global_cadence_transition.target_dt")
+    _require(target_dt > 0.0,
+             "global cadence target must be finite and positive")
+    source_parameters = plan.get("source", {}).get("parameters")
+    _require(isinstance(source_parameters, dict),
+             "plan source parameters must bind global cadence")
+    streams = value.get("streams")
+    _require(isinstance(streams, list) and len(streams) == 2,
+             "global cadence transition must contain exactly two streams")
+    validated: list[dict[str, Any]] = []
+    for index, (block_name, variable) in enumerate(GLOBAL_CADENCE_STREAMS):
+        stream = streams[index]
+        _require(isinstance(stream, dict) and set(stream) == {
+            "block", "parameter", "file_type", "variable", "source_dt",
+            "target_dt", "phase", "runtime_override", "source_schedule",
+            "target_schedule", "source_endpoint_state", "target_endpoint_state",
+        }, f"global cadence stream {index} is not the exact strict object")
+        block = source_parameters.get(block_name)
+        _require(isinstance(block, dict),
+                 f"source parameters lack paired global stream {block_name}")
+        try:
+            gid = int(block.get("gid", "-1"))
+            serialized_source_dt = float(block["dt"])
+            serialized_phase = {
+                "file_number": int(block.get("file_number", "0")),
+                "last_time": float(block.get("last_time", "-1")),
+                "last_write_cycle": int(block.get("last_write_cycle", "-1")),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckFailure(
+                f"source {block_name} global cadence state is invalid") from exc
+        phase = stream.get("phase")
+        _require(type(stream.get("source_dt")) is float and
+                 type(stream.get("target_dt")) is float and
+                 isinstance(phase, dict) and set(phase) == {
+                     "file_number", "last_time", "last_write_cycle"} and
+                 type(phase.get("file_number")) is int and
+                 type(phase.get("last_time")) is float and
+                 type(phase.get("last_write_cycle")) is int,
+                 "global cadence transition numeric types are not canonical")
+        source_dt = _number(
+            stream.get("source_dt"), f"{block_name} global source dt")
+        stream_target = _number(
+            stream.get("target_dt"), f"{block_name} global target dt")
+        file_id = block.get("id", variable)
+        _require(
+            block.get("file_type", "").strip() == "bin" and
+            block.get("variable", "").strip() == variable and
+            isinstance(file_id, str) and file_id == variable and
+            "dcycle" not in block and gid < 0 and
+            "region_center" not in block and "region_half_width" not in block and
+            not any(f"region_half_width{axis}" in block
+                    for axis in (1, 2, 3)) and
+            "region_slice_axis" not in block and
+            "region_slice_offset" not in block and
+            not any(f"slice_x{axis}" in block for axis in (1, 2, 3)) and
+            block.get("ghost_zones", "false").strip().lower() in ("false", "0") and
+            stream.get("block") == block_name and
+            stream.get("parameter") == f"{block_name}/dt" and
+            stream.get("file_type") == "bin" and
+            stream.get("variable") == variable and
+            serialized_source_dt == source_dt and source_dt > 0.0 and
+            stream_target == target_dt and phase == serialized_phase and
+            phase["file_number"] >= 0 and math.isfinite(phase["last_time"]),
+            f"{block_name} global cadence source/target/phase is not canonical")
+        source_schedule, source_endpoint = _replay_global_stream_schedule(
+            phase, source_dt, expected)
+        target_schedule, target_endpoint = _replay_global_stream_schedule(
+            phase, target_dt, expected)
+        for schedule_name in ("source_schedule", "target_schedule"):
+            schedule = stream.get(schedule_name)
+            _require(isinstance(schedule, list) and all(
+                isinstance(write, dict) and set(write) == {
+                    "cycle", "time", "kind", "file_number"} and
+                type(write.get("cycle")) is int and
+                type(write.get("time")) is float and
+                math.isfinite(write["time"]) and
+                write.get("kind") in ("scheduled", "forced_final") and
+                type(write.get("file_number")) is int
+                for write in schedule),
+                f"{block_name} {schedule_name} numeric types are not canonical")
+        for endpoint_name in ("source_endpoint_state", "target_endpoint_state"):
+            endpoint = stream.get(endpoint_name)
+            _require(isinstance(endpoint, dict) and set(endpoint) == {
+                "file_number", "last_time", "last_write_cycle"} and
+                type(endpoint.get("file_number")) is int and
+                type(endpoint.get("last_time")) is float and
+                math.isfinite(endpoint["last_time"]) and
+                type(endpoint.get("last_write_cycle")) is int,
+                f"{block_name} {endpoint_name} numeric types are not canonical")
+        _require(stream.get("source_schedule") == source_schedule and
+                 stream.get("target_schedule") == target_schedule and
+                 stream.get("source_endpoint_state") == source_endpoint and
+                 stream.get("target_endpoint_state") == target_endpoint,
+                 f"{block_name} old/new cadence schedule or endpoint is invalid")
+        validated.append(stream)
+    _require(validated[0]["source_dt"] == validated[1]["source_dt"] and
+             validated[0]["phase"] == validated[1]["phase"] and
+             validated[0]["source_schedule"] ==
+             validated[1]["source_schedule"] and
+             validated[0]["target_schedule"] ==
+             validated[1]["target_schedule"],
+             "paired global streams do not share one phase and schedule")
+    source_dt = validated[0]["source_dt"]
+    if target_dt == source_dt:
+        _require(value.get("kind") == "unchanged_pair_v1" and
+                 all(stream["runtime_override"] is None for stream in validated) and
+                 value.get("runtime_overrides") == [],
+                 "unchanged global cadence may not carry an override")
+    else:
+        overrides = [
+            f"{stream['parameter']}={target_dt!r}" for stream in validated
+        ]
+        _require(target_dt < source_dt and
+                 value.get("kind") == "tighten_pair_v1" and
+                 [stream["runtime_override"] for stream in validated] == overrides and
+                 value.get("runtime_overrides") == overrides,
+                 "paired global cadence tightening lacks canonical overrides")
     return value
 
 
@@ -1166,6 +1313,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     capacity_transition = _validate_capacity_transition(plan)
     restart_cadence_transition = _validate_restart_cadence_transition(
         plan, root_dt)
+    global_cadence_transition = _validate_global_cadence_transition(
+        plan, expected)
     expected_overrides = {
         "time/nlim": final_cycle,
         "time/tlim": tlim,
@@ -1174,6 +1323,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if restart_cadence_transition["kind"] == "tighten_v1":
         expected_overrides[restart_cadence_transition["parameter"]] = \
             restart_cadence_transition["target_dt"]
+    for stream in global_cadence_transition["streams"]:
+        if stream["runtime_override"] is not None:
+            expected_overrides[stream["parameter"]] = stream["target_dt"]
     if capacity_transition["kind"] == "increase_v1":
         expected_overrides["mesh_refinement/max_nmb_per_rank"] = \
             capacity_transition["target_max_nmb_per_rank"]
@@ -1184,7 +1336,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
              _number(overrides.get("output3/dt"),
                      "command_overrides.output3/dt") == root_dt,
              "command_overrides must be exactly the canonical limits, divB "
-             "cadence, optional restart tightening, and optional capacity increase")
+             "cadence, optional restart/global tightening, and optional capacity "
+             "increase")
 
     for name in ("binary", "trajectory", "source_restart"):
         _validate_planned_file_record(inputs.get(name), f"inputs.{name}")
@@ -1399,6 +1552,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     ]
     if restart_cadence_transition["kind"] == "tighten_v1":
         expected_athena.append(restart_cadence_transition["runtime_override"])
+    expected_athena.extend(global_cadence_transition["runtime_overrides"])
     if capacity_transition["kind"] == "increase_v1":
         expected_athena.append(capacity_transition["runtime_override"])
     _require(launch_contract.get("world_size") == ranks and
@@ -1540,6 +1694,9 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                      f"outputs[{index}] dcycle must be an integer")
         _require(isinstance(output.get("numbered"), bool),
                  f"outputs[{index}].numbered must be boolean")
+        if file_type in ("bin", "rst"):
+            _require(output["numbered"],
+                     f"{block}: bin/rst output must be numbered")
         template = output.get("relative_path_template")
         required_unnumbered = output.get("required_unnumbered_paths")
         if output["numbered"]:
@@ -1601,6 +1758,13 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 restart_cadence_transition["kind"] == "tighten_v1"):
             expected_runtime_parameters["dt"] = repr(
                 restart_cadence_transition["target_dt"])
+        global_stream = next(
+            (stream for stream in global_cadence_transition["streams"]
+             if stream["block"] == block), None)
+        if (global_stream is not None and
+                global_stream["runtime_override"] is not None):
+            expected_runtime_parameters["dt"] = repr(
+                global_stream["target_dt"])
         _require(parameters == expected_runtime_parameters,
                  f"{block}: planned runtime parameter snapshot differs from the "
                  "source plus exact canonical override")
@@ -1659,10 +1823,18 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 f"{block}.expected_endpoint_state.last_time")
         _integer(expected_endpoint_state.get("last_write_cycle"),
                  f"{block}.expected_endpoint_state.last_write_cycle")
+        if global_stream is not None:
+            _require(output["expected_writes"] ==
+                     global_stream["target_schedule"] and
+                     expected_endpoint_state ==
+                     global_stream["target_endpoint_state"],
+                     f"{block}: output schedule differs from paired global "
+                     "cadence transition")
         if block == "output3":
             canonical_topology_output = output
     _require(restart_outputs == 1,
              "strict segment plan must declare exactly one restart output")
+    _validate_numbered_output_contract(outputs, source_plan_parameters)
     replayed_schedules, replayed_endpoint_states = _replay_output_plan(
         outputs, source_plan_parameters, expected)
     for output in outputs:
@@ -1742,6 +1914,67 @@ def _validate_relative_template(template: str, numbered: bool) -> None:
     _require(not path.is_absolute() and all(part not in ("", ".", "..")
                                             for part in path.parts),
              f"unsafe output relative path template: {template}")
+
+
+def _validate_numbered_output_contract(
+        outputs: list[dict[str, Any]],
+        source_parameters: dict[str, dict[str, str]]) -> None:
+    """Prove canonical, disjoint paths and a continuable five-digit counter."""
+
+    job = source_parameters.get("job")
+    _require(isinstance(job, dict),
+             "source parameters lack the job output namespace")
+    basename = job.get("basename")
+    _require(isinstance(basename, str) and basename and "/" not in basename,
+             "source job basename is not canonical")
+    template_owners: dict[str, str] = {}
+    path_owners: dict[str, str] = {}
+    for output in outputs:
+        if not output.get("numbered"):
+            continue
+        block = output["block"]
+        file_type = output["file_type"]
+        _require(file_type in ("bin", "rst"),
+                 f"{block}: numbered file_type must be bin or rst")
+        parameters = output["parameters"]
+        if file_type == "bin":
+            variable = parameters.get("variable")
+            file_id = parameters.get("id", variable)
+            _require(isinstance(variable, str) and variable.strip() and
+                     isinstance(file_id, str) and file_id.strip(),
+                     f"{block}: binary variable/id is not canonical")
+            canonical_template = (
+                f"bin/{basename}.{file_id.strip()}."
+                f"{NUMBERED_FILE_NUMBER_MARKER}.bin")
+        else:
+            canonical_template = (
+                f"rst/{basename}.{NUMBERED_FILE_NUMBER_MARKER}.rst")
+        template = output["relative_path_template"]
+        _require(template == canonical_template,
+                 f"{block}: numbered filename template differs from C++ naming")
+        previous = template_owners.get(template)
+        _require(previous is None,
+                 f"{block}: numbered filename template collides with {previous}")
+        template_owners[template] = block
+
+        for write in output["expected_writes"]:
+            file_number = _integer(
+                write.get("file_number"), f"{block} expected file_number")
+            _require(0 <= file_number < NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX,
+                     f"{block}: expected file_number {file_number} exceeds the "
+                     "C++ five-digit filename limit")
+            relative = template.format(file_number=file_number)
+            previous = path_owners.get(relative)
+            _require(previous is None,
+                     f"{block}: planned numbered path {relative} collides with "
+                     f"{previous}")
+            path_owners[relative] = block
+        endpoint = output["expected_endpoint_state"]
+        next_file_number = _integer(
+            endpoint.get("file_number"), f"{block} endpoint next file_number")
+        _require(0 <= next_file_number < NUMBERED_FILE_NUMBER_EXCLUSIVE_MAX,
+                 f"{block}: endpoint next file_number {next_file_number} cannot "
+                 "continue within the C++ five-digit filename limit")
 
 
 def _expected_binary_variables(variable: str,
@@ -2348,6 +2581,9 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
         plan, float(plan["expected"]["root_dt"]))
     if restart_cadence_transition["kind"] == "tighten_v1":
         permitted.add(restart_cadence_transition["runtime_override"])
+    global_cadence_transition = _validate_global_cadence_transition(
+        plan, plan["expected"])
+    permitted.update(global_cadence_transition["runtime_overrides"])
     capacity_transition = _validate_capacity_transition(plan)
     if capacity_transition["kind"] == "increase_v1":
         permitted.add(capacity_transition["runtime_override"])
@@ -3036,6 +3272,60 @@ def _float32(value: float) -> float:
             from exc
 
 
+def _replay_global_stream_schedule(
+        phase: dict[str, Any], dt: float,
+        expected: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Independently replay one numbered non-restart global dt stream."""
+
+    state = {
+        "file_number": phase["file_number"],
+        "last_time": phase["last_time"],
+        "last_write_cycle": phase["last_write_cycle"],
+        "wrote_this_run": False,
+    }
+    writes: list[dict[str, Any]] = []
+
+    def due(output_time: float, enforce_time_limit: bool) -> bool:
+        return (_float32(output_time) >=
+                _float32(state["last_time"] + dt) and
+                (not enforce_time_limit or
+                 _float32(output_time) < _float32(expected["tlim"])))
+
+    def write(cycle: int, output_time: float, kind: str,
+              advance: bool) -> None:
+        writes.append({
+            "cycle": cycle,
+            "time": output_time,
+            "kind": kind,
+            "file_number": state["file_number"],
+        })
+        state["file_number"] += 1
+        if advance:
+            state["last_time"] = (output_time if state["last_time"] < 0.0
+                                  else state["last_time"] + dt)
+        state["last_write_cycle"] = cycle
+        state["wrote_this_run"] = True
+
+    current_time = expected["source_time"]
+    for cycle in range(expected["source_cycle"] + 1,
+                       expected["final_cycle"] + 1):
+        current_time += expected["root_dt"]
+        if due(current_time, True):
+            write(cycle, current_time, "scheduled", True)
+    wrote_current = (state["wrote_this_run"] and
+                     state["last_write_cycle"] == expected["final_cycle"])
+    if not wrote_current:
+        advance = (state["last_write_cycle"] != expected["final_cycle"] and
+                   due(expected["final_time"], False))
+        write(expected["final_cycle"], expected["final_time"],
+              "forced_final", advance)
+    return writes, {
+        "file_number": state["file_number"],
+        "last_time": state["last_time"],
+        "last_write_cycle": state["last_write_cycle"],
+    }
+
+
 def _replay_output_plan(
         outputs: list[dict[str, Any]],
         source_parameters: dict[str, dict[str, str]],
@@ -3218,6 +3508,8 @@ def expected_output_paths(plan: dict[str, Any], source: RestartMetadata,
     schedules = _replay_all_output_writes(plan, source, endpoint, expected)
     restart_cadence_transition = _validate_restart_cadence_transition(
         plan, float(expected["root_dt"]))
+    global_cadence_transition = _validate_global_cadence_transition(
+        plan, expected)
     for output in plan["outputs"]:
         block = output["block"]
         source_block = source.parameters.get(block)
@@ -3231,6 +3523,12 @@ def expected_output_paths(plan: dict[str, Any], source: RestartMetadata,
                 restart_cadence_transition["kind"] == "tighten_v1"):
             expected_runtime_block["dt"] = repr(
                 restart_cadence_transition["target_dt"])
+        global_stream = next(
+            (stream for stream in global_cadence_transition["streams"]
+             if stream["block"] == block), None)
+        if (global_stream is not None and
+                global_stream["runtime_override"] is not None):
+            expected_runtime_block["dt"] = repr(global_stream["target_dt"])
         _require(output["parameters"] == expected_runtime_block,
                  f"plan snapshot for {block} differs from the source restart plus "
                  "the exact canonical runtime override")
@@ -5847,6 +6145,14 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
             "source": [source_metadata.parameters[restart_block]["dt"]],
             "endpoint": repr(restart_cadence_transition["target_dt"]),
         }
+    global_cadence_transition = _validate_global_cadence_transition(
+        plan, expected)
+    for stream in global_cadence_transition["streams"]:
+        if stream["runtime_override"] is not None:
+            exact_rebindings[stream["parameter"]] = {
+                "source": [source_metadata.parameters[stream["block"]]["dt"]],
+                "endpoint": repr(stream["target_dt"]),
+            }
     capacity_transition = _validate_capacity_transition(plan)
     if capacity_transition["kind"] == "increase_v1":
         exact_rebindings["mesh_refinement/max_nmb_per_rank"] = {
