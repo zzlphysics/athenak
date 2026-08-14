@@ -102,6 +102,29 @@ constexpr std::uint8_t ReasonFromSolver(const Primitive::Error error,
   }
 }
 
+// NVCC rejects a View whose first extended-lambda capture appears inside an
+// ``if constexpr``.  Keep the compile-time choice outside the device lambda instead:
+// the disabled specialization is empty, while only the enabled specialization owns
+// and touches the reason View.  The common Record() call therefore compiles to a no-op
+// without a View capture, device branch, or atomic on the default path.
+template<bool ENABLED>
+struct ReasonRecorder {
+  KOKKOS_INLINE_FUNCTION
+  void Record(const int, const int, const int, const int,
+              const Primitive::Error, const std::uint32_t) const {}
+};
+
+template<>
+struct ReasonRecorder<true> {
+  DvceArray4D<std::uint8_t> reason;
+
+  KOKKOS_INLINE_FUNCTION
+  void Record(const int m, const int k, const int j, const int i,
+              const Primitive::Error error, const std::uint32_t events) const {
+    reason(m,k,j,i) = ReasonFromSolver(error, events);
+  }
+};
+
 KOKKOS_INLINE_FUNCTION
 constexpr int LevelBin(const int level) {
   return (level >= 0 && level < kExplicitLevelBins) ? level : kLevelOverflow;
