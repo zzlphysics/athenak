@@ -8,6 +8,7 @@
 //! \file mhd.hpp
 //  \brief definitions for MHD class
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -143,6 +144,12 @@ class MHD {
   DvceArray4D<bool> fofc;  // flag for each cell to indicate if FOFC is needed
   DvceArray5D<bool> fofc_scal;  // flag to indicate if FOFC for scalar is needed
   bool use_fofc = false;   // flag to enable FOFC
+  // Optional dynamical-GRMHD diagnostic.  Neither View allocates when disabled, keeping
+  // the normal FOFC memory and device path unchanged.
+  bool fofc_spatial_telemetry = false;
+  Real fofc_telemetry_center[3] = {0.0, 0.0, 0.0};
+  DvceArray4D<std::uint8_t> fofc_reason;
+  DvceArray1D<std::uint64_t> fofc_telemetry_pending;
 
   // container to hold names of TaskIDs
   MHDTaskIDs id;

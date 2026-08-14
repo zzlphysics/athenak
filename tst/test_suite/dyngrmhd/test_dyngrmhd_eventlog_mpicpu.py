@@ -17,6 +17,10 @@ import bin_convert
 
 ROOT = Path(__file__).resolve().parents[3]
 INPUT = ROOT / "tst" / "inputs" / "dyngrmhd_eventlog.athinput"
+STABLE_AMR_INPUT = (
+    ROOT / "inputs" / "dyngr"
+    / "subcycling_stable_amr_restart_dyngrmhd.athinput"
+)
 TIMEOUT_SECONDS = 30
 
 
@@ -36,12 +40,14 @@ def _mpi_launcher() -> str:
     raise AssertionError("an MPI launcher matching the test binary is required")
 
 
-def _run(run_dir: Path, *, ranks: int, overrides: tuple[str, ...] = ()) -> str:
+def _run(
+        run_dir: Path, *, ranks: int, overrides: tuple[str, ...] = (),
+        input_file: Path = INPUT) -> str:
     command = [] if ranks == 1 else [_mpi_launcher(), "-np", str(ranks)]
     command += [
         "./athena",
         "-i",
-        str(INPUT),
+        str(input_file),
         "-d",
         str(run_dir),
         *overrides,
@@ -63,12 +69,13 @@ def _run(run_dir: Path, *, ranks: int, overrides: tuple[str, ...] = ()) -> str:
 
 def _run_restart(
         restart: Path, run_dir: Path, *, nlim: int, ranks: int = 1,
-        overrides: tuple[str, ...] = ()) -> str:
+        overrides: tuple[str, ...] = (), input_overlay: Path | None = None) -> str:
     command = [] if ranks == 1 else [_mpi_launcher(), "-np", str(ranks)]
     command += [
         "./athena",
         "-r",
         str(restart),
+        *([] if input_overlay is None else ["-i", str(input_overlay)]),
         "-d",
         str(run_dir),
         f"time/nlim={nlim}",
@@ -162,6 +169,20 @@ def _restart_parameter(restart: Path, block: str, name: str) -> str:
     return values[0]
 
 
+def _without_restart_parameter(restart: Path, destination: Path, name: str) -> None:
+    """Create a legacy-format fixture with one ParameterInput line removed."""
+    raw = restart.read_bytes()
+    updated, substitutions = re.subn(
+        rb"(?m)^[ \t]*" + re.escape(name.encode("ascii"))
+        + rb"[ \t]*=[^\r\n]*(?:\r?\n)",
+        b"",
+        raw,
+        count=1,
+    )
+    assert substitutions == 1, f"No unique {name} line in {restart}"
+    destination.write_bytes(updated)
+
+
 def _run_expect_failure(run_dir: Path, *overrides: str) -> str:
     command = [
         "./athena",
@@ -201,6 +222,23 @@ def _event_rows(run_dir: Path) -> list[dict[str, int]]:
         assert len(values) == len(names)
         rows.append(dict(zip(names, values)))
     return rows
+
+
+def _fofc_spatial_records(run_dir: Path) -> list[dict[str, str]]:
+    lines = (run_dir / "dyngrmhd_eventlog.log").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    records = []
+    for line in lines:
+        if not line.startswith("# fofc_spatial_v1 "):
+            continue
+        fields = line.split()[2:]
+        record = {}
+        for field in fields:
+            key, value = field.split("=", 1)
+            record[key] = value
+        records.append(record)
+    return records
 
 
 def _state_dump_at_cycle(run_dir: Path, cycle: int) -> dict[str, object]:
@@ -265,6 +303,243 @@ def test_dense_event_rows_and_mpi_uint64_aggregation(tmp_path: Path) -> None:
     # problem.  This keeps the values invariant under ghost width and decomposition.
     assert [row["c2p_calls"] for row in serial] == [8, 16, 16]
     assert [row["fofc_tests"] for row in serial] == [0, 16, 16]
+    # The opt-in diagnostic must leave the legacy comment stream and numeric schema
+    # completely untouched when disabled.
+    assert _fofc_spatial_records(serial_dir) == []
+    assert _fofc_spatial_records(mpi_dir) == []
+
+
+def test_fofc_spatial_telemetry_maps_reasons_and_matches_mpi_total(
+        tmp_path: Path) -> None:
+    run_dir = tmp_path / "fofc_spatial"
+    _run(
+        run_dir,
+        ranks=2,
+        overrides=(
+            "mesh/nx1=16",
+            "meshblock/nx1=8",
+            "time/nlim=1",
+            "mhd/c2p_iter=1",
+            "mhd/fofc_spatial_telemetry=true",
+            "output2/dcycle=0",
+        ),
+    )
+
+    rows = _event_rows(run_dir)
+    records = _fofc_spatial_records(run_dir)
+    schemas = [record for record in records if record["kind"] == "schema"]
+    summaries = [record for record in records if record["kind"] == "summary"]
+    bins = [record for record in records if record["kind"] == "bin"]
+    assert len(schemas) == 1
+    assert [int(record["cycle"]) for record in summaries] == [0, 1]
+
+    for row, summary in zip(rows, summaries):
+        cycle_bins = [
+            record for record in bins
+            if int(record["cycle"]) == row["cycle"]
+        ]
+        assert int(summary["count"]) == row["fofc"]
+        assert int(summary["nfofc"]) == row["fofc"]
+        assert sum(int(record["count"]) for record in cycle_bins) == row["fofc"]
+
+    cycle_one = [record for record in bins if record["cycle"] == "1"]
+    assert rows[1]["fofc"] == 32
+    assert int(summaries[1]["unattributed"]) == 0
+    assert {record["reason"] for record in cycle_one} == {"cons_density_floor"}
+    assert {int(record["level_bin"]) for record in cycle_one} == {1}
+    stage_totals = {
+        stage: sum(
+            int(record["count"]) for record in cycle_one
+            if int(record["stage_bin"]) == stage
+        )
+        for stage in (1, 2)
+    }
+    assert stage_totals == {1: 16, 2: 16}
+
+
+def test_fofc_spatial_telemetry_does_not_change_evolution(tmp_path: Path) -> None:
+    disabled_dir = tmp_path / "telemetry_disabled"
+    enabled_dir = tmp_path / "telemetry_enabled"
+    common = ("time/nlim=2", "output3/dcycle=1")
+    _run(disabled_dir, ranks=1, overrides=common)
+    _run(
+        enabled_dir,
+        ranks=1,
+        overrides=(*common, "mhd/fofc_spatial_telemetry=true"),
+    )
+
+    assert _event_rows(enabled_dir) == _event_rows(disabled_dir)
+    disabled = _state_dump_at_cycle(disabled_dir, cycle=2)
+    enabled = _state_dump_at_cycle(enabled_dir, cycle=2)
+    assert disabled["var_names"] == enabled["var_names"]
+    np.testing.assert_array_equal(
+        np.asarray(disabled["mb_logical"])[_canonical_order(disabled)],
+        np.asarray(enabled["mb_logical"])[_canonical_order(enabled)],
+    )
+    for variable in disabled["var_names"]:
+        np.testing.assert_array_equal(
+            _canonical_field(enabled, variable),
+            _canonical_field(disabled, variable),
+            err_msg=f"FOFC telemetry changed physical field {variable}",
+        )
+
+
+def test_fofc_spatial_telemetry_survives_subcycling_regrid(
+        tmp_path: Path) -> None:
+    enabled_dir = tmp_path / "telemetry_amr_enabled"
+    disabled_dir = tmp_path / "telemetry_amr_disabled"
+    augmented_input = tmp_path / "telemetry_amr.athinput"
+    augmented_input.write_text(
+        STABLE_AMR_INPUT.read_text(encoding="utf-8")
+        + """
+
+<mhd>
+c2p_iter = 1
+fofc_spatial_telemetry = true
+
+<output5>
+file_type = log
+dcycle = 1
+write_zeros = true
+""",
+        encoding="utf-8",
+    )
+    common = (
+        "job/basename=dyngrmhd_eventlog",
+        "time/nlim=2",
+        "output2/dcycle=0",
+        "output3/dcycle=0",
+        "output4/dcycle=0",
+    )
+    enabled_stdout = _run(
+        enabled_dir,
+        ranks=2,
+        input_file=augmented_input,
+        overrides=common,
+    )
+    _run(
+        disabled_dir,
+        ranks=2,
+        input_file=augmented_input,
+        overrides=(*common, "mhd/fofc_spatial_telemetry=false"),
+    )
+    assert "7 MeshBlocks created, 0 deleted by AMR" in enabled_stdout
+
+    rows = _event_rows(enabled_dir)
+    assert rows == _event_rows(disabled_dir)
+    records = _fofc_spatial_records(enabled_dir)
+    summaries = [record for record in records if record["kind"] == "summary"]
+    bins = [record for record in records if record["kind"] == "bin"]
+    assert [int(record["cycle"]) for record in summaries] == [0, 1, 2]
+    for row, summary in zip(rows, summaries):
+        cycle_bins = [
+            record for record in bins
+            if int(record["cycle"]) == row["cycle"]
+        ]
+        assert int(summary["count"]) == row["fofc"]
+        assert int(summary["unattributed"]) == 0
+        assert sum(int(record["count"]) for record in cycle_bins) == row["fofc"]
+    evolved_bins = [record for record in bins if int(record["cycle"]) == 2]
+    evolved_levels = {int(record["level_bin"]) for record in evolved_bins}
+    assert len(evolved_levels) >= 2
+    assert max(evolved_levels) - min(evolved_levels) >= 1
+    assert {int(record["stage_bin"]) for record in evolved_bins} >= {1, 2}
+
+    enabled = _state_dump_at_cycle(enabled_dir, cycle=2)
+    disabled = _state_dump_at_cycle(disabled_dir, cycle=2)
+    assert enabled["var_names"] == disabled["var_names"]
+    np.testing.assert_array_equal(
+        np.asarray(enabled["mb_logical"])[_canonical_order(enabled)],
+        np.asarray(disabled["mb_logical"])[_canonical_order(disabled)],
+    )
+    for variable in enabled["var_names"]:
+        np.testing.assert_array_equal(
+            _canonical_field(enabled, variable),
+            _canonical_field(disabled, variable),
+            err_msg=f"FOFC telemetry changed post-regrid field {variable}",
+        )
+
+
+def test_fofc_spatial_telemetry_requires_root_cycle_event_cadence(
+        tmp_path: Path) -> None:
+    stdout = _run_expect_failure(
+        tmp_path / "invalid_telemetry_cadence",
+        "mhd/fofc_spatial_telemetry=true",
+        "output1/dcycle=2",
+    )
+    assert "FOFC spatial telemetry requires its event log to use dcycle=1" in stdout
+
+
+def test_fofc_spatial_telemetry_requires_dense_event_rows(tmp_path: Path) -> None:
+    stdout = _run_expect_failure(
+        tmp_path / "invalid_telemetry_sparse_log",
+        "mhd/fofc_spatial_telemetry=true",
+        "output1/write_zeros=false",
+    )
+    assert (
+        "FOFC spatial telemetry requires its event log to use write_zeros=true"
+        in stdout
+    )
+
+
+def test_missing_legacy_telemetry_key_stays_absent_and_overlay_enables_replay(
+        tmp_path: Path) -> None:
+    source_dir = tmp_path / "telemetry_migration_source"
+    _run(
+        source_dir,
+        ranks=1,
+        overrides=("time/nlim=0", "output3/dcycle=0"),
+    )
+    source_restart = (
+        source_dir / "rst" / "dyngrmhd_eventlog.00000.rst"
+    )
+    legacy_restart = tmp_path / "legacy_without_fofc_telemetry.rst"
+    _without_restart_parameter(
+        source_restart, legacy_restart, "fofc_spatial_telemetry"
+    )
+
+    legacy_bytes = legacy_restart.read_bytes()
+
+    # The default-off path must not mutate an old ParameterInput header by inserting a
+    # new false key.  A zero-step child isolates this serialization contract.
+    default_dir = tmp_path / "telemetry_default_absent"
+    _run_restart(legacy_restart, default_dir, nlim=0)
+    default_restarts = sorted(
+        (default_dir / "rst").glob("dyngrmhd_eventlog.*.rst")
+    )
+    assert len(default_restarts) == 1
+    default_header = default_restarts[0].read_bytes().split(b"<par_end>\n", 1)[0]
+    assert b"fofc_spatial_telemetry" not in default_header
+    assert legacy_restart.read_bytes() == legacy_bytes
+
+    # AthenaK supports a second input after -r.  A minimal, checksum-bound read-only
+    # overlay can add the diagnostic key without modifying the retained source restart.
+    overlay = tmp_path / "fofc_telemetry.overlay.athinput"
+    overlay.write_text(
+        "<mhd>\nfofc_spatial_telemetry = true\n",
+        encoding="utf-8",
+    )
+    diagnostic_dir = tmp_path / "telemetry_diagnostic"
+    _run_restart(
+        legacy_restart,
+        diagnostic_dir,
+        nlim=1,
+        input_overlay=overlay,
+        overrides=(
+            "mhd/c2p_iter=1",
+        ),
+    )
+    rows = _event_rows(diagnostic_dir)
+    summaries = [
+        record for record in _fofc_spatial_records(diagnostic_dir)
+        if record["kind"] == "summary"
+    ]
+    assert [row["cycle"] for row in rows] == [1]
+    assert [int(record["cycle"]) for record in summaries] == [1]
+    assert int(summaries[0]["count"]) == rows[0]["fofc"]
+    assert int(summaries[0]["nfofc"]) == rows[0]["fofc"]
+    assert int(summaries[0]["unattributed"]) == 0
+    assert legacy_restart.read_bytes() == legacy_bytes
 
 
 def test_active_zone_events_are_decomposition_invariant(tmp_path: Path) -> None:
@@ -380,6 +655,7 @@ def test_zero_step_restart_preserves_physical_main_state(tmp_path: Path) -> None
 def test_device_fofc_pending_is_drained_into_restart(tmp_path: Path) -> None:
     source_dir = tmp_path / "device_fofc_source"
     resumed_dir = tmp_path / "device_fofc_resumed"
+    telemetry_resumed_dir = tmp_path / "device_fofc_telemetry_resumed"
     _run(
         source_dir,
         ranks=1,
@@ -398,6 +674,30 @@ def test_device_fofc_pending_is_drained_into_restart(tmp_path: Path) -> None:
     resumed_rows = _event_rows(resumed_dir)
     assert [row["cycle"] for row in resumed_rows] == [1]
     assert resumed_rows[0]["fofc"] == pending["nfofc"]
+
+    # The authoritative nfofc accumulator is restart-persistent, while spatial bins are
+    # deliberately process-local.  A diagnostic-enabled zero-step restart must retain
+    # exact conservation by putting the carried total in the explicit unknown bin.
+    _run_restart(
+        checkpoint,
+        telemetry_resumed_dir,
+        nlim=1,
+        overrides=(
+            "mhd/fofc_spatial_telemetry=true",
+            "output1/dcycle=1",
+        ),
+    )
+    records = _fofc_spatial_records(telemetry_resumed_dir)
+    summaries = [record for record in records if record["kind"] == "summary"]
+    bins = [record for record in records if record["kind"] == "bin"]
+    assert len(summaries) == 1
+    assert int(summaries[0]["count"]) == pending["nfofc"]
+    assert int(summaries[0]["unattributed"]) == pending["nfofc"]
+    assert len(bins) == 1
+    assert bins[0]["reason"] == "unknown"
+    assert int(bins[0]["level_bin"]) == 32
+    assert int(bins[0]["stage_bin"]) == 0
+    assert int(bins[0]["count"]) == pending["nfofc"]
 
 
 def test_pending_event_counters_survive_shared_and_per_rank_restarts(

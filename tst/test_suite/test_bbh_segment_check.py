@@ -1085,6 +1085,31 @@ def test_event_log_requires_every_cycle_exactly_once(
             event_log, 10, 13, THRESHOLDS, ABSOLUTE_THRESHOLDS)
 
 
+def test_event_log_ignores_fofc_spatial_comment_records(tmp_path: Path) -> None:
+    event_log = tmp_path / "events.log"
+    _event_log(event_log, [11, 12, 13])
+    lines = event_log.read_text(encoding="utf-8").splitlines()
+    annotated = []
+    for line in lines:
+        if line and not line.startswith("#"):
+            cycle = line.split()[0]
+            annotated.extend((
+                f"# fofc_spatial_v1 kind=summary cycle={cycle} count=1 "
+                "nfofc=1 unattributed=0",
+                f"# fofc_spatial_v1 kind=bin cycle={cycle} level_bin=8 "
+                "stage_bin=2 reason=prim_temperature_floor r_cyl_bin=2 "
+                "abs_z_bin=3 lapse_bin=1 count=1",
+            ))
+        annotated.append(line)
+    event_log.write_text("\n".join(annotated) + "\n", encoding="utf-8")
+
+    result = CHECKER.audit_event_log(
+        event_log, 10, 13, THRESHOLDS, ABSOLUTE_THRESHOLDS)
+    assert result["rows"] == 3
+    assert result["cycle_min"] == 11
+    assert result["cycle_max"] == 13
+
+
 def test_mag_adjust_hard_ratio_is_enforced_at_exact_boundary(
         tmp_path: Path) -> None:
     event_log = tmp_path / "events.log"

@@ -194,6 +194,66 @@ to read earlier four-field files.  This prevents horizon-interior regularization
 (`sigma` reached `2.3e8` in the raw unmasked field) from being confused with the
 outside-excision physical maximum.
 
+### Opt-in FOFC spatial telemetry
+
+For a short diagnostic replay, set `mhd/fofc_spatial_telemetry=true` in the input and use
+exactly one active event-log output with `dcycle=1` and `write_zeros=true`.  The dense row
+makes every root step explicit, including intervals with zero corrections.  Telemetry is
+deliberately disabled by default: the disabled path allocates neither its per-cell reason
+byte nor its fixed histogram, adds no atomics, and retains the existing numeric event-row
+schema.  Enabling it adds one byte per allocated FOFC cell, a 582,120-bin (`4.44MiB`)
+`uint64` histogram per rank, and one histogram MPI reduction per root cycle; it is not
+intended for an entire production campaign.
+
+Each physical active cell counted by `fofc` is added once to a joint histogram of:
+
+- absolute logical AMR level (0--31 plus overflow);
+- RK stage (1--3 plus `other`);
+- C2P/floor cause, DMP preflag, scalar-only correction, or `unknown`;
+- cylindrical radius from `fofc_telemetry_center1/2` (default 0,0), absolute height from
+  `fofc_telemetry_center3` (default 0), and local lapse.
+
+The fixed edges are `R_cyl={2,4,8,16,32,64}M`,
+`|z|={0.5,1,2,4,8,16}M`, and
+`alpha={0.2,0.4,0.6,0.8,1}`.  Radius and height distinguish disk/funnel location; lapse
+acts as a trajectory-independent moving-hole proximity proxy.  Rank-local device
+histograms survive AMR topology changes and are summed over MPI at every synchronized
+root cycle.  Sparse records are written immediately before the unchanged numeric row as
+comments beginning with `# fofc_spatial_v1`; the campaign checker and prefix recovery
+therefore ignore them as event data.  Every `kind=summary` record asserts
+`count=nfofc`, and the following `kind=bin` counts sum exactly to that value.
+Non-finite coordinates and non-finite or negative lapse are tagged with the dedicated
+`invalid_geometry` reason instead of being silently mixed into a physical overflow bin.
+These are raw contributions to global `nfofc`, not per-bin failure probabilities.  A
+fine level has more active cells and, under strict 2:1 subcycling, approximately twice as
+many cell-stage exposures per added level during each root cycle.  Cross-level or spatial
+rates therefore require the matching active cell-stage exposure as denominator; the
+global `fofc_tests` value is not a joint per-bin denominator.  This diagnostic deliberately
+does not add exposure atomics to the billions of tested cells per production step.
+
+The histogram is diagnostic state, not evolution state: its pending bins are reset only
+after event output and are not serialized in restart files.  Restart-persistent `nfofc`
+totals that predate the current process are conservatively placed in the joint
+overflow/`other`/`unknown` bin and reported as `unattributed`; no old location or cause is
+invented.  The per-cell reason scratch is also not migrated by AMR, because FOFC consumes
+and clears it inside each RK stage before root-boundary regridding.  These semantics make
+one-step restart replays useful for localization while keeping the authoritative event
+counter and all numerical updates unchanged.
+
+For an older checkpoint that predates this parameter (for example the retained `c322`
+checkpoint), a command-line `mhd/fofc_spatial_telemetry=true` override is intentionally
+rejected because the key is absent.  Keep the checkpoint read-only and launch the reviewed
+binary with both `-r` and a minimal read-only `-i` overlay containing only
+`<mhd>/fofc_spatial_telemetry=true`; `LoadFromFile` adds that key without modifying the
+source.  Bind the exact checkpoint, binary, trajectory, and overlay SHA-256 values in the
+diagnostic manifest, use a separate output directory, and retain `dcycle=1` plus
+`write_zeros=true`.  First stop after one root step and require `count=nfofc`.  Any pending
+prefix counter restored from `c322` is explicitly reported as `unattributed`; if clean
+attribution of just the new step is required, first account for that prefix in a separate
+default-off zero-step child, but start the diagnostic itself from the unchanged source and
+record the subtraction rather than promoting either child into the production chain.  A
+default-off restart never inserts this telemetry key into an old checkpoint header.
+
 ## The horizon lower bound matters
 
 At physical level `l`, the tracker uses

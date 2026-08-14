@@ -51,6 +51,7 @@
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
+#include "mhd/mhd.hpp"
 #include "outputs.hpp"
 
 //----------------------------------------------------------------------------------------
@@ -372,6 +373,13 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
               << "More than one history, event log, or restart output block found in "
               << "input file" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (pm->pmb_pack->pmhd != nullptr &&
+      pm->pmb_pack->pmhd->fofc_spatial_telemetry && num_log != 1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "FOFC spatial telemetry requires exactly one active "
+              << "event-log output" << std::endl;
     exit(EXIT_FAILURE);
   }
 }

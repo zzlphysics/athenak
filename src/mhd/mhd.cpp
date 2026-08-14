@@ -6,6 +6,7 @@
 //! \file mhd.cpp
 //! \brief implementation of MHD class constructor and assorted functions
 
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
+#include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 
 namespace mhd {
@@ -181,6 +183,37 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   if (evolution_t.compare("stationary") != 0) {
     // determine if FOFC is enabled
     use_fofc = pin->GetOrAddBoolean("mhd","fofc",false);
+    // This high-volume diagnostic is strictly opt-in and restricted to the
+    // PrimitiveSolver-based dynamical-GRMHD path.  Do not add a false default to
+    // ParameterInput: old checkpoints must retain their original parameter headers.
+    fofc_spatial_telemetry =
+        pin->DoesParameterExist("mhd", "fofc_spatial_telemetry") &&
+        pin->GetBoolean("mhd", "fofc_spatial_telemetry");
+    if (fofc_spatial_telemetry &&
+        (!use_fofc || !pmy_pack->pcoord->is_dynamical_relativistic)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd> fofc_spatial_telemetry requires fofc=true and "
+                << "dynamical GRMHD" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (fofc_spatial_telemetry) {
+      const char *center_names[3] = {
+        "fofc_telemetry_center1", "fofc_telemetry_center2", "fofc_telemetry_center3"
+      };
+      for (int n=0; n<3; ++n) {
+        if (pin->DoesParameterExist("mhd", center_names[n])) {
+          fofc_telemetry_center[n] = pin->GetReal("mhd", center_names[n]);
+        }
+        if (!std::isfinite(fofc_telemetry_center[n])) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "<mhd> " << center_names[n]
+                    << " must be finite" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      }
+      Kokkos::realloc(fofc_telemetry_pending, fofc_telemetry::kHistogramSize);
+      Kokkos::deep_copy(fofc_telemetry_pending, std::uint64_t{0});
+    }
 
     // select reconstruction method (default PLM)
     std::string xorder = pin->GetOrAddString("mhd","reconstruct","plm");
@@ -345,6 +378,11 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
         if (nscalars > 0) {
           Kokkos::realloc(fofc_scal,    nmb, nscalars, ncells3, ncells2, ncells1);
           Kokkos::deep_copy(fofc_scal, false);
+        }
+        if (fofc_spatial_telemetry) {
+          Kokkos::realloc(fofc_reason, nmb, ncells3, ncells2, ncells1);
+          Kokkos::deep_copy(fofc_reason,
+                            static_cast<std::uint8_t>(fofc_telemetry::Reason::unknown));
         }
       }
     }

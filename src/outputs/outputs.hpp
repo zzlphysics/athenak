@@ -8,6 +8,7 @@
 //! \file outputs.hpp
 //  \brief provides classes to handle ALL types of data output
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -476,6 +477,11 @@ class EventLogOutput : public BaseTypeOutput {
   bool header_written=false;
   bool no_output=true;
   bool write_zeros=false;
+  bool fofc_spatial_telemetry=false;
+  std::uint64_t fofc_telemetry_total=0;
+  std::uint64_t fofc_telemetry_unattributed=0;
+  std::uint64_t fofc_telemetry_allowed_prefix=0;
+  std::vector<std::uint64_t> fofc_telemetry_bins;
 
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;

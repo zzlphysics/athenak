@@ -40,6 +40,7 @@
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "coordinates/adm.hpp"
+#include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 #include "coordinates/coordinates.hpp"
 #include "coordinates/cell_locations.hpp"
@@ -337,6 +338,7 @@ class PrimitiveSolverHydro {
     return;
   }
 
+  template<bool RECORD_FOFC_REASON = false>
   dyngr::C2PProjectionStats ConsToPrim(
       DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &bfc,
       DvceArray5D<Real> &bcc0, DvceArray5D<Real> &prim,
@@ -351,6 +353,7 @@ class PrimitiveSolverHydro {
     const int nmb_active = pmy_pack->nmb_active;
     if (nmb_active <= 0) return {};
     auto &fofc_ = pmy_pack->pmhd->fofc;
+    auto fofc_reason_ = pmy_pack->pmhd->fofc_reason;
 
     // Some problem-specific parameters
     auto &excise = pmy_pack->pcoord->coord_data.bh_excise;
@@ -559,6 +562,10 @@ class PrimitiveSolverHydro {
           if (diagnostic_cell) sumfofctests++;
           if (result.error != Primitive::Error::SUCCESS) {
             fofc_(m,k,j,i) = true;
+            if constexpr (RECORD_FOFC_REASON) {
+              fofc_reason_(m,k,j,i) =
+                  mhd::fofc_telemetry::ReasonFromSolver(result.error, result.events);
+            }
           }
         }
       } else {

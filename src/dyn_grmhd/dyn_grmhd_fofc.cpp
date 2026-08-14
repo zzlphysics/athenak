@@ -20,6 +20,7 @@
 #include "dyn_grmhd/rsolvers/llf_dyn_grmhd.hpp"
 #include "dyn_grmhd/rsolvers/hlle_dyn_grmhd.hpp"
 #include "dyn_grmhd/dyn_grmhd_util.hpp"
+#include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 #include "coordinates/adm.hpp"
 
@@ -197,11 +198,32 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
       }
     });
 
-    // Test whether conversion to primitives requires floors
-    // Note b0 and w0 passed to function, but not used/changed.
-    eos.ConsToPrim(utest_, pmy_pack->pmhd->b0, bcctest_,
-                           pmy_pack->pmhd->w0, temperature,
-                           il, iu, jl, ju, kl, ku, true);
+    // When diagnostic telemetry is enabled, preserve the cause of an existing DMP
+    // preflag before the floor-test C2P short-circuits that cell.  This extra traversal
+    // and reason View do not exist on the default path.
+    if (pmy_pack->pmhd->fofc_spatial_telemetry) {
+      auto fofc_reason_ = pmy_pack->pmhd->fofc_reason;
+      par_for_active("FOFC-telemetry-preflag", DevExeSpace(), active_lids,
+      active_offset, nmb_active, kl, ku, jl, ju, il, iu,
+      KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+        fofc_reason_(m,k,j,i) = fofc_(m,k,j,i)
+            ? static_cast<std::uint8_t>(mhd::fofc_telemetry::Reason::dmp_preflag)
+            : static_cast<std::uint8_t>(mhd::fofc_telemetry::Reason::unknown);
+      });
+    }
+
+    // Test whether conversion to primitives requires floors.  Note b0 and w0 are
+    // passed to the function but not used/changed.  Compile the default call without
+    // reason recording so disabled telemetry adds no per-cell device branch.
+    if (pmy_pack->pmhd->fofc_spatial_telemetry) {
+      eos.template ConsToPrim<true>(utest_, pmy_pack->pmhd->b0, bcctest_,
+                                    pmy_pack->pmhd->w0, temperature,
+                                    il, iu, jl, ju, kl, ku, true);
+    } else {
+      eos.ConsToPrim(utest_, pmy_pack->pmhd->b0, bcctest_,
+                     pmy_pack->pmhd->w0, temperature,
+                     il, iu, jl, ju, kl, ku, true);
+    }
   }
 
   auto &use_fofc_ = pmy_pack->pmhd->use_fofc;
@@ -756,28 +778,97 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::FOFC(Driver *pdriver, int stage) {
     const int nactive_cells = nmb_active*nkji;
     auto nfofc_stage = pmy_pack->pmesh->device_nfofc_stage;
     auto nfofc_pending = pmy_pack->pmesh->device_nfofc_pending;
-    Kokkos::parallel_reduce(
-      "FOFC-count-reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, nactive_cells),
-      KOKKOS_LAMBDA(const int &idx, std::uint64_t &count) {
-        const int a = idx/nkji;
-        const int m = active_lids(active_offset + a);
-        const int k = (idx - a*nkji)/nji;
-        const int j = (idx - a*nkji - k*nji)/ni;
-        const int i = idx - a*nkji - k*nji - j*ni;
+    if (pmy_pack->pmhd->fofc_spatial_telemetry) {
+      auto fofc_reason_ = pmy_pack->pmhd->fofc_reason;
+      auto telemetry_pending_ = pmy_pack->pmhd->fofc_telemetry_pending;
+      auto mb_lev_ = pmy_pack->pmb->mb_lev.d_view;
+      auto alpha_ = pmy_pack->padm->adm.alpha;
+      const Real center1 = pmy_pack->pmhd->fofc_telemetry_center[0];
+      const Real center2 = pmy_pack->pmhd->fofc_telemetry_center[1];
+      const Real center3 = pmy_pack->pmhd->fofc_telemetry_center[2];
+      Kokkos::parallel_reduce(
+        "FOFC-count-reset-telemetry",
+        Kokkos::RangePolicy<>(DevExeSpace(), 0, nactive_cells),
+        KOKKOS_LAMBDA(const int &idx, std::uint64_t &count) {
+          const int a = idx/nkji;
+          const int m = active_lids(active_offset + a);
+          const int k = (idx - a*nkji)/nji;
+          const int j = (idx - a*nkji - k*nji)/ni;
+          const int i = idx - a*nkji - k*nji - j*ni;
 
-        bool corrected = fofc_(m,k,j,i);
-        fofc_(m,k,j,i) = false;
-        for (int n=0; n<nscal_; ++n) {
-          corrected |= fofc_scal_(m,n,k,j,i);
-          fofc_scal_(m,n,k,j,i) = false;
-        }
-        // Reset every slot because ghost flags are transient scratch, but report only
-        // physical cells.  Otherwise this scientific diagnostic varies with ghost
-        // width, MeshBlock decomposition, and restart cache history.
-        const bool physical_cell =
-            i >= is && i <= ie && j >= js && j <= je && k >= ks && k <= ke;
-        count += static_cast<std::uint64_t>(corrected && physical_cell);
-      }, nfofc_stage);
+          const bool mhd_corrected = fofc_(m,k,j,i);
+          bool scalar_corrected = false;
+          fofc_(m,k,j,i) = false;
+          for (int n=0; n<nscal_; ++n) {
+            scalar_corrected |= fofc_scal_(m,n,k,j,i);
+            fofc_scal_(m,n,k,j,i) = false;
+          }
+          int reason = static_cast<int>(fofc_reason_(m,k,j,i));
+          fofc_reason_(m,k,j,i) =
+              static_cast<std::uint8_t>(mhd::fofc_telemetry::Reason::unknown);
+          if (!mhd_corrected && scalar_corrected) {
+            reason = static_cast<int>(mhd::fofc_telemetry::Reason::scalar);
+          }
+          if (reason < 0 || reason >= mhd::fofc_telemetry::kReasonBins) {
+            reason = static_cast<int>(mhd::fofc_telemetry::Reason::unknown);
+          }
+
+          // Reset every slot because ghost flags are transient scratch, but report only
+          // physical cells.  Otherwise this scientific diagnostic varies with ghost
+          // width, MeshBlock decomposition, and restart cache history.
+          const bool corrected = mhd_corrected || scalar_corrected;
+          const bool physical_cell =
+              i >= is && i <= ie && j >= js && j <= je && k >= ks && k <= ke;
+          if (corrected && physical_cell) {
+            const Real x1 = CellCenterX(i-is, indcs.nx1,
+                                        size.d_view(m).x1min, size.d_view(m).x1max);
+            const Real x2 = CellCenterX(j-js, indcs.nx2,
+                                        size.d_view(m).x2min, size.d_view(m).x2max);
+            const Real x3 = CellCenterX(k-ks, indcs.nx3,
+                                        size.d_view(m).x3min, size.d_view(m).x3max);
+            const int level_bin = mhd::fofc_telemetry::LevelBin(mb_lev_(m));
+            const int stage_bin = mhd::fofc_telemetry::StageBin(stage);
+            const int radius_bin =
+                mhd::fofc_telemetry::RadiusBin(x1, x2, center1, center2);
+            const int abs_z_bin = mhd::fofc_telemetry::AbsZBin(x3, center3);
+            const Real lapse = alpha_(m,k,j,i);
+            const int lapse_bin = mhd::fofc_telemetry::LapseBin(lapse);
+            // Do not let a non-finite coordinate or an invalid lapse masquerade as a
+            // legitimate far-field/alpha>=1 sample.  A dedicated reason bin preserves
+            // histogram conservation while making the pathological geometry explicit.
+            if (!isfinite(x1) || !isfinite(x2) || !isfinite(x3) ||
+                !isfinite(lapse) || lapse < 0.0) {
+              reason = static_cast<int>(
+                  mhd::fofc_telemetry::Reason::invalid_geometry);
+            }
+            const std::size_t histogram_index = mhd::fofc_telemetry::HistogramIndex(
+                level_bin, stage_bin, reason, radius_bin, abs_z_bin, lapse_bin);
+            Kokkos::atomic_fetch_add(&telemetry_pending_(histogram_index),
+                                     std::uint64_t{1});
+            count++;
+          }
+        }, nfofc_stage);
+    } else {
+      Kokkos::parallel_reduce(
+        "FOFC-count-reset", Kokkos::RangePolicy<>(DevExeSpace(), 0, nactive_cells),
+        KOKKOS_LAMBDA(const int &idx, std::uint64_t &count) {
+          const int a = idx/nkji;
+          const int m = active_lids(active_offset + a);
+          const int k = (idx - a*nkji)/nji;
+          const int j = (idx - a*nkji - k*nji)/ni;
+          const int i = idx - a*nkji - k*nji - j*ni;
+
+          bool corrected = fofc_(m,k,j,i);
+          fofc_(m,k,j,i) = false;
+          for (int n=0; n<nscal_; ++n) {
+            corrected |= fofc_scal_(m,n,k,j,i);
+            fofc_scal_(m,n,k,j,i) = false;
+          }
+          const bool physical_cell =
+              i >= is && i <= ie && j >= js && j <= je && k >= ks && k <= ke;
+          count += static_cast<std::uint64_t>(corrected && physical_cell);
+        }, nfofc_stage);
+    }
     Kokkos::parallel_for(
       "FOFC-defer-count", Kokkos::RangePolicy<>(DevExeSpace(), 0, 1),
       KOKKOS_LAMBDA(const int) {

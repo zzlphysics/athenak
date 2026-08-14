@@ -171,6 +171,29 @@ def test_prefix_is_original_bytes_and_suffix_is_forensic() -> None:
     assert prefix + suffix == raw
 
 
+def test_event_prefix_keeps_target_telemetry_but_not_next_cycle_comments() -> None:
+    raw = (
+        b"# event header\n"
+        b"# fofc_spatial_v1 kind=summary cycle=322 count=1 nfofc=1 "
+        b"unattributed=0\n"
+        b"# fofc_spatial_v1 kind=bin cycle=322 level_bin=8 count=1\n"
+        b"322 1\n"
+        b"# fofc_spatial_v1 kind=summary cycle=323 count=2 nfofc=2 "
+        b"unattributed=0\n"
+        b"# fofc_spatial_v1 kind=bin cycle=323 level_bin=9 count=2\n"
+        b"323 2\n"
+    )
+
+    prefix, suffix = RECOVERY._exact_text_prefix(raw, 1, "event")
+
+    assert b"kind=summary cycle=322" in prefix
+    assert b"kind=bin cycle=322" in prefix
+    assert prefix.endswith(b"322 1\n")
+    assert b"cycle=323" not in prefix
+    assert suffix.startswith(b"# fofc_spatial_v1 kind=summary cycle=323")
+    assert prefix + suffix == raw
+
+
 def test_run_log_prefix_replays_cache_and_fixed_root_steps(tmp_path: Path) -> None:
     path = tmp_path / "run.log"
     path.write_text(
