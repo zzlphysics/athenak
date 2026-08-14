@@ -59,6 +59,7 @@ YELLOW_CAPACITY_HEADROOM = 128
 GIB_BYTES = 1 << 30
 DEFAULT_PLANNED_PEAK_OUTPUT_GIB = 200
 MAX_NMB_PER_RANK = 16384
+CADENCE_MULTIPLE_MAX_ULPS = 2
 CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
 CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
 CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
@@ -455,6 +456,87 @@ def _capacity_transition(source_capacity: int,
             "required_per_rank_memory_mib_ceiling": required_mib,
             "minimum_gpu_memory_total_mib": minimum_total_mib,
         },
+    }
+
+
+def _root_step_cadence_multiple(value: float, root_dt: float,
+                                label: str) -> int:
+    """Return the exact positive root-step multiple for a time cadence."""
+
+    cadence = _positive_finite(value, label)
+    ratio = cadence / root_dt
+    nearest = round(ratio) if math.isfinite(ratio) else 0
+    tolerance = (CADENCE_MULTIPLE_MAX_ULPS *
+                 max(math.ulp(ratio), math.ulp(float(nearest)))) \
+        if math.isfinite(ratio) else 0.0
+    if (nearest < 1 or not math.isfinite(ratio) or
+            abs(ratio - nearest) > tolerance):
+        raise ValueError(
+            f"{label} must be an integer multiple of --root-dt")
+    return nearest
+
+
+def _restart_cadence_transition(
+        parameters: dict[str, dict[str, str]], root_dt: float,
+        requested_target: float | None) -> dict[str, Any]:
+    """Bind the sole restart stream and an optional cadence tightening."""
+
+    restart_blocks = sorted(
+        (name for name, block in parameters.items()
+         if re.fullmatch(r"output[0-9]+", name) and
+         block.get("file_type", "").strip() == "rst"),
+        key=lambda name: int(name[6:]),
+    )
+    if len(restart_blocks) != 1:
+        raise ValueError(
+            "strict segment plan requires exactly one restart output")
+    block_name = restart_blocks[0]
+    block = parameters[block_name]
+    if "dcycle" in block:
+        raise ValueError(
+            f"<{block_name}> restart output must use dt and may not contain dcycle")
+    try:
+        source_dt = float(block["dt"])
+        phase = {
+            "file_number": int(block.get("file_number", "0")),
+            "last_time": float(block.get("last_time", "-1")),
+            "last_write_cycle": int(block.get("last_write_cycle", "-1")),
+        }
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"<{block_name}> restart output has invalid dt/cadence phase") from exc
+    source_multiple = _root_step_cadence_multiple(
+        source_dt, root_dt, f"source <{block_name}>/dt")
+    if (phase["file_number"] < 0 or
+            not math.isfinite(phase["last_time"])):
+        raise ValueError(
+            f"<{block_name}> restart output has invalid cadence phase")
+
+    if requested_target is None:
+        target_dt = source_dt
+    else:
+        target_dt = _positive_finite(
+            requested_target, "--target-restart-dt")
+    target_multiple = _root_step_cadence_multiple(
+        target_dt, root_dt, "--target-restart-dt")
+    if target_dt > source_dt:
+        raise ValueError(
+            "--target-restart-dt may not increase/relax the source restart "
+            "cadence")
+    changed = target_dt < source_dt
+    runtime_override = (
+        f"{block_name}/dt={target_dt!r}" if changed else None)
+    return {
+        "kind": "tighten_v1" if changed else "unchanged_v1",
+        "block": block_name,
+        "parameter": f"{block_name}/dt",
+        "source_dt": source_dt,
+        "target_dt": target_dt,
+        "root_dt": root_dt,
+        "source_root_step_multiple": source_multiple,
+        "target_root_step_multiple": target_multiple,
+        "phase": phase,
+        "runtime_override": runtime_override,
     }
 
 
@@ -873,10 +955,11 @@ def _output_blocks(
     return outputs
 
 
-def _runtime_parameters_with_topology_reference(
+def _runtime_parameters_with_output_overrides(
         source: dict[str, dict[str, str]], root_dt: float,
+        restart_transition: dict[str, Any],
         *, anchor: bool) -> dict[str, dict[str, str]]:
-    """Apply the sole exact scientific-output override used by strict segments."""
+    """Apply the exact, plan-bound output cadence overrides."""
 
     runtime = copy.deepcopy(source)
     block = runtime.get("output3")
@@ -907,6 +990,11 @@ def _runtime_parameters_with_topology_reference(
         raise ValueError(
             "parent-chain source restart must serialize output3/dt=root_dt")
     block["dt"] = repr(root_dt)
+    if restart_transition["runtime_override"] is not None:
+        restart_block = runtime.get(restart_transition["block"])
+        if not isinstance(restart_block, dict):  # pragma: no cover - prevalidated
+            raise ValueError("planned restart output disappeared")
+        restart_block["dt"] = repr(restart_transition["target_dt"])
     return runtime
 
 
@@ -1263,6 +1351,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "source restart max_nmb_per_rank must be canonical decimal")
     capacity_transition = _capacity_transition(
         capacity, getattr(args, "target_max_nmb_per_rank", None))
+    restart_cadence_transition = _restart_cadence_transition(
+        parameters, root_dt, getattr(args, "target_restart_dt", None))
     READER.load_balance(metadata.costs, ranks, capacity)
     target_capacity = capacity_transition["target_max_nmb_per_rank"]
     target_partitions = READER.load_balance(
@@ -1337,8 +1427,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if not math.isfinite(final_time) or not math.isfinite(tlim) or tlim <= final_time:
         raise ValueError("planned endpoint/tlim is non-finite or non-increasing")
 
-    runtime_parameters = _runtime_parameters_with_topology_reference(
-        parameters, root_dt, anchor=anchor)
+    runtime_parameters = _runtime_parameters_with_output_overrides(
+        parameters, root_dt, restart_cadence_transition, anchor=anchor)
     outputs = _output_blocks(runtime_parameters, required)
     for output in outputs:
         if output["inspect_binary"]:
@@ -1388,6 +1478,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         f"problem/trajectory_file={trajectory_proc_template}",
         f"output3/dt={root_dt!r}",
     ]
+    if restart_cadence_transition["runtime_override"] is not None:
+        athena_argv_template.append(
+            restart_cadence_transition["runtime_override"])
     if capacity_transition["runtime_override"] is not None:
         athena_argv_template.append(capacity_transition["runtime_override"])
     evidence = {
@@ -1431,6 +1524,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "source_qualification": source_qualification,
         "source": source_summary,
         "capacity_transition": capacity_transition,
+        "restart_cadence_transition": restart_cadence_transition,
         "expected": {
             "source_cycle": metadata.cycle,
             "source_time": metadata.time,
@@ -1445,6 +1539,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "time/nlim": final_cycle,
             "time/tlim": tlim,
             "output3/dt": root_dt,
+            **({restart_cadence_transition["parameter"]:
+                restart_cadence_transition["target_dt"]}
+               if restart_cadence_transition["runtime_override"] is not None
+               else {}),
             **({"mesh_refinement/max_nmb_per_rank":
                 capacity_transition["target_max_nmb_per_rank"]}
                if capacity_transition["runtime_override"] is not None else {}),
@@ -1569,6 +1667,12 @@ def main() -> int:
         "--target-max-nmb-per-rank", type=int, action=_StoreOnce,
         help=("strictly increase max_nmb_per_rank for this segment; omit to "
               "preserve the source capacity (maximum: 16384)"),
+    )
+    parser.add_argument(
+        "--target-restart-dt", type=float, action=_StoreOnce,
+        help=("tighten the sole restart output cadence for this segment; the "
+              "value must be a positive root-dt multiple no larger than the "
+              "serialized source cadence; omit to preserve it"),
     )
     parser.add_argument("--launcher", required=True, type=Path)
     parser.add_argument(

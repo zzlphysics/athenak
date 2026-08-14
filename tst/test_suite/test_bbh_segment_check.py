@@ -293,6 +293,16 @@ def _plan() -> dict[str, object]:
                 "minimum_gpu_memory_total_mib": 18343,
             },
         },
+        "restart_cadence_transition": {
+            "kind": "unchanged_v1", "block": "output4",
+            "parameter": "output4/dt", "source_dt": 4.8,
+            "target_dt": 4.8, "root_dt": 4.8,
+            "source_root_step_multiple": 1,
+            "target_root_step_multiple": 1,
+            "phase": {"file_number": 0, "last_time": -1.0,
+                      "last_write_cycle": -1},
+            "runtime_override": None,
+        },
         "inputs": {
             "repo": {"path": "/campaign/repo", "commit": "a" * 40,
                      "clean": True},
@@ -676,6 +686,112 @@ def _run_log(path: Path, termination: str = "cycle") -> None:
 
 def test_checker_consumes_planner_contract_schema() -> None:
     assert CHECKER.validate_plan(_plan()) == EXPECTED
+
+
+def _set_restart_cadence_tightening(plan: dict[str, object]) -> None:
+    plan["source"]["parameters"]["output4"]["dt"] = "48.0"
+    plan["restart_cadence_transition"] = {
+        "kind": "tighten_v1", "block": "output4",
+        "parameter": "output4/dt", "source_dt": 48.0,
+        "target_dt": 19.2, "root_dt": 4.8,
+        "source_root_step_multiple": 10,
+        "target_root_step_multiple": 4,
+        "phase": {"file_number": 0, "last_time": -1.0,
+                  "last_write_cycle": -1},
+        "runtime_override": "output4/dt=19.2",
+    }
+    plan["command_overrides"]["output4/dt"] = 19.2
+    plan["launch_contract"]["athena_argv_template"].append(
+        "output4/dt=19.2")
+    output4 = next(
+        output for output in plan["outputs"] if output["block"] == "output4")
+    output4["cadence"] = 19.2
+    output4["parameters"]["dt"] = "19.2"
+    output4["expected_writes"] = [
+        {"cycle": 11, "time": 52.8, "kind": "scheduled",
+         "file_number": 0},
+        {"cycle": 13, "time": 62.39999999999999,
+         "kind": "forced_final", "file_number": 1},
+    ]
+    output4["expected_endpoint_state"] = {
+        "file_number": 2, "last_time": 52.8, "last_write_cycle": 13,
+    }
+
+
+def test_validate_plan_accepts_exact_restart_cadence_tightening() -> None:
+    plan = _plan()
+    _set_restart_cadence_tightening(plan)
+
+    assert CHECKER.validate_plan(plan) == EXPECTED
+
+
+def test_checker_accepts_decimal_restart_multiple_with_division_roundoff() -> None:
+    plan = _plan()
+    plan["source"]["parameters"]["output4"]["dt"] = "33.6"
+    plan["restart_cadence_transition"].update({
+        "source_dt": 33.6, "target_dt": 33.6,
+        "source_root_step_multiple": 7,
+        "target_root_step_multiple": 7,
+    })
+
+    transition = CHECKER._validate_restart_cadence_transition(plan, 4.8)
+
+    assert transition["source_root_step_multiple"] == 7
+
+
+@pytest.mark.parametrize(
+    "tamper", ("command", "argv", "phase", "target", "write", "endpoint"))
+def test_validate_plan_rejects_restart_cadence_transition_tamper(
+        tamper: str) -> None:
+    plan = _plan()
+    _set_restart_cadence_tightening(plan)
+    if tamper == "command":
+        plan["command_overrides"]["output4/dt"] = 9.6
+    elif tamper == "argv":
+        plan["launch_contract"]["athena_argv_template"][-1] = \
+            "output4/dt=9.6"
+    elif tamper == "phase":
+        plan["restart_cadence_transition"]["phase"]["last_time"] = 0.0
+    elif tamper == "target":
+        plan["restart_cadence_transition"]["target_dt"] = 9.6
+    elif tamper == "write":
+        output4 = next(
+            output for output in plan["outputs"]
+            if output["block"] == "output4")
+        del output4["expected_writes"][0]
+    else:
+        output4 = next(
+            output for output in plan["outputs"]
+            if output["block"] == "output4")
+        output4["expected_endpoint_state"]["file_number"] += 1
+
+    with pytest.raises(CHECKER.CheckFailure):
+        CHECKER.validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda transition: transition.__setitem__("source_dt", 4),
+        lambda transition: transition.__setitem__(
+            "source_root_step_multiple", True),
+        lambda transition: transition["phase"].__setitem__(
+            "file_number", 0.0),
+        lambda transition: transition["phase"].__setitem__(
+            "last_time", -1),
+        lambda transition: transition["phase"].__setitem__(
+            "last_write_cycle", -1.0),
+    ),
+    ids=("integer-dt", "boolean-multiple", "float-file-number",
+         "integer-last-time", "float-last-write-cycle"),
+)
+def test_checker_rejects_noncanonical_restart_cadence_numeric_types(
+        mutation) -> None:
+    plan = _plan()
+    mutation(plan["restart_cadence_transition"])
+
+    with pytest.raises(CHECKER.CheckFailure, match="numeric types"):
+        CHECKER.validate_plan(plan)
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,10 @@ def _write_restart(
         output3_dt: str = "4.8", output3_last_time: str = "148.8",
         output3_last_write_cycle: int = 31, cycle: int = 31,
         time_value: float = 148.8,
+        output4_dt: str | None = "19.2", output4_dcycle: int | None = None,
+        output4_file_number: int = 9, output4_last_time: str = "148.8",
+        output4_last_write_cycle: int = 31,
+        output5_file_type: str = "bin",
         output_states: dict[str, dict[str, object]] | None = None,
         nlim: int = -1, tlim: float = 628.8) -> None:
     real_code = "d" if real_bytes == 8 else "f"
@@ -53,8 +57,9 @@ def _write_restart(
                     "last_write_cycle": 25},
         "output3": {"file_number": 9, "last_time": output3_last_time,
                     "last_write_cycle": output3_last_write_cycle},
-        "output4": {"file_number": 9, "last_time": 148.8,
-                    "last_write_cycle": 31},
+        "output4": {"file_number": output4_file_number,
+                    "last_time": output4_last_time,
+                    "last_write_cycle": output4_last_write_cycle},
         "output5": {"file_number": 4, "last_time": 120,
                     "last_write_cycle": 25},
         "output6": {"file_number": 0, "last_time": -1,
@@ -65,6 +70,15 @@ def _write_restart(
 
     def output_value(block: str, name: str) -> object:
         return states[block][name]
+
+    if output4_dcycle is not None:
+        output4_cadence = f"dcycle = {output4_dcycle}"
+        if output4_dt is not None:
+            output4_cadence += f"\ndt = {output4_dt}"
+    elif output4_dt is not None:
+        output4_cadence = f"dt = {output4_dt}"
+    else:
+        output4_cadence = ""
 
     parameters = f"""<job>
 basename = effective_bbh_4pn_V100Q
@@ -126,13 +140,13 @@ last_write_cycle = {output_value('output3', 'last_write_cycle')}
 ghost_zones = false
 <output4>
 file_type = rst
-dt = 19.2
+{output4_cadence}
 file_number = {output_value('output4', 'file_number')}
 last_time = {output_value('output4', 'last_time')}
 last_write_cycle = {output_value('output4', 'last_write_cycle')}
 single_file_per_rank = false
 <output5>
-file_type = bin
+file_type = {output5_file_type}
 variable = mhd_gr_diagnostics
 dt = 48.0
 file_number = {output_value('output5', 'file_number')}
@@ -223,10 +237,11 @@ def _campaign(tmp_path: Path, **restart_options: object) -> dict[str, Path]:
     restart = repo / "source.rst"
     _write_restart(restart, trajectory.resolve(), **restart_options)
     source_history = repo / "source.user.hst"
+    history_time = float(restart_options.get("time_value", 148.8))
     source_history.write_text(
         "# Athena++ history data\n"
         "# [1]=time [2]=dt [3]=baryon_m\n"
-        "1.4880000000000000e2 4.8 1.0e2\n", encoding="utf-8")
+        f"{history_time:.17e} 4.8 1.0e2\n", encoding="utf-8")
     _git(repo, "add", "athena", "mpirun", "trajectory.dat", "source.rst",
          "source.user.hst")
     _git(repo, "commit", "-q", "-m", "fixture")
@@ -293,6 +308,10 @@ def _command(campaign: dict[str, Path], **overrides: str) -> list[str]:
         command.extend([
             "--target-max-nmb-per-rank", values["target_capacity"],
         ])
+    if "target_restart_dt" in overrides:
+        command.extend([
+            "--target-restart-dt", values["target_restart_dt"],
+        ])
     return command
 
 
@@ -338,6 +357,15 @@ def test_binary64_endpoint_cycle_guard_and_snapshots(tmp_path: Path) -> None:
     assert plan["capacity_transition"]["source_max_nmb_per_rank"] == 1024
     assert plan["capacity_transition"]["target_max_nmb_per_rank"] == 1024
     assert plan["capacity_transition"]["runtime_override"] is None
+    assert plan["restart_cadence_transition"] == {
+        "kind": "unchanged_v1", "block": "output4",
+        "parameter": "output4/dt", "source_dt": 19.2,
+        "target_dt": 19.2, "root_dt": 4.8,
+        "source_root_step_multiple": 4, "target_root_step_multiple": 4,
+        "phase": {"file_number": 9, "last_time": 148.8,
+                  "last_write_cycle": 31},
+        "runtime_override": None,
+    }
     assert plan["source_qualification"]["mode"] == "anchor_full_audit"
     assert plan["source_qualification"]["audit"]["valid"] is True
     assert plan["source_qualification"]["audit"]["stored_reals"][
@@ -764,6 +792,136 @@ def test_anchor_can_rebind_disabled_output3_dt_to_root_cadence(
     plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
     output3 = next(row for row in plan["outputs"] if row["block"] == "output3")
     assert output3["parameters"]["dt"] == "4.8"
+
+
+def test_restart_cadence_tightening_preserves_phase_and_replays_c322_to_c372(
+        tmp_path: Path) -> None:
+    campaign = _campaign(
+        tmp_path, cycle=322, time_value=1545.599999999991,
+        output3_last_time="1545.599999999991",
+        output3_last_write_cycle=322,
+        output4_dt="48.0", output4_file_number=45,
+        output4_last_time="1540.8000000000002",
+        output4_last_write_cycle=322)
+
+    result = _run(
+        campaign, root_steps="50", target_restart_dt="19.2")
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    transition = plan["restart_cadence_transition"]
+    assert transition == {
+        "kind": "tighten_v1", "block": "output4",
+        "parameter": "output4/dt", "source_dt": 48.0,
+        "target_dt": 19.2, "root_dt": 4.8,
+        "source_root_step_multiple": 10, "target_root_step_multiple": 4,
+        "phase": {"file_number": 45, "last_time": 1540.8000000000002,
+                  "last_write_cycle": 322},
+        "runtime_override": "output4/dt=19.2",
+    }
+    restart = next(
+        output for output in plan["outputs"] if output["file_type"] == "rst")
+    assert restart["block"] == "output4"
+    assert restart["parameters"]["dt"] == "19.2"
+    assert [write["cycle"] for write in restart["expected_writes"]
+            if write["kind"] == "scheduled"] == list(range(325, 370, 4))
+    assert [write["file_number"] for write in restart["expected_writes"]] == \
+        list(range(45, 58))
+    assert restart["expected_writes"][-1]["cycle"] == 372
+    assert restart["expected_writes"][-1]["kind"] == "forced_final"
+    assert restart["expected_endpoint_state"]["file_number"] == 58
+    assert plan["source"]["parameters"]["output4"]["dt"] == "48.0"
+    assert plan["command_overrides"]["output4/dt"] == 19.2
+    assert plan["launch_contract"]["athena_argv_template"][-1] == \
+        "output4/dt=19.2"
+
+
+def test_restart_cadence_already_at_target_needs_no_runtime_override(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_dt="19.2")
+
+    result = _run(campaign)
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    assert plan["restart_cadence_transition"]["kind"] == "unchanged_v1"
+    assert plan["restart_cadence_transition"]["runtime_override"] is None
+    assert "output4/dt" not in plan["command_overrides"]
+    assert "output4/dt=19.2" not in \
+        plan["launch_contract"]["athena_argv_template"]
+
+
+def test_restart_cadence_accepts_decimal_root_multiple_with_division_roundoff(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_dt="48.0")
+
+    result = _run(campaign, target_restart_dt="33.6")
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    transition = plan["restart_cadence_transition"]
+    assert transition["target_dt"] == 33.6
+    assert transition["target_root_step_multiple"] == 7
+    assert transition["runtime_override"] == "output4/dt=33.6"
+
+
+def test_serialized_restart_cadence_accepts_decimal_root_multiple_roundoff(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_dt="33.6")
+
+    result = _run(campaign)
+
+    assert result.returncode == 0, result.stderr
+    transition = json.loads(campaign["output"].read_text(
+        encoding="utf-8"))["restart_cadence_transition"]
+    assert transition["source_root_step_multiple"] == 7
+    assert transition["target_root_step_multiple"] == 7
+    assert transition["runtime_override"] is None
+
+
+@pytest.mark.parametrize(
+    ("restart_options", "target", "message"),
+    (
+        ({"output4_dt": "48.0"}, "20.0", "integer multiple"),
+        ({"output4_dt": "48.0"}, "52.8", "may not increase/relax"),
+        ({"output4_dt": "48.0"}, "nan", "finite and positive"),
+        ({"output4_dt": "48.0"}, "inf", "finite and positive"),
+        ({"output4_dt": "48.0"}, "0", "finite and positive"),
+        ({"output4_dt": "20.0"}, None, "integer multiple"),
+        ({"output4_dt": None, "output4_dcycle": 4}, None,
+         "must use dt"),
+        ({"output4_dt": "48.0", "output5_file_type": "rst"}, None,
+         "exactly one restart output"),
+    ),
+)
+def test_restart_cadence_transition_rejects_invalid_contracts(
+        tmp_path: Path, restart_options: dict[str, object],
+        target: str | None, message: str) -> None:
+    campaign = _campaign(tmp_path, **restart_options)
+
+    result = _run(
+        campaign, **({"target_restart_dt": target} if target is not None else {}))
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not campaign["output"].exists()
+
+
+def test_plan_rejects_duplicate_restart_cadence_target(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path, output4_dt="48.0")
+    command = _command(campaign, target_restart_dt="19.2")
+    command.extend(["--target-restart-dt", "9.6"])
+    environment = dict(os.environ)
+    environment["PATH"] = (
+        f"{campaign['nvidia_smi'].parent}{os.pathsep}"
+        f"{environment.get('PATH', '')}")
+
+    result = subprocess.run(
+        command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment)
+
+    assert result.returncode != 0
+    assert "may be specified only once" in result.stderr
 
 
 def _make_parent_pass(campaign: dict[str, Path], tmp_path: Path,

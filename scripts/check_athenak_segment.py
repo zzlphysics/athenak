@@ -51,6 +51,7 @@ from read_athenak_restart_metadata import (
 
 SCHEMA = 1
 MAX_NMB_PER_RANK = 16384
+CADENCE_MULTIPLE_MAX_ULPS = 2
 CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
 CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
 CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
@@ -337,6 +338,102 @@ def _validate_capacity_transition(plan: dict[str, Any]) -> dict[str, Any]:
             "plan source lacks mesh_refinement/max_nmb_per_rank") from exc
     _require(serialized_source == str(source),
              "plan source capacity is not the canonical transition source")
+    return value
+
+
+def _cadence_root_step_multiple(value: float, root_dt: float,
+                                label: str) -> int:
+    ratio = value / root_dt
+    nearest = round(ratio) if math.isfinite(ratio) else 0
+    tolerance = (CADENCE_MULTIPLE_MAX_ULPS *
+                 max(math.ulp(ratio), math.ulp(float(nearest)))) \
+        if math.isfinite(ratio) else 0.0
+    _require(value > 0.0 and math.isfinite(ratio) and nearest >= 1 and
+             abs(ratio - nearest) <= tolerance,
+             f"{label} must be a positive integer root-dt multiple")
+    return nearest
+
+
+def _validate_restart_cadence_transition(
+        plan: dict[str, Any], root_dt: float) -> dict[str, Any]:
+    """Validate the exact optional tightening of the sole restart stream."""
+
+    value = plan.get("restart_cadence_transition")
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "block", "parameter", "source_dt", "target_dt", "root_dt",
+        "source_root_step_multiple", "target_root_step_multiple", "phase",
+        "runtime_override",
+    }, "plan restart_cadence_transition must be the exact strict object")
+    source_record = plan.get("source")
+    _require(isinstance(source_record, dict),
+             "plan source must bind restart cadence")
+    source_parameters = source_record.get("parameters")
+    _require(isinstance(source_parameters, dict),
+             "plan source parameters must bind restart cadence")
+    restart_blocks = sorted(
+        name for name, block in source_parameters.items()
+        if isinstance(name, str) and re.fullmatch(r"output\d+", name) and
+        isinstance(block, dict) and
+        block.get("file_type", "").strip() == "rst")
+    _require(len(restart_blocks) == 1,
+             "source must contain exactly one restart output")
+    block_name = restart_blocks[0]
+    block = source_parameters[block_name]
+    _require("dt" in block and "dcycle" not in block,
+             f"source {block_name} restart output must use dt without dcycle")
+    try:
+        serialized_source_dt = float(block["dt"])
+        serialized_phase = {
+            "file_number": int(block.get("file_number", "0")),
+            "last_time": float(block.get("last_time", "-1")),
+            "last_write_cycle": int(block.get("last_write_cycle", "-1")),
+        }
+    except (TypeError, ValueError) as exc:
+        raise CheckFailure(
+            f"source {block_name} restart cadence state is invalid") from exc
+    _require(serialized_phase["file_number"] >= 0 and
+             math.isfinite(serialized_phase["last_time"]),
+             f"source {block_name} restart cadence phase is invalid")
+    planned_phase = value.get("phase")
+    _require(type(value.get("source_dt")) is float and
+             type(value.get("target_dt")) is float and
+             type(value.get("root_dt")) is float and
+             type(value.get("source_root_step_multiple")) is int and
+             type(value.get("target_root_step_multiple")) is int and
+             isinstance(planned_phase, dict) and
+             set(planned_phase) == {
+                 "file_number", "last_time", "last_write_cycle"} and
+             type(planned_phase.get("file_number")) is int and
+             type(planned_phase.get("last_time")) is float and
+             type(planned_phase.get("last_write_cycle")) is int,
+             "restart cadence transition numeric types are not canonical")
+    source_dt = _number(value.get("source_dt"),
+                        "restart_cadence_transition.source_dt")
+    target_dt = _number(value.get("target_dt"),
+                        "restart_cadence_transition.target_dt")
+    transition_root_dt = _number(
+        value.get("root_dt"), "restart_cadence_transition.root_dt")
+    source_multiple = _cadence_root_step_multiple(
+        source_dt, root_dt, "restart cadence source_dt")
+    target_multiple = _cadence_root_step_multiple(
+        target_dt, root_dt, "restart cadence target_dt")
+    _require(value.get("block") == block_name and
+             value.get("parameter") == f"{block_name}/dt" and
+             transition_root_dt == root_dt and
+             serialized_source_dt == source_dt and target_dt <= source_dt and
+             value.get("source_root_step_multiple") == source_multiple and
+             value.get("target_root_step_multiple") == target_multiple and
+             planned_phase == serialized_phase,
+             "restart cadence transition source/target/phase is not canonical")
+    if target_dt == source_dt:
+        _require(value.get("kind") == "unchanged_v1" and
+                 value.get("runtime_override") is None,
+                 "unchanged restart cadence may not carry an override")
+    else:
+        _require(target_dt < source_dt and value.get("kind") == "tighten_v1" and
+                 value.get("runtime_override") ==
+                 f"{block_name}/dt={target_dt!r}",
+                 "restart cadence tightening lacks its canonical override")
     return value
 
 
@@ -1067,11 +1164,16 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
              "expected tlim is not the sequential binary64 guard endpoint")
     _require(tlim > final_time, "expected tlim must be a nonbinding upper guard")
     capacity_transition = _validate_capacity_transition(plan)
+    restart_cadence_transition = _validate_restart_cadence_transition(
+        plan, root_dt)
     expected_overrides = {
         "time/nlim": final_cycle,
         "time/tlim": tlim,
         "output3/dt": root_dt,
     }
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        expected_overrides[restart_cadence_transition["parameter"]] = \
+            restart_cadence_transition["target_dt"]
     if capacity_transition["kind"] == "increase_v1":
         expected_overrides["mesh_refinement/max_nmb_per_rank"] = \
             capacity_transition["target_max_nmb_per_rank"]
@@ -1082,7 +1184,7 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
              _number(overrides.get("output3/dt"),
                      "command_overrides.output3/dt") == root_dt,
              "command_overrides must be exactly the canonical limits, divB "
-             "cadence, and optional capacity increase")
+             "cadence, optional restart tightening, and optional capacity increase")
 
     for name in ("binary", "trajectory", "source_restart"):
         _validate_planned_file_record(inputs.get(name), f"inputs.{name}")
@@ -1295,6 +1397,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         f"problem/trajectory_file={trajectory_template}",
         f"output3/dt={root_dt!r}",
     ]
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        expected_athena.append(restart_cadence_transition["runtime_override"])
     if capacity_transition["kind"] == "increase_v1":
         expected_athena.append(capacity_transition["runtime_override"])
     _require(launch_contract.get("world_size") == ranks and
@@ -1493,6 +1597,10 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 "source output3/dt must be finite/nonnegative and a chain source "
                 "must already equal root_dt")
             expected_runtime_parameters["dt"] = repr(root_dt)
+        if (block == restart_cadence_transition["block"] and
+                restart_cadence_transition["kind"] == "tighten_v1"):
+            expected_runtime_parameters["dt"] = repr(
+                restart_cadence_transition["target_dt"])
         _require(parameters == expected_runtime_parameters,
                  f"{block}: planned runtime parameter snapshot differs from the "
                  "source plus exact canonical override")
@@ -1555,6 +1663,17 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
             canonical_topology_output = output
     _require(restart_outputs == 1,
              "strict segment plan must declare exactly one restart output")
+    replayed_schedules, replayed_endpoint_states = _replay_output_plan(
+        outputs, source_plan_parameters, expected)
+    for output in outputs:
+        block = output["block"]
+        _require(output["expected_writes"] == replayed_schedules[block],
+                 f"{block}: plan expected_writes differs from independent "
+                 "source-phase cadence replay")
+        _require(output["expected_endpoint_state"] ==
+                 replayed_endpoint_states[block],
+                 f"{block} endpoint cadence state: plan expected_endpoint_state "
+                 "differs from independent source-phase cadence replay")
     _require("output3" in seen_blocks,
              "strict segment plan lacks canonical output3 topology reference")
     _require(canonical_topology_output is not None and
@@ -2225,6 +2344,10 @@ def audit_launch_record(path: Path, plan: dict[str, Any], plan_path: Path,
         f"problem/trajectory_file=/proc/{holder_pid}/fd/{TRAJECTORY_FD}",
         f"output3/dt={plan['expected']['root_dt']!r}",
     }
+    restart_cadence_transition = _validate_restart_cadence_transition(
+        plan, float(plan["expected"]["root_dt"]))
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        permitted.add(restart_cadence_transition["runtime_override"])
     capacity_transition = _validate_capacity_transition(plan)
     if capacity_transition["kind"] == "increase_v1":
         permitted.add(capacity_transition["runtime_override"])
@@ -2913,17 +3036,18 @@ def _float32(value: float) -> float:
             from exc
 
 
-def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
-                              endpoint: RestartMetadata,
-                              expected: dict[str, Any]
-                              ) -> dict[str, list[dict[str, Any]]]:
-    """Replay Execute plus ordered Finalize, including a restart rewrite."""
+def _replay_output_plan(
+        outputs: list[dict[str, Any]],
+        source_parameters: dict[str, dict[str, str]],
+        expected: dict[str, Any],
+        ) -> tuple[dict[str, list[dict[str, Any]]],
+                   dict[str, dict[str, Any]]]:
+    """Replay Execute/Finalize from immutable source parameters alone."""
 
     states: dict[str, dict[str, Any]] = {}
-    output_by_block = {output["block"]: output for output in plan["outputs"]}
-    for output in plan["outputs"]:
+    for output in outputs:
         block = output["block"]
-        source_block = source.parameters.get(block)
+        source_block = source_parameters.get(block)
         _require(source_block is not None, f"source restart parameter dump lacks {block}")
         try:
             file_number = int(source_block.get("file_number", "0"))
@@ -2984,7 +3108,7 @@ def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
     current_time = expected["source_time"]
     for cycle in range(expected["source_cycle"] + 1, expected["final_cycle"] + 1):
         current_time += expected["root_dt"]
-        for output in plan["outputs"]:
+        for output in outputs:
             state = states[output["block"]]
             if due(state, cycle, current_time, True):
                 write(output, state, cycle, current_time, "scheduled", True)
@@ -2992,9 +3116,9 @@ def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
     # Outputs stores all non-restart objects by push-front and the sole restart at the
     # tail.  Therefore Finalize visits non-restarts in reverse block order, then restart.
     non_restarts = sorted(
-        (output for output in plan["outputs"] if output["file_type"] != "rst"),
+        (output for output in outputs if output["file_type"] != "rst"),
         key=lambda output: output["index"], reverse=True)
-    restarts = [output for output in plan["outputs"]
+    restarts = [output for output in outputs
                 if output["file_type"] == "rst"]
     _require(len(restarts) == 1,
              "strict segment qualification requires exactly one restart output")
@@ -3014,7 +3138,27 @@ def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
         if not is_restart:
             final_parameter_state_changed = True
 
-    for block, state in states.items():
+    schedules = {block: state["writes"] for block, state in states.items()}
+    endpoint_states = {
+        block: {
+            "file_number": state["file_number"],
+            "last_time": state["last_time"],
+            "last_write_cycle": state["last_write_cycle"],
+        }
+        for block, state in states.items()
+    }
+    return schedules, endpoint_states
+
+
+def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
+                              endpoint: RestartMetadata,
+                              expected: dict[str, Any]
+                              ) -> dict[str, list[dict[str, Any]]]:
+    """Replay Execute/Finalize and re-prove the endpoint restart state."""
+
+    schedules, endpoint_states = _replay_output_plan(
+        plan["outputs"], source.parameters, expected)
+    for block, replayed in endpoint_states.items():
         endpoint_block = endpoint.parameters.get(block)
         _require(endpoint_block is not None,
                  f"endpoint restart parameter dump lacks {block}")
@@ -3027,11 +3171,12 @@ def _replay_all_output_writes(plan: dict[str, Any], source: RestartMetadata,
         except (KeyError, ValueError) as exc:
             raise CheckFailure(f"{block}: endpoint lacks valid cadence state") from exc
         replayed_state = (
-            state["file_number"], state["last_time"], state["last_write_cycle"])
+            replayed["file_number"], replayed["last_time"],
+            replayed["last_write_cycle"])
         _require(endpoint_state == replayed_state,
                  f"{block}: endpoint cadence state does not match independent "
                  f"Execute/Finalize replay: {endpoint_state} != {replayed_state}")
-    return {block: state["writes"] for block, state in states.items()}
+    return schedules
 
 
 def _assert_exact_numbered_output_set(state_dir: Path, template: str,
@@ -3071,6 +3216,8 @@ def expected_output_paths(plan: dict[str, Any], source: RestartMetadata,
     inventory: list[dict[str, Any]] = []
     seen: set[Path] = set()
     schedules = _replay_all_output_writes(plan, source, endpoint, expected)
+    restart_cadence_transition = _validate_restart_cadence_transition(
+        plan, float(expected["root_dt"]))
     for output in plan["outputs"]:
         block = output["block"]
         source_block = source.parameters.get(block)
@@ -3080,6 +3227,10 @@ def expected_output_paths(plan: dict[str, Any], source: RestartMetadata,
         expected_runtime_block = dict(source_block)
         if block == "output3":
             expected_runtime_block["dt"] = repr(expected["root_dt"])
+        if (block == restart_cadence_transition["block"] and
+                restart_cadence_transition["kind"] == "tighten_v1"):
+            expected_runtime_block["dt"] = repr(
+                restart_cadence_transition["target_dt"])
         _require(output["parameters"] == expected_runtime_block,
                  f"plan snapshot for {block} differs from the source restart plus "
                  "the exact canonical runtime override")
@@ -5687,6 +5838,14 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
             "problem/trajectory_file": {
                 "source": [source_trajectory], "endpoint": runtime_trajectory,
             },
+        }
+    restart_cadence_transition = _validate_restart_cadence_transition(
+        plan, float(expected["root_dt"]))
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        restart_block = restart_cadence_transition["block"]
+        exact_rebindings[restart_cadence_transition["parameter"]] = {
+            "source": [source_metadata.parameters[restart_block]["dt"]],
+            "endpoint": repr(restart_cadence_transition["target_dt"]),
         }
     capacity_transition = _validate_capacity_transition(plan)
     if capacity_transition["kind"] == "increase_v1":

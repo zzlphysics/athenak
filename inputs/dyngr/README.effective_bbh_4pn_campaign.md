@@ -171,9 +171,15 @@ mask output below.  The endpoint's weighted level work is 582,904 block-updates 
 (3.52x ideal work ratio).  This is a software-soak result, not a resolution-convergence
 or physical-floor validation.
 
-The qualification output policy is history and event log plus both COM-following local
-slices every root endpoint, global primitive and native-GR state every `48M`, global
-`divB` every `19.2M`, and restart every `19.2M`.  The event log writes a row even when
+The current V100 qualification output policy is history and event log plus both
+COM-following local slices every root endpoint, global primitive and native-GR state
+every `48M`, the strict full-domain `divB` topology reference every root endpoint
+(`4.8M`), and the source restart stream every `48M` (not `19.2M`).  Before the next
+long segment, the strict planner may make the one-time audited `48M -> 19.2M` restart
+transition with `--target-restart-dt 19.2`; it preserves the serialized `last_time`
+phase, records the exact `output4/dt=19.2` runtime token, and serializes `19.2M` into the
+new checkpoints.  Later segments omit the option and inherit that tighter cadence
+without another override.  The event log writes a row even when
 all fault counters are zero and records 64-bit totals for conserved/primitive floors,
 C2P failures and actual iteration maxima, conserved and magnetization adjustments,
 non-excision FOFC corrections, normal C2P calls, and FOFC trial solves.  Detailed C2P

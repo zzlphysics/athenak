@@ -154,6 +154,84 @@ def test_execute_only_replay_never_adds_finalize_write() -> None:
     assert states["output4"]["file_number"] == 9
 
 
+def test_recovered_endpoint_audits_restart_cadence_rebinding(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_path = tmp_path / "source.rst"
+    endpoint_path = tmp_path / "endpoint.rst"
+    source_path.write_bytes(b"source")
+    endpoint_path.write_bytes(b"endpoint")
+    source_parameters = {
+        "output3": {"dt": "19.2"},
+        "output4": {"file_type": "rst", "dt": "48.0",
+                    "file_number": "45", "last_time": "1540.8",
+                    "last_write_cycle": "322"},
+        "problem": {"trajectory_file": "/source/trajectory.dat"},
+    }
+    endpoint_parameters = {
+        "output3": {"dt": "4.8", "file_number": "224",
+                    "last_time": "1560.0", "last_write_cycle": "325"},
+        "output4": {"file_type": "rst", "dt": "19.2",
+                    "file_number": "46", "last_time": "1560.0",
+                    "last_write_cycle": "325"},
+        "problem": {"trajectory_file": "/proc/123/fd/201"},
+    }
+    source = SimpleNamespace(parameters=source_parameters)
+    endpoint = SimpleNamespace(
+        cycle=325, time=1560.0, parameters=endpoint_parameters)
+    monkeypatch.setattr(
+        RECOVERY, "read_restart_metadata",
+        lambda path: source if path == source_path else endpoint)
+    monkeypatch.setattr(
+        RECOVERY.CHECKER, "audit_restart_contract",
+        lambda *unused, **kwargs: {"status": "pass"})
+    captured: dict[str, Any] = {}
+
+    def compare(source_value, endpoint_value, mutable, exact):
+        captured["exact"] = exact
+        return {"status": "pass"}
+
+    monkeypatch.setattr(RECOVERY.CHECKER, "compare_parameters", compare)
+    plan = {
+        "expected": {"root_dt": 4.8, "source_cycle": 322},
+        "inputs": {"source_restart": {"path": str(source_path)}},
+        "policy": {"mutable_parameters": []},
+        "source": {"parameters": source_parameters},
+        "capacity_transition": {"kind": "unchanged_v1"},
+        "restart_cadence_transition": {
+            "kind": "tighten_v1", "block": "output4",
+            "parameter": "output4/dt", "source_dt": 48.0,
+            "target_dt": 19.2, "root_dt": 4.8,
+            "source_root_step_multiple": 10,
+            "target_root_step_multiple": 4,
+            "phase": {"file_number": 45, "last_time": 1540.8,
+                      "last_write_cycle": 322},
+            "runtime_override": "output4/dt=19.2",
+        },
+        "outputs": [
+            {"block": "output3"},
+            {"block": "output4"},
+        ],
+    }
+    states = {
+        "output3": {"file_number": 224, "last_time": 1560.0,
+                    "last_write_cycle": 325},
+        "output4": {"file_number": 46, "last_time": 1560.0,
+                    "last_write_cycle": 325},
+    }
+
+    RECOVERY._assert_execute_endpoint(
+        plan,
+        {"athena_argv": [
+            "problem/trajectory_file=/proc/123/fd/201",
+            "output3/dt=4.8", "output4/dt=19.2",
+        ]},
+        {"path": str(endpoint_path)}, 325, 1560.0, states)
+
+    assert captured["exact"]["output4/dt"] == {
+        "source": ["48.0"], "endpoint": "19.2",
+    }
+
+
 def test_history_truncation_before_target_is_fatal() -> None:
     raw = b"# [1]=time [2]=baryon_m\n1 2\n2 2\n"
 

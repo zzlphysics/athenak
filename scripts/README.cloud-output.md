@@ -49,6 +49,7 @@ python3 scripts/plan_athenak_segment.py \
   --binary /data/athenak/build/src/athena \
   --trajectory /data/athenak/trajectory/trajectory.dat \
   --root-steps 100 --root-dt 4.8 --tlim-guard-steps 2 --ranks 8 \
+  --target-restart-dt 19.2 \
   --target-max-nmb-per-rank 1280 \
   --launcher /data/athenak-l4/opt/strict-prrte-5.0.9/prterun \
   --mca-prefix /data/athenak-l4/opt/openmpi-5.0.9-cuda \
@@ -77,9 +78,9 @@ of the six Open MPI 5 default MCA files under
 device/inode, owner/mode, timestamps, size, and SHA-256.  Do not create, remove, chmod,
 or edit any of those paths between planning, launch qualification, and checking.  The
 filename is fixed to the direct evidence child `segment.plan.json`.  The planner also
-proves that the sole runtime
-cadence override `output3/dt=4.8` produces one full-domain, ghost-free `divB` topology
-file on every root cycle; a serialized `output3/dcycle` is rejected.
+proves that the unconditional runtime cadence override `output3/dt=4.8` produces one
+full-domain, ghost-free `divB` topology file on every root cycle; a serialized
+`output3/dcycle` is rejected.
 
 For this deployment, bind the absolute, regular copied PRRTE executable shown above
 directly and bind its actual Open MPI installation/configuration tree separately with
@@ -102,6 +103,20 @@ gates before spawning MPI, then repeats them immediately before process creation
 the checker rebinds the source restart to the old capacity and every normal or recovered
 endpoint restart to the target capacity.  For an unchanged segment, omit the option
 rather than repeating the current value.
+
+`--target-restart-dt` is the only authorized restart-cadence transition.  The source
+must contain exactly one `file_type=rst` output using `dt` and no `dcycle`; both its
+serialized cadence and the requested target must be positive integer multiples of
+`root_dt` (the binary64 ratio is accepted only within a fixed two-ULP representation
+tolerance).  The target may tighten (decrease) the interval but may never relax it.  A
+real transition such as the audited `48M -> 19.2M` change adds exactly one
+`output4/dt=19.2` token while preserving the serialized `last_time`, `file_number`, and
+`last_write_cycle` phase.  The immutable plan binds the source/target multiples, phase,
+and exact token, and the checker replays the resulting schedule.  Once an endpoint
+restart has serialized `dt=19.2`, omit the option on subsequent segments: the default
+preserves that value and emits no restart override.  An explicit equal target is also
+unchanged; increasing, non-finite, non-root-step-multiple, duplicate, multi-restart, or
+`dcycle` requests fail closed.
 
 `--planned-peak-output-gib` is a conservative peak for files newly created under the
 segment's state directory.  It does not include the staged source-restart and trajectory

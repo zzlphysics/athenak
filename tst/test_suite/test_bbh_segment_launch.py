@@ -276,10 +276,24 @@ def _campaign(tmp_path: Path, world_size: int = 2) -> dict[str, Any]:
                 "minimum_gpu_memory_total_mib": 18343,
             },
         },
+        "restart_cadence_transition": {
+            "kind": "unchanged_v1", "block": "output4",
+            "parameter": "output4/dt", "source_dt": 19.2,
+            "target_dt": 19.2, "root_dt": 4.8,
+            "source_root_step_multiple": 4,
+            "target_root_step_multiple": 4,
+            "phase": {"file_number": 9, "last_time": 48.0,
+                      "last_write_cycle": 10},
+            "runtime_override": None,
+        },
         "source": {
             "parameters": {
                 "problem": {"trajectory_file": str(trajectory.resolve())},
                 "mesh_refinement": {"max_nmb_per_rank": "1024"},
+                "output4": {
+                    "file_type": "rst", "dt": "19.2", "file_number": "9",
+                    "last_time": "48.0", "last_write_cycle": "10",
+                },
             },
         },
         "inputs": {
@@ -446,6 +460,23 @@ def _set_capacity_increase(plan: dict[str, Any], target: int = 1280) -> None:
     }
     plan["command_overrides"]["mesh_refinement/max_nmb_per_rank"] = target
     plan["launch_contract"]["athena_argv_template"].append(token)
+
+
+def _set_restart_cadence_tightening(plan: dict[str, Any]) -> None:
+    plan["source"]["parameters"]["output4"]["dt"] = "48.0"
+    plan["restart_cadence_transition"] = {
+        "kind": "tighten_v1", "block": "output4",
+        "parameter": "output4/dt", "source_dt": 48.0,
+        "target_dt": 19.2, "root_dt": 4.8,
+        "source_root_step_multiple": 10,
+        "target_root_step_multiple": 4,
+        "phase": {"file_number": 9, "last_time": 48.0,
+                  "last_write_cycle": 10},
+        "runtime_override": "output4/dt=19.2",
+    }
+    plan["command_overrides"]["output4/dt"] = 19.2
+    plan["launch_contract"]["athena_argv_template"].append(
+        "output4/dt=19.2")
 
 
 def test_prepare_derives_only_the_canonical_token_arrays(tmp_path: Path) -> None:
@@ -662,6 +693,94 @@ def test_prepare_accepts_exact_1024_to_1280_capacity_transition(
             "mesh_refinement/max_nmb_per_rank=1280") == 1
     finally:
         prepared.close()
+
+
+def test_prepare_accepts_exact_restart_cadence_tightening(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+    _rewrite_plan(campaign, _set_restart_cadence_tightening)
+
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert prepared.athena_argv[-1] == "output4/dt=19.2"
+        assert prepared.athena_argv.count("output4/dt=19.2") == 1
+    finally:
+        prepared.close()
+
+
+def test_prepare_accepts_decimal_restart_multiple_with_division_roundoff(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        plan["source"]["parameters"]["output4"]["dt"] = "33.6"
+        plan["restart_cadence_transition"].update({
+            "source_dt": 33.6, "target_dt": 33.6,
+            "source_root_step_multiple": 7,
+            "target_root_step_multiple": 7,
+        })
+
+    _rewrite_plan(campaign, mutate)
+
+    prepared = LAUNCHER.prepare_launch(
+        campaign["plan_path"], campaign["state"], campaign["runtime"])
+    try:
+        assert "output4/dt=33.6" not in prepared.athena_argv
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize("tamper", ("command", "argv", "phase"))
+def test_prepare_rejects_restart_cadence_transition_tamper(
+        tmp_path: Path, tamper: str) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        _set_restart_cadence_tightening(plan)
+        if tamper == "command":
+            plan["command_overrides"]["output4/dt"] = 9.6
+        elif tamper == "argv":
+            plan["launch_contract"]["athena_argv_template"][-1] = \
+                "output4/dt=9.6"
+        else:
+            plan["restart_cadence_transition"]["phase"]["last_time"] = 52.8
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda transition: transition.__setitem__("source_dt", 19),
+        lambda transition: transition.__setitem__(
+            "source_root_step_multiple", 4.0),
+        lambda transition: transition["phase"].__setitem__(
+            "file_number", 9.0),
+        lambda transition: transition["phase"].__setitem__(
+            "last_time", 48),
+        lambda transition: transition["phase"].__setitem__(
+            "last_write_cycle", 10.0),
+    ),
+    ids=("integer-dt", "float-multiple", "float-file-number",
+         "integer-last-time", "float-last-write-cycle"),
+)
+def test_launcher_rejects_noncanonical_restart_cadence_numeric_types(
+        tmp_path: Path, mutation) -> None:
+    campaign = _campaign(tmp_path)
+
+    def mutate(plan: dict[str, Any]) -> None:
+        mutation(plan["restart_cadence_transition"])
+
+    _rewrite_plan(campaign, mutate)
+
+    with pytest.raises(LAUNCHER.LaunchFailure, match="numeric types"):
+        LAUNCHER.prepare_launch(
+            campaign["plan_path"], campaign["state"], campaign["runtime"])
 
 
 def test_prepare_rejects_low_total_memory_before_popen(tmp_path: Path) -> None:
@@ -2153,6 +2272,51 @@ def test_real_planner_tamper_is_rejected_before_popen(
         run=fake_run, popen=forbidden_popen,
         statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
     with pytest.raises(LAUNCHER.LaunchFailure, match=message):
+        LAUNCHER.prepare_launch(plan_path, campaign["state_dir"], runtime)
+    assert popen_called is False
+
+
+@pytest.mark.parametrize("tamper", ("c329_write", "endpoint_state"))
+def test_real_c322_restart_transition_tamper_is_rejected_before_popen(
+        tmp_path: Path, tamper: str) -> None:
+    import test_suite.test_bbh_segment_plan as plan_tests
+
+    campaign = plan_tests._campaign(
+        tmp_path, cycle=322, time_value=1545.599999999991,
+        output3_last_time="1545.599999999991",
+        output3_last_write_cycle=322,
+        output4_dt="48.0", output4_file_number=45,
+        output4_last_time="1540.8000000000002",
+        output4_last_write_cycle=322)
+    result = plan_tests._run(
+        campaign, root_steps="50", target_restart_dt="19.2")
+    assert result.returncode == 0, result.stderr
+    plan_path = campaign["output"]
+    plan_path.chmod(0o644)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    output4 = next(
+        output for output in plan["outputs"] if output["block"] == "output4")
+    if tamper == "c329_write":
+        output4["expected_writes"] = [
+            write for write in output4["expected_writes"]
+            if write["cycle"] != 329]
+    else:
+        output4["expected_endpoint_state"]["file_number"] += 1
+    plan_path.write_text(
+        json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    plan_path.chmod(0o444)
+    popen_called = False
+
+    def forbidden_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("tampered restart schedule reached Popen")
+
+    runtime = LAUNCHER.Runtime(
+        run=FakeRun(plan["policy"]["ranks"]), popen=forbidden_popen,
+        statvfs=_ample_statvfs, fstatvfs=_ample_statvfs)
+    with pytest.raises(LAUNCHER.LaunchFailure,
+                       match="strict plan validation failed.*output4"):
         LAUNCHER.prepare_launch(plan_path, campaign["state_dir"], runtime)
     assert popen_called is False
 

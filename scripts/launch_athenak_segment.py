@@ -63,6 +63,7 @@ from read_athenak_restart_metadata import (
 
 SCHEMA = 1
 MAX_NMB_PER_RANK = 16384
+CADENCE_MULTIPLE_MAX_ULPS = 2
 CAPACITY_MEMORY_MIB_PER_SLOT_NUMERATOR = 1433
 CAPACITY_MEMORY_MIB_PER_SLOT_DENOMINATOR = 100
 CAPACITY_GPU_USABLE_FRACTION_NUMERATOR = 4
@@ -429,6 +430,93 @@ def _finite(value: Any, label: str) -> float:
     number = float(value)
     _require(math.isfinite(number), f"{label} must be finite")
     return number
+
+
+def _restart_cadence_transition_contract(
+        plan: Mapping[str, Any], root_dt: float) -> dict[str, Any]:
+    value = plan.get("restart_cadence_transition")
+    _require(isinstance(value, dict) and set(value) == {
+        "kind", "block", "parameter", "source_dt", "target_dt", "root_dt",
+        "source_root_step_multiple", "target_root_step_multiple", "phase",
+        "runtime_override",
+    }, "restart_cadence_transition must be the exact strict object")
+    source_record = plan.get("source")
+    _require(isinstance(source_record, Mapping),
+             "source must bind restart cadence")
+    source_parameters = source_record.get("parameters")
+    _require(isinstance(source_parameters, dict),
+             "source parameters must bind restart cadence")
+    restart_blocks = sorted(
+        name for name, block in source_parameters.items()
+        if isinstance(name, str) and re.fullmatch(r"output\d+", name) and
+        isinstance(block, dict) and
+        block.get("file_type", "").strip() == "rst")
+    _require(len(restart_blocks) == 1,
+             "source must contain exactly one restart output")
+    block_name = restart_blocks[0]
+    block = source_parameters[block_name]
+    _require("dt" in block and "dcycle" not in block,
+             f"source {block_name} must use dt without dcycle")
+    try:
+        source_dt = float(block["dt"])
+        phase = {
+            "file_number": int(block.get("file_number", "0")),
+            "last_time": float(block.get("last_time", "-1")),
+            "last_write_cycle": int(block.get("last_write_cycle", "-1")),
+        }
+    except (TypeError, ValueError) as exc:
+        raise LaunchFailure("source restart cadence state is invalid") from exc
+    planned_phase = value.get("phase")
+    _require(type(value.get("source_dt")) is float and
+             type(value.get("target_dt")) is float and
+             type(value.get("root_dt")) is float and
+             type(value.get("source_root_step_multiple")) is int and
+             type(value.get("target_root_step_multiple")) is int and
+             isinstance(planned_phase, dict) and
+             set(planned_phase) == {
+                 "file_number", "last_time", "last_write_cycle"} and
+             type(planned_phase.get("file_number")) is int and
+             type(planned_phase.get("last_time")) is float and
+             type(planned_phase.get("last_write_cycle")) is int,
+             "restart cadence transition numeric types are not canonical")
+    target_dt = _finite(value.get("target_dt"), "restart target dt")
+    planned_source_dt = _finite(value.get("source_dt"), "restart source dt")
+    planned_root_dt = _finite(value.get("root_dt"), "restart root dt")
+    source_ratio = planned_source_dt / root_dt
+    target_ratio = target_dt / root_dt
+    source_nearest = round(source_ratio) if math.isfinite(source_ratio) else 0
+    target_nearest = round(target_ratio) if math.isfinite(target_ratio) else 0
+    source_tolerance = (CADENCE_MULTIPLE_MAX_ULPS * max(
+        math.ulp(source_ratio), math.ulp(float(source_nearest)))) \
+        if math.isfinite(source_ratio) else 0.0
+    target_tolerance = (CADENCE_MULTIPLE_MAX_ULPS * max(
+        math.ulp(target_ratio), math.ulp(float(target_nearest)))) \
+        if math.isfinite(target_ratio) else 0.0
+    _require(source_dt == planned_source_dt and planned_source_dt > 0.0 and
+             target_dt > 0.0 and target_dt <= planned_source_dt and
+             planned_root_dt == root_dt and math.isfinite(source_ratio) and
+             math.isfinite(target_ratio) and source_nearest >= 1 and
+             target_nearest >= 1 and
+             abs(source_ratio - source_nearest) <= source_tolerance and
+             abs(target_ratio - target_nearest) <= target_tolerance and
+             phase["file_number"] >= 0 and
+             math.isfinite(phase["last_time"]) and
+             value.get("block") == block_name and
+             value.get("parameter") == f"{block_name}/dt" and
+             value.get("source_root_step_multiple") == source_nearest and
+             value.get("target_root_step_multiple") == target_nearest and
+             planned_phase == phase,
+             "restart cadence transition source/target/phase is not canonical")
+    if target_dt == planned_source_dt:
+        _require(value.get("kind") == "unchanged_v1" and
+                 value.get("runtime_override") is None,
+                 "unchanged restart cadence may not carry an override")
+    else:
+        _require(value.get("kind") == "tighten_v1" and
+                 value.get("runtime_override") ==
+                 f"{block_name}/dt={target_dt!r}",
+                 "restart cadence tightening lacks its canonical override")
+    return value
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -2196,18 +2284,23 @@ def prepare_launch(plan_path: Path, state_dir: Path,
              "planned cycle/time limits must be nonnegative/positive")
     _require(root_dt > 0.0, "planned root_dt must be positive")
     capacity_transition = _capacity_transition_contract(plan)
+    restart_cadence_transition = _restart_cadence_transition_contract(
+        plan, root_dt)
     expected_overrides = {
         "time/nlim": final_cycle,
         "time/tlim": tlim,
         "output3/dt": root_dt,
     }
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        expected_overrides[restart_cadence_transition["parameter"]] = \
+            restart_cadence_transition["target_dt"]
     if capacity_transition["kind"] == "increase_v1":
         expected_overrides["mesh_refinement/max_nmb_per_rank"] = \
             capacity_transition["target_max_nmb_per_rank"]
     overrides = plan.get("command_overrides")
     _require(overrides == expected_overrides,
              "plan command_overrides must contain only the exact limits, divB "
-             "cadence, and optional capacity increase")
+             "cadence, optional restart tightening, and optional capacity increase")
 
     transport = contract.get("input_transport")
     _require(isinstance(transport, dict) and
@@ -2275,6 +2368,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
         f"time/nlim={final_cycle}", f"time/tlim={tlim!r}",
         f"problem/trajectory_file={trajectory_template}",
         divb_cadence_override,
+        *(() if restart_cadence_transition["kind"] == "unchanged_v1" else
+          (restart_cadence_transition["runtime_override"],)),
         *(() if capacity_transition["kind"] == "unchanged_v1" else
           (capacity_transition["runtime_override"],)),
     )
@@ -2290,6 +2385,8 @@ def prepare_launch(plan_path: Path, state_dir: Path,
              "launch_contract.mpi_argv is not canonical")
     permitted_trajectory = f"problem/trajectory_file={trajectory_template}"
     permitted_overrides = {permitted_trajectory, divb_cadence_override}
+    if restart_cadence_transition["kind"] == "tighten_v1":
+        permitted_overrides.add(restart_cadence_transition["runtime_override"])
     if capacity_transition["kind"] == "increase_v1":
         permitted_overrides.add(capacity_transition["runtime_override"])
     _require(not any(FORBIDDEN_OVERRIDE.match(token) and token not in permitted_overrides

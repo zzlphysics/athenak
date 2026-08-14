@@ -555,6 +555,14 @@ def _assert_execute_endpoint(plan: dict[str, Any], launch: dict[str, Any],
                 "source": [source_trajectory], "endpoint": runtime_trajectory,
             },
         }
+    restart_transition = CHECKER._validate_restart_cadence_transition(
+        plan, float(plan["expected"]["root_dt"]))
+    if restart_transition["kind"] == "tighten_v1":
+        restart_block = restart_transition["block"]
+        exact_rebindings[restart_transition["parameter"]] = {
+            "source": [source.parameters[restart_block]["dt"]],
+            "endpoint": repr(restart_transition["target_dt"]),
+        }
     transition = plan.get("capacity_transition", {})
     if transition.get("kind") == "increase_v1":
         exact_rebindings["mesh_refinement/max_nmb_per_rank"] = {
