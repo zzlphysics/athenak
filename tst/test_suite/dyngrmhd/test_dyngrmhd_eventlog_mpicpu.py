@@ -697,6 +697,9 @@ def test_device_fofc_pending_is_drained_into_restart(tmp_path: Path) -> None:
     assert bins[0]["reason"] == "unknown"
     assert int(bins[0]["level_bin"]) == 32
     assert int(bins[0]["stage_bin"]) == 0
+    assert int(bins[0]["r_cyl_bin"]) == 6
+    assert int(bins[0]["abs_z_bin"]) == 6
+    assert int(bins[0]["lapse_bin"]) == 5
     assert int(bins[0]["count"]) == pending["nfofc"]
 
 

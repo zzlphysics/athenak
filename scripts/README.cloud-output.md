@@ -186,6 +186,27 @@ stored endpoint-restart Real, every planned binary field, `divB`, histories, and
 baryon-mass loss.  Publish and transfer the closed segment only after this qualification;
 do not let a launcher silently continue past a missing or failed report.
 
+For opt-in FOFC spatial telemetry, analyze only an event log whose AthenaK producer has
+exited and whose file is closed.  For example, inspect cycle 323 as pretty JSON with:
+
+```bash
+python3 scripts/analyze_fofc_spatial_eventlog.py \
+  /scratch/run/diagnostic/state/effective_bbh.log --cycle 323 \
+  --require-unattributed-zero --pretty
+```
+
+Without `--require-unattributed-zero`, the general analyzer accepts a nonzero
+restart/IC prefix only on the first complete telemetry cycle and only when it is
+included in the canonical `level=overflow`, `stage=other`, `reason=unknown`,
+`R_cyl/|z|/lapse=other` bin.  The JSON records both that prefix and the selected
+zero-unattributed policy.  The diagnostic qualification above requires zero so
+cycle 323 contains only newly localized corrections.  Regardless of the selected
+cycle, the analyzer streams the complete file and requires the exact event header before
+the unique schema, followed by every group as `summary`, zero or more unique `bin`
+records, then its matching numeric event row;
+under the required `dcycle=1` contract, group cycles must be strictly increasing and
+consecutive, and a newline-terminated trailing partial group is rejected.
+
 ### Interrupted-segment scheduled-prefix recovery
 
 Do not run the complete-segment checker against a partial run.  If a launched segment
