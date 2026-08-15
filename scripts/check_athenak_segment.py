@@ -9,12 +9,14 @@ recent files return a retry status so a closed-file hand-off cannot race final I
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import copy
 import csv
 import fnmatch
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import pwd
@@ -5997,9 +5999,98 @@ def audit_completion_record(
     }
 
 
+_INVENTORY_AUDIT_CONTEXT: tuple[
+    dict[str, Any], RestartMetadata, dict[str, dict[str, str]]
+] | None = None
+
+
+def _initialize_inventory_audit_worker(
+        expected: dict[str, Any], endpoint_metadata: RestartMetadata,
+        source_parameters: dict[str, dict[str, str]]) -> None:
+    """Install immutable per-segment context once in each audit worker."""
+
+    global _INVENTORY_AUDIT_CONTEXT
+    _INVENTORY_AUDIT_CONTEXT = (
+        expected, endpoint_metadata, source_parameters)
+
+
+def _audit_inventory_row(row: dict[str, Any], expected: dict[str, Any],
+                         endpoint_metadata: RestartMetadata,
+                         source_parameters: dict[str, dict[str, str]]
+                         ) -> dict[str, Any]:
+    """Audit one independent planned output without mutating shared state."""
+
+    path = row["path"]
+    if row["inspect_binary"]:
+        return audit_binary(
+            path, expected["source_cycle"], expected["final_cycle"],
+            expected["source_time"], endpoint_metadata.time,
+            row["parameters"], endpoint_metadata, source_parameters,
+            row["block"], row["expected_binary_variables"])
+    if row["file_type"] == "hst" or path.suffix == ".hst":
+        history_binding = _hash_record(path)
+        history = audit_history(
+            path, expected["source_cycle"], expected["final_cycle"],
+            expected["source_time"], expected["root_dt"],
+            endpoint_metadata.time, expected["endpoint_time_ulp_tolerance"])
+        _assert_binding_unchanged(path, history_binding)
+        return {**history_binding, "history": history}
+    if row["file_type"] == "rst":
+        restart_audit = _verify_endpoint_audit(audit_restart(path), path)
+        expected_write = row["expected_write"]
+        metadata_record = restart_audit.get("metadata", {})
+        _require(isinstance(expected_write, dict) and
+                 metadata_record.get("cycle") == expected_write["cycle"] and
+                 metadata_record.get("time") == expected_write["time"],
+                 f"{path}: restart cycle/time differs from cadence replay")
+        return {
+            "path": restart_audit["path"],
+            **restart_audit["signature"],
+            "sha256": restart_audit["sha256"],
+            "closure_check": restart_audit["closure_check"],
+            "restart_audit": restart_audit,
+        }
+    return _hash_record(path)
+
+
+def _audit_inventory_row_worker(row: dict[str, Any]) -> dict[str, Any]:
+    """Process-pool entry point; results remain consumed in plan order."""
+
+    _require(_INVENTORY_AUDIT_CONTEXT is not None,
+             "parallel inventory worker lacks initialized context")
+    expected, endpoint_metadata, source_parameters = _INVENTORY_AUDIT_CONTEXT
+    return _audit_inventory_row(
+        row, expected, endpoint_metadata, source_parameters)
+
+
+def audit_inventory_rows(
+        inventory: list[dict[str, Any]], expected: dict[str, Any],
+        endpoint_metadata: RestartMetadata,
+        source_parameters: dict[str, dict[str, str]], workers: int
+        ) -> list[dict[str, Any]]:
+    """Audit independent files concurrently while preserving inventory order."""
+
+    _require(1 <= workers <= 32, "inventory audit workers must be in 1..32")
+    if workers == 1:
+        return [
+            _audit_inventory_row(
+                row, expected, endpoint_metadata, source_parameters)
+            for row in inventory
+        ]
+    with ProcessPoolExecutor(
+            max_workers=workers, initializer=_initialize_inventory_audit_worker,
+            initargs=(expected, endpoint_metadata, source_parameters),
+            mp_context=multiprocessing.get_context("fork")) as executor:
+        # executor.map yields in input order even though files finish out of order.
+        return list(executor.map(_audit_inventory_row_worker, inventory, chunksize=1))
+
+
 def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     requalify_event_policy = bool(getattr(
         args, "event_policy_v2_requalification", False))
+    audit_workers = _integer(
+        getattr(args, "audit_workers", 1), "--audit-workers")
+    _require(1 <= audit_workers <= 32, "--audit-workers must be in 1..32")
     output = args.output
     _reject_output_ancestors(output)
     _require(output.name.endswith(".pass.ready"),
@@ -6344,13 +6435,13 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     divb_maxima: list[dict[str, Any]] = []
     baryon_histories: list[dict[str, Any]] = []
     bbh_histories: list[dict[str, Any]] = []
-    for row in inventory:
+    audited_inventory = audit_inventory_rows(
+        inventory, expected, endpoint_metadata, source_metadata.parameters,
+        audit_workers)
+    _require(len(audited_inventory) == len(inventory),
+             "inventory audit result count differs from the immutable plan")
+    for row, audited in zip(inventory, audited_inventory):
         if row["inspect_binary"]:
-            audited = audit_binary(
-                row["path"], expected["source_cycle"], expected["final_cycle"],
-                expected["source_time"], endpoint_metadata.time,
-                row["parameters"], endpoint_metadata, source_metadata.parameters,
-                row["block"], row["expected_binary_variables"])
             binary_by_block.setdefault(row["block"], []).append(audited)
             expected_write = row["expected_write"]
             _require(audited["cycle"] == expected_write["cycle"] and
@@ -6365,37 +6456,12 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
                         "max_abs": maximum,
                     })
         elif row["file_type"] == "hst" or row["path"].suffix == ".hst":
-            history_binding = _hash_record(row["path"])
-            history = audit_history(
-                row["path"], expected["source_cycle"], expected["final_cycle"],
-                expected["source_time"], expected["root_dt"],
-                endpoint_metadata.time,
-                expected["endpoint_time_ulp_tolerance"])
-            _assert_binding_unchanged(row["path"], history_binding)
-            audited = {**history_binding, "history": history}
+            history = audited["history"]
             if "baryon_m" in history["columns"]:
                 baryon_histories.append({"path": str(row["path"]), **history})
             if {"bh1_x", "bh2_x", "bh1_mass", "bh2_mass"}.issubset(
                     history["columns"]):
                 bbh_histories.append({"path": str(row["path"]), **history})
-        elif row["file_type"] == "rst":
-            restart_audit = _verify_endpoint_audit(
-                audit_restart(row["path"]), row["path"])
-            expected_write = row["expected_write"]
-            metadata_record = restart_audit.get("metadata", {})
-            _require(isinstance(expected_write, dict) and
-                     metadata_record.get("cycle") == expected_write["cycle"] and
-                     metadata_record.get("time") == expected_write["time"],
-                     f"{row['path']}: restart cycle/time differs from cadence replay")
-            audited = {
-                "path": restart_audit["path"],
-                **restart_audit["signature"],
-                "sha256": restart_audit["sha256"],
-                "closure_check": restart_audit["closure_check"],
-                "restart_audit": restart_audit,
-            }
-        else:
-            audited = _hash_record(row["path"])
         output_rows.append({
             "block": row["block"],
             "file_number": row["file_number"],
@@ -6591,6 +6657,11 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "qualification_mode": ("event_policy_v2_requalification_v1"
                                if requalify_event_policy
                                else "complete_segment_v1"),
+        "qualification_execution": {
+            "inventory_audit_workers": audit_workers,
+            "result_order": "immutable_plan_inventory_order",
+            "file_audits_are_independent": True,
+        },
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "expected": expected,
         "bindings": bindings,
@@ -6658,6 +6729,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-before", type=Path, required=True)
     parser.add_argument("--gpu-after", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--audit-workers", type=int, default=1,
+        help="parallel independent output-file auditors (1..32; default: 1)")
     parser.add_argument(
         "--event-policy-v2-requalification", action="store_true",
         help=("re-audit an immutable version-1 plan under version-2 operational "

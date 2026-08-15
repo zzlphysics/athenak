@@ -242,6 +242,10 @@ for mass and energy, and (3) L/M/H resolution and floor/magnetization sensitivit
 `event_policy_v2_requalification_v1` report may qualify an immutable old endpoint only as
 a continuation source.  It preserves the old predeclared failure in the report, claims
 no publication acceptance, and must never replace or overwrite the original evidence.
+Large closed-output inventories may be checked with `--audit-workers N` (`1<=N<=32`).
+Workers audit independent files in parallel, while results are consumed in immutable
+plan order and every binding is rechecked after all workers finish.  The report records
+the worker count; concurrency changes throughput, never thresholds or accepted bytes.
 
 ### Opt-in FOFC spatial telemetry
 

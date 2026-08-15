@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -1541,6 +1542,34 @@ def test_event_policy_requalification_rejects_unnecessary_rewrite() -> None:
     with pytest.raises(CHECKER.CheckFailure, match="real version-1 breach"):
         CHECKER.audit_event_policy_requalification(
             {"_rows": rows}, CHECKER.LEGACY_EVENT_HARD_THRESHOLDS_V1)
+
+
+def test_parallel_inventory_audit_preserves_plan_order(tmp_path: Path) -> None:
+    paths = [tmp_path / name for name in ("third.dat", "first.dat", "second.dat")]
+    payloads = (b"third", b"first", b"second")
+    for path, payload in zip(paths, payloads):
+        path.write_bytes(payload)
+    inventory = [{
+        "path": path,
+        "inspect_binary": False,
+        "file_type": "opaque",
+    } for path in paths]
+
+    serial = CHECKER.audit_inventory_rows(
+        inventory, {}, None, {}, workers=1)
+    parallel = CHECKER.audit_inventory_rows(
+        inventory, {}, None, {}, workers=3)
+
+    assert [row["path"] for row in parallel] == [str(path) for path in paths]
+    assert [row["sha256"] for row in parallel] == [
+        hashlib.sha256(payload).hexdigest() for payload in payloads]
+    assert parallel == serial
+
+
+@pytest.mark.parametrize("workers", (0, 33))
+def test_inventory_audit_rejects_unsafe_worker_count(workers: int) -> None:
+    with pytest.raises(CHECKER.CheckFailure, match="workers must be in 1..32"):
+        CHECKER.audit_inventory_rows([], {}, None, {}, workers)
 
 
 def test_floor_rates_record_anchor_and_parent_normalized_trends() -> None:
