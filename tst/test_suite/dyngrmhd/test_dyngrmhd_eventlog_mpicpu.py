@@ -247,7 +247,7 @@ def _c2p_spatial_records(run_dir: Path) -> list[dict[str, str]]:
     ).splitlines()
     records = []
     for line in lines:
-        if not line.startswith("# c2p_spatial_v1 "):
+        if not line.startswith("# c2p_spatial_v2 "):
             continue
         fields = line.split()[2:]
         record = {}
@@ -353,6 +353,8 @@ def test_c2p_spatial_telemetry_maps_interventions_and_matches_mpi_total(
     stages = [record for record in records if record["kind"] == "stage"]
     geometries = [record for record in records if record["kind"] == "geometry"]
     assert len(schemas) == 1
+    assert schemas[0]["density_floor_ratio_invalid_bin"] == "15"
+    assert schemas[0]["magnetization_limit_ratio_invalid_bin"] == "7"
     assert len(summaries) == 2 * len(rows)
 
     for row in rows:
@@ -393,8 +395,10 @@ def test_c2p_spatial_telemetry_maps_interventions_and_matches_mpi_total(
     ]
     assert rows[1]["mag_adjust"] > 0
     assert {int(record["level_bin"]) for record in cycle_one_mag} == {1}
-    assert {int(record["density_floor_ratio_bin"])
-            for record in cycle_one_mag} == {6}
+    density_bins = {
+        int(record["density_floor_ratio_bin"]) for record in cycle_one_mag
+    }
+    assert density_bins and min(density_bins) >= 6 and max(density_bins) < 15
     # The input magnetization was above, but within a factor of two of, max_bsq.
     assert {int(record["magnetization_limit_ratio_bin"])
             for record in cycle_one_mag} == {4}
@@ -906,7 +910,7 @@ def test_restart_carried_c2p_events_use_explicit_unattributed_bins(
         and int(record["r_cyl_bin"]) == 6
         and int(record["abs_z_bin"]) == 6
         and int(record["lapse_bin"]) == 5
-        and int(record["density_floor_ratio_bin"]) == 7
+        and int(record["density_floor_ratio_bin"]) == 15
         and int(record["magnetization_limit_ratio_bin"]) == 7
     ]
     assert len(canonical) == 1

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Strictly validate and summarize AthenaK C2P spatial telemetry.
 
-``# c2p_spatial_v1`` records are diagnostic comments adjacent to the traditional
-event row.  This reader treats each cycle as one conservative object: both
+``# c2p_spatial_v1`` and ``# c2p_spatial_v2`` records are diagnostic comments
+adjacent to the traditional event row.  This reader treats each cycle as one
+conservative object: both
 intervention summaries must be present, joint/stage/geometry histograms must each
 sum to the matching traditional counter, keys must be unique and in range, and
 restart-carried unattributed counts are permitted only in the first telemetry cycle.
@@ -36,10 +37,12 @@ LEVEL_BINS = 33
 R_CYL_EDGES = (2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 ABS_Z_EDGES = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 LAPSE_EDGES = (0.2, 0.4, 0.6, 0.8, 1.0)
-DENSITY_RATIO_EDGES = (1.0, 2.0, 4.0, 16.0, 64.0, 256.0)
+DENSITY_RATIO_EDGES_V1 = (1.0, 2.0, 4.0, 16.0, 64.0, 256.0)
+DENSITY_RATIO_EDGES_V2 = (
+    1.0, 2.0, 4.0, 16.0, 64.0, 256.0, 1.0e3, 1.0e4, 1.0e5,
+    1.0e6, 1.0e7, 1.0e8, 1.0e9, 1.0e10,
+)
 MAG_RATIO_EDGES = (0.01, 0.1, 0.5, 1.0, 2.0, 10.0)
-QUANTITY_BINS = 8
-QUANTITY_INVALID_BIN = 7
 STAGE_BINS = 4
 GEOMETRY_BINS = 2
 UINT64_MAX = (1 << 64) - 1
@@ -47,12 +50,16 @@ INT_MAX = (1 << 31) - 1
 KEY_PATTERN = re.compile(r"[a-z][a-z0-9_]*\Z")
 UNSIGNED_PATTERN = re.compile(r"[0-9]+\Z")
 
-SCHEMA_KEYS = frozenset({
+SCHEMA_KEYS_V1 = frozenset({
     "kind", "intervention_bins", "level_bins", "r_cyl_edges",
     "abs_z_edges", "lapse_edges", "density_floor_ratio_edges",
     "magnetization_limit_ratio_edges", "quantity_invalid_bin",
     "stage_bins", "geometry_bins", "center1", "center2", "center3",
 })
+SCHEMA_KEYS_V2 = (SCHEMA_KEYS_V1 - {"quantity_invalid_bin"}) | {
+    "density_floor_ratio_invalid_bin",
+    "magnetization_limit_ratio_invalid_bin",
+}
 SUMMARY_KEYS = frozenset({
     "kind", "cycle", "intervention", "count", "authoritative", "unattributed",
 })
@@ -70,7 +77,7 @@ GEOMETRY_KEYS = frozenset({
 
 
 class C2PTelemetryError(ValueError):
-    """The event log does not satisfy the C2P spatial-v1 contract."""
+    """The event log does not satisfy a supported C2P spatial contract."""
 
 
 def _fail(source: str, line: int | None, message: str) -> None:
@@ -113,10 +120,15 @@ def _bounded(
     return value
 
 
-def _record(line: str, source: str, line_number: int) -> dict[str, str]:
+def _record(
+    line: str, source: str, line_number: int,
+) -> tuple[int, dict[str, str]]:
     fields = line.split()
-    if fields[:2] != ["#", "c2p_spatial_v1"]:
+    if len(fields) < 2 or fields[0] != "#" or fields[1] not in (
+        "c2p_spatial_v1", "c2p_spatial_v2"
+    ):
         _fail(source, line_number, "invalid C2P telemetry prefix")
+    version = int(fields[1].rsplit("v", 1)[1])
     parsed: dict[str, str] = {}
     for field in fields[2:]:
         if "=" not in field:
@@ -129,7 +141,7 @@ def _record(line: str, source: str, line_number: int) -> dict[str, str]:
         parsed[key] = value
     if "kind" not in parsed:
         _fail(source, line_number, "telemetry record lacks kind")
-    return parsed
+    return version, parsed
 
 
 def _finite(value: str, name: str, source: str, line: int) -> float:
@@ -152,16 +164,29 @@ def _csv_edges(
 
 
 def _parse_schema(
-    record: Mapping[str, str], source: str, line: int,
+    record: Mapping[str, str], source: str, line: int, version: int,
 ) -> dict[str, Any]:
-    _exact_keys(record, SCHEMA_KEYS, source, line)
+    schema_keys = SCHEMA_KEYS_V1 if version == 1 else SCHEMA_KEYS_V2
+    _exact_keys(record, schema_keys, source, line)
+    density_edges = (
+        DENSITY_RATIO_EDGES_V1 if version == 1 else DENSITY_RATIO_EDGES_V2
+    )
+    density_invalid = len(density_edges)+1
+    magnetization_invalid = len(MAG_RATIO_EDGES)+1
     expected_literals = {
         "intervention_bins": ",".join(INTERVENTIONS),
         "level_bins": "0..31,overflow",
-        "quantity_invalid_bin": str(QUANTITY_INVALID_BIN),
         "stage_bins": "other,1,2,3",
         "geometry_bins": "invalid,valid",
     }
+    if version == 1:
+        expected_literals["quantity_invalid_bin"] = str(density_invalid)
+    else:
+        expected_literals.update({
+            "density_floor_ratio_invalid_bin": str(density_invalid),
+            "magnetization_limit_ratio_invalid_bin":
+                str(magnetization_invalid),
+        })
     for name, expected in expected_literals.items():
         if record[name] != expected:
             _fail(
@@ -169,7 +194,7 @@ def _parse_schema(
                 f"{name} changed: expected {expected!r}, got {record[name]!r}",
             )
     return {
-        "version": 1,
+        "version": version,
         "intervention_bins": list(INTERVENTIONS),
         "level_bins": [str(value) for value in range(32)] + ["overflow"],
         "r_cyl_edges": _csv_edges(
@@ -180,11 +205,12 @@ def _parse_schema(
             record["lapse_edges"], "lapse_edges", LAPSE_EDGES, source, line),
         "density_floor_ratio_edges": _csv_edges(
             record["density_floor_ratio_edges"], "density_floor_ratio_edges",
-            DENSITY_RATIO_EDGES, source, line),
+            density_edges, source, line),
         "magnetization_limit_ratio_edges": _csv_edges(
             record["magnetization_limit_ratio_edges"],
             "magnetization_limit_ratio_edges", MAG_RATIO_EDGES, source, line),
-        "quantity_invalid_bin": QUANTITY_INVALID_BIN,
+        "density_floor_ratio_invalid_bin": density_invalid,
+        "magnetization_limit_ratio_invalid_bin": magnetization_invalid,
         "stage_bins": ["other", "1", "2", "3"],
         "geometry_bins": ["invalid", "valid"],
         "center": [
@@ -235,16 +261,18 @@ def analyze_lines(
                 _fail(source, line_number, "duplicate traditional event header")
             event_header = names
             continue
-        if line.startswith("# c2p_spatial_v1 "):
-            record = _record(line, source, line_number)
+        if line.startswith(("# c2p_spatial_v1 ", "# c2p_spatial_v2 ")):
+            version, record = _record(line, source, line_number)
             kind = record["kind"]
             if kind == "schema":
                 if schema is not None:
                     _fail(source, line_number, "duplicate C2P telemetry schema")
-                schema = _parse_schema(record, source, line_number)
+                schema = _parse_schema(record, source, line_number, version)
                 continue
             if schema is None:
                 _fail(source, line_number, "C2P record precedes schema")
+            if version != schema["version"]:
+                _fail(source, line_number, "C2P record version differs from schema")
             expected = {
                 "summary": SUMMARY_KEYS, "bin": BIN_KEYS,
                 "stage": STAGE_KEYS, "geometry": GEOMETRY_KEYS,
@@ -294,10 +322,14 @@ def analyze_lines(
                         record, "lapse_bin", len(LAPSE_EDGES)+1,
                         source, line_number,
                     ),
-                    _bounded(record, "density_floor_ratio_bin", QUANTITY_BINS,
-                             source, line_number),
-                    _bounded(record, "magnetization_limit_ratio_bin", QUANTITY_BINS,
-                             source, line_number),
+                    _bounded(
+                        record, "density_floor_ratio_bin",
+                        schema["density_floor_ratio_invalid_bin"]+1,
+                        source, line_number),
+                    _bounded(
+                        record, "magnetization_limit_ratio_bin",
+                        schema["magnetization_limit_ratio_invalid_bin"]+1,
+                        source, line_number),
                 )
                 target = group["bins"]
             elif kind == "stage":
@@ -327,7 +359,7 @@ def analyze_lines(
             events[row["cycle"]] = row
 
     if schema is None:
-        _fail(source, None, "no C2P spatial-v1 schema found")
+        _fail(source, None, "no supported C2P spatial schema found")
     telemetry_cycles = sorted({key[0] for key in groups})
     if not telemetry_cycles:
         _fail(source, None, "no C2P telemetry summaries found")
@@ -379,7 +411,9 @@ def analyze_lines(
             if unattributed:
                 canonical_joint = (
                     LEVEL_BINS-1, len(R_CYL_EDGES), len(ABS_Z_EDGES),
-                    len(LAPSE_EDGES), QUANTITY_INVALID_BIN, QUANTITY_INVALID_BIN,
+                    len(LAPSE_EDGES),
+                    schema["density_floor_ratio_invalid_bin"],
+                    schema["magnetization_limit_ratio_invalid_bin"],
                 )
                 if (group["bins"].get(canonical_joint, 0) < unattributed or
                     group["stages"].get((0,), 0) < unattributed or
@@ -421,9 +455,11 @@ def analyze_lines(
         }
         radius = {int(key): value for key, value in marginals["r_cyl_bin"].items()}
         geometry = {int(key): value for key, value in marginals["geometry_valid"].items()}
+        density_invalid = schema["density_floor_ratio_invalid_bin"]
+        magnetization_invalid = schema["magnetization_limit_ratio_invalid_bin"]
         invalid_quantity_count = sum(
             count for key, count in group["bins"].items()
-            if key[4] == QUANTITY_INVALID_BIN or key[5] == QUANTITY_INVALID_BIN
+            if key[4] == density_invalid or key[5] == magnetization_invalid
         )
         interventions[intervention] = {
             "summary": {
@@ -438,7 +474,9 @@ def analyze_lines(
                 ),
                 "density_lt_16_times_floor": _fraction(
                     sum(density.get(index, 0) for index in range(4)), total),
-                "density_ge_256_times_floor": _fraction(density.get(6, 0), total),
+                "density_ge_256_times_floor": _fraction(
+                    sum(density.get(index, 0)
+                        for index in range(6, density_invalid)), total),
                 "magnetization_at_or_above_limit": _fraction(
                     sum(magnetization.get(index, 0) for index in (4, 5, 6)), total),
                 "quantity_invalid": _fraction(invalid_quantity_count, total),

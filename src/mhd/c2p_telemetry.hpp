@@ -40,8 +40,11 @@ enum Intervention : std::uint8_t {
 constexpr int kInterventionBins = static_cast<int>(Intervention::nintervention);
 
 // Density is normalized by the configured rest-mass atmosphere floor D_floor.
-// Finite-bin edges: 1, 2, 4, 16, 64, 256.  The final bin is invalid/non-finite.
-constexpr int kFiniteDensityRatioBins = 7;
+// v2 retains the floor-neighborhood resolution from v1, then resolves decades up to
+// the dense torus scale.  Finite-bin edges:
+//   1, 2, 4, 16, 64, 256, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10.
+// The final bin is invalid/non-finite.
+constexpr int kFiniteDensityRatioBins = 15;
 constexpr int kDensityRatioInvalid = kFiniteDensityRatioBins;
 constexpr int kDensityRatioBins = kFiniteDensityRatioBins + 1;
 
@@ -77,7 +80,15 @@ int DensityRatioBin(const Real ratio) {
   if (ratio < 16.0) return 3;
   if (ratio < 64.0) return 4;
   if (ratio < 256.0) return 5;
-  return 6;
+  if (ratio < 1.0e3) return 6;
+  if (ratio < 1.0e4) return 7;
+  if (ratio < 1.0e5) return 8;
+  if (ratio < 1.0e6) return 9;
+  if (ratio < 1.0e7) return 10;
+  if (ratio < 1.0e8) return 11;
+  if (ratio < 1.0e9) return 12;
+  if (ratio < 1.0e10) return 13;
+  return 14;
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -195,9 +206,9 @@ struct Recorder<true> {
   }
 };
 
-static_assert(kJointHistogramSize == 1241856,
+static_assert(kJointHistogramSize == 2483712,
               "C2P telemetry schema/memory budget changed");
-static_assert(kPendingSize == 1241868,
+static_assert(kPendingSize == 2483724,
               "C2P telemetry appended marginals changed");
 static_assert(JointHistogramIndex(kInterventionBins-1, kLevelBins-1,
                                   kRadiusBins-1, kAbsZBins-1, kLapseBins-1,

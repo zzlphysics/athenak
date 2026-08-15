@@ -27,6 +27,19 @@ SCHEMA = (
     "quantity_invalid_bin=7 stage_bins=other,1,2,3 "
     "geometry_bins=invalid,valid center1=0 center2=0 center3=0"
 )
+SCHEMA_V2 = (
+    "# c2p_spatial_v2 kind=schema "
+    "intervention_bins=cons_adjust,mag_adjust level_bins=0..31,overflow "
+    "r_cyl_edges=2,4,8,16,32,64 abs_z_edges=0.5,1,2,4,8,16 "
+    "lapse_edges=0.2,0.4,0.6,0.8,1 "
+    "density_floor_ratio_edges=1,2,4,16,64,256,1e3,1e4,1e5,1e6,"
+    "1e7,1e8,1e9,1e10 "
+    "magnetization_limit_ratio_edges=0.01,0.1,0.5,1,2,10 "
+    "density_floor_ratio_invalid_bin=15 "
+    "magnetization_limit_ratio_invalid_bin=7 "
+    "stage_bins=other,1,2,3 geometry_bins=invalid,valid "
+    "center1=0 center2=0 center3=0"
+)
 HEADER = (
     "#  cycle eos_dfloor eos_efloor eos_tfloor eos_vceil eos_fail c2p_it "
     "fofc cons_adjust mag_adjust c2p_calls fofc_tests"
@@ -132,6 +145,19 @@ def test_valid_cycle_is_conservative_and_reports_physical_fractions() -> None:
     assert mag["derived_fractions"]["magnetization_at_or_above_limit"] == 1.0
 
 
+def test_v2_extended_density_bins_are_conservative() -> None:
+    cycle = [
+        line.replace("c2p_spatial_v1", "c2p_spatial_v2").replace(
+            "density_floor_ratio_bin=6", "density_floor_ratio_bin=14")
+        for line in _cycle(602)
+    ]
+    report = analyze_lines([HEADER, SCHEMA_V2, *cycle], cycle=602)
+    assert report["schema"]["version"] == 2
+    cons = report["interventions"]["cons_adjust"]
+    assert cons["marginals"]["density_floor_ratio_bin"] == {"14": 3}
+    assert cons["derived_fractions"]["density_ge_256_times_floor"] == 1.0
+
+
 def test_zero_count_intervention_requires_no_fake_bins() -> None:
     report = analyze_lines([HEADER, SCHEMA, *_cycle(10, cons=0, mag=0)])
     for intervention in ("cons_adjust", "mag_adjust"):
@@ -209,4 +235,4 @@ def test_cli_returns_two_for_invalid_log(tmp_path: Path, capsys: Any) -> None:
     path = tmp_path / "invalid.log"
     path.write_text("# no telemetry\n", encoding="utf-8")
     assert analyzer.main([str(path)]) == 2
-    assert "no C2P spatial-v1 schema found" in capsys.readouterr().err
+    assert "no supported C2P spatial schema found" in capsys.readouterr().err

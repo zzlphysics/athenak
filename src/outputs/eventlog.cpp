@@ -348,14 +348,17 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
       }
       if (c2p_spatial_telemetry) {
         std::fprintf(pfile,
-            "# c2p_spatial_v1 kind=schema "
+            "# c2p_spatial_v2 kind=schema "
             "intervention_bins=cons_adjust,mag_adjust "
             "level_bins=0..31,overflow "
             "r_cyl_edges=2,4,8,16,32,64 abs_z_edges=0.5,1,2,4,8,16 "
             "lapse_edges=0.2,0.4,0.6,0.8,1 "
-            "density_floor_ratio_edges=1,2,4,16,64,256 "
+            "density_floor_ratio_edges=1,2,4,16,64,256,1e3,1e4,1e5,1e6,"
+            "1e7,1e8,1e9,1e10 "
             "magnetization_limit_ratio_edges=0.01,0.1,0.5,1,2,10 "
-            "quantity_invalid_bin=7 stage_bins=other,1,2,3 "
+            "density_floor_ratio_invalid_bin=15 "
+            "magnetization_limit_ratio_invalid_bin=7 "
+            "stage_bins=other,1,2,3 "
             "geometry_bins=invalid,valid "
             "center1=%.17g center2=%.17g center3=%.17g\n",
             pm->pmb_pack->pmhd->c2p_telemetry_center[0],
@@ -403,7 +406,7 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
               (intervention == mhd::c2p_telemetry::Intervention::cons_adjust)
               ? pm->ecounter.ncons_adjust : pm->ecounter.nmag_adjust;
           std::fprintf(pfile,
-              "# c2p_spatial_v1 kind=summary cycle=%d intervention=%s "
+              "# c2p_spatial_v2 kind=summary cycle=%d intervention=%s "
               "count=%" PRIu64 " authoritative=%" PRIu64
               " unattributed=%" PRIu64 "\n",
               pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
@@ -425,7 +428,7 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                       const std::uint64_t count = c2p_telemetry_bins[index];
                       if (count == 0) continue;
                       std::fprintf(pfile,
-                          "# c2p_spatial_v1 kind=bin cycle=%d intervention=%s "
+                          "# c2p_spatial_v2 kind=bin cycle=%d intervention=%s "
                           "level_bin=%d r_cyl_bin=%d abs_z_bin=%d lapse_bin=%d "
                           "density_floor_ratio_bin=%d "
                           "magnetization_limit_ratio_bin=%d count=%" PRIu64 "\n",
@@ -443,7 +446,7 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                 mhd::c2p_telemetry::StageHistogramIndex(intervention, stage)];
             if (count == 0) continue;
             std::fprintf(pfile,
-                "# c2p_spatial_v1 kind=stage cycle=%d intervention=%s "
+                "# c2p_spatial_v2 kind=stage cycle=%d intervention=%s "
                 "stage_bin=%d count=%" PRIu64 "\n",
                 pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
                 stage, count);
@@ -454,7 +457,7 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                     intervention, valid != 0)];
             if (count == 0) continue;
             std::fprintf(pfile,
-                "# c2p_spatial_v1 kind=geometry cycle=%d intervention=%s "
+                "# c2p_spatial_v2 kind=geometry cycle=%d intervention=%s "
                 "valid=%d count=%" PRIu64 "\n",
                 pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
                 valid, count);
