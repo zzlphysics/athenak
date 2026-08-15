@@ -40,6 +40,7 @@
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "coordinates/adm.hpp"
+#include "mhd/c2p_telemetry.hpp"
 #include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 #include "coordinates/coordinates.hpp"
@@ -338,14 +339,14 @@ class PrimitiveSolverHydro {
     return;
   }
 
-  template<bool RECORD_FOFC_REASON = false>
+  template<bool RECORD_FOFC_REASON = false, bool RECORD_C2P_TELEMETRY = false>
   dyngr::C2PProjectionStats ConsToPrim(
       DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &bfc,
       DvceArray5D<Real> &bcc0, DvceArray5D<Real> &prim,
       DvceArray5D<Real> &temperature,
       const int il, const int iu, const int jl, const int ju,
       const int kl, const int ku, bool floors_only=false,
-      bool preserve_cons=false, bool count_events=true) {
+      bool preserve_cons=false, bool count_events=true, int telemetry_stage=0) {
     int &nhyd = pmy_pack->pmhd->nmhd;
     int &nscal = pmy_pack->pmhd->nscalars;
     auto active_lids = pmy_pack->active_lids.d_view;
@@ -359,6 +360,28 @@ class PrimitiveSolverHydro {
             pmy_pack->pmhd->fofc_reason};
       } else {
         return mhd::fofc_telemetry::ReasonRecorder<false>{};
+      }
+    }();
+    auto c2p_telemetry_recorder = [&]() {
+      if constexpr (RECORD_C2P_TELEMETRY) {
+        auto &indcs = pmy_pack->pmesh->mb_indcs;
+        const Real density_floor =
+            ps.GetEOS().GetDensityFloor()*ps.GetEOS().GetBaryonMass();
+        const Real max_magnetization = ps.GetEOS().GetMaximumMagnetization();
+        return mhd::c2p_telemetry::Recorder<true>{
+            pmy_pack->pmhd->c2p_telemetry_pending,
+            pmy_pack->pmb->mb_lev.d_view,
+            pmy_pack->pmb->mb_size.d_view,
+            pmy_pack->padm->adm.alpha,
+            indcs.is, indcs.js, indcs.ks,
+            indcs.nx1, indcs.nx2, indcs.nx3,
+            telemetry_stage,
+            pmy_pack->pmhd->c2p_telemetry_center[0],
+            pmy_pack->pmhd->c2p_telemetry_center[1],
+            pmy_pack->pmhd->c2p_telemetry_center[2],
+            density_floor, max_magnetization};
+      } else {
+        return mhd::c2p_telemetry::Recorder<false>{};
       }
     }();
 
@@ -596,6 +619,22 @@ class PrimitiveSolverHydro {
           if ((events & Primitive::MAGNETIZATION_ADJUSTED) != 0U) {
             summagadjust++;
           }
+          Real telemetry_input_bsq = 0.0;
+          Real telemetry_magnetization_density = 0.0;
+          if constexpr (RECORD_C2P_TELEMETRY) {
+            telemetry_input_bsq = Primitive::SquareVector(b3u, g3d);
+            telemetry_magnetization_density =
+                (events & Primitive::CONS_DENSITY_FLOOR) != 0U
+                ? preserve_reference_scale : cons_pt_old[CDN];
+          }
+          // Keep the recorder's first device-lambda capture outside if constexpr.
+          // NVCC rejects a View-owning specialization first captured in that context;
+          // the disabled specialization remains an inline empty operation.
+          c2p_telemetry_recorder.Record(
+              result.cons_adjusted,
+              (events & Primitive::MAGNETIZATION_ADJUSTED) != 0U,
+              m, k, j, i, cons_pt_old[CDN],
+              telemetry_magnetization_density, telemetry_input_bsq);
           max_iterations_used = (result.iterations > max_iterations_used) ?
                                 result.iterations : max_iterations_used;
         }

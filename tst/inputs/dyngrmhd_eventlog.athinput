@@ -65,6 +65,7 @@ c2perrs = 1
 max_bsq = 1.0e6
 fofc = true
 fofc_spatial_telemetry = false
+c2p_spatial_telemetry = false
 
 <problem>
 pgen_name = dynbbh

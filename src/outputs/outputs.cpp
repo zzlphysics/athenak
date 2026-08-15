@@ -376,9 +376,10 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
     exit(EXIT_FAILURE);
   }
   if (pm->pmb_pack->pmhd != nullptr &&
-      pm->pmb_pack->pmhd->fofc_spatial_telemetry && num_log != 1) {
+      (pm->pmb_pack->pmhd->fofc_spatial_telemetry ||
+       pm->pmb_pack->pmhd->c2p_spatial_telemetry) && num_log != 1) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-              << std::endl << "FOFC spatial telemetry requires exactly one active "
+              << std::endl << "Spatial event telemetry requires exactly one active "
               << "event-log output" << std::endl;
     exit(EXIT_FAILURE);
   }

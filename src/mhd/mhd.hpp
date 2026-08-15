@@ -150,6 +150,11 @@ class MHD {
   Real fofc_telemetry_center[3] = {0.0, 0.0, 0.0};
   DvceArray4D<std::uint8_t> fofc_reason;
   DvceArray1D<std::uint64_t> fofc_telemetry_pending;
+  // Optional C2P-intervention diagnostic.  The compact histogram is allocated only
+  // when explicitly requested, so production stepping retains its historical path.
+  bool c2p_spatial_telemetry = false;
+  Real c2p_telemetry_center[3] = {0.0, 0.0, 0.0};
+  DvceArray1D<std::uint64_t> c2p_telemetry_pending;
 
   // container to hold names of TaskIDs
   MHDTaskIDs id;

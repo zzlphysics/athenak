@@ -8,6 +8,7 @@
 //! \file outputs.hpp
 //  \brief provides classes to handle ALL types of data output
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -482,6 +483,11 @@ class EventLogOutput : public BaseTypeOutput {
   std::uint64_t fofc_telemetry_unattributed=0;
   std::uint64_t fofc_telemetry_allowed_prefix=0;
   std::vector<std::uint64_t> fofc_telemetry_bins;
+  bool c2p_spatial_telemetry=false;
+  std::array<std::uint64_t, 2> c2p_telemetry_total{};
+  std::array<std::uint64_t, 2> c2p_telemetry_unattributed{};
+  std::array<std::uint64_t, 2> c2p_telemetry_allowed_prefix{};
+  std::vector<std::uint64_t> c2p_telemetry_bins;
 
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;

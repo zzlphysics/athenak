@@ -22,6 +22,7 @@
 #include "shearing_box/shearing_box.hpp"
 #include "shearing_box/orbital_advection.hpp"
 #include "bvals/bvals.hpp"
+#include "mhd/c2p_telemetry.hpp"
 #include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 
@@ -213,6 +214,36 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       }
       Kokkos::realloc(fofc_telemetry_pending, fofc_telemetry::kHistogramSize);
       Kokkos::deep_copy(fofc_telemetry_pending, std::uint64_t{0});
+    }
+    // C2P intervention telemetry is independent of FOFC: it observes the normal
+    // conserved-to-primitive solve and is meaningful only for dynamical GRMHD.
+    c2p_spatial_telemetry =
+        pin->DoesParameterExist("mhd", "c2p_spatial_telemetry") &&
+        pin->GetBoolean("mhd", "c2p_spatial_telemetry");
+    if (c2p_spatial_telemetry &&
+        !pmy_pack->pcoord->is_dynamical_relativistic) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "<mhd> c2p_spatial_telemetry requires dynamical GRMHD"
+                << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    if (c2p_spatial_telemetry) {
+      const char *center_names[3] = {
+        "c2p_telemetry_center1", "c2p_telemetry_center2", "c2p_telemetry_center3"
+      };
+      for (int n=0; n<3; ++n) {
+        if (pin->DoesParameterExist("mhd", center_names[n])) {
+          c2p_telemetry_center[n] = pin->GetReal("mhd", center_names[n]);
+        }
+        if (!std::isfinite(c2p_telemetry_center[n])) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "<mhd> " << center_names[n]
+                    << " must be finite" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      }
+      Kokkos::realloc(c2p_telemetry_pending, c2p_telemetry::kPendingSize);
+      Kokkos::deep_copy(c2p_telemetry_pending, std::uint64_t{0});
     }
 
     // select reconstruction method (default PLM)

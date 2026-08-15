@@ -21,6 +21,7 @@
 #include "athena.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
+#include "mhd/c2p_telemetry.hpp"
 #include "mhd/fofc_telemetry.hpp"
 #include "mhd/mhd.hpp"
 #include "outputs.hpp"
@@ -34,13 +35,18 @@ EventLogOutput::EventLogOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
   write_zeros = pin->GetOrAddBoolean(op.block_name, "write_zeros", false);
   if (pm->pmb_pack->pmhd != nullptr) {
     fofc_spatial_telemetry = pm->pmb_pack->pmhd->fofc_spatial_telemetry;
+    c2p_spatial_telemetry = pm->pmb_pack->pmhd->c2p_spatial_telemetry;
   }
-  if (fofc_spatial_telemetry) {
+  if (fofc_spatial_telemetry || c2p_spatial_telemetry) {
+    const char *telemetry_name = fofc_spatial_telemetry && !c2p_spatial_telemetry
+        ? "FOFC spatial telemetry"
+        : (!fofc_spatial_telemetry && c2p_spatial_telemetry
+           ? "C2P spatial telemetry" : "Spatial event telemetry");
     // A fixed one-root-cycle interval is part of the telemetry contract.  In particular,
     // a time-based cadence could silently combine a variable number of root steps.
     if (op.dcycle != 1) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "FOFC spatial telemetry requires its event log to use "
+                << std::endl << telemetry_name << " requires its event log to use "
                 << "dcycle=1" << std::endl;
       std::exit(EXIT_FAILURE);
     }
@@ -48,15 +54,26 @@ EventLogOutput::EventLogOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     // summary would be ambiguous between "zero corrections" and an interrupted output.
     if (!write_zeros) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                << std::endl << "FOFC spatial telemetry requires its event log to use "
+                << std::endl << telemetry_name << " requires its event log to use "
                 << "write_zeros=true" << std::endl;
       std::exit(EXIT_FAILURE);
     }
+  }
+  if (fofc_spatial_telemetry) {
     // This is the only nfofc contribution allowed to lack process-local spatial bins:
     // a prefix restored before Outputs construction (or produced by fresh IC setup).
     // Once the first dense event row consumes it, any later mismatch is a telemetry bug.
     fofc_telemetry_allowed_prefix = pm->ecounter.nfofc;
     fofc_telemetry_bins.assign(mhd::fofc_telemetry::kHistogramSize, 0);
+  }
+  if (c2p_spatial_telemetry) {
+    // Like FOFC telemetry, device histograms are intentionally not restart-persistent.
+    // Capture the sole prefix that may be unattributed in the first dense event row.
+    c2p_telemetry_allowed_prefix[mhd::c2p_telemetry::Intervention::cons_adjust] =
+        pm->ecounter.ncons_adjust;
+    c2p_telemetry_allowed_prefix[mhd::c2p_telemetry::Intervention::mag_adjust] =
+        pm->ecounter.nmag_adjust;
+    c2p_telemetry_bins.assign(mhd::c2p_telemetry::kPendingSize, 0);
   }
 }
 
@@ -78,6 +95,14 @@ void EventLogOutput::LoadOutputData(Mesh *pm) {
     // a fresh interval even when AMR changed the MeshBlock topology in between.
     Kokkos::deep_copy(pending, std::uint64_t{0});
   }
+  if (c2p_spatial_telemetry) {
+    auto pending = pm->pmb_pack->pmhd->c2p_telemetry_pending;
+    auto host_pending = Kokkos::create_mirror_view_and_copy(HostMemSpace(), pending);
+    for (std::size_t n=0; n<c2p_telemetry_bins.size(); ++n) {
+      c2p_telemetry_bins[n] = host_pending(n);
+    }
+    Kokkos::deep_copy(pending, std::uint64_t{0});
+  }
 #if MPI_PARALLEL_ENABLED
   // perform in-place sum or max over all MPI ranks, depending on counter
   std::uint64_t* sum_counters[] = {
@@ -97,6 +122,14 @@ void EventLogOutput::LoadOutputData(Mesh *pm) {
                   static_cast<int>(fofc_telemetry_bins.size()), MPI_UINT64_T, MPI_SUM,
                   MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &fofc_telemetry_allowed_prefix, 1, MPI_UINT64_T,
+                  MPI_SUM, MPI_COMM_WORLD);
+  }
+  if (c2p_spatial_telemetry) {
+    MPI_Allreduce(MPI_IN_PLACE, c2p_telemetry_bins.data(),
+                  static_cast<int>(c2p_telemetry_bins.size()), MPI_UINT64_T, MPI_SUM,
+                  MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, c2p_telemetry_allowed_prefix.data(),
+                  static_cast<int>(c2p_telemetry_allowed_prefix.size()), MPI_UINT64_T,
                   MPI_SUM, MPI_COMM_WORLD);
   }
 #endif
@@ -149,6 +182,95 @@ void EventLogOutput::LoadOutputData(Mesh *pm) {
                 << std::endl << "FOFC spatial histogram does not match nfofc"
                 << std::endl;
       std::exit(EXIT_FAILURE);
+    }
+  }
+  if (c2p_spatial_telemetry) {
+    const std::uint64_t authoritative[mhd::c2p_telemetry::kInterventionBins] = {
+      pm->ecounter.ncons_adjust, pm->ecounter.nmag_adjust
+    };
+    const std::size_t joint_stride =
+        mhd::c2p_telemetry::kJointHistogramSize /
+        mhd::c2p_telemetry::kInterventionBins;
+    for (int intervention=0;
+         intervention<mhd::c2p_telemetry::kInterventionBins; ++intervention) {
+      auto checked_add = [&](std::uint64_t &total, const std::uint64_t value,
+                             const char *which) {
+        if (value > std::numeric_limits<std::uint64_t>::max()-total) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "C2P spatial " << which << " total overflow"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        total += value;
+      };
+      c2p_telemetry_total[intervention] = 0;
+      const std::size_t begin = static_cast<std::size_t>(intervention)*joint_stride;
+      for (std::size_t n=begin; n<begin+joint_stride; ++n) {
+        checked_add(c2p_telemetry_total[intervention], c2p_telemetry_bins[n], "joint");
+      }
+      std::uint64_t stage_total = 0;
+      for (int stage=0; stage<mhd::c2p_telemetry::kStageBins; ++stage) {
+        checked_add(stage_total, c2p_telemetry_bins[
+            mhd::c2p_telemetry::StageHistogramIndex(intervention, stage)], "stage");
+      }
+      std::uint64_t geometry_total = 0;
+      for (int valid=0; valid<2; ++valid) {
+        checked_add(geometry_total, c2p_telemetry_bins[
+            mhd::c2p_telemetry::GeometryHistogramIndex(intervention, valid != 0)],
+            "geometry");
+      }
+      if (stage_total != c2p_telemetry_total[intervention] ||
+          geometry_total != c2p_telemetry_total[intervention]) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "C2P spatial joint/marginal mismatch for "
+                  << mhd::c2p_telemetry::InterventionName(intervention) << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      if (c2p_telemetry_total[intervention] > authoritative[intervention]) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "C2P spatial histogram exceeds authoritative "
+                  << mhd::c2p_telemetry::InterventionName(intervention)
+                  << " counter" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      c2p_telemetry_unattributed[intervention] =
+          authoritative[intervention]-c2p_telemetry_total[intervention];
+      if (c2p_telemetry_unattributed[intervention] !=
+          c2p_telemetry_allowed_prefix[intervention]) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "C2P spatial histogram mismatch is not the captured "
+                  << "pre-output prefix for "
+                  << mhd::c2p_telemetry::InterventionName(intervention)
+                  << ": missing=" << c2p_telemetry_unattributed[intervention]
+                  << " allowed=" << c2p_telemetry_allowed_prefix[intervention]
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      const std::uint64_t prefix = c2p_telemetry_unattributed[intervention];
+      if (prefix > 0) {
+        const std::size_t joint_index = mhd::c2p_telemetry::JointHistogramIndex(
+            intervention, mhd::c2p_telemetry::kLevelOverflow,
+            mhd::c2p_telemetry::kRadiusBins-1, mhd::c2p_telemetry::kAbsZBins-1,
+            mhd::c2p_telemetry::kLapseBins-1,
+            mhd::c2p_telemetry::kDensityRatioInvalid,
+            mhd::c2p_telemetry::kMagRatioInvalid);
+        checked_add(c2p_telemetry_bins[joint_index], prefix, "unattributed joint");
+        checked_add(c2p_telemetry_bins[
+            mhd::c2p_telemetry::StageHistogramIndex(
+                intervention, mhd::c2p_telemetry::kStageOther)],
+            prefix, "unattributed stage");
+        checked_add(c2p_telemetry_bins[
+            mhd::c2p_telemetry::GeometryHistogramIndex(intervention, false)],
+            prefix, "unattributed geometry");
+        checked_add(c2p_telemetry_total[intervention], prefix, "unattributed total");
+      }
+      if (c2p_telemetry_total[intervention] != authoritative[intervention]) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "C2P spatial histogram does not match authoritative "
+                  << mhd::c2p_telemetry::InterventionName(intervention)
+                  << " counter" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
     }
   }
 
@@ -224,6 +346,22 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
             pm->pmb_pack->pmhd->fofc_telemetry_center[1],
             pm->pmb_pack->pmhd->fofc_telemetry_center[2]);
       }
+      if (c2p_spatial_telemetry) {
+        std::fprintf(pfile,
+            "# c2p_spatial_v1 kind=schema "
+            "intervention_bins=cons_adjust,mag_adjust "
+            "level_bins=0..31,overflow "
+            "r_cyl_edges=2,4,8,16,32,64 abs_z_edges=0.5,1,2,4,8,16 "
+            "lapse_edges=0.2,0.4,0.6,0.8,1 "
+            "density_floor_ratio_edges=1,2,4,16,64,256 "
+            "magnetization_limit_ratio_edges=0.01,0.1,0.5,1,2,10 "
+            "quantity_invalid_bin=7 stage_bins=other,1,2,3 "
+            "geometry_bins=invalid,valid "
+            "center1=%.17g center2=%.17g center3=%.17g\n",
+            pm->pmb_pack->pmhd->c2p_telemetry_center[0],
+            pm->pmb_pack->pmhd->c2p_telemetry_center[1],
+            pm->pmb_pack->pmhd->c2p_telemetry_center[2]);
+      }
     }
 
     // write event counters
@@ -255,6 +393,71 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
                 }
               }
             }
+          }
+        }
+      }
+      if (c2p_spatial_telemetry) {
+        for (int intervention=0;
+             intervention<mhd::c2p_telemetry::kInterventionBins; ++intervention) {
+          const std::uint64_t authoritative =
+              (intervention == mhd::c2p_telemetry::Intervention::cons_adjust)
+              ? pm->ecounter.ncons_adjust : pm->ecounter.nmag_adjust;
+          std::fprintf(pfile,
+              "# c2p_spatial_v1 kind=summary cycle=%d intervention=%s "
+              "count=%" PRIu64 " authoritative=%" PRIu64
+              " unattributed=%" PRIu64 "\n",
+              pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
+              c2p_telemetry_total[intervention], authoritative,
+              c2p_telemetry_unattributed[intervention]);
+          for (int level=0; level<mhd::c2p_telemetry::kLevelBins; ++level) {
+            for (int radius=0; radius<mhd::c2p_telemetry::kRadiusBins; ++radius) {
+              for (int abs_z=0; abs_z<mhd::c2p_telemetry::kAbsZBins; ++abs_z) {
+                for (int lapse=0; lapse<mhd::c2p_telemetry::kLapseBins; ++lapse) {
+                  for (int density=0;
+                       density<mhd::c2p_telemetry::kDensityRatioBins; ++density) {
+                    for (int magnetization=0;
+                         magnetization<mhd::c2p_telemetry::kMagRatioBins;
+                         ++magnetization) {
+                      const std::size_t index =
+                          mhd::c2p_telemetry::JointHistogramIndex(
+                              intervention, level, radius, abs_z, lapse,
+                              density, magnetization);
+                      const std::uint64_t count = c2p_telemetry_bins[index];
+                      if (count == 0) continue;
+                      std::fprintf(pfile,
+                          "# c2p_spatial_v1 kind=bin cycle=%d intervention=%s "
+                          "level_bin=%d r_cyl_bin=%d abs_z_bin=%d lapse_bin=%d "
+                          "density_floor_ratio_bin=%d "
+                          "magnetization_limit_ratio_bin=%d count=%" PRIu64 "\n",
+                          pm->ncycle,
+                          mhd::c2p_telemetry::InterventionName(intervention),
+                          level, radius, abs_z, lapse, density, magnetization, count);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          for (int stage=0; stage<mhd::c2p_telemetry::kStageBins; ++stage) {
+            const std::uint64_t count = c2p_telemetry_bins[
+                mhd::c2p_telemetry::StageHistogramIndex(intervention, stage)];
+            if (count == 0) continue;
+            std::fprintf(pfile,
+                "# c2p_spatial_v1 kind=stage cycle=%d intervention=%s "
+                "stage_bin=%d count=%" PRIu64 "\n",
+                pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
+                stage, count);
+          }
+          for (int valid=0; valid<2; ++valid) {
+            const std::uint64_t count = c2p_telemetry_bins[
+                mhd::c2p_telemetry::GeometryHistogramIndex(
+                    intervention, valid != 0)];
+            if (count == 0) continue;
+            std::fprintf(pfile,
+                "# c2p_spatial_v1 kind=geometry cycle=%d intervention=%s "
+                "valid=%d count=%" PRIu64 "\n",
+                pm->ncycle, mhd::c2p_telemetry::InterventionName(intervention),
+                valid, count);
           }
         }
       }
@@ -295,6 +498,12 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     fofc_telemetry_total = 0;
     fofc_telemetry_unattributed = 0;
     fofc_telemetry_allowed_prefix = 0;
+  }
+  if (c2p_spatial_telemetry) {
+    std::fill(c2p_telemetry_bins.begin(), c2p_telemetry_bins.end(), 0);
+    c2p_telemetry_total.fill(0);
+    c2p_telemetry_unattributed.fill(0);
+    c2p_telemetry_allowed_prefix.fill(0);
   }
 
   UpdateOutputParameters(pm, pin, false);

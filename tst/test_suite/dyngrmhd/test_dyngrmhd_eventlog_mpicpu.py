@@ -241,6 +241,23 @@ def _fofc_spatial_records(run_dir: Path) -> list[dict[str, str]]:
     return records
 
 
+def _c2p_spatial_records(run_dir: Path) -> list[dict[str, str]]:
+    lines = (run_dir / "dyngrmhd_eventlog.log").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    records = []
+    for line in lines:
+        if not line.startswith("# c2p_spatial_v1 "):
+            continue
+        fields = line.split()[2:]
+        record = {}
+        for field in fields:
+            key, value = field.split("=", 1)
+            record[key] = value
+        records.append(record)
+    return records
+
+
 def _state_dump_at_cycle(run_dir: Path, cycle: int) -> dict[str, object]:
     paths = sorted(
         (run_dir / "bin").glob("dyngrmhd_eventlog.mhd_u_bcc.*.bin")
@@ -307,6 +324,116 @@ def test_dense_event_rows_and_mpi_uint64_aggregation(tmp_path: Path) -> None:
     # completely untouched when disabled.
     assert _fofc_spatial_records(serial_dir) == []
     assert _fofc_spatial_records(mpi_dir) == []
+    assert _c2p_spatial_records(serial_dir) == []
+    assert _c2p_spatial_records(mpi_dir) == []
+
+
+def test_c2p_spatial_telemetry_maps_interventions_and_matches_mpi_total(
+        tmp_path: Path) -> None:
+    run_dir = tmp_path / "c2p_spatial"
+    _run(
+        run_dir,
+        ranks=2,
+        overrides=(
+            "mesh/nx1=16",
+            "meshblock/nx1=8",
+            "time/nlim=1",
+            "problem/b3=1.0",
+            "mhd/max_bsq=1.0",
+            "mhd/c2p_spatial_telemetry=true",
+            "output2/dcycle=0",
+        ),
+    )
+
+    rows = _event_rows(run_dir)
+    records = _c2p_spatial_records(run_dir)
+    schemas = [record for record in records if record["kind"] == "schema"]
+    summaries = [record for record in records if record["kind"] == "summary"]
+    bins = [record for record in records if record["kind"] == "bin"]
+    stages = [record for record in records if record["kind"] == "stage"]
+    geometries = [record for record in records if record["kind"] == "geometry"]
+    assert len(schemas) == 1
+    assert len(summaries) == 2 * len(rows)
+
+    for row in rows:
+        for intervention, event_column in (
+            ("cons_adjust", "cons_adjust"),
+            ("mag_adjust", "mag_adjust"),
+        ):
+            matching = [
+                record for record in summaries
+                if int(record["cycle"]) == row["cycle"]
+                and record["intervention"] == intervention
+            ]
+            assert len(matching) == 1
+            summary = matching[0]
+            expected = row[event_column]
+            assert int(summary["count"]) == expected
+            assert int(summary["authoritative"]) == expected
+            assert int(summary["unattributed"]) == 0
+            def selected(record: dict[str, str]) -> bool:
+                return (
+                    int(record["cycle"]) == row["cycle"]
+                    and record["intervention"] == intervention
+                )
+
+            assert sum(
+                int(record["count"]) for record in bins if selected(record)
+            ) == expected
+            assert sum(
+                int(record["count"]) for record in stages if selected(record)
+            ) == expected
+            assert sum(
+                int(record["count"]) for record in geometries if selected(record)
+            ) == expected
+
+    cycle_one_mag = [
+        record for record in bins
+        if record["cycle"] == "1" and record["intervention"] == "mag_adjust"
+    ]
+    assert rows[1]["mag_adjust"] > 0
+    assert {int(record["level_bin"]) for record in cycle_one_mag} == {1}
+    assert {int(record["density_floor_ratio_bin"])
+            for record in cycle_one_mag} == {6}
+    # The input magnetization was above, but within a factor of two of, max_bsq.
+    assert {int(record["magnetization_limit_ratio_bin"])
+            for record in cycle_one_mag} == {4}
+    assert {
+        int(record["stage_bin"]): int(record["count"])
+        for record in stages
+        if record["cycle"] == "1"
+        and record["intervention"] == "mag_adjust"
+    } == {1: rows[1]["mag_adjust"] // 2, 2: rows[1]["mag_adjust"] // 2}
+
+
+def test_c2p_spatial_telemetry_does_not_change_evolution(tmp_path: Path) -> None:
+    disabled_dir = tmp_path / "c2p_telemetry_disabled"
+    enabled_dir = tmp_path / "c2p_telemetry_enabled"
+    common = (
+        "time/nlim=2", "problem/b3=1.0", "mhd/max_bsq=1.0",
+        "output3/dcycle=1",
+    )
+    _run(disabled_dir, ranks=1, overrides=common)
+    _run(
+        enabled_dir,
+        ranks=1,
+        overrides=(*common, "mhd/c2p_spatial_telemetry=true"),
+    )
+
+    assert _event_rows(enabled_dir) == _event_rows(disabled_dir)
+    disabled = _state_dump_at_cycle(disabled_dir, cycle=2)
+    enabled = _state_dump_at_cycle(enabled_dir, cycle=2)
+    assert disabled["var_names"] == enabled["var_names"]
+    np.testing.assert_array_equal(
+        np.asarray(disabled["mb_logical"])[_canonical_order(disabled)],
+        np.asarray(enabled["mb_logical"])[_canonical_order(enabled)],
+    )
+    for variable in disabled["var_names"]:
+        np.testing.assert_array_equal(
+            _canonical_field(enabled, variable),
+            _canonical_field(disabled, variable),
+            err_msg=f"C2P telemetry changed physical field {variable}",
+        )
 
 
 def test_fofc_spatial_telemetry_maps_reasons_and_matches_mpi_total(
@@ -478,6 +605,28 @@ def test_fofc_spatial_telemetry_requires_dense_event_rows(tmp_path: Path) -> Non
     )
     assert (
         "FOFC spatial telemetry requires its event log to use write_zeros=true"
+        in stdout
+    )
+
+
+def test_c2p_spatial_telemetry_requires_root_cycle_event_cadence(
+        tmp_path: Path) -> None:
+    stdout = _run_expect_failure(
+        tmp_path / "invalid_c2p_telemetry_cadence",
+        "mhd/c2p_spatial_telemetry=true",
+        "output1/dcycle=2",
+    )
+    assert "C2P spatial telemetry requires its event log to use dcycle=1" in stdout
+
+
+def test_c2p_spatial_telemetry_requires_dense_event_rows(tmp_path: Path) -> None:
+    stdout = _run_expect_failure(
+        tmp_path / "invalid_c2p_telemetry_sparse_log",
+        "mhd/c2p_spatial_telemetry=true",
+        "output1/write_zeros=false",
+    )
+    assert (
+        "C2P spatial telemetry requires its event log to use write_zeros=true"
         in stdout
     )
 
@@ -701,6 +850,73 @@ def test_device_fofc_pending_is_drained_into_restart(tmp_path: Path) -> None:
     assert int(bins[0]["abs_z_bin"]) == 6
     assert int(bins[0]["lapse_bin"]) == 5
     assert int(bins[0]["count"]) == pending["nfofc"]
+
+
+def test_restart_carried_c2p_events_use_explicit_unattributed_bins(
+        tmp_path: Path) -> None:
+    source_dir = tmp_path / "device_c2p_source"
+    resumed_dir = tmp_path / "device_c2p_telemetry_resumed"
+    _run(
+        source_dir,
+        ranks=1,
+        overrides=(
+            "time/nlim=1",
+            "mhd/c2p_iter=1",
+            "output1/dcycle=10",
+        ),
+    )
+    checkpoint = source_dir / "rst" / "dyngrmhd_eventlog.00001.rst"
+    pending = _restart_metadata(checkpoint, ranks=1)["event_counters"]
+    assert isinstance(pending, dict)
+    assert pending["ncons_adjust"] > 0
+    assert pending["nmag_adjust"] == 0
+
+    _run_restart(
+        checkpoint,
+        resumed_dir,
+        nlim=1,
+        overrides=(
+            "mhd/c2p_spatial_telemetry=true",
+            "output1/dcycle=1",
+        ),
+    )
+    records = _c2p_spatial_records(resumed_dir)
+    summaries = [record for record in records if record["kind"] == "summary"]
+    bins = [record for record in records if record["kind"] == "bin"]
+    stages = [record for record in records if record["kind"] == "stage"]
+    geometries = [record for record in records if record["kind"] == "geometry"]
+    cons_summary = next(
+        record for record in summaries
+        if record["intervention"] == "cons_adjust"
+    )
+    mag_summary = next(
+        record for record in summaries
+        if record["intervention"] == "mag_adjust"
+    )
+    rows = _event_rows(resumed_dir)
+    assert len(rows) == 1
+    assert int(cons_summary["count"]) == rows[0]["cons_adjust"]
+    assert int(cons_summary["count"]) >= pending["ncons_adjust"]
+    assert int(cons_summary["unattributed"]) == pending["ncons_adjust"]
+    assert int(mag_summary["count"]) == 0
+    assert int(mag_summary["unattributed"]) == 0
+    canonical = [
+        record for record in bins
+        if int(record["level_bin"]) == 32
+        and int(record["r_cyl_bin"]) == 6
+        and int(record["abs_z_bin"]) == 6
+        and int(record["lapse_bin"]) == 5
+        and int(record["density_floor_ratio_bin"]) == 7
+        and int(record["magnetization_limit_ratio_bin"]) == 7
+    ]
+    assert len(canonical) == 1
+    assert int(canonical[0]["count"]) == pending["ncons_adjust"]
+    stage_zero = next(record for record in stages if record["stage_bin"] == "0")
+    assert int(stage_zero["count"]) >= pending["ncons_adjust"]
+    geometry_invalid = next(
+        record for record in geometries if record["valid"] == "0"
+    )
+    assert int(geometry_invalid["count"]) == pending["ncons_adjust"]
 
 
 def test_pending_event_counters_survive_shared_and_per_rank_restarts(
