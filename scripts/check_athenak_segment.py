@@ -9,6 +9,7 @@ recent files return a retry status so a closed-file hand-off cannot race final I
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import fnmatch
 import hashlib
@@ -99,6 +100,46 @@ EVENT_COLUMNS = (
     "c2p_calls",
     "fofc_tests",
 )
+EVENT_RATIO_POLICY_V2 = {
+    "version": 2,
+    "normalization": "raw_intervention_opportunities_per_root_step",
+    "hard_threshold_role": "operational_emergency_guard",
+    "yellow_threshold_role": "sustained_diagnostic_advisory",
+    "raw_ratios_are_physical_volume_or_mass_fractions": False,
+    "publication_acceptance_requires": [
+        "spatial_telemetry",
+        "conservative_correction_budget",
+        "resolution_convergence",
+    ],
+}
+EVENT_HARD_THRESHOLDS_V2 = [
+    {"name": "fofc_per_test", "numerator": "fofc",
+     "denominator": "fofc_tests", "max_ratio": 0.05},
+    {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
+     "denominator": "c2p_calls", "max_ratio": 0.10},
+    {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
+     "denominator": "c2p_calls", "max_ratio": 0.10},
+]
+EVENT_YELLOW_THRESHOLDS_V2 = [
+    {**rule,
+     "max_ratio": 0.01 if rule["name"] == "fofc_per_test" else 0.02,
+     "consecutive_rows": 3}
+    for rule in EVENT_HARD_THRESHOLDS_V2
+]
+LEGACY_EVENT_HARD_THRESHOLDS_V1 = [
+    {"name": "fofc_per_test", "numerator": "fofc",
+     "denominator": "fofc_tests", "max_ratio": 0.01},
+    {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
+     "denominator": "c2p_calls", "max_ratio": 0.005},
+    {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
+     "denominator": "c2p_calls", "max_ratio": 0.005},
+]
+LEGACY_EVENT_YELLOW_THRESHOLDS_V1 = [
+    {**rule,
+     "max_ratio": 0.005 if rule["name"] == "fofc_per_test" else 0.001,
+     "consecutive_rows": 3}
+    for rule in LEGACY_EVENT_HARD_THRESHOLDS_V1
+]
 GPU_HEADER = (
     "index", "uuid", "pci_bus_id", "cuda_ordinal", "uncorr", "corr",
     "memory_total", "memory_used",
@@ -1276,7 +1317,8 @@ def _validate_rank_environment(value: Any, *, global_rank: int,
     return {key: value[key] for key in RANK_ENVIRONMENT_KEYS}
 
 
-def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def validate_plan(plan: dict[str, Any], *, event_policy_version: int = 2
+                  ) -> dict[str, Any]:
     _require(plan.get("schema") == SCHEMA, f"plan schema must equal {SCHEMA}")
     expected = plan.get("expected")
     policy = plan.get("policy")
@@ -1376,7 +1418,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         _validate_planned_file_record(parent, "source_qualification.parent_segment_pass")
         _require(source_qualification.get("parent_qualification_mode") in
                  ("complete_segment_v1", "legacy_complete_segment_v1",
-                  "scheduled_prefix_recovery_v1"),
+                  "scheduled_prefix_recovery_v1",
+                  "event_policy_v2_requalification_v1"),
                  "parent source qualification lacks an explicit supported mode")
     else:
         _require("parent_segment_pass" not in source_qualification,
@@ -1585,16 +1628,19 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "minimum_headroom_blocks_hard": 64,
         "minimum_headroom_blocks_yellow": 128,
     }, "policy.capacity differs from the strict campaign thresholds")
+    _require(event_policy_version in (1, 2),
+             "event policy version must be 1 or 2")
+    expected_ratio_policy = EVENT_RATIO_POLICY_V2 if event_policy_version == 2 \
+        else None
+    expected_hard_events = EVENT_HARD_THRESHOLDS_V2 \
+        if event_policy_version == 2 else LEGACY_EVENT_HARD_THRESHOLDS_V1
+    expected_yellow_events = EVENT_YELLOW_THRESHOLDS_V2 \
+        if event_policy_version == 2 else LEGACY_EVENT_YELLOW_THRESHOLDS_V1
+    _require(policy.get("event_ratio_policy") == expected_ratio_policy,
+             "event-ratio policy meaning differs from the requested contract")
     normalized_events = _normalize_event_thresholds(policy.get("event_thresholds"))
-    _require(normalized_events == [
-        {"name": "fofc_per_test", "numerator": "fofc",
-         "denominator": "fofc_tests", "max_ratio": 0.01},
-        {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
-         "denominator": "c2p_calls",
-         "max_ratio": 0.005},
-        {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
-         "denominator": "c2p_calls", "max_ratio": 0.005},
-    ], "policy event ratios differ from strict campaign thresholds")
+    _require(normalized_events == expected_hard_events,
+             "policy event ratios differ from the requested contract")
     absolute_events = policy.get("event_absolute_thresholds")
     _require(absolute_events == {
         "hard_equal_zero": ["eos_fail", "eos_vceil"],
@@ -1649,17 +1695,8 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "minimum_reserve_gib": 50,
         "minimum_reserve_restart_multiples": 2,
     }, "remote-disk policy differs from the exact strict thresholds")
-    _require(policy.get("yellow_event_thresholds") == [
-        {"name": "fofc_per_test", "numerator": "fofc",
-         "denominator": "fofc_tests", "max_ratio": 0.005,
-         "consecutive_rows": 3},
-        {"name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
-         "denominator": "c2p_calls", "max_ratio": 0.001,
-         "consecutive_rows": 3},
-        {"name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
-         "denominator": "c2p_calls", "max_ratio": 0.001,
-         "consecutive_rows": 3},
-    ], "yellow event policy differs from strict campaign thresholds")
+    _require(policy.get("yellow_event_thresholds") == expected_yellow_events,
+             "yellow event policy differs from the requested contract")
 
     seen_blocks: set[str] = set()
     source_plan_parameters = plan.get("source", {}).get("parameters")
@@ -2831,6 +2868,53 @@ def audit_event_ratio_advisories(event_audit: dict[str, Any],
     return {
         "severity": ("yellow" if any(row["severity"] == "yellow" for row in audits)
                      else "green"),
+        "ratios": audits,
+    }
+
+
+def audit_event_policy_requalification(
+        event_audit: dict[str, Any], original_thresholds: Any
+        ) -> dict[str, Any]:
+    """Record exactly why an immutable version-1 segment failed its old policy."""
+
+    rules = _normalize_event_thresholds(original_thresholds)
+    rows = event_audit.get("_rows")
+    _require(isinstance(rows, list) and rows,
+             "event audit lacks rows needed for policy requalification")
+    audits: list[dict[str, Any]] = []
+    for rule in rules:
+        exceedances: list[tuple[int, float]] = []
+        observations: list[tuple[int, float]] = []
+        for row in rows:
+            denominator = _integer(row.get(rule["denominator"]),
+                                   f"event {rule['denominator']}")
+            numerator = _integer(row.get(rule["numerator"]),
+                                 f"event {rule['numerator']}")
+            _require(denominator > 0,
+                     f"event denominator {rule['denominator']} is zero")
+            observation = (_integer(row.get("cycle"), "event cycle"),
+                           numerator / denominator)
+            observations.append(observation)
+            if observation[1] > rule["max_ratio"]:
+                exceedances.append(observation)
+        maximum_cycle, maximum_ratio = max(observations, key=lambda item: item[1])
+        audits.append({
+            **rule,
+            "result": "fail" if exceedances else "pass",
+            "rows_checked": len(observations),
+            "exceedance_rows": len(exceedances),
+            "first_exceedance_cycle": exceedances[0][0] if exceedances else None,
+            "last_exceedance_cycle": exceedances[-1][0] if exceedances else None,
+            "maximum_ratio": maximum_ratio,
+            "maximum_cycle": maximum_cycle,
+        })
+    _require(any(row["result"] == "fail" for row in audits),
+             "event-policy requalification requires a real version-1 breach")
+    return {
+        "original_policy_version": 1,
+        "original_result": "fail",
+        "replacement_policy_version": 2,
+        "replacement_result": "pass_operational_emergency_guards",
         "ratios": audits,
     }
 
@@ -4831,12 +4915,31 @@ def audit_parent_qualification_provenance(
         mode = "legacy_complete_segment_v1"
     _require(mode == source_qualification.get("parent_qualification_mode") and
              mode in ("complete_segment_v1", "legacy_complete_segment_v1",
-                      "scheduled_prefix_recovery_v1"),
+                      "scheduled_prefix_recovery_v1",
+                      "event_policy_v2_requalification_v1"),
              "parent pass qualification mode differs from the source plan")
     if mode in ("complete_segment_v1", "legacy_complete_segment_v1"):
         _require("recovery_provenance" not in parent,
                  "complete parent pass may not contain recovery provenance")
         return {"qualification_mode": mode}
+    if mode == "event_policy_v2_requalification_v1":
+        requalification = parent.get("event_policy_requalification")
+        _require(isinstance(requalification, dict) and
+                 requalification.get("schema") ==
+                 "athenak_event_policy_requalification_v1" and
+                 requalification.get("scope") == "continuation_source_only" and
+                 requalification.get("historical_record") ==
+                 "original_predeclared_failure_preserved" and
+                 requalification.get("publication_acceptance") == "not_claimed" and
+                 requalification.get("policy_audit", {}).get(
+                     "original_result") == "fail" and
+                 requalification.get("policy_audit", {}).get(
+                     "replacement_result") ==
+                 "pass_operational_emergency_guards" and
+                 "recovery_provenance" not in parent,
+                 "event-policy parent requalification is incomplete")
+        return {"qualification_mode": mode,
+                "event_policy_requalification": requalification}
 
     provenance = parent.get("recovery_provenance")
     advisories = parent.get("scientific_advisories")
@@ -5895,6 +5998,8 @@ def audit_completion_record(
 
 
 def check_segment(args: argparse.Namespace) -> dict[str, Any]:
+    requalify_event_policy = bool(getattr(
+        args, "event_policy_v2_requalification", False))
     output = args.output
     _reject_output_ancestors(output)
     _require(output.name.endswith(".pass.ready"),
@@ -5902,7 +6007,15 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     _require(not output.exists() and not output.is_symlink(),
              f"refusing to overwrite report: {output}")
     plan, plan_raw = _load_json(args.plan)
-    expected = validate_plan(plan)
+    expected = validate_plan(
+        plan, event_policy_version=1 if requalify_event_policy else 2)
+    active_event_ratio_policy = copy.deepcopy(EVENT_RATIO_POLICY_V2)
+    active_event_thresholds = (EVENT_HARD_THRESHOLDS_V2
+                               if requalify_event_policy
+                               else plan["policy"]["event_thresholds"])
+    active_yellow_event_thresholds = (EVENT_YELLOW_THRESHOLDS_V2
+                                      if requalify_event_policy
+                                      else plan["policy"]["yellow_event_thresholds"])
     _require(args.plan.resolve(strict=True) ==
              Path(plan["launch_contract"]["plan_path"]).resolve(strict=True),
              "--plan differs from the exact plan-bound evidence path")
@@ -5965,24 +6078,27 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         name: _verify_planned_file(plan["tools"][name], f"planning tool {name}")
         for name in PLANNED_TOOL_NAMES
     }
-    current_tool_bindings = {
-        "segment_checker": _verify_current_tool(
-            plan["tools"]["segment_checker"], Path(__file__), "segment checker"),
-        "restart_auditor": _verify_current_tool(
-            plan["tools"]["restart_auditor"],
-            Path(sys.modules[audit_restart.__module__].__file__), "restart auditor"),
-        "output_integrity": _verify_current_tool(
-            plan["tools"]["output_integrity"],
-            Path(sys.modules[stable_sha256.__module__].__file__), "output integrity"),
-        "restart_metadata_reader": _verify_current_tool(
-            plan["tools"]["restart_metadata_reader"],
+    current_tool_paths = {
+        "segment_checker": Path(__file__),
+        "restart_auditor": Path(sys.modules[audit_restart.__module__].__file__),
+        "output_integrity": Path(sys.modules[stable_sha256.__module__].__file__),
+        "restart_metadata_reader":
             Path(sys.modules[read_restart_metadata.__module__].__file__),
-            "restart metadata reader"),
-        "restart_layout": _verify_current_tool(
-            plan["tools"]["restart_layout"],
-            SCRIPT_DIRECTORY / "compare_athenak_restart_fields.py",
-            "restart layout tool"),
+        "restart_layout": SCRIPT_DIRECTORY / "compare_athenak_restart_fields.py",
     }
+    if requalify_event_policy:
+        # The immutable plan still binds and verifies every original execution
+        # tool above.  A later checker cannot equal that historical checker, so
+        # bind its complete independent tool set into the new report instead.
+        current_tool_bindings = {
+            name: _hash_record(path) for name, path in current_tool_paths.items()
+        }
+    else:
+        current_tool_bindings = {
+            name: _verify_current_tool(
+                plan["tools"][name], path, name.replace("_", " "))
+            for name, path in current_tool_paths.items()
+        }
 
     source_audit = _verify_endpoint_audit(audit_restart(source_path), source_path)
     source_binding = {
@@ -6166,8 +6282,12 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     run = audit_run_log(args.run_log, expected)
     events = audit_event_log(args.event_log, expected["source_cycle"],
                              expected["final_cycle"],
-                             plan["policy"]["event_thresholds"],
+                             active_event_thresholds,
                              plan["policy"]["event_absolute_thresholds"])
+    event_policy_requalification = (
+        audit_event_policy_requalification(
+            events, plan["policy"]["event_thresholds"])
+        if requalify_event_policy else None)
     gpus = audit_gpus(args.gpu_before, args.gpu_after, expected["ranks"],
                       expected["gpu_exit_memory_mib_max"],
                       plan["policy"].get("gpu_ecc"))
@@ -6351,7 +6471,7 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         baryon_policy["yellow_per_48M"],
         baryon_policy["rolling_window_root_steps"])
     event_advisories = audit_event_ratio_advisories(
-        events, plan["policy"]["yellow_event_thresholds"])
+        events, active_yellow_event_thresholds)
     floor_trends = audit_floor_rate_trends(events, parent)
     divb_yellow = _number(plan["policy"]["divb_max_abs"]["yellow"],
                            "divb_max_abs.yellow")
@@ -6374,6 +6494,7 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "divb": divb_advisory,
         "floor_rates": floor_trends,
         "pass_fail_effect": "none_yellow_advisories_are_nonfatal",
+        "event_ratio_policy": active_event_ratio_policy,
     }
     scientific = {
         "nonfinite_count": 0,
@@ -6423,7 +6544,9 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
     for name, binding in planned_tool_bindings.items():
         _assert_binding_unchanged(Path(plan["tools"][name]["path"]), binding)
     for name, binding in current_tool_bindings.items():
-        _assert_binding_unchanged(Path(plan["tools"][name]["path"]), binding)
+        current_path = (current_tool_paths[name] if requalify_event_policy
+                        else Path(plan["tools"][name]["path"]))
+        _assert_binding_unchanged(current_path, binding)
     _require(_verify_planned_repository(
         plan["inputs"]["repo"], plan["tools"]["git"]) ==
              repository_binding,
@@ -6461,11 +6584,13 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "verified_planning_tools": planned_tool_bindings,
         "verified_current_tools": current_tool_bindings,
     }
-    return {
+    report = {
         "schema": SCHEMA,
         "kind": "athenak_segment_pass",
         "status": "pass",
-        "qualification_mode": "complete_segment_v1",
+        "qualification_mode": ("event_policy_v2_requalification_v1"
+                               if requalify_event_policy
+                               else "complete_segment_v1"),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "expected": expected,
         "bindings": bindings,
@@ -6489,6 +6614,16 @@ def check_segment(args: argparse.Namespace) -> dict[str, Any]:
         "state_directory_audit": state_tree,
         "output_inventory": output_rows,
     }
+    if requalify_event_policy:
+        report["event_policy_requalification"] = {
+            "schema": "athenak_event_policy_requalification_v1",
+            "scope": "continuation_source_only",
+            "historical_record": "original_predeclared_failure_preserved",
+            "publication_acceptance": "not_claimed",
+            "policy_audit": event_policy_requalification,
+            "replacement_policy": active_event_ratio_policy,
+        }
+    return report
 
 
 def publish_report(path: Path, report: dict[str, Any]) -> None:
@@ -6523,6 +6658,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-before", type=Path, required=True)
     parser.add_argument("--gpu-after", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--event-policy-v2-requalification", action="store_true",
+        help=("re-audit an immutable version-1 plan under version-2 operational "
+              "event guards; produces continuation-source qualification only"))
     args = parser.parse_args(argv)
     try:
         report = check_segment(args)

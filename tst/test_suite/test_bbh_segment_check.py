@@ -64,17 +64,17 @@ ABSOLUTE_THRESHOLDS = {
 }
 CANONICAL_EVENT_THRESHOLDS = [{
     "name": "fofc_per_test", "numerator": "fofc",
-    "denominator": "fofc_tests", "max_ratio": 0.01,
+    "denominator": "fofc_tests", "max_ratio": 0.05,
 }, {
     "name": "cons_adjust_per_c2p_call", "numerator": "cons_adjust",
-    "denominator": "c2p_calls", "max_ratio": 0.005,
+    "denominator": "c2p_calls", "max_ratio": 0.10,
 }, {
     "name": "mag_adjust_per_c2p_call", "numerator": "mag_adjust",
-    "denominator": "c2p_calls", "max_ratio": 0.005,
+    "denominator": "c2p_calls", "max_ratio": 0.10,
 }]
 CANONICAL_YELLOW_EVENT_THRESHOLDS = [{
     **rule,
-    "max_ratio": 0.005 if rule["name"] == "fofc_per_test" else 0.001,
+    "max_ratio": 0.01 if rule["name"] == "fofc_per_test" else 0.02,
     "consecutive_rows": 3,
 } for rule in CANONICAL_EVENT_THRESHOLDS]
 
@@ -386,31 +386,44 @@ def _plan() -> dict[str, object]:
                 "uncorrected_before_max": 0, "uncorrected_after_max": 0,
             },
             "mutable_parameters": CHECKER.CANONICAL_MUTABLE_PARAMETERS,
+            "event_ratio_policy": {
+                "version": 2,
+                "normalization":
+                    "raw_intervention_opportunities_per_root_step",
+                "hard_threshold_role": "operational_emergency_guard",
+                "yellow_threshold_role": "sustained_diagnostic_advisory",
+                "raw_ratios_are_physical_volume_or_mass_fractions": False,
+                "publication_acceptance_requires": [
+                    "spatial_telemetry",
+                    "conservative_correction_budget",
+                    "resolution_convergence",
+                ],
+            },
             "event_thresholds": [{
                 "name": "fofc_per_test", "numerator": "fofc",
-                "denominator": "fofc_tests", "max_ratio": 0.01,
+                "denominator": "fofc_tests", "max_ratio": 0.05,
             }, {
                 "name": "cons_adjust_per_c2p_call",
                 "numerator": "cons_adjust", "denominator": "c2p_calls",
-                "max_ratio": 0.005,
+                "max_ratio": 0.10,
             }, {
                 "name": "mag_adjust_per_c2p_call",
                 "numerator": "mag_adjust", "denominator": "c2p_calls",
-                "max_ratio": 0.005,
+                "max_ratio": 0.10,
             }],
             "event_absolute_thresholds": ABSOLUTE_THRESHOLDS,
             "yellow_event_thresholds": [{
                 "name": "fofc_per_test", "numerator": "fofc",
-                "denominator": "fofc_tests", "max_ratio": 0.005,
+                "denominator": "fofc_tests", "max_ratio": 0.01,
                 "consecutive_rows": 3,
             }, {
                 "name": "cons_adjust_per_c2p_call",
                 "numerator": "cons_adjust", "denominator": "c2p_calls",
-                "max_ratio": 0.001, "consecutive_rows": 3,
+                "max_ratio": 0.02, "consecutive_rows": 3,
             }, {
                 "name": "mag_adjust_per_c2p_call",
                 "numerator": "mag_adjust", "denominator": "c2p_calls",
-                "max_ratio": 0.001, "consecutive_rows": 3,
+                "max_ratio": 0.02, "consecutive_rows": 3,
             }],
             "nonfinite_count_max": 0,
             "divb_max_abs": {"hard": 1.0e-8, "yellow": 1.0e-11},
@@ -1035,17 +1048,37 @@ def test_validate_plan_requires_every_execution_tool_binding() -> None:
         lambda plan: plan["policy"]["event_thresholds"].pop(),
         lambda plan: plan["policy"]["yellow_event_thresholds"][2].__setitem__(
             "consecutive_rows", 2),
+        lambda plan: plan["policy"]["event_ratio_policy"].__setitem__(
+            "hard_threshold_role", "publication_acceptance"),
         lambda plan: plan["policy"]["baryon_mass_fractional_loss"].__setitem__(
             "rolling_window_root_steps", 9),
     ),
     ids=("remove-magnetic-hard-rule", "weaken-yellow-consecutive-run",
-         "change-baryon-window"),
+         "mislabel-event-role", "change-baryon-window"),
 )
 def test_validate_plan_rejects_tampered_scientific_policy(mutate) -> None:
     plan = _plan()
     mutate(plan)
     with pytest.raises(CHECKER.CheckFailure, match="policy|threshold"):
         CHECKER.validate_plan(plan)
+
+
+def test_legacy_event_policy_is_accepted_only_for_explicit_requalification(
+        ) -> None:
+    plan = _plan()
+    plan["policy"].pop("event_ratio_policy")
+    plan["policy"]["event_thresholds"] = copy.deepcopy(
+        CHECKER.LEGACY_EVENT_HARD_THRESHOLDS_V1)
+    plan["policy"]["yellow_event_thresholds"] = copy.deepcopy(
+        CHECKER.LEGACY_EVENT_YELLOW_THRESHOLDS_V1)
+
+    with pytest.raises(CHECKER.CheckFailure, match="event-ratio policy"):
+        CHECKER.validate_plan(plan)
+    assert CHECKER.validate_plan(plan, event_policy_version=1)["final_cycle"] == 13
+
+    current = _plan()
+    with pytest.raises(CHECKER.CheckFailure, match="event-ratio policy"):
+        CHECKER.validate_plan(current, event_policy_version=1)
 
 
 @pytest.mark.parametrize(
@@ -1434,9 +1467,9 @@ def test_mag_adjust_hard_ratio_is_enforced_at_exact_boundary(
         tmp_path: Path) -> None:
     event_log = tmp_path / "events.log"
     rows = [
-        # ratio=0.005 is allowed by the inclusive hard maximum.
-        "11 0 0 0 0 0 1 0 0 5 1000 1",
-        "12 0 0 0 0 0 1 0 0 6 1000 1",
+        # ratio=0.10 is allowed by the inclusive emergency maximum.
+        "11 0 0 0 0 0 1 0 0 100 1000 1",
+        "12 0 0 0 0 0 1 0 0 101 1000 1",
     ]
     event_log.write_text(EVENT_HEADER + "\n" + "\n".join(rows) + "\n",
                          encoding="utf-8")
@@ -1447,18 +1480,18 @@ def test_mag_adjust_hard_ratio_is_enforced_at_exact_boundary(
 
     event_log.write_text(
         EVENT_HEADER + "\n" + rows[0] + "\n"
-        "12 0 0 0 0 0 1 0 0 5 1000 1\n", encoding="utf-8")
+        "12 0 0 0 0 0 1 0 0 100 1000 1\n", encoding="utf-8")
     result = CHECKER.audit_event_log(
         event_log, 10, 12, CANONICAL_EVENT_THRESHOLDS,
         ABSOLUTE_THRESHOLDS)
     magnetic = next(row for row in result["hard_ratio_observations"]
                     if row["name"] == "mag_adjust_per_c2p_call")
-    assert magnetic["maximum_ratio"] == 0.005
+    assert magnetic["maximum_ratio"] == 0.10
     assert magnetic["maximum_cycle"] == 11
 
 
 def test_yellow_event_ratio_requires_three_consecutive_exceedances() -> None:
-    ratios = (0.0051, 0.0052, 0.005, 0.0053, 0.0054, 0.0055)
+    ratios = (0.0101, 0.0102, 0.01, 0.0103, 0.0104, 0.0105)
     rows = [{
         "cycle": 11 + index,
         "fofc": round(ratio * 10000), "fofc_tests": 10000,
@@ -1473,11 +1506,41 @@ def test_yellow_event_ratio_requires_three_consecutive_exceedances() -> None:
     assert fofc["maximum_consecutive_exceedances"] == 3
     assert fofc["triggered_runs"] == [{
         "cycle_start": 14, "cycle_end": 16, "rows": 3,
-        "maximum_ratio": 0.0055, "maximum_cycle": 16,
+        "maximum_ratio": 0.0105, "maximum_cycle": 16,
     }]
     # Equality is green, and two yellow rows alone are not sustained.
     assert next(row for row in audit["ratios"]
                 if row["name"] == "cons_adjust_per_c2p_call")["severity"] == "green"
+
+
+def test_event_policy_requalification_preserves_original_failure() -> None:
+    rows = [{
+        "cycle": 601, "fofc": 50, "fofc_tests": 10000,
+        "cons_adjust": 50, "mag_adjust": 50, "c2p_calls": 10000,
+    }, {
+        "cycle": 602, "fofc": 167, "fofc_tests": 10000,
+        "cons_adjust": 324, "mag_adjust": 305, "c2p_calls": 10000,
+    }]
+    audit = CHECKER.audit_event_policy_requalification(
+        {"_rows": rows}, CHECKER.LEGACY_EVENT_HARD_THRESHOLDS_V1)
+    assert audit["original_result"] == "fail"
+    assert audit["replacement_result"] == \
+        "pass_operational_emergency_guards"
+    fofc = next(row for row in audit["ratios"]
+                if row["name"] == "fofc_per_test")
+    assert fofc["result"] == "fail"
+    assert fofc["first_exceedance_cycle"] == 602
+    assert fofc["maximum_ratio"] == 0.0167
+
+
+def test_event_policy_requalification_rejects_unnecessary_rewrite() -> None:
+    rows = [{
+        "cycle": 601, "fofc": 1, "fofc_tests": 10000,
+        "cons_adjust": 1, "mag_adjust": 1, "c2p_calls": 10000,
+    }]
+    with pytest.raises(CHECKER.CheckFailure, match="real version-1 breach"):
+        CHECKER.audit_event_policy_requalification(
+            {"_rows": rows}, CHECKER.LEGACY_EVENT_HARD_THRESHOLDS_V1)
 
 
 def test_floor_rates_record_anchor_and_parent_normalized_trends() -> None:

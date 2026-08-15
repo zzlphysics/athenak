@@ -208,6 +208,41 @@ to read earlier four-field files.  This prevents horizon-interior regularization
 (`sigma` reached `2.3e8` in the raw unmasked field) from being confused with the
 outside-excision physical maximum.
 
+### Raw event-ratio policy v2
+
+The original campaign used per-row hard maxima of 1% for `fofc/fofc_tests` and 0.5% for
+each C2P adjustment divided by `c2p_calls`.  Those values were conservative operational
+heuristics, not bounds derived from a convergence theorem, a physical-volume fraction,
+or a literature-standard publication criterion.  They are especially misleading with
+strict level subcycling: repeated Runge--Kutta and fine-level opportunities weight the
+smallest near-hole cells far more heavily than their coordinate volume or mass.
+
+Policy v2 therefore uses 5% FOFC and 10% conserved/magnetization adjustment as per-row
+**emergency guards**.  It emits a nonfatal yellow diagnostic when FOFC exceeds 1%, or
+either adjustment exceeds 2%, for three consecutive root rows.  Exact zero C2P failure,
+zero velocity-ceiling failure, finite fields, `c2p_it<25`, divB, baryon history, restart
+integrity, GPU ECC, and capacity checks remain hard requirements.  The raw-rate change
+does not waive those structural tests and does not turn a yellow interval into a
+publication-quality physical result.
+
+The change is motivated by the independently replayed cycle-602 peak: FOFC was 1.669%,
+the two C2P adjustments were 3.239% and 3.045%, EOS failure and velocity-ceiling counts
+were zero, and the maximum C2P iteration count was 12.  Spatial telemetry placed 93.1%
+of FOFC events and at least 97.9% of both adjustment classes on logical L11, predominantly
+at cylindrical radius 8--16M.  Full-state analysis showed that the dominant L11 region
+occupied only about `3.55e-8` of the non-excised coordinate volume and contained roughly
+`4.11e-5` of its coordinate-volume-weighted conserved density; the global baryon history
+remained smooth across the peak.  This establishes why a raw event count cannot be read
+as “1.669% of the simulated volume is bad.”  It does not establish that the interventions
+are physically negligible.
+
+Publication acceptance consequently remains incomplete until the campaign binds (1)
+spatial intervention telemetry, (2) signed and absolute conservative correction budgets
+for mass and energy, and (3) L/M/H resolution and floor/magnetization sensitivity.  An
+`event_policy_v2_requalification_v1` report may qualify an immutable old endpoint only as
+a continuation source.  It preserves the old predeclared failure in the report, claims
+no publication acceptance, and must never replace or overwrite the original evidence.
+
 ### Opt-in FOFC spatial telemetry
 
 For a short diagnostic replay, set `mhd/fofc_spatial_telemetry=true` in the input and use

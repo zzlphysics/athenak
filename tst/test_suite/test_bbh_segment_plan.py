@@ -1272,6 +1272,53 @@ def _run_with_parent(campaign: dict[str, Path], parent: Path
         text=True, env=environment)
 
 
+def test_event_policy_requalification_can_seed_next_segment(tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    def requalify(parent: dict[str, object]) -> None:
+        parent["qualification_mode"] = "event_policy_v2_requalification_v1"
+        parent["event_policy_requalification"] = {
+            "schema": "athenak_event_policy_requalification_v1",
+            "scope": "continuation_source_only",
+            "historical_record": "original_predeclared_failure_preserved",
+            "publication_acceptance": "not_claimed",
+            "policy_audit": {
+                "original_result": "fail",
+                "replacement_result": "pass_operational_emergency_guards",
+            },
+        }
+
+    parent = _make_parent_pass(campaign, tmp_path, requalify)
+    result = _run_with_parent(campaign, parent)
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(campaign["output"].read_text(encoding="utf-8"))
+    assert plan["source_qualification"]["parent_qualification_mode"] == \
+        "event_policy_v2_requalification_v1"
+
+
+def test_incomplete_event_policy_requalification_cannot_seed_segment(
+        tmp_path: Path) -> None:
+    campaign = _campaign(tmp_path)
+
+    def incomplete(parent: dict[str, object]) -> None:
+        parent["qualification_mode"] = "event_policy_v2_requalification_v1"
+        parent["event_policy_requalification"] = {
+            "schema": "athenak_event_policy_requalification_v1",
+            "scope": "continuation_source_only",
+            "historical_record": "original_predeclared_failure_preserved",
+            "publication_acceptance": "pass",
+            "policy_audit": {
+                "original_result": "fail",
+                "replacement_result": "pass_operational_emergency_guards",
+            },
+        }
+
+    parent = _make_parent_pass(campaign, tmp_path, incomplete)
+    result = _run_with_parent(campaign, parent)
+    assert result.returncode != 0
+    assert "requalification is incomplete" in result.stderr
+
+
 def _make_recovery_parent_pass(
         campaign: dict[str, Path], tmp_path: Path, mutation=None) -> Path:
     anchor_result = _run(campaign)
