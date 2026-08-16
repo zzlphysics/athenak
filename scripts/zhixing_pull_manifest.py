@@ -2532,6 +2532,54 @@ def optional_remote_record(sftp: paramiko.SFTPClient, path: str) -> bytes | None
         return None
 
 
+def repair_mode_zero_segment_lock_at(parent_descriptor: int, name: str) -> None:
+    """Restore owner access to one pinned legacy NFS lock inode."""
+
+    try:
+        visible = stat_regular_at(parent_descriptor, name)
+    except FileNotFoundError:
+        return
+    if stat.S_IMODE(visible.st_mode) != 0:
+        return
+    if (
+        visible.st_uid != os.geteuid()
+        or visible.st_nlink != 1
+        or visible.st_size > 128
+    ):
+        raise RuntimeError(f"unsafe mode-000 segment lock: {name}")
+    path_flag = getattr(os, "O_PATH", None)
+    if path_flag is None or not Path("/proc/self/fd").is_dir():
+        raise RuntimeError("mode-000 lock recovery requires Linux O_PATH and /proc")
+    descriptor = os.open(
+        name,
+        path_flag | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        pinned = os.fstat(descriptor)
+        if _mode_recovery_identity(pinned) != _mode_recovery_identity(visible):
+            raise RuntimeError(f"mode-000 segment lock changed while pinning: {name}")
+        os.chmod(f"/proc/self/fd/{descriptor}", 0o600)
+        repaired = os.fstat(descriptor)
+        if (
+            _mode_recovery_identity(repaired) != _mode_recovery_identity(pinned)
+            or stat.S_IMODE(repaired.st_mode) != 0o600
+        ):
+            raise RuntimeError(f"mode-000 segment lock changed while repairing: {name}")
+        visible_after = stat_regular_at(parent_descriptor, name)
+        if (
+            (visible_after.st_dev, visible_after.st_ino)
+            != (repaired.st_dev, repaired.st_ino)
+            or stat.S_IMODE(visible_after.st_mode) != 0o600
+        ):
+            raise RuntimeError(
+                f"mode-000 segment lock path changed while repairing: {name}"
+            )
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class SegmentLock:
     def __init__(self, destination: DestinationRoot, segment: str) -> None:
         self.destination = destination
@@ -2544,6 +2592,12 @@ class SegmentLock:
             (".locks",),
             create=True,
         )
+        try:
+            repair_mode_zero_segment_lock_at(self.parent_descriptor, self.name)
+        except BaseException:
+            os.close(self.parent_descriptor)
+            self.parent_descriptor = None
+            raise
         try:
             self.descriptor = os.open(
                 self.name,
@@ -2571,10 +2625,20 @@ class SegmentLock:
         except BaseException:
             self.__exit__()
             raise
-        os.ftruncate(self.descriptor, 0)
-        os.write(self.descriptor, f"pid={os.getpid()}\n".encode("ascii"))
-        os.fsync(self.descriptor)
-        os.fsync(self.parent_descriptor)
+        try:
+            os.fchmod(self.descriptor, 0o600)
+            repaired = os.fstat(self.descriptor)
+            if stat.S_IMODE(repaired.st_mode) != 0o600:
+                raise RuntimeError(
+                    f"segment lock mode could not be stabilized: {self.name}"
+                )
+            os.ftruncate(self.descriptor, 0)
+            os.write(self.descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+            os.fsync(self.descriptor)
+            os.fsync(self.parent_descriptor)
+        except BaseException:
+            self.__exit__()
+            raise
         return self
 
     def __exit__(self, *unused: object) -> None:

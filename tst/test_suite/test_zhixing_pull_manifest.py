@@ -125,6 +125,22 @@ def test_immutable_write_rejects_a_writable_existing_record(tmp_path: Path) -> N
         PULLER.immutable_write(record, b"same\n")
 
 
+def test_segment_lock_recovers_pinned_mode_zero_nfs_inode(tmp_path: Path) -> None:
+    destination_path = tmp_path / "destination"
+    locks = destination_path / ".locks"
+    locks.mkdir(parents=True)
+    lock_path = locks / "segment.lock"
+    lock_path.write_text("pid=123\n", encoding="ascii")
+    lock_path.chmod(0)
+
+    with PULLER.DestinationRoot(destination_path) as destination:
+        with PULLER.SegmentLock(destination, "segment"):
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+            assert lock_path.read_text(encoding="ascii") == f"pid={os.getpid()}\n"
+
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
 def test_immutable_write_recovers_linked_temporary_alias(tmp_path: Path) -> None:
     record = tmp_path / "records" / "segment.ack"
     record.parent.mkdir()
