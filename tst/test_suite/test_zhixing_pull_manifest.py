@@ -660,7 +660,9 @@ def test_range_hash_mismatch_quarantines_only_bad_piece(
     payload = b"local-range"
     piece = tmp_path / "payload.part.piece01"
     piece.write_bytes(payload)
-    validation = _DownloadValidation([_DownloadClient(payload)], len(payload))
+    validation = _DownloadValidation(
+        [_DownloadClient(payload) for _ in range(3)], len(payload)
+    )
     monkeypatch.setattr(
         PULLER,
         "remote_range_sha256",
@@ -688,6 +690,108 @@ def test_range_hash_mismatch_quarantines_only_bad_piece(
     assert len(evidence) == 1
     assert evidence[0].read_bytes() == payload
     assert stat.S_IMODE(evidence[0].stat().st_mode) == 0o400
+
+
+def test_transient_initial_range_mismatch_requires_two_matching_confirmations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"stable-range"
+    expected_digest = PULLER.hashlib.sha256(payload).hexdigest()
+    piece = tmp_path / "payload.part.piece00"
+    piece.write_bytes(payload)
+    validation = _DownloadValidation(
+        [_DownloadClient(payload) for _ in range(3)], len(payload)
+    )
+    real_hash = PULLER.sha256_regular_at
+    local_calls = 0
+    remote_calls = 0
+
+    def transient_first_local(*args, **kwargs):
+        nonlocal local_calls
+        info, digest = real_hash(*args, **kwargs)
+        local_calls += 1
+        if local_calls == 1:
+            return info, PULLER.hashlib.sha256(b"transient-read").hexdigest()
+        return info, digest
+
+    def stable_remote(*_args):
+        nonlocal remote_calls
+        remote_calls += 1
+        return expected_digest
+
+    monkeypatch.setattr(PULLER, "sha256_regular_at", transient_first_local)
+    monkeypatch.setattr(PULLER, "remote_range_sha256", stable_remote)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        proof = PULLER.download_verified_piece(
+            object(),
+            "/remote/payload",
+            os.dup(parent),
+            piece.name,
+            0,
+            len(payload),
+            0,
+            validation,
+            _remote_download_identity(len(payload)),
+        )
+    finally:
+        os.close(parent)
+
+    assert proof.sha256 == expected_digest
+    assert local_calls == 3
+    assert remote_calls == 3
+    assert piece.read_bytes() == payload
+    assert stat.S_IMODE(piece.stat().st_mode) == 0o400
+    assert not list(tmp_path.glob("range-*.bad"))
+
+
+def test_unstable_range_proof_preserves_piece_without_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"preserve-range"
+    piece = tmp_path / "payload.part.piece00"
+    piece.write_bytes(payload)
+    validation = _DownloadValidation(
+        [_DownloadClient(payload) for _ in range(3)], len(payload)
+    )
+    real_hash = PULLER.sha256_regular_at
+    fake_digests = iter(
+        PULLER.hashlib.sha256(value).hexdigest()
+        for value in (b"first-read", b"second-read", b"third-read")
+    )
+
+    def unstable_local(*args, **kwargs):
+        info, _digest = real_hash(*args, **kwargs)
+        return info, next(fake_digests)
+
+    monkeypatch.setattr(PULLER, "sha256_regular_at", unstable_local)
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda *_args: PULLER.hashlib.sha256(b"remote-range").hexdigest(),
+    )
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(PULLER.RangeProofInstability, match="preserving"):
+            PULLER.download_verified_piece(
+                object(),
+                "/remote/payload",
+                os.dup(parent),
+                piece.name,
+                0,
+                len(payload),
+                0,
+                validation,
+                _remote_download_identity(len(payload)),
+            )
+    finally:
+        os.close(parent)
+
+    assert piece.read_bytes() == payload
+    assert stat.S_IMODE(piece.stat().st_mode) == 0o400
+    assert not list(tmp_path.glob("range-*.bad"))
 
 
 def test_prove_existing_parallel_pieces_only_proves_present_ranges(

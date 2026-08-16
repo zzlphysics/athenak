@@ -42,6 +42,7 @@ FSYNC_INTERVAL = 512 * 1024 * 1024
 MIN_RESERVE = 50 * 1024 * 1024 * 1024
 PARALLEL_THRESHOLD = 512 * 1024 * 1024
 PARALLEL_STREAMS = 2
+MISMATCH_CONFIRMATION_ROUNDS = 2
 CONNECT_ATTEMPTS = 5
 CONNECT_BACKOFF_SECONDS = 5.0
 STREAM_RECONNECT_ATTEMPTS = 4
@@ -1040,6 +1041,10 @@ class RangeHashMismatch(RuntimeError):
     """A completed local range differs from the same pinned remote range."""
 
 
+class RangeProofInstability(RuntimeError):
+    """Independent range proofs disagree, so the payload must be preserved."""
+
+
 REMOTE_RETRYABLE_ERRORS = (
     EOFError,
     socket.timeout,
@@ -1829,6 +1834,81 @@ def verify_completed_piece(
                 f"range hash {number} {piece_name}",
             )
     if local_digest != remote_digest:
+        # A single mismatch is not sufficient evidence for a destructive
+        # quarantine.  In particular, a transient local/NFS read anomaly or a
+        # transient source-side hash anomaly can disappear while the payload
+        # inode and the pinned remote identity remain unchanged.  Require two
+        # fresh, mutually agreeing local/remote proofs before accepting that
+        # transient recovery.  Conversely, quarantine only when all three
+        # independent proof pairs reproduce the same stable mismatch.
+        local_checks = [(info, local_digest)]
+        remote_checks = [remote_digest]
+        for confirmation in range(1, MISMATCH_CONFIRMATION_ROUNDS + 1):
+            confirmed_info, confirmed_local = sha256_regular_at(
+                parent_descriptor,
+                piece_name,
+                sync=True,
+                seal_read_only=True,
+            )
+            if confirmed_info.st_size != end - start:
+                raise RuntimeError(
+                    f"range {number} size mismatch during confirmation"
+                )
+            with RANGE_HASH_LOCK:
+                with ValidatedRemoteSession(validation) as session:
+                    confirmed_remote = remote_range_sha256(
+                        session,
+                        remote_path,
+                        expected_remote_identity,
+                        start,
+                        end,
+                        f"range hash confirmation {confirmation} "
+                        f"{number} {piece_name}",
+                    )
+            local_checks.append((confirmed_info, confirmed_local))
+            remote_checks.append(confirmed_remote)
+
+        identities = [_identity(check_info) for check_info, _ in local_checks]
+        local_digests = [check_digest for _, check_digest in local_checks]
+        confirmations_match = (
+            len(set(identities)) == 1
+            and len(set(local_digests[1:])) == 1
+            and len(set(remote_checks[1:])) == 1
+            and local_digests[-1] == remote_checks[-1]
+        )
+        if confirmations_match:
+            info, local_digest = local_checks[-1]
+            with PRINT_LOCK:
+                print(
+                    f"{piece_name}: initial range proof mismatch disappeared "
+                    "in two independent confirmations; accepting the "
+                    "reconfirmed immutable range",
+                    flush=True,
+                )
+            return RangeProof(
+                number,
+                start,
+                end,
+                piece_name,
+                local_digest,
+                _identity(info),
+            )
+
+        stable_mismatch = (
+            len(set(identities)) == 1
+            and len(set(local_digests)) == 1
+            and len(set(remote_checks)) == 1
+        )
+        if not stable_mismatch:
+            local_summary = ",".join(digest[:12] for digest in local_digests)
+            remote_summary = ",".join(digest[:12] for digest in remote_checks)
+            raise RangeProofInstability(
+                f"range {number} proof was not reproducible; preserving "
+                f"{piece_name}; local={local_summary} remote={remote_summary}"
+            )
+
+        # All independent reads reproduce the same mismatch, so the exact
+        # sealed inode can now be retained as immutable evidence.
         key = hashlib.sha256(piece_name.encode("utf-8")).hexdigest()[:12]
         evidence = (
             f"range-{key}-{number:02d}-{start}-{end}-"
