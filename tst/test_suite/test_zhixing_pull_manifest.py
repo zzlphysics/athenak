@@ -190,6 +190,34 @@ def test_regular_hash_rejects_symlinks_and_hardlinks(tmp_path: Path) -> None:
         PULLER.sha256_regular(source)
 
 
+def test_regular_hash_can_evict_verified_payload_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"0123456789")
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "HASH_CACHE_WINDOW", 4)
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        PULLER.os,
+        "posix_fadvise",
+        lambda _descriptor, offset, length, advice:
+            calls.append((offset, length, advice)),
+    )
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        PULLER.sha256_regular_at(parent, payload.name, evict_after=True)
+    finally:
+        os.close(parent)
+
+    assert calls == [
+        (0, 4, PULLER.os.POSIX_FADV_DONTNEED),
+        (4, 4, PULLER.os.POSIX_FADV_DONTNEED),
+        (0, 0, PULLER.os.POSIX_FADV_DONTNEED),
+    ]
+
+
 def test_secure_destination_rejects_symlinked_payload_parent(tmp_path: Path) -> None:
     destination = tmp_path / "destination"
     outside = tmp_path / "outside"
@@ -551,12 +579,22 @@ def test_preopened_writer_can_invalidate_payload_but_not_authorize_cleanup(
 def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> None:
     parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     partial_name = "dump.part"
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "ASSEMBLY_CACHE_WINDOW", 4)
     piece0 = tmp_path / f"{partial_name}.piece00"
     piece1 = tmp_path / f"{partial_name}.piece01"
     piece0.write_bytes(b"a" * PULLER.CHUNK)
     piece1.write_bytes(b"b")
     (tmp_path / f"{partial_name}.assembling").write_bytes(b"stale")
     monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+    evictions: list[tuple[str, int, int]] = []
+
+    def record_eviction(descriptor: int, offset: int, length: int) -> None:
+        evictions.append(
+            (Path(os.readlink(f"/proc/self/fd/{descriptor}")).name, offset, length)
+        )
+
+    monkeypatch.setattr(PULLER, "evict_cached_range", record_eviction)
     monkeypatch.setattr(
         PULLER,
         "download_verified_piece",
@@ -581,6 +619,12 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
     assert (tmp_path / partial_name).read_bytes() == b"a" * PULLER.CHUNK + b"b"
     assert not (tmp_path / f"{partial_name}.assembling").exists()
     assert piece0.exists() and piece1.exists()
+    assembly_evictions = [
+        (offset, length)
+        for name, offset, length in evictions
+        if name == f"{partial_name}.assembling"
+    ]
+    assert assembly_evictions == [(0, 4), (4, 1)]
 
 
 def test_parallel_ranges_are_ordered_and_uneven(monkeypatch) -> None:
@@ -1017,6 +1061,12 @@ def test_download_rotates_transport_before_rekey_threshold(
     clients = [_DownloadClient(payload) for _ in range(3)]
     validation = _DownloadValidation(clients, len(payload))
     monkeypatch.setattr(PULLER, "STREAM_WINDOW_BYTES", 4)
+    evictions: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        PULLER,
+        "evict_cached_range",
+        lambda _descriptor, offset, length: evictions.append((offset, length)),
+    )
     parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
 
     PULLER.download_range(
@@ -1033,6 +1083,7 @@ def test_download_rotates_transport_before_rekey_threshold(
 
     assert (tmp_path / "payload.part").read_bytes() == payload
     assert validation.opens == 3
+    assert evictions == [(0, 4), (4, 4), (8, 2)]
     assert [client.commands[0] for client in clients] == [
         "dd if=/remote/payload iflag=skip_bytes,count_bytes skip=0 count=4 status=none",
         "dd if=/remote/payload iflag=skip_bytes,count_bytes skip=4 count=4 status=none",

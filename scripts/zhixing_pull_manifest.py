@@ -39,6 +39,8 @@ DEFAULT_SSH_STATE = Path("/tmp/zhixing_l4_ssh.private.json")
 CHUNK = 8 * 1024 * 1024
 PROGRESS_INTERVAL = 256 * 1024 * 1024
 FSYNC_INTERVAL = 512 * 1024 * 1024
+HASH_CACHE_WINDOW = 128 * 1024 * 1024
+ASSEMBLY_CACHE_WINDOW = 128 * 1024 * 1024
 MIN_RESERVE = 50 * 1024 * 1024 * 1024
 PARALLEL_THRESHOLD = 512 * 1024 * 1024
 PARALLEL_STREAMS = 2
@@ -434,6 +436,7 @@ def sha256_regular_at(
     sync: bool = False,
     seal_read_only: bool = False,
     require_single_link: bool = True,
+    evict_after: bool = False,
 ) -> tuple[os.stat_result, str]:
     before_path = stat_regular_at(
         parent_descriptor,
@@ -471,13 +474,25 @@ def sha256_regular_at(
             )
             if _identity(before) != _identity(sealed_path):
                 raise RuntimeError(f"file changed while sealing read-only: {name}")
+        hashed = 0
+        cache_evicted = 0
         while True:
             chunk = os.read(descriptor, CHUNK)
             if not chunk:
                 break
             digest.update(chunk)
+            hashed += len(chunk)
+            if evict_after and hashed - cache_evicted >= HASH_CACHE_WINDOW:
+                evict_cached_range(
+                    descriptor,
+                    cache_evicted,
+                    hashed - cache_evicted,
+                )
+                cache_evicted = hashed
         if sync:
             os.fsync(descriptor)
+        if evict_after:
+            evict_cached_range(descriptor, 0, 0)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -490,6 +505,26 @@ def sha256_regular_at(
     if _identity(before) != _identity(after) or _identity(after) != _identity(after_path):
         raise RuntimeError(f"file changed while hashing: {name}")
     return after, digest.hexdigest()
+
+
+def evict_cached_range(descriptor: int, offset: int, length: int) -> None:
+    """Drop a durable streaming range from the caller's page-cache charge."""
+
+    if offset < 0 or length < 0:
+        raise ValueError("cache eviction range must be non-negative")
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or dontneed is None:
+        raise RuntimeError(
+            "bounded transfer caching requires POSIX_FADV_DONTNEED"
+        )
+    try:
+        advise(descriptor, offset, length, dontneed)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot evict durable transfer cache range [{offset},"
+            f"{offset + length})"
+        ) from exc
 
 
 def _mode_recovery_identity(info: os.stat_result) -> tuple[int, ...]:
@@ -572,6 +607,7 @@ def hash_manifest_final_at(
         sync=sync,
         seal_read_only=seal_read_only,
         require_single_link=require_single_link,
+        evict_after=True,
     )
     if info.st_size != expected_size or digest != expected_digest:
         raise RuntimeError(f"manifest verification failed for final file: {name}")
@@ -1490,6 +1526,17 @@ def _append_validated_window(
         if opened_size != current:
             stream.close()
             raise RuntimeError(f"partial changed while opening: {piece_name}")
+
+        def sync_received_window() -> None:
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fsync(parent_descriptor)
+            evict_cached_range(
+                stream.fileno(),
+                opened_size,
+                current - opened_size,
+            )
+
         try:
             while current < target_size:
                 chunk = retryable_remote_io(
@@ -1506,18 +1553,14 @@ def _append_validated_window(
                         raise OSError("short local partial write")
                     current += written
                     view = view[written:]
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.fsync(parent_descriptor)
+            sync_received_window()
         except BaseException as transfer_error:
             # Preserve all complete bytes already returned by recv().  The next
             # validated connection derives its skip offset only from this durable
             # inode.  A local flush/fsync error must override an SSH error so it can
             # never be misclassified as reconnectable.
             try:
-                stream.flush()
-                os.fsync(stream.fileno())
-                os.fsync(parent_descriptor)
+                sync_received_window()
             except BaseException as durability_error:
                 raise durability_error from transfer_error
             raise
@@ -1754,7 +1797,7 @@ def download_range(
                     f"{(offset / elapsed) / (1024 * 1024):.2f} MiB/s",
                     flush=True,
                 )
-        info, _ = sha256_regular_at(parent_descriptor, piece_name)
+        info = stat_regular_at(parent_descriptor, piece_name)
         if info.st_size != expected:
             raise RuntimeError(f"range {number} size mismatch")
         return expected, time.monotonic() - started
@@ -1818,6 +1861,7 @@ def verify_completed_piece(
         piece_name,
         sync=True,
         seal_read_only=True,
+        evict_after=True,
     )
     if info.st_size != end - start:
         raise RuntimeError(f"range {number} size mismatch before proof")
@@ -1849,6 +1893,7 @@ def verify_completed_piece(
                 piece_name,
                 sync=True,
                 seal_read_only=True,
+                evict_after=True,
             )
             if confirmed_info.st_size != end - start:
                 raise RuntimeError(
@@ -2043,8 +2088,14 @@ def parallel_download(
         # altered the requested create mode.
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=False) as output:
+            written = 0
+            output_evicted = 0
             for proof in proofs:
-                info, digest = sha256_regular_at(parent_descriptor, proof.name)
+                info, digest = sha256_regular_at(
+                    parent_descriptor,
+                    proof.name,
+                    evict_after=True,
+                )
                 if info.st_size != proof.end - proof.start or digest != proof.sha256:
                     raise RuntimeError(
                         f"range {proof.number} changed before assembly"
@@ -2054,10 +2105,41 @@ def parallel_download(
                     os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=parent_descriptor,
                 )
-                with os.fdopen(source_descriptor, "rb") as source:
-                    shutil.copyfileobj(source, output, length=CHUNK)
+                with os.fdopen(source_descriptor, "rb", buffering=0) as source:
+                    source_consumed = 0
+                    source_evicted = 0
+                    while True:
+                        chunk = source.read(CHUNK)
+                        if not chunk:
+                            break
+                        copied = output.write(chunk)
+                        if copied != len(chunk):
+                            raise OSError("short parallel assembly write")
+                        written += copied
+                        source_consumed += copied
+                        if written - output_evicted >= ASSEMBLY_CACHE_WINDOW:
+                            output.flush()
+                            os.fsync(output.fileno())
+                            evict_cached_range(
+                                output.fileno(),
+                                output_evicted,
+                                written - output_evicted,
+                            )
+                            output_evicted = written
+                            evict_cached_range(
+                                source.fileno(),
+                                source_evicted,
+                                source_consumed - source_evicted,
+                            )
+                            source_evicted = source_consumed
+                    evict_cached_range(source.fileno(), 0, 0)
             output.flush()
             os.fsync(output.fileno())
+            evict_cached_range(
+                output.fileno(),
+                output_evicted,
+                written - output_evicted,
+            )
     finally:
         os.close(descriptor)
     if stat_regular_at(parent_descriptor, assembling_name).st_size != expected_size:
@@ -2081,7 +2163,11 @@ def cleanup_parallel_pieces(
     changed = False
     for proof in sorted(proofs, key=lambda item: item.number):
         try:
-            info, digest = sha256_regular_at(parent_descriptor, proof.name)
+            info, digest = sha256_regular_at(
+                parent_descriptor,
+                proof.name,
+                evict_after=True,
+            )
         except FileNotFoundError:
             continue
         if (
@@ -2293,6 +2379,7 @@ def transfer_file(
             partial_parent,
             partial_name,
             sync=True,
+            evict_after=True,
         )
         if partial_info.st_size != expected_size or digest != expected_digest:
             key = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()[:12]
