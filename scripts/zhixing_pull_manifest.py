@@ -41,6 +41,7 @@ PROGRESS_INTERVAL = 256 * 1024 * 1024
 FSYNC_INTERVAL = 512 * 1024 * 1024
 HASH_CACHE_WINDOW = 128 * 1024 * 1024
 ASSEMBLY_CACHE_WINDOW = 128 * 1024 * 1024
+PARALLEL_ASSEMBLY_ATTEMPTS = 3
 MIN_RESERVE = 50 * 1024 * 1024 * 1024
 PARALLEL_THRESHOLD = 512 * 1024 * 1024
 PARALLEL_STREAMS = 2
@@ -2017,6 +2018,157 @@ def prove_existing_parallel_pieces(
     return proofs
 
 
+def _write_parallel_assembly(
+    parent_descriptor: int,
+    assembling_name: str,
+    proofs: list[RangeProof],
+) -> int:
+    """Create one fresh assembly attempt from sealed, independently proved ranges."""
+
+    descriptor = os.open(
+        assembling_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        # Match the per-range partial contract even if an NFS ACL or umask
+        # altered the requested create mode.  Unbuffered writes make every
+        # successful byte count correspond to a completed write(2), rather than
+        # merely accepting bytes into a userspace buffer before the next fsync.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", buffering=0, closefd=False) as output:
+            written = 0
+            output_evicted = 0
+            for proof in proofs:
+                info, digest = sha256_regular_at(
+                    parent_descriptor,
+                    proof.name,
+                    evict_after=True,
+                )
+                if (
+                    info.st_size != proof.end - proof.start
+                    or digest != proof.sha256
+                    or _identity(info) != proof.identity
+                ):
+                    raise RuntimeError(
+                        f"range {proof.number} changed before assembly"
+                    )
+                source_descriptor = os.open(
+                    proof.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_descriptor,
+                )
+                with os.fdopen(source_descriptor, "rb", buffering=0) as source:
+                    source_consumed = 0
+                    source_evicted = 0
+                    while True:
+                        chunk = source.read(CHUNK)
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            copied = output.write(view)
+                            if copied is None or copied <= 0:
+                                raise OSError("short parallel assembly write")
+                            written += copied
+                            source_consumed += copied
+                            view = view[copied:]
+                        if written - output_evicted >= ASSEMBLY_CACHE_WINDOW:
+                            output.flush()
+                            os.fsync(output.fileno())
+                            evict_cached_range(
+                                output.fileno(),
+                                output_evicted,
+                                written - output_evicted,
+                            )
+                            output_evicted = written
+                            evict_cached_range(
+                                source.fileno(),
+                                source_evicted,
+                                source_consumed - source_evicted,
+                            )
+                            source_evicted = source_consumed
+                    if source_consumed != proof.end - proof.start:
+                        raise RuntimeError(
+                            f"range {proof.number} ended early during assembly"
+                        )
+                    evict_cached_range(source.fileno(), 0, 0)
+                after = stat_regular_at(parent_descriptor, proof.name)
+                if _identity(after) != proof.identity:
+                    raise RuntimeError(
+                        f"range {proof.number} identity changed during assembly"
+                    )
+            output.flush()
+            os.fsync(output.fileno())
+            evict_cached_range(
+                output.fileno(),
+                output_evicted,
+                written - output_evicted,
+            )
+    finally:
+        os.close(descriptor)
+    os.fsync(parent_descriptor)
+    return written
+
+
+def assemble_parallel_pieces(
+    parent_descriptor: int,
+    partial_name: str,
+    expected_size: int,
+    expected_digest: str | None,
+    proofs: list[RangeProof],
+) -> None:
+    """Assemble proved ranges, retrying only local assembly on digest mismatch."""
+
+    assembling_name = f"{partial_name}.assembling"
+    attempts = PARALLEL_ASSEMBLY_ATTEMPTS if expected_digest is not None else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            stale = stat_regular_at(parent_descriptor, assembling_name)
+        except FileNotFoundError:
+            stale = None
+        if stale is not None:
+            # `.assembling` is never authoritative: only the verified `.part`
+            # name can be installed.  Remove this pinned, one-link temporary
+            # inode so a crash or failed prior attempt is resumable.
+            os.unlink(assembling_name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        written = _write_parallel_assembly(
+            parent_descriptor,
+            assembling_name,
+            proofs,
+        )
+        assembled, digest = sha256_regular_at(
+            parent_descriptor,
+            assembling_name,
+            sync=True,
+            evict_after=True,
+        )
+        size_matches = written == expected_size and assembled.st_size == expected_size
+        digest_matches = expected_digest is None or digest == expected_digest
+        if size_matches and digest_matches:
+            break
+        with PRINT_LOCK:
+            print(
+                f"parallel assembly verification failed {attempt}/{attempts}: "
+                f"size={assembled.st_size}/{expected_size}, sha256={digest}",
+                flush=True,
+            )
+        if attempt == attempts:
+            # Install the fully flushed but mismatched attempt under the usual
+            # partial name.  The caller's independent full-file verifier will
+            # quarantine it and fail closed while retaining all proved ranges.
+            break
+    os.replace(
+        assembling_name,
+        partial_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+    )
+    os.fsync(parent_descriptor)
+
+
 def parallel_download(
     config: ConnectionConfig,
     remote_path: str,
@@ -2025,6 +2177,7 @@ def parallel_download(
     expected_size: int,
     validation: ReconnectValidation | None = None,
     expected_remote_identity: tuple[int, int, int, int] | None = None,
+    expected_digest: str | None = None,
 ) -> list[RangeProof]:
     ranges = parallel_ranges(expected_size, partial_name)
     try:
@@ -2065,92 +2218,13 @@ def parallel_download(
         ]
         proofs = [future.result() for future in concurrent.futures.as_completed(futures)]
     proofs.sort(key=lambda proof: proof.number)
-
-    assembling_name = f"{partial_name}.assembling"
-    try:
-        stale = stat_regular_at(parent_descriptor, assembling_name)
-    except FileNotFoundError:
-        stale = None
-    if stale is not None:
-        # `.assembling` is never authoritative: only the verified `.part` name
-        # can be installed.  Remove this pinned, one-link temporary inode so a
-        # crash during assembly is deterministically resumable.
-        os.unlink(assembling_name, dir_fd=parent_descriptor)
-        os.fsync(parent_descriptor)
-    descriptor = os.open(
-        assembling_name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-        0o600,
-        dir_fd=parent_descriptor,
-    )
-    try:
-        # Match the per-range partial contract even if an NFS ACL or umask
-        # altered the requested create mode.
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=False) as output:
-            written = 0
-            output_evicted = 0
-            for proof in proofs:
-                info, digest = sha256_regular_at(
-                    parent_descriptor,
-                    proof.name,
-                    evict_after=True,
-                )
-                if info.st_size != proof.end - proof.start or digest != proof.sha256:
-                    raise RuntimeError(
-                        f"range {proof.number} changed before assembly"
-                    )
-                source_descriptor = os.open(
-                    proof.name,
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=parent_descriptor,
-                )
-                with os.fdopen(source_descriptor, "rb", buffering=0) as source:
-                    source_consumed = 0
-                    source_evicted = 0
-                    while True:
-                        chunk = source.read(CHUNK)
-                        if not chunk:
-                            break
-                        copied = output.write(chunk)
-                        if copied != len(chunk):
-                            raise OSError("short parallel assembly write")
-                        written += copied
-                        source_consumed += copied
-                        if written - output_evicted >= ASSEMBLY_CACHE_WINDOW:
-                            output.flush()
-                            os.fsync(output.fileno())
-                            evict_cached_range(
-                                output.fileno(),
-                                output_evicted,
-                                written - output_evicted,
-                            )
-                            output_evicted = written
-                            evict_cached_range(
-                                source.fileno(),
-                                source_evicted,
-                                source_consumed - source_evicted,
-                            )
-                            source_evicted = source_consumed
-                    evict_cached_range(source.fileno(), 0, 0)
-            output.flush()
-            os.fsync(output.fileno())
-            evict_cached_range(
-                output.fileno(),
-                output_evicted,
-                written - output_evicted,
-            )
-    finally:
-        os.close(descriptor)
-    if stat_regular_at(parent_descriptor, assembling_name).st_size != expected_size:
-        raise RuntimeError("assembled partial size mismatch")
-    os.replace(
-        assembling_name,
+    assemble_parallel_pieces(
+        parent_descriptor,
         partial_name,
-        src_dir_fd=parent_descriptor,
-        dst_dir_fd=parent_descriptor,
+        expected_size,
+        expected_digest,
+        proofs,
     )
-    os.fsync(parent_descriptor)
     return proofs
 
 
@@ -2360,6 +2434,7 @@ def transfer_file(
                 expected_size,
                 validation,
                 _remote_identity(remote_before),
+                expected_digest,
             )
             offset = expected_size
         if offset < expected_size:

@@ -627,6 +627,153 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
     assert assembly_evictions == [(0, 4), (4, 1)]
 
 
+def test_parallel_assembly_retries_without_redownloading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    partial_name = "dump.part"
+    payload = b"aaaab"
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "ASSEMBLY_CACHE_WINDOW", 4)
+    monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+    piece0 = tmp_path / f"{partial_name}.piece00"
+    piece1 = tmp_path / f"{partial_name}.piece01"
+    piece0.write_bytes(payload[:4])
+    piece1.write_bytes(payload[4:])
+    downloads: list[str] = []
+
+    def prove_existing(
+        _config, _remote, descriptor, name, start, end, number,
+        _validation, _identity,
+    ) -> PULLER.RangeProof:
+        downloads.append(name)
+        info, digest = PULLER.sha256_regular_at(descriptor, name)
+        return PULLER.RangeProof(
+            number,
+            start,
+            end,
+            name,
+            digest,
+            PULLER._identity(info),
+        )
+
+    monkeypatch.setattr(PULLER, "download_verified_piece", prove_existing)
+    original_write = PULLER._write_parallel_assembly
+    assembly_attempts = 0
+
+    def corrupt_first_assembly(descriptor, name, proofs) -> int:
+        nonlocal assembly_attempts
+        assembly_attempts += 1
+        written = original_write(descriptor, name, proofs)
+        if assembly_attempts == 1:
+            assembly = os.open(
+                name,
+                os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            try:
+                assert os.pwrite(assembly, b"x", 0) == 1
+                os.fsync(assembly)
+            finally:
+                os.close(assembly)
+        return written
+
+    monkeypatch.setattr(
+        PULLER,
+        "_write_parallel_assembly",
+        corrupt_first_assembly,
+    )
+    try:
+        PULLER.parallel_download(
+            object(),
+            "/remote/dump",
+            parent,
+            partial_name,
+            len(payload),
+            expected_digest=PULLER.hashlib.sha256(payload).hexdigest(),
+        )
+    finally:
+        os.close(parent)
+
+    assert assembly_attempts == 2
+    assert sorted(downloads) == [piece0.name, piece1.name]
+    assert (tmp_path / partial_name).read_bytes() == payload
+    assert piece0.read_bytes() + piece1.read_bytes() == payload
+    assert not (tmp_path / f"{partial_name}.assembling").exists()
+
+
+def test_parallel_assembly_retry_limit_leaves_mismatch_for_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    partial_name = "dump.part"
+    payload = b"aaaab"
+    monkeypatch.setattr(PULLER, "CHUNK", 4)
+    monkeypatch.setattr(PULLER, "ASSEMBLY_CACHE_WINDOW", 4)
+    monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
+    monkeypatch.setattr(PULLER, "PARALLEL_ASSEMBLY_ATTEMPTS", 2)
+    for number, content in enumerate((payload[:4], payload[4:])):
+        (tmp_path / f"{partial_name}.piece{number:02d}").write_bytes(content)
+
+    def prove_existing(
+        _config, _remote, descriptor, name, start, end, number,
+        _validation, _identity,
+    ) -> PULLER.RangeProof:
+        info, digest = PULLER.sha256_regular_at(descriptor, name)
+        return PULLER.RangeProof(
+            number,
+            start,
+            end,
+            name,
+            digest,
+            PULLER._identity(info),
+        )
+
+    monkeypatch.setattr(PULLER, "download_verified_piece", prove_existing)
+    original_write = PULLER._write_parallel_assembly
+    assembly_attempts = 0
+
+    def corrupt_every_assembly(descriptor, name, proofs) -> int:
+        nonlocal assembly_attempts
+        assembly_attempts += 1
+        written = original_write(descriptor, name, proofs)
+        assembly = os.open(
+            name,
+            os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=descriptor,
+        )
+        try:
+            assert os.pwrite(assembly, b"x", 0) == 1
+            os.fsync(assembly)
+        finally:
+            os.close(assembly)
+        return written
+
+    monkeypatch.setattr(
+        PULLER,
+        "_write_parallel_assembly",
+        corrupt_every_assembly,
+    )
+    try:
+        PULLER.parallel_download(
+            object(),
+            "/remote/dump",
+            parent,
+            partial_name,
+            len(payload),
+            expected_digest=PULLER.hashlib.sha256(payload).hexdigest(),
+        )
+    finally:
+        os.close(parent)
+
+    assert assembly_attempts == 2
+    assert (tmp_path / partial_name).read_bytes() == b"xaaab"
+    assert not (tmp_path / f"{partial_name}.assembling").exists()
+    assert len(list(tmp_path.glob(f"{partial_name}.piece*"))) == 2
+
+
 def test_parallel_ranges_are_ordered_and_uneven(monkeypatch) -> None:
     monkeypatch.setattr(PULLER, "CHUNK", 4)
     monkeypatch.setattr(PULLER, "PARALLEL_STREAMS", 2)
