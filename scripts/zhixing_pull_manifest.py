@@ -44,6 +44,9 @@ ASSEMBLY_CACHE_WINDOW = 128 * 1024 * 1024
 PARALLEL_ASSEMBLY_ATTEMPTS = 3
 MIN_RESERVE = 50 * 1024 * 1024 * 1024
 PARALLEL_THRESHOLD = 512 * 1024 * 1024
+# Two flows already reach the aggregate throughput currently granted by the
+# opportunistic Zhixing SSH gateway.  Extra flows add connection failures and
+# proof work without increasing useful bandwidth.
 PARALLEL_STREAMS = 2
 MISMATCH_CONFIRMATION_ROUNDS = 2
 CONNECT_ATTEMPTS = 5
@@ -972,6 +975,9 @@ def connect(config: ConnectionConfig) -> tuple[paramiko.SSHClient, paramiko.SFTP
                 auth_timeout=30,
                 look_for_keys=False,
                 allow_agent=False,
+                # GRMHD restart payloads compress enough to increase useful
+                # throughput when the opportunistic gateway is egress-limited.
+                compress=True,
             )
             transport = client.get_transport()
             if transport is None:

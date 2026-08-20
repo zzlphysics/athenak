@@ -61,12 +61,13 @@ def test_connect_applies_hard_timeout_to_sftp_channel(
     class Client:
         def __init__(self) -> None:
             self.sftp = Sftp()
+            self.connect_options = None
 
         def set_missing_host_key_policy(self, _policy) -> None:
             return None
 
-        def connect(self, **_kwargs) -> None:
-            return None
+        def connect(self, **kwargs) -> None:
+            self.connect_options = kwargs
 
         def get_transport(self):
             return Transport()
@@ -90,6 +91,7 @@ def test_connect_applies_hard_timeout_to_sftp_channel(
 
     assert client.sftp is sftp
     assert sftp.channel.timeout == PULLER.CHANNEL_IO_TIMEOUT_SECONDS
+    assert client.connect_options["compress"] is True
 
 
 @pytest.mark.parametrize(
