@@ -594,17 +594,32 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
             (Path(os.readlink(f"/proc/self/fd/{descriptor}")).name, offset, length)
         )
 
+    def fake_download_verified_piece(
+        _config,
+        _remote,
+        descriptor,
+        name,
+        start,
+        end,
+        number,
+        _validation,
+        _identity,
+    ):
+        result = PULLER.sha256_regular_at(descriptor, name)
+        return PULLER.RangeProof(
+            number,
+            start,
+            end,
+            name,
+            result[1],
+            PULLER._identity(result[0]),
+        )
+
     monkeypatch.setattr(PULLER, "evict_cached_range", record_eviction)
     monkeypatch.setattr(
         PULLER,
         "download_verified_piece",
-        lambda _config, _remote, descriptor, name, start, end, number,
-               _validation, _identity: (
-                   lambda result: PULLER.RangeProof(
-                       number, start, end, name, result[1],
-                       PULLER._identity(result[0]),
-                   )
-               )(PULLER.sha256_regular_at(descriptor, name)),
+        fake_download_verified_piece,
     )
     try:
         PULLER.parallel_download(
@@ -624,7 +639,7 @@ def test_stale_parallel_assembly_is_replaced(tmp_path: Path, monkeypatch) -> Non
         for name, offset, length in evictions
         if name == f"{partial_name}.assembling"
     ]
-    assert assembly_evictions == [(0, 4), (4, 1)]
+    assert assembly_evictions == [(0, 4), (4, 1), (0, 0)]
 
 
 def test_parallel_assembly_retries_without_redownloading(
@@ -1107,7 +1122,9 @@ class _DownloadChannel:
 
     def recv(self, size: int) -> bytes:
         if self.fail_after is not None and self.position >= self.fail_after:
-            raise paramiko.SSHException("Key-exchange timed out waiting for key negotiation")
+            raise paramiko.SSHException(
+                "Key-exchange timed out waiting for key negotiation"
+            )
         limit = len(self.payload)
         if self.fail_after is not None:
             limit = min(limit, self.fail_after)
@@ -1115,6 +1132,37 @@ class _DownloadChannel:
         result = self.payload[self.position:end]
         self.position = end
         return result
+
+    def recv_exit_status(self) -> int:
+        return 0
+
+    def exit_status_ready(self) -> bool:
+        return True
+
+
+class _CaptureChannel:
+    def __init__(self, output: bytes) -> None:
+        self.output = output
+        self.position = 0
+        self.timeout = None
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def recv_ready(self) -> bool:
+        return self.position < len(self.output)
+
+    def recv(self, size: int) -> bytes:
+        end = min(len(self.output), self.position + size)
+        result = self.output[self.position:end]
+        self.position = end
+        return result
+
+    def recv_stderr_ready(self) -> bool:
+        return False
+
+    def recv_stderr(self, _size: int) -> bytes:
+        return b""
 
     def recv_exit_status(self) -> int:
         return 0
@@ -1133,6 +1181,21 @@ class _DownloadClient:
     def exec_command(self, command: str, timeout=None):
         del timeout
         self.commands.append(command)
+        if "sha256sum" in command:
+            match = PULLER.re.search(r"skip=(\d+) count=(\d+)", command)
+            if match is None:
+                raise AssertionError(f"malformed range-hash command: {command}")
+            start = int(match.group(1))
+            count = int(match.group(2))
+            digest = PULLER.hashlib.sha256(
+                self.payload[start:start + count]
+            ).hexdigest().encode("ascii")
+            stdout = type(
+                "Stdout",
+                (),
+                {"channel": _CaptureChannel(digest + b"  -\n")},
+            )()
+            return None, stdout, None
         fields = {
             item.split("=", 1)[0]: item.split("=", 1)[1]
             for item in PULLER.shlex.split(command)
@@ -1230,12 +1293,199 @@ def test_download_rotates_transport_before_rekey_threshold(
 
     assert (tmp_path / "payload.part").read_bytes() == payload
     assert validation.opens == 3
-    assert evictions == [(0, 4), (4, 4), (8, 2)]
+    assert evictions == [
+        (0, 4), (0, 4),
+        (4, 4), (4, 4),
+        (8, 2), (8, 2),
+    ]
     assert [client.commands[0] for client in clients] == [
         "dd if=/remote/payload iflag=skip_bytes,count_bytes skip=0 count=4 status=none",
         "dd if=/remote/payload iflag=skip_bytes,count_bytes skip=4 count=4 status=none",
         "dd if=/remote/payload iflag=skip_bytes,count_bytes skip=8 count=2 status=none",
     ]
+
+
+def test_window_hash_mismatch_retries_only_the_bad_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"abcdefgh"
+    partial = tmp_path / "payload.part"
+    partial.write_bytes(payload[:4])
+    clients = [_DownloadClient(payload) for _ in range(5)]
+    validation = _DownloadValidation(clients, len(payload))
+    monkeypatch.setattr(PULLER, "STREAM_WINDOW_BYTES", 4)
+    monkeypatch.setattr(PULLER.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda _session, _path, _identity, start, end, _label:
+            PULLER.hashlib.sha256(payload[start:end]).hexdigest(),
+    )
+    real_append = PULLER._append_validated_window
+    append_calls = 0
+
+    def corrupt_first_window(
+        session,
+        remote_path,
+        remote_identity,
+        parent_descriptor,
+        piece_name,
+        range_start,
+        target_size,
+        label,
+    ) -> None:
+        nonlocal append_calls
+        real_append(
+            session,
+            remote_path,
+            remote_identity,
+            parent_descriptor,
+            piece_name,
+            range_start,
+            target_size,
+            label,
+        )
+        append_calls += 1
+        if append_calls == 1:
+            descriptor = os.open(
+                piece_name,
+                os.O_RDWR | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.pwrite(descriptor, b"X", target_size - 1)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    monkeypatch.setattr(PULLER, "_append_validated_window", corrupt_first_window)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    PULLER.download_range(
+        object(),
+        "/remote/payload",
+        parent,
+        partial.name,
+        0,
+        len(payload),
+        0,
+        validation,
+        _remote_download_identity(len(payload)),
+    )
+
+    assert partial.read_bytes() == payload
+    assert append_calls == 2
+    assert validation.opens == 5
+    assert "skip=4 count=4" in clients[1].commands[0]
+    assert "skip=4 count=4" in clients[4].commands[0]
+
+
+def test_window_hash_retry_limit_preserves_last_bad_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"abcd"
+    partial = tmp_path / "payload.part"
+    clients = [_DownloadClient(payload) for _ in range(9)]
+    validation = _DownloadValidation(clients, len(payload))
+    monkeypatch.setattr(PULLER, "STREAM_WINDOW_BYTES", len(payload))
+    monkeypatch.setattr(PULLER.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda _session, _path, _identity, start, end, _label:
+            PULLER.hashlib.sha256(payload[start:end]).hexdigest(),
+    )
+    real_append = PULLER._append_validated_window
+    append_calls = 0
+
+    def corrupt_every_window(
+        session,
+        remote_path,
+        remote_identity,
+        parent_descriptor,
+        piece_name,
+        range_start,
+        target_size,
+        label,
+    ) -> None:
+        nonlocal append_calls
+        real_append(
+            session,
+            remote_path,
+            remote_identity,
+            parent_descriptor,
+            piece_name,
+            range_start,
+            target_size,
+            label,
+        )
+        append_calls += 1
+        descriptor = os.open(
+            piece_name,
+            os.O_RDWR | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.pwrite(descriptor, b"X", target_size - 1)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(PULLER, "_append_validated_window", corrupt_every_window)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    with pytest.raises(PULLER.WindowHashMismatch, match="retry limit 3 exhausted"):
+        PULLER.download_range(
+            object(),
+            "/remote/payload",
+            parent,
+            partial.name,
+            0,
+            len(payload),
+            0,
+            validation,
+            _remote_download_identity(len(payload)),
+        )
+
+    assert append_calls == PULLER.WINDOW_DOWNLOAD_ATTEMPTS
+    assert validation.opens == 9
+    assert partial.stat().st_size == len(payload)
+    assert partial.read_bytes() != payload
+
+
+def test_resumed_rate_counts_only_bytes_downloaded_this_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    window = 1024 * 1024
+    payload = b"a" * window + b"b" * window
+    partial = tmp_path / "payload.part"
+    partial.write_bytes(payload[:window])
+    clients = [_DownloadClient(payload) for _ in range(2)]
+    validation = _DownloadValidation(clients, len(payload))
+    monkeypatch.setattr(PULLER, "STREAM_WINDOW_BYTES", window)
+    monkeypatch.setattr(
+        PULLER,
+        "remote_range_sha256",
+        lambda _session, _path, _identity, start, end, _label:
+            PULLER.hashlib.sha256(payload[start:end]).hexdigest(),
+    )
+    clock = iter((100.0, 100.0, 102.0, 103.0))
+    monkeypatch.setattr(PULLER.time, "monotonic", lambda: next(clock))
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    PULLER.download_range(
+        object(),
+        "/remote/payload",
+        parent,
+        partial.name,
+        0,
+        len(payload),
+        0,
+        validation,
+        _remote_download_identity(len(payload)),
+    )
+
+    assert partial.read_bytes() == payload
+    assert "0.50 MiB/s" in capsys.readouterr().out
 
 
 def test_data_channel_stall_uses_timeout_and_bounded_reconnects(

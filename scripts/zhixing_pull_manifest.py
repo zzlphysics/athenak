@@ -51,6 +51,8 @@ CONNECT_BACKOFF_SECONDS = 5.0
 STREAM_RECONNECT_ATTEMPTS = 4
 STREAM_RECONNECT_BACKOFF_SECONDS = 2.0
 STREAM_WINDOW_BYTES = 256 * 1024 * 1024
+WINDOW_DOWNLOAD_ATTEMPTS = 3
+WINDOW_RETRY_BACKOFF_SECONDS = 2.0
 CHANNEL_IO_TIMEOUT_SECONDS = 120.0
 CHANNEL_STATUS_POLL_SECONDS = 0.1
 REMOTE_COMMAND_OUTPUT_LIMIT = 4096
@@ -506,6 +508,93 @@ def sha256_regular_at(
     if _identity(before) != _identity(after) or _identity(after) != _identity(after_path):
         raise RuntimeError(f"file changed while hashing: {name}")
     return after, digest.hexdigest()
+
+
+def sha256_regular_range_at(
+    parent_descriptor: int,
+    name: str,
+    start: int,
+    end: int,
+    expected_size: int,
+) -> tuple[os.stat_result, str]:
+    """Hash one exact range while pinning the mutable partial's identity."""
+
+    if start < 0 or end < start or end > expected_size:
+        raise ValueError("invalid local hash range")
+    before_path = stat_regular_at(parent_descriptor, name)
+    if before_path.st_size != expected_size:
+        raise RuntimeError(f"partial size changed before range hash: {name}")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_descriptor,
+    )
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if _identity(before) != _identity(before_path):
+            raise RuntimeError(f"partial changed while opening for range hash: {name}")
+        offset = start
+        evicted = start
+        while offset < end:
+            chunk = os.pread(descriptor, min(CHUNK, end - offset), offset)
+            if not chunk:
+                raise RuntimeError(f"early EOF while hashing range: {name}")
+            digest.update(chunk)
+            offset += len(chunk)
+            if offset - evicted >= HASH_CACHE_WINDOW:
+                evict_cached_range(descriptor, evicted, offset - evicted)
+                evicted = offset
+        os.fsync(descriptor)
+        if evicted < end:
+            evict_cached_range(descriptor, evicted, end - evicted)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = stat_regular_at(parent_descriptor, name)
+    if _identity(before) != _identity(after) or _identity(after) != _identity(after_path):
+        raise RuntimeError(f"partial changed while hashing range: {name}")
+    return after, digest.hexdigest()
+
+
+def truncate_regular_at(
+    parent_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int, int, int, int, int],
+    size: int,
+) -> os.stat_result:
+    """Truncate exactly one pinned mutable partial after a stable bad proof."""
+
+    if size < 0:
+        raise ValueError("truncate size must be non-negative")
+    visible = stat_regular_at(parent_descriptor, name)
+    if _identity(visible) != expected_identity:
+        raise RuntimeError(f"partial changed before window rollback: {name}")
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if _identity(before) != expected_identity:
+            raise RuntimeError(f"partial changed while opening for rollback: {name}")
+        if size > before.st_size:
+            raise RuntimeError(f"window rollback would grow partial: {name}")
+        os.ftruncate(descriptor, size)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = stat_regular_at(parent_descriptor, name)
+    if (
+        (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or after.st_size != size
+        or _identity(after) != _identity(after_path)
+    ):
+        raise RuntimeError(f"window rollback verification failed: {name}")
+    os.fsync(parent_descriptor)
+    return after
 
 
 def evict_cached_range(descriptor: int, offset: int, length: int) -> None:
@@ -1078,6 +1167,18 @@ class RangeHashMismatch(RuntimeError):
     """A completed local range differs from the same pinned remote range."""
 
 
+class WindowHashMismatch(RangeHashMismatch):
+    """One durable transfer window reproducibly differs from its remote range."""
+
+    def __init__(
+        self,
+        message: str,
+        local_identity: tuple[int, int, int, int, int, int],
+    ) -> None:
+        super().__init__(message)
+        self.local_identity = local_identity
+
+
 class RangeProofInstability(RuntimeError):
     """Independent range proofs disagree, so the payload must be preserved."""
 
@@ -1643,6 +1744,103 @@ def remote_range_sha256(
     return session.remote_call(label, operation)
 
 
+def prove_durable_window(
+    session: ValidatedRemoteSession,
+    validation: ReconnectValidation,
+    remote_path: str,
+    expected_remote_identity: tuple[int, int, int, int],
+    parent_descriptor: int,
+    piece_name: str,
+    range_start: int,
+    window_start: int,
+    window_end: int,
+    expected_file_size: int,
+    number: int,
+) -> os.stat_result:
+    """Independently bind one durable local window to its remote byte range."""
+
+    info, local_digest = sha256_regular_range_at(
+        parent_descriptor,
+        piece_name,
+        window_start,
+        window_end,
+        expected_file_size,
+    )
+    with RANGE_HASH_LOCK:
+        remote_digest = remote_range_sha256(
+            session,
+            remote_path,
+            expected_remote_identity,
+            range_start + window_start,
+            range_start + window_end,
+            f"window hash {number} {piece_name} [{window_start},{window_end})",
+        )
+    if local_digest == remote_digest:
+        return info
+
+    local_checks = [(info, local_digest)]
+    remote_checks = [remote_digest]
+    for confirmation in range(1, MISMATCH_CONFIRMATION_ROUNDS + 1):
+        confirmed_info, confirmed_local = sha256_regular_range_at(
+            parent_descriptor,
+            piece_name,
+            window_start,
+            window_end,
+            expected_file_size,
+        )
+        with RANGE_HASH_LOCK:
+            with ValidatedRemoteSession(validation) as confirmation_session:
+                confirmed_remote = remote_range_sha256(
+                    confirmation_session,
+                    remote_path,
+                    expected_remote_identity,
+                    range_start + window_start,
+                    range_start + window_end,
+                    f"window hash confirmation {confirmation} {number} "
+                    f"{piece_name} [{window_start},{window_end})",
+                )
+        local_checks.append((confirmed_info, confirmed_local))
+        remote_checks.append(confirmed_remote)
+
+    identities = [_identity(check_info) for check_info, _ in local_checks]
+    local_digests = [check_digest for _, check_digest in local_checks]
+    confirmations_match = (
+        len(set(identities)) == 1
+        and len(set(local_digests[1:])) == 1
+        and len(set(remote_checks[1:])) == 1
+        and local_digests[-1] == remote_checks[-1]
+    )
+    if confirmations_match:
+        with PRINT_LOCK:
+            print(
+                f"{piece_name}: initial window proof mismatch disappeared "
+                f"for [{window_start},{window_end}); accepting two matching "
+                "confirmations",
+                flush=True,
+            )
+        return local_checks[-1][0]
+
+    stable_mismatch = (
+        len(set(identities)) == 1
+        and len(set(local_digests)) == 1
+        and len(set(remote_checks)) == 1
+    )
+    if not stable_mismatch:
+        local_summary = ",".join(digest[:12] for digest in local_digests)
+        remote_summary = ",".join(digest[:12] for digest in remote_checks)
+        raise RangeProofInstability(
+            f"window proof was not reproducible; preserving {piece_name}; "
+            f"window=[{window_start},{window_end}) local={local_summary} "
+            f"remote={remote_summary}"
+        )
+
+    raise WindowHashMismatch(
+        f"window {number} [{window_start},{window_end}) local={local_digest} "
+        f"remote={remote_digest}",
+        identities[-1],
+    )
+
+
 def quarantine_regular_at(
     parent_descriptor: int,
     name: str,
@@ -1736,7 +1934,10 @@ def quarantine_regular_at(
     return evidence_name
 
 
-def parallel_ranges(expected_size: int, partial_name: str) -> list[tuple[int, int, int, str]]:
+def parallel_ranges(
+    expected_size: int,
+    partial_name: str,
+) -> list[tuple[int, int, int, str]]:
     piece_span = (expected_size + PARALLEL_STREAMS - 1) // PARALLEL_STREAMS
     piece_span = ((piece_span + CHUNK - 1) // CHUNK) * CHUNK
     return [
@@ -1770,9 +1971,66 @@ def download_range(
             return expected, 0.0
         if validation is None or expected_remote_identity is None:
             raise RuntimeError("incomplete reconnect validation for remote range")
+
+        # Re-prove every complete pre-existing window before extending a partial.
+        # A torn final window remains in place and is completed below before it is
+        # proved.  Reusing one validated session keeps restart audits inexpensive.
+        verified = 0
+        window_failures: dict[int, int] = {}
+        if offset:
+            with ValidatedRemoteSession(validation) as audit_session:
+                while verified < offset:
+                    target = min(expected, verified + STREAM_WINDOW_BYTES)
+                    if target > offset:
+                        break
+                    window_index = verified // STREAM_WINDOW_BYTES
+                    try:
+                        prove_durable_window(
+                            audit_session,
+                            validation,
+                            remote_path,
+                            expected_remote_identity,
+                            parent_descriptor,
+                            piece_name,
+                            start,
+                            verified,
+                            target,
+                            offset,
+                            window_index,
+                        )
+                    except WindowHashMismatch as error:
+                        window_failures[window_index] = 1
+                        truncate_regular_at(
+                            parent_descriptor,
+                            piece_name,
+                            error.local_identity,
+                            verified,
+                        )
+                        offset = verified
+                        with PRINT_LOCK:
+                            print(
+                                f"{piece_name}: existing window {window_index} "
+                                f"failed stable proof and was rolled back to "
+                                f"{verified}; retry 1/{WINDOW_DOWNLOAD_ATTEMPTS}",
+                                flush=True,
+                            )
+                        break
+                    verified = target
+
         started = time.monotonic()
-        while offset < expected:
-            target = min(expected, offset + STREAM_WINDOW_BYTES)
+        downloaded_bytes = 0
+        while verified < expected:
+            target = min(expected, verified + STREAM_WINDOW_BYTES)
+            try:
+                current = stat_regular_at(parent_descriptor, piece_name).st_size
+            except FileNotFoundError:
+                current = 0
+            if current < verified or current > target:
+                raise RuntimeError(
+                    f"range {number} has an invalid window resume offset: "
+                    f"{current} not in [{verified},{target}]"
+                )
+            window_index = verified // STREAM_WINDOW_BYTES
             # Proactively use a fresh pinned and revalidated transport for each
             # <=256 MiB window, safely below Paramiko 2.12's 512 MiB rekey point.
             with ValidatedRemoteSession(validation) as session:
@@ -1786,16 +2044,61 @@ def download_range(
                     target,
                     f"range {number} {piece_name}",
                 )
+                downloaded_bytes += target - current
+                window_info = stat_regular_at(parent_descriptor, piece_name)
+                if window_info.st_size != target:
+                    raise RuntimeError(f"range {number} window size mismatch")
+                try:
+                    prove_durable_window(
+                        session,
+                        validation,
+                        remote_path,
+                        expected_remote_identity,
+                        parent_descriptor,
+                        piece_name,
+                        start,
+                        verified,
+                        target,
+                        target,
+                        window_index,
+                    )
+                except WindowHashMismatch as error:
+                    attempts = window_failures.get(window_index, 0) + 1
+                    window_failures[window_index] = attempts
+                    if attempts >= WINDOW_DOWNLOAD_ATTEMPTS:
+                        raise WindowHashMismatch(
+                            f"{error}; retry limit "
+                            f"{WINDOW_DOWNLOAD_ATTEMPTS} exhausted",
+                            error.local_identity,
+                        ) from error
+                    truncate_regular_at(
+                        parent_descriptor,
+                        piece_name,
+                        error.local_identity,
+                        verified,
+                    )
+                    delay = WINDOW_RETRY_BACKOFF_SECONDS * attempts
+                    with PRINT_LOCK:
+                        print(
+                            f"{piece_name}: window {window_index} failed stable "
+                            f"proof and was rolled back to {verified}; retry "
+                            f"{attempts}/{WINDOW_DOWNLOAD_ATTEMPTS} in "
+                            f"{delay:.0f}s",
+                            flush=True,
+                        )
+                    time.sleep(delay)
+                    continue
             offset = stat_regular_at(parent_descriptor, piece_name).st_size
             if offset != target:
                 raise RuntimeError(f"range {number} window size mismatch")
             os.fsync(parent_descriptor)
+            verified = target
             elapsed = max(time.monotonic() - started, 1e-9)
             with PRINT_LOCK:
                 print(
                     f"{piece_name}: {100.0 * offset / expected:.1f}% "
                     f"({offset}/{expected}), "
-                    f"{(offset / elapsed) / (1024 * 1024):.2f} MiB/s",
+                    f"{(downloaded_bytes / elapsed) / (1024 * 1024):.2f} MiB/s",
                     flush=True,
                 )
         info = stat_regular_at(parent_descriptor, piece_name)
