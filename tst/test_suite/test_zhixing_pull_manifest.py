@@ -841,6 +841,119 @@ def test_quarantine_is_read_only_and_idempotent_after_link_crash(
     assert evidence.stat().st_nlink == 1
 
 
+def test_transient_initial_full_file_mismatch_requires_two_confirmations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"stable-full-file"
+    expected_digest = PULLER.hashlib.sha256(payload).hexdigest()
+    partial = tmp_path / "payload.part"
+    partial.write_bytes(payload)
+    initial_mode = stat.S_IMODE(partial.stat().st_mode)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_hash = PULLER.sha256_regular_at
+    try:
+        initial_info, _digest = real_hash(parent, partial.name)
+        calls = 0
+
+        def confirmed_hash(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_hash(*args, **kwargs)
+
+        monkeypatch.setattr(PULLER, "sha256_regular_at", confirmed_hash)
+        info, digest, recovered = PULLER.reconfirm_full_file_mismatch(
+            parent,
+            partial.name,
+            len(payload),
+            expected_digest,
+            initial_info,
+            PULLER.hashlib.sha256(b"transient-stale-read").hexdigest(),
+        )
+    finally:
+        os.close(parent)
+
+    assert recovered is True
+    assert digest == expected_digest
+    assert info.st_size == len(payload)
+    assert calls == PULLER.MISMATCH_CONFIRMATION_ROUNDS
+    assert partial.read_bytes() == payload
+    assert stat.S_IMODE(partial.stat().st_mode) == initial_mode
+    assert not list(tmp_path.glob("full-*.bad"))
+
+
+def test_unstable_full_file_hash_preserves_partial_without_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"preserve-full-file"
+    expected_digest = PULLER.hashlib.sha256(payload).hexdigest()
+    partial = tmp_path / "payload.part"
+    partial.write_bytes(payload)
+    initial_mode = stat.S_IMODE(partial.stat().st_mode)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_hash = PULLER.sha256_regular_at
+    try:
+        initial_info, _digest = real_hash(parent, partial.name)
+        fake_digests = iter(
+            PULLER.hashlib.sha256(value).hexdigest()
+            for value in (b"second-read", b"third-read")
+        )
+
+        def unstable_hash(*args, **kwargs):
+            info, _digest = real_hash(*args, **kwargs)
+            return info, next(fake_digests)
+
+        monkeypatch.setattr(PULLER, "sha256_regular_at", unstable_hash)
+        with pytest.raises(PULLER.FullFileProofInstability, match="preserving"):
+            PULLER.reconfirm_full_file_mismatch(
+                parent,
+                partial.name,
+                len(payload),
+                expected_digest,
+                initial_info,
+                PULLER.hashlib.sha256(b"first-read").hexdigest(),
+            )
+    finally:
+        os.close(parent)
+
+    assert partial.read_bytes() == payload
+    assert stat.S_IMODE(partial.stat().st_mode) == initial_mode
+    assert not list(tmp_path.glob("full-*.bad"))
+
+
+def test_stable_full_file_mismatch_remains_eligible_for_quarantine(
+    tmp_path: Path,
+) -> None:
+    payload = b"stable-bad-full-file"
+    bad_digest = PULLER.hashlib.sha256(payload).hexdigest()
+    expected_digest = PULLER.hashlib.sha256(b"expected-payload").hexdigest()
+    partial = tmp_path / "payload.part"
+    partial.write_bytes(payload)
+    initial_mode = stat.S_IMODE(partial.stat().st_mode)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        initial_info, initial_digest = PULLER.sha256_regular_at(
+            parent, partial.name
+        )
+        info, digest, recovered = PULLER.reconfirm_full_file_mismatch(
+            parent,
+            partial.name,
+            len(payload),
+            expected_digest,
+            initial_info,
+            initial_digest,
+        )
+    finally:
+        os.close(parent)
+
+    assert recovered is False
+    assert digest == bad_digest
+    assert info.st_size == len(payload)
+    assert partial.read_bytes() == payload
+    assert stat.S_IMODE(partial.stat().st_mode) == initial_mode
+
+
 def test_remote_range_hash_uses_exact_pinned_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

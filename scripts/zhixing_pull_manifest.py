@@ -1189,6 +1189,10 @@ class RangeProofInstability(RuntimeError):
     """Independent range proofs disagree, so the payload must be preserved."""
 
 
+class FullFileProofInstability(RuntimeError):
+    """Independent full-file hashes disagree, so the payload must be preserved."""
+
+
 REMOTE_RETRYABLE_ERRORS = (
     EOFError,
     socket.timeout,
@@ -1938,6 +1942,69 @@ def quarantine_regular_at(
         raise RuntimeError(f"quarantine evidence changed: {evidence_name}")
     os.fsync(parent_descriptor)
     return evidence_name
+
+
+def reconfirm_full_file_mismatch(
+    parent_descriptor: int,
+    name: str,
+    expected_size: int,
+    expected_digest: str,
+    initial_info: os.stat_result,
+    initial_digest: str,
+) -> tuple[os.stat_result, str, bool]:
+    """Distinguish a stable bad file from a transient post-rename NFS read.
+
+    A freshly assembled file can be durable and correct while an immediate reopen
+    through an NFSv3 client briefly returns stale cached bytes for the new pathname.
+    Never accept one apparently corrected read: require two fresh, mutually agreeing
+    hashes of the same inode and the immutable manifest digest.  Conversely, allow
+    quarantine only when the initial read and both confirmations reproduce the same
+    mismatch.  Any other sequence is unstable and is preserved without mutation.
+    """
+
+    checks = [(initial_info, initial_digest)]
+    for _confirmation in range(1, MISMATCH_CONFIRMATION_ROUNDS + 1):
+        confirmed_info, confirmed_digest = sha256_regular_at(
+            parent_descriptor,
+            name,
+            sync=True,
+            evict_after=True,
+        )
+        if confirmed_info.st_size != expected_size:
+            raise FullFileProofInstability(
+                f"full-file size was not reproducible; preserving {name}: "
+                f"{confirmed_info.st_size} != {expected_size}"
+            )
+        checks.append((confirmed_info, confirmed_digest))
+
+    identities = [_identity(info) for info, _digest in checks]
+    digests = [digest for _info, digest in checks]
+    confirmations_match = (
+        len(set(identities)) == 1
+        and len(set(digests[1:])) == 1
+        and digests[-1] == expected_digest
+    )
+    if confirmations_match:
+        with PRINT_LOCK:
+            print(
+                f"{name}: initial full-file verification mismatch disappeared "
+                "in two independent confirmations; accepting the reconfirmed "
+                "manifest payload",
+                flush=True,
+            )
+        confirmed_info, confirmed_digest = checks[-1]
+        return confirmed_info, confirmed_digest, True
+
+    stable_mismatch = len(set(identities)) == 1 and len(set(digests)) == 1
+    if stable_mismatch:
+        confirmed_info, confirmed_digest = checks[-1]
+        return confirmed_info, confirmed_digest, False
+
+    digest_summary = ",".join(value[:12] for value in digests)
+    raise FullFileProofInstability(
+        f"full-file hash was not reproducible; preserving {name}; "
+        f"digests={digest_summary}"
+    )
 
 
 def parallel_ranges(
@@ -2766,20 +2833,33 @@ def transfer_file(
             evict_after=True,
         )
         if partial_info.st_size != expected_size or digest != expected_digest:
-            key = hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()[:12]
-            evidence = f"full-{key}-{digest[:16]}.bad"
-            quarantine_regular_at(
-                partial_parent,
-                partial_name,
-                evidence,
-                partial_info.st_size,
-                digest,
-            )
-            raise RuntimeError(
-                f"local verification failed; immutable evidence retained as "
-                f"{evidence} for {relative}: size={partial_info.st_size}, "
-                f"sha256={digest}"
-            )
+            recovered = False
+            if partial_info.st_size == expected_size:
+                partial_info, digest, recovered = reconfirm_full_file_mismatch(
+                    partial_parent,
+                    partial_name,
+                    expected_size,
+                    expected_digest,
+                    partial_info,
+                    digest,
+                )
+            if not recovered:
+                key = hashlib.sha256(
+                    relative.as_posix().encode("utf-8")
+                ).hexdigest()[:12]
+                evidence = f"full-{key}-{digest[:16]}.bad"
+                quarantine_regular_at(
+                    partial_parent,
+                    partial_name,
+                    evidence,
+                    partial_info.st_size,
+                    digest,
+                )
+                raise RuntimeError(
+                    f"local verification failed; immutable evidence retained as "
+                    f"{evidence} for {relative}: size={partial_info.st_size}, "
+                    f"sha256={digest}"
+                )
         if used_parallel and not range_proofs:
             range_proofs = prove_existing_parallel_pieces(
                 remote_path,
