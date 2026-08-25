@@ -156,6 +156,37 @@ it; plotting their complete extents can otherwise show asymmetric blank corners 
 are outside the stored region.  Cropping to the configured half-width does not discard
 data from inside the requested window.
 
+To inspect an out-of-plane jet around one moving hole, use the full-3D native GR
+diagnostic stream with `make_bbh_following_plane_movie.py`.  The following example
+tracks BH1, places the camera origin on that trajectory center, linearly samples the
+moving x-z plane, and fixes the complete movie to the conventional
+`1e-3 <= sigma <= 1e3` display range:
+
+```bash
+python3 vis/python/make_bbh_following_plane_movie.py /nas/campaign \
+  --path-prefix segment-000/ --output-dir output/bh1-xz-sigma \
+  --stream mhd_gr_diagnostics --panels gr_sigma \
+  --panel-limit gr_sigma=1e-3,1e3 --plane y --follow-bh 1 --extent 40 \
+  --raster-resolution 512 --trajectory /path/to/q1_4pn_to_remnant.dat
+```
+
+The two bracketing normal planes are first resampled from their leaf MeshBlocks onto
+one BH-centered display grid, then interpolated using the actual cell-center
+coordinates at every pixel.  If AMR refinement terminates between the two planes, the
+manifest reports the fraction for which only one valid leaf-side sample exists; those
+pixels use that available sample rather than inventing a cross-level value.  The
+fallback is a visualization policy and must not be used as a replacement for native
+surface diagnostics.
+
+`render_bbh_grmhd_3d.py` builds a BH-centered uniform cube from full-3D leaf blocks and
+uses marching cubes to show the `sigma=1` jet boundary together with selected density
+isosurfaces.  It records the AMR-to-uniform resolution, spacing, contour levels, input
+time/cycle, and output hashes.  The optional rotating movie shows the geometry at one
+simulation time.  `make_bbh_grmhd_3d_movie.py` repeats the same volume resampling at the
+stored dumps nearest to uniformly spaced physical times, keeps the BH-centered camera
+fixed, and renders the actual evolution of the `sigma=1` surface.  Absence of a surface
+in an early frame is recorded explicitly rather than treated as a plotting failure.
+
 ## Dynamic-spacetime limitation
 
 The `mhd_w_bcc` output stores primitive fluid variables and densitized magnetic

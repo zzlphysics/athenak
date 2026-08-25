@@ -33,10 +33,15 @@ from analyze_bbh_grmhd_campaign import (  # noqa: E402
     verify_file,
 )
 from compare_bbh_grmhd_convergence import analyze, automatic_diagnostics  # noqa: E402
+from make_bbh_following_plane_movie import (  # noqa: E402
+    parse_panel_limits,
+    plane_geometry,
+)
 from plot_bbh_grmhd import (  # noqa: E402
     PANELS,
     SliceBlock,
     SliceData,
+    _bracketing_cell_centers,
     panel_values,
     read_cell_face_interpolated_slice,
 )
@@ -314,6 +319,41 @@ def test_cell_face_slice_averages_both_cell_centers() -> None:
     np.testing.assert_allclose(interpolated.blocks[0].fields["dens"], [[3.0, 5.0]])
     assert interpolated.location == 0.0
     assert not interpolated.presliced
+
+
+def test_arbitrary_slice_bracketing_cell_centers() -> None:
+    lower, upper, upper_weight = _bracketing_cell_centers(
+        location=-0.25,
+        domain_min=-1.0,
+        domain_max=1.0,
+        root_cells=2,
+        cells_per_block=1,
+        level=0,
+    )
+    assert lower == (0, 0)
+    assert upper == (1, 0)
+    assert upper_weight == 0.25
+
+    lower, upper, upper_weight = _bracketing_cell_centers(
+        location=0.0,
+        domain_min=-1.0,
+        domain_max=1.0,
+        root_cells=2,
+        cells_per_block=1,
+        level=2,
+    )
+    assert lower == (3, 0)
+    assert upper == (4, 0)
+    assert upper_weight == 0.5
+
+
+def test_following_plane_geometry_and_explicit_limits() -> None:
+    location, origin = plane_geometry([2.0, 3.0, 4.0], "y")
+    assert location == 3.0
+    assert origin == (2.0, 4.0)
+    assert parse_panel_limits(
+        ["gr_sigma=1e-3,1e3"], ["gr_sigma"]
+    ) == {"gr_sigma": (1.0e-3, 1.0e3)}
 
 
 def test_local_and_global_duplicate_variables_use_ids_for_cadence() -> None:

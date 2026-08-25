@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import glob
 import json
 import math
@@ -70,6 +70,7 @@ class SliceData:
     level_counts: Counter
     selected_level_counts: Counter
     presliced: bool
+    sampling_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -299,16 +300,48 @@ def _target_block_and_index(
 
 
 def _overlaps_extent(
-    extent: tuple[float, float, float, float], half_width: float | None
+    extent: tuple[float, float, float, float],
+    half_width: float | None,
+    center: tuple[float, float] = (0.0, 0.0),
 ) -> bool:
     if half_width is None:
         return True
     return not (
-        extent[1] <= -half_width
-        or extent[0] >= half_width
-        or extent[3] <= -half_width
-        or extent[2] >= half_width
+        extent[1] <= center[0] - half_width
+        or extent[0] >= center[0] + half_width
+        or extent[3] <= center[1] - half_width
+        or extent[2] >= center[1] + half_width
     )
+
+
+def _bracketing_cell_centers(
+    location: float,
+    domain_min: float,
+    domain_max: float,
+    root_cells: int,
+    cells_per_block: int,
+    level: int,
+) -> tuple[tuple[int, int], tuple[int, int], float]:
+    """Return block/cell indices and the upper-center interpolation weight."""
+
+    number_cells = root_cells * 2**level
+    spacing = (domain_max - domain_min) / number_cells
+    fractional_center_index = (location - domain_min) / spacing - 0.5
+    lower_index = math.floor(fractional_center_index)
+    upper_index = lower_index + 1
+    if lower_index < 0:
+        lower_index = upper_index = 0
+        upper_weight = 0.0
+    elif upper_index >= number_cells:
+        lower_index = upper_index = number_cells - 1
+        upper_weight = 0.0
+    else:
+        lower_center = domain_min + (lower_index + 0.5) * spacing
+        upper_weight = (location - lower_center) / spacing
+        upper_weight = min(max(upper_weight, 0.0), 1.0)
+    lower = lower_index // cells_per_block, lower_index % cells_per_block
+    upper = upper_index // cells_per_block, upper_index % cells_per_block
+    return lower, upper, upper_weight
 
 
 def read_slice(
@@ -482,6 +515,413 @@ def read_slice(
         level_counts=level_counts,
         selected_level_counts=selected_level_counts,
         presliced=bool(file_presliced),
+    )
+
+
+def read_linearly_interpolated_slice(
+    path: Path,
+    panel_names: list[str],
+    plane: str,
+    location: float,
+    half_width: float | None,
+    in_plane_center: tuple[float, float] = (0.0, 0.0),
+    raster_resolution: int | None = None,
+) -> SliceData:
+    """Interpolate an arbitrary AMR plane between bracketing cell centers.
+
+    Both normal-direction samples must have identical projected leaf topology.  The
+    routine aborts instead of silently mixing refinement levels when a moving plane
+    crosses an asymmetric AMR boundary.
+    """
+
+    header = read_binary_header(path)
+    if header.location_size not in (4, 8) or header.variable_size not in (4, 8):
+        raise RuntimeError(
+            "only 4- and 8-byte AthenaK location/variable data are supported"
+        )
+    dependencies = {
+        dependency
+        for panel_name in panel_names
+        for dependency in PANELS[panel_name].dependencies
+    }
+    if (
+        EXCISION_MASK_FIELD in header.variables
+        and any(panel_name in MASKED_GR_PANELS for panel_name in panel_names)
+    ):
+        dependencies.add(EXCISION_MASK_FIELD)
+    missing = sorted(dependencies.difference(header.variables))
+    if missing:
+        raise RuntimeError(
+            f"{path}: panels require missing variables: {', '.join(missing)}; "
+            f"available: {', '.join(header.variables)}"
+        )
+    variable_indices = {name: header.variables.index(name) for name in dependencies}
+    nghost = _get_int(header, "mesh", "nghost")
+    axis = {"x": 0, "y": 1, "z": 2}[plane]
+    mesh_cells = tuple(_get_int(header, "mesh", f"nx{i}") for i in (1, 2, 3))
+    block_cells_config = tuple(
+        _get_int(header, "meshblock", f"nx{i}") for i in (1, 2, 3)
+    )
+    domain_min = _get_float(header, "mesh", f"x{axis + 1}min")
+    domain_max = _get_float(header, "mesh", f"x{axis + 1}max")
+    if not domain_min <= location <= domain_max:
+        raise RuntimeError(
+            f"{path}: slice location {location} lies outside "
+            f"[{domain_min}, {domain_max}]"
+        )
+    if raster_resolution is not None:
+        if raster_resolution < 32:
+            raise ValueError("raster_resolution must be at least 32")
+        if half_width is None:
+            raise ValueError("rasterized interpolation requires a finite extent")
+        if "level" in panel_names:
+            raise ValueError("rasterized interpolation does not support the level panel")
+
+    location_dtype = np.dtype("<f4" if header.location_size == 4 else "<f8")
+    variable_dtype = np.dtype("<f4" if header.variable_size == 4 else "<f8")
+    level_counts: Counter = Counter()
+    brackets: dict[int, tuple[tuple[int, int], tuple[int, int], float]] = {}
+    side_blocks: dict[str, dict[tuple[int, int, int], SliceBlock]] = {
+        "lower": {},
+        "upper": {},
+    }
+    normal_coordinates: dict[str, dict[tuple[int, int, int], float]] = {
+        "lower": {},
+        "upper": {},
+    }
+
+    def projected_key(
+        level: int, logical_location: tuple[int, int, int]
+    ) -> tuple[int, int, int]:
+        coordinates = list(logical_location)
+        del coordinates[axis]
+        return level, coordinates[0], coordinates[1]
+
+    with path.open("rb") as stream:
+        stream.seek(header.data_offset)
+        file_size = path.stat().st_size
+        while stream.tell() < file_size:
+            index_bytes = stream.read(24)
+            if not index_bytes:
+                break
+            if len(index_bytes) != 24:
+                raise RuntimeError(f"{path}: truncated MeshBlock index record")
+            indices = np.asarray(struct.unpack("=6i", index_bytes)) - nghost
+            logical = struct.unpack("=4i", stream.read(16))
+            block_i, block_j, block_k, level = logical
+            logical_location = (block_i, block_j, block_k)
+            level_counts[level] += 1
+            block_cells = (
+                int(indices[1] - indices[0] + 1),
+                int(indices[3] - indices[2] + 1),
+                int(indices[5] - indices[4] + 1),
+            )
+            if block_cells[axis] == 1 and block_cells_config[axis] > 1:
+                raise RuntimeError(
+                    f"{path}: the output already stores one cell along {plane}; "
+                    "linear spatial interpolation requires a full 3-D dump"
+                )
+            if block_cells != block_cells_config:
+                raise RuntimeError(
+                    f"{path}: output block shape {block_cells} differs from "
+                    f"configured shape {block_cells_config}"
+                )
+            number_cells = math.prod(block_cells)
+            variable_bytes = number_cells * header.variable_size
+            record_data_bytes = len(header.variables) * variable_bytes
+            bracket = brackets.setdefault(
+                level,
+                _bracketing_cell_centers(
+                    location,
+                    domain_min,
+                    domain_max,
+                    mesh_cells[axis],
+                    block_cells[axis],
+                    level,
+                ),
+            )
+            lower_target, upper_target, _ = bracket
+            block_location = logical_location[axis]
+            targets: dict[str, int] = {}
+            if block_location == lower_target[0]:
+                targets["lower"] = lower_target[1]
+            if block_location == upper_target[0]:
+                targets["upper"] = upper_target[1]
+            if not targets:
+                stream.seek(6 * header.location_size + record_data_bytes, os.SEEK_CUR)
+                continue
+
+            limits_buffer = stream.read(6 * header.location_size)
+            limits = np.frombuffer(limits_buffer, dtype=location_dtype)
+            if limits.size != 6:
+                raise RuntimeError(f"{path}: truncated MeshBlock coordinate record")
+            if plane == "x":
+                extent = (limits[2], limits[3], limits[4], limits[5])
+            elif plane == "y":
+                extent = (limits[0], limits[1], limits[4], limits[5])
+            else:
+                extent = (limits[0], limits[1], limits[2], limits[3])
+            extent_tuple = tuple(float(value) for value in extent)
+            if not _overlaps_extent(extent_tuple, half_width, in_plane_center):
+                stream.seek(record_data_bytes, os.SEEK_CUR)
+                continue
+
+            data_start = stream.tell()
+            fields_by_side: dict[str, dict[str, np.ndarray]] = {
+                side: {} for side in targets
+            }
+            for name, variable_index in sorted(
+                variable_indices.items(), key=lambda item: item[1]
+            ):
+                stream.seek(data_start + variable_index * variable_bytes)
+                values = np.fromfile(stream, dtype=variable_dtype, count=number_cells)
+                if values.size != number_cells:
+                    raise RuntimeError(f"{path}: truncated cell data for {name}")
+                values = values.reshape(block_cells[2], block_cells[1], block_cells[0])
+                for side, slice_index in targets.items():
+                    if plane == "x":
+                        fields_by_side[side][name] = values[:, :, slice_index]
+                    elif plane == "y":
+                        fields_by_side[side][name] = values[:, slice_index, :]
+                    else:
+                        fields_by_side[side][name] = values[slice_index, :, :]
+            stream.seek(data_start + record_data_bytes)
+            slice_shape = (
+                (block_cells[2], block_cells[1])
+                if plane == "x"
+                else (block_cells[2], block_cells[0])
+                if plane == "y"
+                else (block_cells[1], block_cells[0])
+            )
+            key = projected_key(level, logical_location)
+            for side, fields in fields_by_side.items():
+                if key in side_blocks[side]:
+                    raise RuntimeError(
+                        f"{path}: duplicate projected {side} block for {key}"
+                    )
+                side_blocks[side][key] = SliceBlock(
+                    extent=extent_tuple,
+                    level=level,
+                    logical_location=logical_location,
+                    slice_shape=slice_shape,
+                    fields=fields,
+                )
+                target = lower_target if side == "lower" else upper_target
+                global_cell = target[0] * block_cells[axis] + target[1]
+                spacing = (domain_max - domain_min) / (mesh_cells[axis] * 2**level)
+                normal_coordinates[side][key] = (
+                    domain_min + (global_cell + 0.5) * spacing
+                )
+
+    lower_blocks = side_blocks["lower"]
+    upper_blocks = side_blocks["upper"]
+    if raster_resolution is not None:
+        return _rasterize_interpolated_slice(
+            header,
+            plane,
+            location,
+            float(half_width),
+            in_plane_center,
+            raster_resolution,
+            lower_blocks,
+            upper_blocks,
+            normal_coordinates,
+            level_counts,
+        )
+    if lower_blocks.keys() != upper_blocks.keys():
+        missing_lower = sorted(upper_blocks.keys() - lower_blocks.keys())
+        missing_upper = sorted(lower_blocks.keys() - upper_blocks.keys())
+        raise RuntimeError(
+            f"{path}: AMR topology differs across moving {plane}={location:g}; "
+            f"missing below={missing_lower[:4]}, missing above={missing_upper[:4]}"
+        )
+    if not lower_blocks:
+        raise RuntimeError(f"{path}: interpolated slice selected no MeshBlocks")
+
+    blocks: list[SliceBlock] = []
+    selected_level_counts: Counter = Counter()
+    for key in sorted(lower_blocks):
+        low_block = lower_blocks[key]
+        high_block = upper_blocks[key]
+        if (
+            low_block.slice_shape != high_block.slice_shape
+            or not np.allclose(low_block.extent, high_block.extent, rtol=0.0, atol=0.0)
+            or low_block.fields.keys() != high_block.fields.keys()
+        ):
+            raise RuntimeError(f"{path}: incompatible moving-plane blocks: {key}")
+        upper_weight = brackets[key[0]][2]
+        lower_weight = 1.0 - upper_weight
+        fields = {
+            name: lower_weight * low_block.fields[name]
+            + upper_weight * high_block.fields[name]
+            for name in low_block.fields
+        }
+        blocks.append(
+            SliceBlock(
+                extent=low_block.extent,
+                level=low_block.level,
+                logical_location=low_block.logical_location,
+                slice_shape=low_block.slice_shape,
+                fields=fields,
+            )
+        )
+        selected_level_counts[low_block.level] += 1
+    return SliceData(
+        header=header,
+        plane=plane,
+        location=location,
+        blocks=blocks,
+        level_counts=level_counts,
+        selected_level_counts=selected_level_counts,
+        presliced=False,
+    )
+
+
+def _rasterize_interpolated_slice(
+    header: BinaryHeader,
+    plane: str,
+    location: float,
+    half_width: float,
+    in_plane_center: tuple[float, float],
+    resolution: int,
+    lower_blocks: dict[tuple[int, int, int], SliceBlock],
+    upper_blocks: dict[tuple[int, int, int], SliceBlock],
+    normal_coordinates: dict[str, dict[tuple[int, int, int], float]],
+    level_counts: Counter,
+) -> SliceData:
+    """Resample different AMR topologies before normal-direction interpolation."""
+
+    from scipy.ndimage import map_coordinates
+
+    if not lower_blocks or not upper_blocks:
+        raise RuntimeError("rasterized interpolation has an empty bracketing side")
+    field_names = set(next(iter(lower_blocks.values())).fields)
+    if any(set(block.fields) != field_names for block in lower_blocks.values()):
+        raise RuntimeError("lower-side raster blocks have inconsistent fields")
+    if any(set(block.fields) != field_names for block in upper_blocks.values()):
+        raise RuntimeError("upper-side raster blocks have inconsistent fields")
+
+    horizontal_min = in_plane_center[0] - half_width
+    horizontal_max = in_plane_center[0] + half_width
+    vertical_min = in_plane_center[1] - half_width
+    vertical_max = in_plane_center[1] + half_width
+    horizontal = np.linspace(
+        horizontal_min,
+        horizontal_max,
+        resolution,
+        endpoint=False,
+        dtype=float,
+    )
+    vertical = np.linspace(
+        vertical_min,
+        vertical_max,
+        resolution,
+        endpoint=False,
+        dtype=float,
+    )
+    pixel_size = 2.0 * half_width / resolution
+    horizontal += 0.5 * pixel_size
+    vertical += 0.5 * pixel_size
+
+    def rasterize_side(
+        blocks: dict[tuple[int, int, int], SliceBlock],
+        coordinates: dict[tuple[int, int, int], float],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        raster_fields = {
+            name: np.full((resolution, resolution), np.nan, dtype=float)
+            for name in field_names
+        }
+        normal_raster = np.full((resolution, resolution), np.nan, dtype=float)
+        for key, block in sorted(blocks.items(), key=lambda item: item[0][0]):
+            x_min, x_max, y_min, y_max = block.extent
+            x_indices = np.flatnonzero(
+                (horizontal >= x_min) & (horizontal < x_max)
+            )
+            y_indices = np.flatnonzero((vertical >= y_min) & (vertical < y_max))
+            if not x_indices.size or not y_indices.size:
+                continue
+            sample = next(iter(block.fields.values()))
+            cell_width = (x_max - x_min) / sample.shape[1]
+            cell_height = (y_max - y_min) / sample.shape[0]
+            x_coordinates = (horizontal[x_indices] - x_min) / cell_width - 0.5
+            y_coordinates = (vertical[y_indices] - y_min) / cell_height - 0.5
+            yy, xx = np.meshgrid(y_coordinates, x_coordinates, indexing="ij")
+            target = np.ix_(y_indices, x_indices)
+            for name, values in block.fields.items():
+                order = 0 if name == EXCISION_MASK_FIELD else 1
+                raster_fields[name][target] = map_coordinates(
+                    values,
+                    (yy, xx),
+                    order=order,
+                    mode="nearest",
+                    prefilter=False,
+                )
+            normal_raster[target] = coordinates[key]
+        return raster_fields, normal_raster
+
+    lower_fields, lower_coordinate = rasterize_side(
+        lower_blocks, normal_coordinates["lower"]
+    )
+    upper_fields, upper_coordinate = rasterize_side(
+        upper_blocks, normal_coordinates["upper"]
+    )
+    lower_valid = np.isfinite(lower_coordinate)
+    upper_valid = np.isfinite(upper_coordinate)
+    uncovered = ~(lower_valid | upper_valid)
+    if np.any(uncovered):
+        missing = int(np.count_nonzero(uncovered))
+        raise RuntimeError(
+            f"rasterized moving plane has {missing} cells missing on both sides"
+        )
+    paired = lower_valid & upper_valid
+    separation = upper_coordinate[paired] - lower_coordinate[paired]
+    if np.any(separation <= 0.0):
+        raise RuntimeError("rasterized bracketing cell centers are not ordered")
+    upper_weight = np.zeros((resolution, resolution), dtype=float)
+    upper_weight[paired] = np.clip(
+        (location - lower_coordinate[paired]) / separation, 0.0, 1.0
+    )
+    fields: dict[str, np.ndarray] = {}
+    for name in field_names:
+        value = np.where(lower_valid, lower_fields[name], upper_fields[name])
+        if name == EXCISION_MASK_FIELD:
+            value[paired] = np.maximum(
+                lower_fields[name][paired], upper_fields[name][paired]
+            )
+        else:
+            value[paired] = (
+                (1.0 - upper_weight[paired]) * lower_fields[name][paired]
+                + upper_weight[paired] * upper_fields[name][paired]
+            )
+        fields[name] = value
+    maximum_level = max(
+        max(key[0] for key in lower_blocks), max(key[0] for key in upper_blocks)
+    )
+    block = SliceBlock(
+        extent=(horizontal_min, horizontal_max, vertical_min, vertical_max),
+        level=maximum_level,
+        logical_location=(0, 0, 0),
+        slice_shape=(resolution, resolution),
+        fields=fields,
+    )
+    return SliceData(
+        header=header,
+        plane=plane,
+        location=location,
+        blocks=[block],
+        level_counts=level_counts,
+        selected_level_counts=Counter({maximum_level: 1}),
+        presliced=False,
+        sampling_metadata={
+            "raster_resolution": resolution,
+            "two_sided_fraction": float(np.count_nonzero(paired) / paired.size),
+            "one_sided_amr_fallback_fraction": float(
+                np.count_nonzero(lower_valid ^ upper_valid) / paired.size
+            ),
+            "one_sided_amr_fallback_policy": (
+                "use the available leaf-side sample without normal interpolation"
+            ),
+        },
     )
 
 
@@ -676,6 +1116,8 @@ def create_dashboard(
     trajectory: dict[str, object] | None,
     rho_mask_fraction: float,
     fixed_limits: dict[str, tuple[float, float]] | None = None,
+    coordinate_origin: tuple[float, float] | None = None,
+    coordinate_origin_label: str | None = None,
 ) -> dict[str, object]:
     """Render a multi-panel AMR dashboard and return its numerical summary."""
 
@@ -710,13 +1152,25 @@ def create_dashboard(
         "panels": {},
         "proxy_density_mask_fraction": rho_mask_fraction,
         "proxy_density_threshold": density_threshold,
+        "coordinate_origin": coordinate_origin,
+        "coordinate_origin_label": coordinate_origin_label,
+        "sampling_metadata": slice_data.sampling_metadata,
     }
     sorted_blocks = sorted(slice_data.blocks, key=lambda block: block.level)
-    xlabel, ylabel = {
-        "x": ("y / M", "z / M"),
-        "y": ("x / M", "z / M"),
-        "z": ("x / M", "y / M"),
+    horizontal_name, vertical_name = {
+        "x": ("y", "z"),
+        "y": ("x", "z"),
+        "z": ("x", "y"),
     }[slice_data.plane]
+    if coordinate_origin is None:
+        xlabel = f"{horizontal_name} / M"
+        ylabel = f"{vertical_name} / M"
+        horizontal_offset = vertical_offset = 0.0
+    else:
+        label = coordinate_origin_label or "origin"
+        xlabel = f"({horizontal_name}-{horizontal_name}_{label}) / M"
+        ylabel = f"({vertical_name}-{vertical_name}_{label}) / M"
+        horizontal_offset, vertical_offset = coordinate_origin
 
     for axis_plot, panel_name in zip(axes_flat, panel_names):
         panel = PANELS[panel_name]
@@ -764,8 +1218,12 @@ def create_dashboard(
         for block in sorted_blocks:
             x_min, x_max, y_min, y_max = block.extent
             value = values_by_id[id(block)]
-            x_edges = np.linspace(x_min, x_max, value.shape[1] + 1)
-            y_edges = np.linspace(y_min, y_max, value.shape[0] + 1)
+            x_edges = (
+                np.linspace(x_min, x_max, value.shape[1] + 1) - horizontal_offset
+            )
+            y_edges = (
+                np.linspace(y_min, y_max, value.shape[0] + 1) - vertical_offset
+            )
             axis_plot.pcolormesh(
                 x_edges,
                 y_edges,
@@ -792,6 +1250,8 @@ def create_dashboard(
             marker_styles = (("o", "white"), ("s", "cyan"))
             for index, center in enumerate(trajectory["centers"]):
                 x_bh, y_bh, normal_bh = _project_center(center, slice_data.plane)
+                x_bh -= horizontal_offset
+                y_bh -= vertical_offset
                 distance = abs(normal_bh - slice_data.location)
                 marker, color = marker_styles[index]
                 axis_plot.scatter(
@@ -806,7 +1266,12 @@ def create_dashboard(
                     zorder=20,
                 )
 
-        if half_width is not None:
+        if coordinate_origin is not None:
+            if half_width is None:
+                raise ValueError("a shifted coordinate origin requires a finite extent")
+            axis_plot.set_xlim(-half_width, half_width)
+            axis_plot.set_ylim(-half_width, half_width)
+        elif half_width is not None:
             axis_plot.set_xlim(-half_width, half_width)
             axis_plot.set_ylim(-half_width, half_width)
         else:
@@ -837,11 +1302,19 @@ def create_dashboard(
 
     for unused_axis in axes_flat[number_panels:]:
         unused_axis.set_visible(False)
-    title = (
-        f"AthenaK BBH GRMHD | t={slice_data.header.time:.6g} M, "
-        f"cycle={slice_data.header.cycle} | {slice_data.plane}="
-        f"{slice_data.location:g} M"
-    )
+    if coordinate_origin_label is None:
+        title = (
+            f"AthenaK BBH GRMHD | t={slice_data.header.time:.6g} M, "
+            f"cycle={slice_data.header.cycle} | {slice_data.plane}="
+            f"{slice_data.location:g} M"
+        )
+    else:
+        title = (
+            f"AthenaK BBH GRMHD | t={slice_data.header.time:.6g} M, "
+            f"cycle={slice_data.header.cycle}\n"
+            f"{coordinate_origin_label}-following plane | {slice_data.plane}="
+            f"{slice_data.location:g} M"
+        )
     if any(PANELS[name].proxy for name in panel_names):
         figure.text(
             0.5,
