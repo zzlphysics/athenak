@@ -422,6 +422,40 @@ def test_final_verification_hashes_installed_path_and_fsyncs(tmp_path: Path) -> 
         PULLER.verify_final_files(destination, records, seal_read_only=False)
 
 
+def test_final_verification_reconfirms_transient_nfs_hash_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "destination"
+    final = destination / "state" / "closed.bin"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"closed")
+    expected_digest = PULLER.hashlib.sha256(b"closed").hexdigest()
+    records = [{
+        "path": PULLER.PurePosixPath("state/closed.bin"),
+        "size": 6,
+        "sha256": expected_digest,
+    }]
+    real_hash = PULLER.sha256_regular_at
+    calls = 0
+
+    def transient_first_hash(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        info, digest = real_hash(*args, **kwargs)
+        if calls == 1:
+            digest = PULLER.hashlib.sha256(b"transient-stale-read").hexdigest()
+        return info, digest
+
+    monkeypatch.setattr(PULLER, "sha256_regular_at", transient_first_hash)
+    proofs = PULLER.verify_final_files(destination, records)
+
+    assert calls == 1 + PULLER.MISMATCH_CONFIRMATION_ROUNDS
+    assert "state/closed.bin" in proofs
+    assert stat.S_IMODE(final.stat().st_mode) == 0o400
+    assert final.read_bytes() == b"closed"
+
+
 def test_final_verification_seals_payload_read_only(tmp_path: Path) -> None:
     destination = tmp_path / "destination"
     final = destination / "state" / "closed.bin"

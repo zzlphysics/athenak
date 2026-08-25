@@ -703,7 +703,21 @@ def hash_manifest_final_at(
         evict_after=True,
     )
     if info.st_size != expected_size or digest != expected_digest:
-        raise RuntimeError(f"manifest verification failed for final file: {name}")
+        info, digest, recovered = reconfirm_full_file_mismatch(
+            parent_descriptor,
+            name,
+            expected_size,
+            expected_digest,
+            info,
+            digest,
+            sync=sync,
+            seal_read_only=seal_read_only,
+            require_single_link=require_single_link,
+        )
+        if not recovered:
+            raise RuntimeError(
+                f"manifest verification failed for final file: {name}"
+            )
     return info, digest
 
 
@@ -1951,6 +1965,10 @@ def reconfirm_full_file_mismatch(
     expected_digest: str,
     initial_info: os.stat_result,
     initial_digest: str,
+    *,
+    sync: bool = True,
+    seal_read_only: bool = False,
+    require_single_link: bool = True,
 ) -> tuple[os.stat_result, str, bool]:
     """Distinguish a stable bad file from a transient post-rename NFS read.
 
@@ -1967,7 +1985,9 @@ def reconfirm_full_file_mismatch(
         confirmed_info, confirmed_digest = sha256_regular_at(
             parent_descriptor,
             name,
-            sync=True,
+            sync=sync,
+            seal_read_only=seal_read_only,
+            require_single_link=require_single_link,
             evict_after=True,
         )
         if confirmed_info.st_size != expected_size:
