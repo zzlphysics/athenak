@@ -124,6 +124,38 @@ python3 vis/python/plot_bbh_grmhd.py \
   --plane z --extent 80
 ```
 
+## Fixed-color movies and equatorial interpolation
+
+Use `make_bbh_grmhd_movie.py` for a reproducible time sequence.  It selects only
+ACK-bound campaign files, samples the complete selected sequence before rendering,
+chooses one robust color range per panel, and applies those limits to every frame.
+The resulting movie therefore does not flicker because an individual frame changed
+its colorbar range.  For example:
+
+```bash
+python3 vis/python/make_bbh_grmhd_movie.py /nas/campaign \
+  --path-prefix segment-000/ --path-prefix segment-001/ \
+  --output-dir output/movie --stream mhd_gr_diagnostics \
+  --panels gr_bsq,gr_sigma,gr_beta_inv \
+  --plane z --location 0 --extent 40 --interpolate-plane \
+  --trajectory /path/to/q1_4pn_to_remnant.dat --fps 12 --workers 4
+```
+
+`--interpolate-plane` is intended for an exact cell face such as `z=0` in an
+even-cell domain.  It reads the cell-center planes immediately below and above the
+requested face, requires identical projected AMR topology, and averages corresponding
+fields with equal weights.  This avoids choosing one neighboring cell at a refinement
+boundary.  It is deliberately rejected for `bbh_local_*` files that were already
+reduced to one stored cell along the slice axis: the discarded second plane cannot be
+reconstructed after the simulation.  Use full-3D `mhd_w_bcc` or
+`mhd_gr_diagnostics` output when two-sided interpolation is required.
+
+For moving-window local output, set `--extent` to the configured
+`region_half_width`.  MeshBlocks intersecting the requested window may extend beyond
+it; plotting their complete extents can otherwise show asymmetric blank corners that
+are outside the stored region.  Cropping to the configured half-width does not discard
+data from inside the requested window.
+
 ## Dynamic-spacetime limitation
 
 The `mhd_w_bcc` output stores primitive fluid variables and densitized magnetic

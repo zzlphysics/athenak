@@ -34,6 +34,9 @@ from plot_bbh_grmhd import (
 )
 
 
+ATHENAK_BINARY_SIGNATURE = b"Athena binary output version=1.1\n"
+
+
 @dataclass(frozen=True)
 class VerifiedFile:
     segment: Path
@@ -158,6 +161,13 @@ def verify_file(record: VerifiedFile, verify_sha256: bool) -> None:
         raise RuntimeError(f"verified output size changed: {record.path}")
     if verify_sha256 and file_sha256(record.path) != record.sha256:
         raise RuntimeError(f"verified output SHA256 changed: {record.path}")
+
+
+def is_athenak_binary_output(path: Path) -> bool:
+    """Distinguish AthenaK dumps from unrelated executables named ``*.bin``."""
+
+    with path.open("rb") as stream:
+        return stream.read(len(ATHENAK_BINARY_SIGNATURE)) == ATHENAK_BINARY_SIGNATURE
 
 
 def classify_binary(name: str, variables: tuple[str, ...]) -> str:
@@ -907,7 +917,11 @@ def main() -> int:
     science_records = [
         record
         for record in all_records
-        if record.path.suffix in (".bin", ".hst", ".log")
+        if record.path.suffix in (".hst", ".log")
+        or (
+            record.path.suffix == ".bin"
+            and is_athenak_binary_output(record.path)
+        )
     ]
     if not science_records:
         raise RuntimeError("ACKs contain no binary, history, or event-log science output")

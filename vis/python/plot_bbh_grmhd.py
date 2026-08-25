@@ -69,6 +69,7 @@ class SliceData:
     blocks: list[SliceBlock]
     level_counts: Counter
     selected_level_counts: Counter
+    presliced: bool
 
 
 @dataclass(frozen=True)
@@ -480,6 +481,106 @@ def read_slice(
         blocks=blocks,
         level_counts=level_counts,
         selected_level_counts=selected_level_counts,
+        presliced=bool(file_presliced),
+    )
+
+
+def read_cell_face_interpolated_slice(
+    path: Path,
+    panel_names: list[str],
+    plane: str,
+    location: float,
+    half_width: float | None,
+) -> SliceData:
+    """Average the two cell-center planes bracketing an exact cell face.
+
+    This is intended for equatorial slices such as ``z=0`` in a symmetric even-cell
+    domain.  It requires a full 3-D output.  A file that AthenaK already reduced to one
+    stored cell along the slice axis cannot be reconstructed after the fact.
+    """
+
+    header = read_binary_header(path)
+    axis = {"x": 0, "y": 1, "z": 2}[plane]
+    domain_min = _get_float(header, "mesh", f"x{axis + 1}min")
+    domain_max = _get_float(header, "mesh", f"x{axis + 1}max")
+    domain_width = domain_max - domain_min
+    if not domain_width > 0.0:
+        raise RuntimeError(f"{path}: invalid slice-axis domain")
+    epsilon = domain_width * 1.0e-12
+    lower = read_slice(
+        path, panel_names, plane, location - epsilon, half_width
+    )
+    upper = read_slice(
+        path, panel_names, plane, location + epsilon, half_width
+    )
+    if lower.presliced or upper.presliced:
+        raise RuntimeError(
+            f"{path}: the output already stores one cell along {plane}; "
+            "two-sided spatial interpolation requires a full 3-D dump"
+        )
+
+    mesh_cells = _get_int(header, "mesh", f"nx{axis + 1}")
+    for level in sorted(lower.selected_level_counts):
+        spacing = domain_width / (mesh_cells * 2**level)
+        face_coordinate = (location - domain_min) / spacing
+        if not math.isclose(
+            face_coordinate,
+            round(face_coordinate),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        ):
+            raise RuntimeError(
+                f"{path}: {plane}={location:g} is not a cell face at physical "
+                f"level {level}; general off-face interpolation is not implemented"
+            )
+
+    def projected_key(block: SliceBlock) -> tuple[int, int, int]:
+        coordinates = list(block.logical_location)
+        del coordinates[axis]
+        return block.level, coordinates[0], coordinates[1]
+
+    lower_blocks = {projected_key(block): block for block in lower.blocks}
+    upper_blocks = {projected_key(block): block for block in upper.blocks}
+    if lower_blocks.keys() != upper_blocks.keys():
+        missing_lower = sorted(upper_blocks.keys() - lower_blocks.keys())
+        missing_upper = sorted(lower_blocks.keys() - upper_blocks.keys())
+        raise RuntimeError(
+            f"{path}: AMR topology differs across {plane}={location:g}; "
+            f"missing below={missing_lower[:4]}, missing above={missing_upper[:4]}"
+        )
+
+    blocks: list[SliceBlock] = []
+    for key in sorted(lower_blocks):
+        low_block = lower_blocks[key]
+        high_block = upper_blocks[key]
+        if (
+            low_block.slice_shape != high_block.slice_shape
+            or not np.allclose(low_block.extent, high_block.extent, rtol=0.0, atol=0.0)
+            or low_block.fields.keys() != high_block.fields.keys()
+        ):
+            raise RuntimeError(f"{path}: incompatible blocks across slice face: {key}")
+        fields = {
+            name: 0.5 * (low_block.fields[name] + high_block.fields[name])
+            for name in low_block.fields
+        }
+        blocks.append(
+            SliceBlock(
+                extent=low_block.extent,
+                level=low_block.level,
+                logical_location=low_block.logical_location,
+                slice_shape=low_block.slice_shape,
+                fields=fields,
+            )
+        )
+
+    return SliceData(
+        header=header,
+        plane=plane,
+        location=location,
+        blocks=blocks,
+        level_counts=lower.level_counts,
+        selected_level_counts=lower.selected_level_counts,
+        presliced=False,
     )
 
 
@@ -574,6 +675,7 @@ def create_dashboard(
     show_grid: bool,
     trajectory: dict[str, object] | None,
     rho_mask_fraction: float,
+    fixed_limits: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, object]:
     """Render a multi-panel AMR dashboard and return its numerical summary."""
 
@@ -619,7 +721,26 @@ def create_dashboard(
     for axis_plot, panel_name in zip(axes_flat, panel_names):
         panel = PANELS[panel_name]
         values = panel_values(slice_data, panel, density_threshold)
-        low, high = calculate_limits(values, panel.scale)
+        if fixed_limits is not None and panel_name in fixed_limits:
+            low, high = fixed_limits[panel_name]
+            if not (math.isfinite(low) and math.isfinite(high) and high > low):
+                raise ValueError(
+                    f"invalid fixed limits for {panel_name}: {low}, {high}"
+                )
+            if panel.scale == "log" and low <= 0.0:
+                raise ValueError(
+                    f"logarithmic fixed limit for {panel_name} must be positive"
+                )
+            if panel.scale == "symlog" and not math.isclose(
+                low, -high, rel_tol=1.0e-12, abs_tol=0.0
+            ):
+                raise ValueError(
+                    f"symmetric-log fixed limits for {panel_name} must be symmetric"
+                )
+            limit_policy = "fixed-across-series"
+        else:
+            low, high = calculate_limits(values, panel.scale)
+            limit_policy = "per-frame-robust-percentile"
         symlog_linthresh = None
         if panel.scale == "log":
             norm = colors.LogNorm(vmin=low, vmax=high, clip=True)
@@ -709,6 +830,7 @@ def create_dashboard(
         summary["panels"][panel_name] = {
             "display_min": low,
             "display_max": high,
+            "display_limit_policy": limit_policy,
             "scale": panel.scale,
             "proxy": panel.proxy,
         }
@@ -720,7 +842,6 @@ def create_dashboard(
         f"cycle={slice_data.header.cycle} | {slice_data.plane}="
         f"{slice_data.location:g} M"
     )
-    figure.suptitle(title, fontsize=13, y=0.985)
     if any(PANELS[name].proxy for name in panel_names):
         figure.text(
             0.5,
@@ -733,7 +854,10 @@ def create_dashboard(
             fontsize=8,
             color="darkred",
         )
-    figure.tight_layout(rect=(0.0, 0.04, 1.0, 0.94), h_pad=3.2, w_pad=2.0)
+    # Reserve the title band explicitly after laying out math-heavy panel labels.
+    # Otherwise tight_layout can move native-GR axes over the figure suptitle.
+    figure.tight_layout(rect=(0.0, 0.04, 1.0, 0.90), h_pad=3.2, w_pad=2.0)
+    figure.suptitle(title, fontsize=13, y=0.975)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=dpi)
     plt.close(figure)
@@ -945,6 +1069,11 @@ def parse_args() -> argparse.Namespace:
         help=f"comma-separated panels; choices: {','.join(PANELS)}",
     )
     parser.add_argument("--grid", action="store_true", help="outline AMR MeshBlocks")
+    parser.add_argument(
+        "--interpolate-plane",
+        action="store_true",
+        help="average the two full-3D cell-center planes bracketing a cell face",
+    )
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument(
         "--rho-mask-fraction",
@@ -992,13 +1121,21 @@ def main() -> int:
         "proxy_warning": PROXY_WARNING
         if any(PANELS[name].proxy for name in panel_names)
         else None,
+        "plane_sampling": (
+            "two-sided-cell-center-linear-interpolation"
+            if args.interpolate_plane
+            else "stored-or-nearest-cell"
+        ),
         "frames": [],
     }
 
     for input_path in input_paths:
-        slice_data = read_slice(
-            input_path, panel_names, args.plane, args.location, half_width
+        reader = (
+            read_cell_face_interpolated_slice
+            if args.interpolate_plane
+            else read_slice
         )
+        slice_data = reader(input_path, panel_names, args.plane, args.location, half_width)
         trajectory = None
         if args.trajectory is not None:
             if args.trajectory_time_offset is not None:

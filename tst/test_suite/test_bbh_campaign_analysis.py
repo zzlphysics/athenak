@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 import struct
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -21,6 +23,7 @@ from analyze_bbh_grmhd_campaign import (  # noqa: E402
     configured_output_dcycle,
     configured_output_dt,
     configured_output_region,
+    is_athenak_binary_output,
     load_verified_files,
     merge_histories,
     meshblock_level_counts,
@@ -30,7 +33,13 @@ from analyze_bbh_grmhd_campaign import (  # noqa: E402
     verify_file,
 )
 from compare_bbh_grmhd_convergence import analyze, automatic_diagnostics  # noqa: E402
-from plot_bbh_grmhd import PANELS, SliceBlock, panel_values  # noqa: E402
+from plot_bbh_grmhd import (  # noqa: E402
+    PANELS,
+    SliceBlock,
+    SliceData,
+    panel_values,
+    read_cell_face_interpolated_slice,
+)
 
 
 def digest(payload: bytes) -> str:
@@ -215,6 +224,16 @@ def test_native_grmhd_diagnostic_stream_is_classified() -> None:
     ) == "bbh_local_w"
 
 
+def test_athenak_binary_signature_rejects_unrelated_bin(tmp_path: Path) -> None:
+    dump = tmp_path / "output.bin"
+    dump.write_bytes(b"Athena binary output version=1.1\nheader\n")
+    executable = tmp_path / "test_mpi_CXX.bin"
+    executable.write_bytes(b"\x7fELF\x02\x01\x01\x00not-an-athenak-dump")
+
+    assert is_athenak_binary_output(dump)
+    assert not is_athenak_binary_output(executable)
+
+
 def test_native_gr_panel_automatically_masks_excised_cells() -> None:
     block = SliceBlock(
         extent=(-1.0, 1.0, -1.0, 1.0),
@@ -245,6 +264,56 @@ def test_native_gr_panel_automatically_masks_excised_cells() -> None:
         density_threshold=None,
     )
     assert np.isfinite(legacy_values[0]).all()
+
+
+def test_cell_face_slice_averages_both_cell_centers() -> None:
+    header = SimpleNamespace(
+        parameters={"mesh": {"x3min": "-1", "x3max": "1", "nx3": "2"}}
+    )
+    common = {
+        "extent": (-1.0, 1.0, -1.0, 1.0),
+        "level": 0,
+        "slice_shape": (1, 2),
+    }
+    lower = SliceData(
+        header=header,
+        plane="z",
+        location=-1.0e-12,
+        blocks=[
+            SliceBlock(
+                logical_location=(0, 0, 0),
+                fields={"dens": np.asarray([[1.0, 3.0]])},
+                **common,
+            )
+        ],
+        level_counts=Counter({0: 2}),
+        selected_level_counts=Counter({0: 1}),
+        presliced=False,
+    )
+    upper = SliceData(
+        header=header,
+        plane="z",
+        location=1.0e-12,
+        blocks=[
+            SliceBlock(
+                logical_location=(0, 0, 1),
+                fields={"dens": np.asarray([[5.0, 7.0]])},
+                **common,
+            )
+        ],
+        level_counts=lower.level_counts,
+        selected_level_counts=lower.selected_level_counts,
+        presliced=False,
+    )
+    with patch("plot_bbh_grmhd.read_binary_header", return_value=header), patch(
+        "plot_bbh_grmhd.read_slice", side_effect=[lower, upper]
+    ):
+        interpolated = read_cell_face_interpolated_slice(
+            Path("full-3d.bin"), ["dens"], "z", 0.0, 1.0
+        )
+    np.testing.assert_allclose(interpolated.blocks[0].fields["dens"], [[3.0, 5.0]])
+    assert interpolated.location == 0.0
+    assert not interpolated.presliced
 
 
 def test_local_and_global_duplicate_variables_use_ids_for_cadence() -> None:
