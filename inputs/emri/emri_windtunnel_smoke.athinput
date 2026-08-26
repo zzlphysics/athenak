@@ -1,0 +1,123 @@
+# AthenaK smoke input for a local, secondary-centered EMRI GRMHD wind tunnel.
+# Lengths are in units with G=c=1.  Here m_secondary=1 and M_primary=1000.
+
+<comment>
+problem   = local EMRI wind tunnel
+geometry  = circular equatorial orbit; aligned spins; helically symmetric metric
+
+<job>
+basename = emri_windtunnel_smoke
+
+<mesh>
+nghost = 4
+nx1    = 16
+x1min  = -8.0
+x1max  =  8.0
+ix1_bc = inflow
+ox1_bc = outflow
+
+nx2    = 16
+x2min  = -8.0
+x2max  =  8.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 16
+x3min  = -8.0
+x3max  =  8.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement         = none
+num_levels         = 1
+max_nmb_per_rank   = 16
+ncycle_check       = 1
+refinement_interval = 1
+prolong_primitives = false
+
+<amr_criterion0>
+method = user
+
+<time>
+evolution  = dynamic
+integrator = rk2
+subcycling = none
+cfl_number = 0.15
+nlim       = 2
+tlim       = 0.05
+ndiag      = 1
+
+<coord>
+minkowski       = false
+excise          = true
+excision_scheme = lapse
+excise_lapse    = 0.25
+dexcise         = 1.0e-8
+pexcise         = 1.0e-10
+
+<adm>
+# The helically symmetric metric is stationary in the local chart.  Set true only when
+# required by strict level subcycling; ordinary AMR refreshes static ADM data on regrid.
+dynamic = false
+
+<mhd>
+eos             = ideal
+dyn_eos         = ideal
+dyn_error       = reset_floor
+gamma           = 1.3333333333333333
+reconstruct     = plm
+rsolver         = hlle
+dfloor          = 1.0e-8
+tfloor          = 1.0e-8
+dthreshold      = 1.01
+dyn_scratch     = 1
+fofc            = true
+enforce_maximum = false
+
+<problem>
+pgen_name        = emri_windtunnel
+
+# Effective spacetime.  orbital_radius is the primary Kerr/BL radial coordinate.
+primary_mass     = 1000.0
+secondary_mass   = 1.0
+primary_chi      = 0.5
+secondary_chi    = 0.0
+orbital_radius   = 10000.0
+orbit_direction  = 1
+omega_mode       = kerr_geodesic
+require_stable_orbit = true
+
+# The GRMHD primitive u1,u2,u3 are the normal-frame spatial four-velocity components.
+rho0              = 1.0
+pgas0             = 1.0e-2
+u1                = 0.5
+u2                = 0.0
+u3                = 0.0
+b1                = 0.0
+b2                = 0.0
+b3                = 1.0e-2
+
+# Metric regularization is compactly supported inside the component horizons.
+spin_buffer_primary   = 0.05
+spin_buffer_secondary = 0.05
+singularity_floor     = 1.0e-3
+
+<output1>
+file_type = bin
+variable  = mhd_w
+dt        = 0.05
+
+<output2>
+file_type = bin
+variable  = adm
+dt        = 0.05
+
+<output3>
+file_type = rst
+dt        = 0.05
