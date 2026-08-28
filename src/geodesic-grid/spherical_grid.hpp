@@ -21,7 +21,8 @@ class MeshBlockPack;
 class SphericalGrid: public GeodesicGrid {
  public:
     // Creates a geodesic grid with refinement level nlev and radius rad
-    SphericalGrid(MeshBlockPack *pmy_pack, int nlev, Real rad, int ninterp = -1);
+    SphericalGrid(MeshBlockPack *pmy_pack, int nlev, Real rad, int ninterp = -1,
+                  const Real *linear_transform = nullptr);
     ~SphericalGrid();
 
     Real radius;  // const radius for SphericalGrid
@@ -34,6 +35,7 @@ class SphericalGrid: public GeodesicGrid {
 
  private:
     MeshBlockPack* pmy_pack;  // ptr to MeshBlockPack containing this Hydro
+    Real coordinate_transform[3][3];  // maps sphere coordinates to interpolation coords
     DualArray2D<int> interp_indcs;   // indices of MeshBlock and zones therein for interp
     DualArray3D<Real> interp_wghts;  // weights for interpolation
     void SetInterpolationCoordinates();  // set indexing for interpolation

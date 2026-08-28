@@ -40,6 +40,18 @@ struct WindTunnelParameters {
   Real pressure;
   Real wind_u[3];
   Real magnetic_field[3];
+  Real wind_eulerian_u[3];
+  Real densitized_magnetic_field[3];
+  Real source_tetrad[4][4];
+  Real force_projection[3][3];
+  Real source_spatial_inverse[3][3];
+  Real source_surface_covector[3][3];
+  Real source_spatial_determinant;
+  Real source_dt_dtau;
+  Real source_coordinate_stretch;
+  Real source_tetrad_stretch;
+  Real secondary_coordinate_stretch;
+  Real secondary_rest_stretch;
   Real refinement_radius;
   Real refinement_radius_ratio;
   Real refinement_hysteresis;
@@ -49,6 +61,8 @@ struct WindTunnelParameters {
   Real adiabatic_index;
   int force_surface_nlevel;
   bool force_subtract_background;
+  bool wind_is_source_tetrad;
+  bool force_is_source_tetrad;
 };
 
 struct MetricWithDerivatives {
@@ -78,11 +92,197 @@ void SetADMVariablesToEMRI(MeshBlockPack *pmbp);
 void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp);
 void RefineSecondary(MeshBlockPack *pmbp);
 void EMRIHistory(HistoryData *pdata, Mesh *);
+void EMRIWindBoundary(Mesh *pm);
 
 KOKKOS_INLINE_FUNCTION
 void EvaluateMetric(const Real x, const Real y, const Real z,
                     const WindTunnelParameters &parameters, Real gcov[4][4]) {
   emri_comoving::ComputeMetric(x, y, z, parameters.metric, gcov);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real MetricInnerProduct(const Real metric[4][4], const Real left[4],
+                        const Real right[4]) {
+  Real product = 0.0;
+  for (int a=0; a<4; ++a) {
+    for (int b=0; b<4; ++b) product += metric[a][b]*left[a]*right[b];
+  }
+  return product;
+}
+
+//! Construct an orthonormal tetrad at the secondary's orbit using only the external
+//! background.  Its timelike leg follows the stationary source worldline x^i=0; the
+//! spatial legs are Gram-Schmidt aligned with local radial, tangential, and vertical axes.
+KOKKOS_INLINE_FUNCTION
+void BuildSourceTetrad(const emri_comoving::MetricParameters &parameters,
+                       Real tetrad[4][4]) {
+  Real external_metric[4][4];
+  emri_comoving::ComputeExternalMetric(0.0, 0.0, 0.0, parameters,
+                                       external_metric);
+  for (int leg=0; leg<4; ++leg) {
+    for (int component=0; component<4; ++component) tetrad[leg][component] = 0.0;
+  }
+  const Real time_norm2 = -external_metric[0][0];
+  if (!(time_norm2 > 0.0) || !isfinite(time_norm2)) {
+    Kokkos::abort("EMRI source worldline is not timelike in the external metric");
+  }
+  tetrad[0][0] = 1.0/sqrt(time_norm2);
+
+  for (int spatial_leg=0; spatial_leg<3; ++spatial_leg) {
+    Real candidate[4] = {0.0, 0.0, 0.0, 0.0};
+    candidate[spatial_leg+1] = 1.0;
+    const Real time_overlap =
+        MetricInnerProduct(external_metric, candidate, tetrad[0]);
+    for (int component=0; component<4; ++component) {
+      candidate[component] += time_overlap*tetrad[0][component];
+    }
+    for (int previous=0; previous<spatial_leg; ++previous) {
+      const Real spatial_overlap = MetricInnerProduct(
+          external_metric, candidate, tetrad[previous+1]);
+      for (int component=0; component<4; ++component) {
+        candidate[component] -= spatial_overlap*tetrad[previous+1][component];
+      }
+    }
+    const Real norm2 = MetricInnerProduct(external_metric, candidate, candidate);
+    if (!(norm2 > 0.0) || !isfinite(norm2)) {
+      Kokkos::abort("failed to construct the EMRI source spatial tetrad");
+    }
+    for (int component=0; component<4; ++component) {
+      tetrad[spatial_leg+1][component] = candidate[component]/sqrt(norm2);
+    }
+  }
+}
+
+//! Build a contravariant orthonormal triad aligned with the coordinate spatial axes.
+KOKKOS_INLINE_FUNCTION
+void BuildSpatialTriad(const Real metric[4][4], Real triad[3][3]) {
+  for (int leg=0; leg<3; ++leg) {
+    Real candidate[3] = {0.0, 0.0, 0.0};
+    candidate[leg] = 1.0;
+    for (int previous=0; previous<leg; ++previous) {
+      Real overlap = 0.0;
+      for (int i=0; i<3; ++i) {
+        for (int j=0; j<3; ++j) {
+          overlap += metric[i+1][j+1]*candidate[i]*triad[previous][j];
+        }
+      }
+      for (int i=0; i<3; ++i) candidate[i] -= overlap*triad[previous][i];
+    }
+    Real norm2 = 0.0;
+    for (int i=0; i<3; ++i) {
+      for (int j=0; j<3; ++j) {
+        norm2 += metric[i+1][j+1]*candidate[i]*candidate[j];
+      }
+    }
+    if (!(norm2 > 0.0) || !isfinite(norm2)) {
+      Kokkos::abort("failed to construct an EMRI spatial triad");
+    }
+    for (int i=0; i<3; ++i) triad[leg][i] = candidate[i]/sqrt(norm2);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void PrimitiveToFourVelocity(const Real metric[4][4], const Real primitive[3],
+                             Real four_velocity[4]) {
+  const Real determinant = adm::SpatialDet(
+      metric[1][1], metric[1][2], metric[1][3],
+      metric[2][2], metric[2][3], metric[3][3]);
+  Real inverse_gamma[3][3];
+  adm::SpatialInv(1.0/determinant,
+      metric[1][1], metric[1][2], metric[1][3],
+      metric[2][2], metric[2][3], metric[3][3],
+      &inverse_gamma[0][0], &inverse_gamma[0][1], &inverse_gamma[0][2],
+      &inverse_gamma[1][1], &inverse_gamma[1][2], &inverse_gamma[2][2]);
+  inverse_gamma[1][0] = inverse_gamma[0][1];
+  inverse_gamma[2][0] = inverse_gamma[0][2];
+  inverse_gamma[2][1] = inverse_gamma[1][2];
+  Real beta[3] = {0.0, 0.0, 0.0};
+  Real beta_squared = 0.0;
+  Real lorentz2 = 1.0;
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      beta[i] += inverse_gamma[i][j]*metric[0][j+1];
+      lorentz2 += metric[i+1][j+1]*primitive[i]*primitive[j];
+    }
+    beta_squared += metric[0][i+1]*beta[i];
+  }
+  const Real alpha = sqrt(beta_squared-metric[0][0]);
+  four_velocity[0] = sqrt(lorentz2)/alpha;
+  for (int i=0; i<3; ++i) {
+    four_velocity[i+1] = primitive[i]-four_velocity[0]*beta[i];
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void FourVelocityToPrimitive(const Real metric[4][4], const Real four_velocity[4],
+                             Real primitive[3]) {
+  const Real determinant = adm::SpatialDet(
+      metric[1][1], metric[1][2], metric[1][3],
+      metric[2][2], metric[2][3], metric[3][3]);
+  Real inverse_gamma[3][3];
+  adm::SpatialInv(1.0/determinant,
+      metric[1][1], metric[1][2], metric[1][3],
+      metric[2][2], metric[2][3], metric[3][3],
+      &inverse_gamma[0][0], &inverse_gamma[0][1], &inverse_gamma[0][2],
+      &inverse_gamma[1][1], &inverse_gamma[1][2], &inverse_gamma[2][2]);
+  inverse_gamma[1][0] = inverse_gamma[0][1];
+  inverse_gamma[2][0] = inverse_gamma[0][2];
+  inverse_gamma[2][1] = inverse_gamma[1][2];
+  Real beta[3] = {0.0, 0.0, 0.0};
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) beta[i] += inverse_gamma[i][j]*metric[0][j+1];
+    primitive[i] = four_velocity[i+1]+four_velocity[0]*beta[i];
+  }
+}
+
+//! Convert the common source-frame wind to the normal-frame spatial four-velocity used
+//! by dynamical GRMHD.  Source-frame matching is exact at the orbital anchor.  Its
+//! Eulerian orthonormal components are held fixed in the source tangent chart and then
+//! transformed into the numerical slicing.  This makes rotating-Minkowski and isolated
+//! controls differ only by the intended non-inertial gradients.
+KOKKOS_INLINE_FUNCTION
+void ComputeWindPrimitive(const Real x, const Real y, const Real z,
+                          const WindTunnelParameters &parameters,
+                          Real primitive_velocity[3]) {
+  if (!parameters.wind_is_source_tetrad) {
+    for (int i=0; i<3; ++i) primitive_velocity[i] = parameters.wind_u[i];
+    return;
+  }
+
+  Real metric[4][4];
+  EvaluateMetric(x, y, z, parameters, metric);
+  Real tangent_metric[4][4];
+  for (int leg_a=0; leg_a<4; ++leg_a) {
+    for (int leg_b=0; leg_b<4; ++leg_b) {
+      tangent_metric[leg_a][leg_b] = 0.0;
+      for (int mu=0; mu<4; ++mu) {
+        for (int nu=0; nu<4; ++nu) {
+          tangent_metric[leg_a][leg_b] += metric[mu][nu]
+              *parameters.source_tetrad[leg_a][mu]
+              *parameters.source_tetrad[leg_b][nu];
+        }
+      }
+    }
+  }
+  Real tangent_triad[3][3];
+  BuildSpatialTriad(tangent_metric, tangent_triad);
+  Real tangent_primitive[3] = {0.0, 0.0, 0.0};
+  for (int axis=0; axis<3; ++axis) {
+    for (int leg=0; leg<3; ++leg) {
+      tangent_primitive[axis] +=
+          parameters.wind_eulerian_u[leg]*tangent_triad[leg][axis];
+    }
+  }
+  Real tangent_velocity[4];
+  PrimitiveToFourVelocity(tangent_metric, tangent_primitive, tangent_velocity);
+  Real coordinate_velocity[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int mu=0; mu<4; ++mu) {
+    for (int leg=0; leg<4; ++leg) {
+      coordinate_velocity[mu] +=
+          parameters.source_tetrad[leg][mu]*tangent_velocity[leg];
+    }
+  }
+  FourVelocityToPrimitive(metric, coordinate_velocity, primitive_velocity);
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -343,11 +543,252 @@ Real KerrISCO(const Real mass, const Real chi, const Real direction) {
   return mass*(3.0+z2-signed_root);
 }
 
+Real MatrixSpectralNorm(const Real matrix[3][3]) {
+  Real normal_matrix[3][3] = {{0.0}};
+  for (int row=0; row<3; ++row) {
+    for (int column=0; column<3; ++column) {
+      for (int coordinate=0; coordinate<3; ++coordinate) {
+        normal_matrix[row][column] +=
+            matrix[coordinate][row]*matrix[coordinate][column];
+      }
+    }
+  }
+  int seed_axis = 0;
+  if (normal_matrix[1][1] > normal_matrix[seed_axis][seed_axis]) seed_axis = 1;
+  if (normal_matrix[2][2] > normal_matrix[seed_axis][seed_axis]) seed_axis = 2;
+  Real vector[3] = {0.0, 0.0, 0.0};
+  vector[seed_axis] = 1.0;
+  Real eigenvalue = 0.0;
+  for (int iteration=0; iteration<32; ++iteration) {
+    Real product[3] = {0.0, 0.0, 0.0};
+    for (int row=0; row<3; ++row) {
+      for (int column=0; column<3; ++column) {
+        product[row] += normal_matrix[row][column]*vector[column];
+      }
+    }
+    const Real norm = std::sqrt(SQR(product[0])+SQR(product[1])+SQR(product[2]));
+    if (!(norm > 0.0) || !std::isfinite(norm)) {
+      Fatal("failed to determine a tangent-frame matrix norm");
+    }
+    for (int axis=0; axis<3; ++axis) vector[axis] = product[axis]/norm;
+    eigenvalue = 0.0;
+    for (int row=0; row<3; ++row) {
+      for (int column=0; column<3; ++column) {
+        eigenvalue += vector[row]*normal_matrix[row][column]*vector[column];
+      }
+    }
+  }
+  return std::sqrt(eigenvalue);
+}
+
+void ConfigureSourceFrame() {
+  auto &parameters = wind_tunnel;
+  BuildSourceTetrad(parameters.metric, parameters.source_tetrad);
+  parameters.source_dt_dtau = parameters.source_tetrad[0][0];
+  for (int source_axis=0; source_axis<3; ++source_axis) {
+    for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+      parameters.force_projection[source_axis][coordinate_axis] =
+          parameters.source_dt_dtau
+          *parameters.source_tetrad[source_axis+1][coordinate_axis+1];
+    }
+  }
+
+  Real external_metric[4][4];
+  emri_comoving::ComputeExternalMetric(0.0, 0.0, 0.0, parameters.metric,
+                                       external_metric);
+  // The dual co-basis theta^A_mu = eta^AA g_mu_nu e_A^nu maps the local
+  // coordinate displacement into the secondary's orthonormal tangent frame.
+  for (int leg=0; leg<4; ++leg) {
+    const Real signature = (leg == 0) ? -1.0 : 1.0;
+    for (int component=0; component<4; ++component) {
+      parameters.metric.secondary_tetrad_covector[leg][component] = 0.0;
+      for (int contracted=0; contracted<4; ++contracted) {
+        parameters.metric.secondary_tetrad_covector[leg][component] +=
+            signature*external_metric[component][contracted]
+            *parameters.source_tetrad[leg][contracted];
+      }
+    }
+  }
+
+  const Real a = parameters.metric.secondary_tetrad_covector[1][1];
+  const Real b = parameters.metric.secondary_tetrad_covector[1][2];
+  const Real c = parameters.metric.secondary_tetrad_covector[1][3];
+  const Real d = parameters.metric.secondary_tetrad_covector[2][1];
+  const Real e = parameters.metric.secondary_tetrad_covector[2][2];
+  const Real f = parameters.metric.secondary_tetrad_covector[2][3];
+  const Real g = parameters.metric.secondary_tetrad_covector[3][1];
+  const Real h = parameters.metric.secondary_tetrad_covector[3][2];
+  const Real i = parameters.metric.secondary_tetrad_covector[3][3];
+  const Real coframe_determinant = a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+  if (!(std::abs(coframe_determinant) > std::numeric_limits<Real>::epsilon())
+      || !std::isfinite(coframe_determinant)) {
+    Fatal("secondary tangent-frame spatial co-basis is singular");
+  }
+  const Real inverse_c[3][3] = {
+    {(e*i-f*h)/coframe_determinant, (c*h-b*i)/coframe_determinant,
+     (b*f-c*e)/coframe_determinant},
+    {(f*g-d*i)/coframe_determinant, (a*i-c*g)/coframe_determinant,
+     (c*d-a*f)/coframe_determinant},
+    {(d*h-e*g)/coframe_determinant, (b*g-a*h)/coframe_determinant,
+     (a*e-b*d)/coframe_determinant}
+  };
+  const Real inverse_determinant = 1.0/std::abs(coframe_determinant);
+  parameters.source_spatial_determinant = std::abs(coframe_determinant);
+  for (int coordinate=0; coordinate<3; ++coordinate) {
+    for (int source_axis=0; source_axis<3; ++source_axis) {
+      parameters.source_spatial_inverse[coordinate][source_axis] =
+          inverse_c[coordinate][source_axis];
+      parameters.source_surface_covector[source_axis][coordinate] =
+          inverse_determinant
+          *parameters.metric.secondary_tetrad_covector[source_axis+1][coordinate+1];
+    }
+  }
+  const Real spatial_c[3][3] = {{a, b, c}, {d, e, f}, {g, h, i}};
+  parameters.source_coordinate_stretch = MatrixSpectralNorm(inverse_c);
+  parameters.source_tetrad_stretch = MatrixSpectralNorm(spatial_c);
+
+  if (parameters.metric.embed_secondary_in_tetrad) {
+    // Bound both directions of the tangent-frame map so refinement and excision
+    // remain conservative in a sheared or stretched local chart.
+    parameters.secondary_coordinate_stretch = parameters.source_coordinate_stretch;
+    parameters.secondary_rest_stretch = parameters.source_tetrad_stretch;
+  } else {
+    const Real speed = parameters.metric.include_orbital_frame
+        ? parameters.metric.omega*parameters.metric.coordinate_radius : 0.0;
+    parameters.secondary_coordinate_stretch = 1.0/std::sqrt(1.0-SQR(speed));
+    parameters.secondary_rest_stretch = parameters.secondary_coordinate_stretch;
+  }
+#if SINGLE_PRECISION_ENABLED
+  const Real tolerance = 2.0e-5;
+#else
+  const Real tolerance = 2.0e-12;
+#endif
+  for (int leg_a=0; leg_a<4; ++leg_a) {
+    for (int leg_b=0; leg_b<4; ++leg_b) {
+      const Real expected = (leg_a == leg_b) ? ((leg_a == 0) ? -1.0 : 1.0) : 0.0;
+      const Real product = MetricInnerProduct(
+          external_metric, parameters.source_tetrad[leg_a],
+          parameters.source_tetrad[leg_b]);
+      if (std::abs(product-expected) > tolerance) {
+        Fatal("EMRI source tetrad failed its orthonormality check");
+      }
+    }
+  }
+
+  if (!parameters.wind_is_source_tetrad) {
+    for (int i=0; i<3; ++i) {
+      parameters.wind_eulerian_u[i] = parameters.wind_u[i];
+      parameters.densitized_magnetic_field[i] = parameters.magnetic_field[i];
+    }
+    return;
+  }
+
+  Real source_lorentz2 = 1.0;
+  for (int i=0; i<3; ++i) source_lorentz2 += SQR(parameters.wind_u[i]);
+  const Real source_lorentz = std::sqrt(source_lorentz2);
+  Real coordinate_velocity[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int component=0; component<4; ++component) {
+    coordinate_velocity[component] =
+        source_lorentz*parameters.source_tetrad[0][component];
+    for (int axis=0; axis<3; ++axis) {
+      coordinate_velocity[component] +=
+          parameters.wind_u[axis]*parameters.source_tetrad[axis+1][component];
+    }
+  }
+  if (!(coordinate_velocity[0] > 0.0) || !std::isfinite(coordinate_velocity[0])) {
+    Fatal("source-frame wind has a non-future-directed coordinate four-velocity");
+  }
+  Real magnetic_source[4];
+  magnetic_source[0] = 0.0;
+  for (int i=0; i<3; ++i) {
+    magnetic_source[0] += parameters.magnetic_field[i]*parameters.wind_u[i];
+  }
+  for (int i=0; i<3; ++i) {
+    magnetic_source[i+1] = (parameters.magnetic_field[i]
+        + magnetic_source[0]*parameters.wind_u[i])/source_lorentz;
+  }
+  Real magnetic_coordinate[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int component=0; component<4; ++component) {
+    for (int leg=0; leg<4; ++leg) {
+      magnetic_coordinate[component] +=
+          magnetic_source[leg]*parameters.source_tetrad[leg][component];
+    }
+  }
+
+  const Real determinant = adm::SpatialDet(
+      external_metric[1][1], external_metric[1][2], external_metric[1][3],
+      external_metric[2][2], external_metric[2][3], external_metric[3][3]);
+  Real inverse_gamma[3][3];
+  adm::SpatialInv(1.0/determinant,
+      external_metric[1][1], external_metric[1][2], external_metric[1][3],
+      external_metric[2][2], external_metric[2][3], external_metric[3][3],
+      &inverse_gamma[0][0], &inverse_gamma[0][1], &inverse_gamma[0][2],
+      &inverse_gamma[1][1], &inverse_gamma[1][2], &inverse_gamma[2][2]);
+  inverse_gamma[1][0] = inverse_gamma[0][1];
+  inverse_gamma[2][0] = inverse_gamma[0][2];
+  inverse_gamma[2][1] = inverse_gamma[1][2];
+  Real beta[3] = {0.0, 0.0, 0.0};
+  Real beta_squared = 0.0;
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      beta[i] += inverse_gamma[i][j]*external_metric[0][j+1];
+    }
+    beta_squared += external_metric[0][i+1]*beta[i];
+  }
+  const Real alpha = std::sqrt(beta_squared-external_metric[0][0]);
+  const Real eulerian_lorentz = alpha*coordinate_velocity[0];
+  const Real sqrt_gamma = std::sqrt(determinant);
+  Real spatial_triad[3][3];
+  BuildSpatialTriad(external_metric, spatial_triad);
+  Real coordinate_primitive[3];
+  for (int i=0; i<3; ++i) {
+    coordinate_primitive[i] = coordinate_velocity[i+1]
+                            + coordinate_velocity[0]*beta[i];
+  }
+  for (int leg=0; leg<3; ++leg) {
+    parameters.wind_eulerian_u[leg] = 0.0;
+    for (int i=0; i<3; ++i) {
+      for (int j=0; j<3; ++j) {
+        parameters.wind_eulerian_u[leg] += external_metric[i+1][j+1]
+            *coordinate_primitive[i]*spatial_triad[leg][j];
+      }
+    }
+  }
+  Real eulerian_lorentz2_check = 1.0;
+  for (int leg=0; leg<3; ++leg) {
+    eulerian_lorentz2_check += SQR(parameters.wind_eulerian_u[leg]);
+  }
+  if (std::abs(eulerian_lorentz2_check-SQR(eulerian_lorentz))
+      > tolerance*SQR(eulerian_lorentz)) {
+    Fatal("source-frame wind failed its Eulerian Lorentz-factor check");
+  }
+  for (int i=0; i<3; ++i) {
+    const Real eulerian_field = eulerian_lorentz*magnetic_coordinate[i+1]
+        - alpha*magnetic_coordinate[0]*coordinate_velocity[i+1];
+    parameters.densitized_magnetic_field[i] = sqrt_gamma*eulerian_field;
+  }
+
+  const Real recovered_lorentz = -MetricInnerProduct(
+      external_metric, coordinate_velocity, parameters.source_tetrad[0]);
+  if (std::abs(recovered_lorentz-source_lorentz) > tolerance*source_lorentz) {
+    Fatal("source-frame wind failed its tetrad transformation check");
+  }
+  for (int axis=0; axis<3; ++axis) {
+    const Real recovered_velocity = MetricInnerProduct(
+        external_metric, coordinate_velocity, parameters.source_tetrad[axis+1]);
+    if (std::abs(recovered_velocity-parameters.wind_u[axis])
+        > tolerance*source_lorentz) {
+      Fatal("source-frame wind failed its spatial tetrad transformation check");
+    }
+    parameters.wind_eulerian_u[axis] = parameters.wind_u[axis];
+  }
+}
+
 std::string MetricRestartContract() {
   const auto &metric = wind_tunnel.metric;
   std::ostringstream contract;
   contract << std::setprecision(std::numeric_limits<Real>::max_digits10)
-           << "emri-comoving-v2"
+           << "emri-comoving-v3"
            << ";primary_mass=" << metric.primary_mass
            << ";secondary_mass=" << metric.secondary_mass
            << ";primary_spin=" << metric.primary_spin
@@ -360,8 +801,19 @@ std::string MetricRestartContract() {
            << ";singularity_floor=" << metric.singularity_floor
            << ";include_primary=" << metric.include_primary
            << ";include_orbital_frame=" << metric.include_orbital_frame
+           << ";embed_secondary_in_tetrad=" << metric.embed_secondary_in_tetrad
            << ";metric_fd_step=" << wind_tunnel.metric_fd_step
-           << ";external_metric_fd_step=" << wind_tunnel.external_metric_fd_step;
+           << ";external_metric_fd_step=" << wind_tunnel.external_metric_fd_step
+           << ";rho=" << wind_tunnel.rho
+           << ";pressure=" << wind_tunnel.pressure
+           << ";wind_u1=" << wind_tunnel.wind_u[0]
+           << ";wind_u2=" << wind_tunnel.wind_u[1]
+           << ";wind_u3=" << wind_tunnel.wind_u[2]
+           << ";magnetic_b1=" << wind_tunnel.magnetic_field[0]
+           << ";magnetic_b2=" << wind_tunnel.magnetic_field[1]
+           << ";magnetic_b3=" << wind_tunnel.magnetic_field[2]
+           << ";wind_is_source_tetrad=" << wind_tunnel.wind_is_source_tetrad
+           << ";force_is_source_tetrad=" << wind_tunnel.force_is_source_tetrad;
   return contract.str();
 }
 
@@ -403,6 +855,21 @@ void ValidateMetricKernel() {
     for (int b=0; b<4; ++b) {
       if (std::abs(metric[a][b]-reference[a][b]) > tolerance) {
         Fatal("local EMRI metric failed its isolated Kerr limit");
+      }
+    }
+  }
+  isolated.embed_secondary_in_tetrad = true;
+  for (int leg=0; leg<4; ++leg) {
+    for (int component=0; component<4; ++component) {
+      isolated.secondary_tetrad_covector[leg][component] =
+          (leg == component) ? 1.0 : 0.0;
+    }
+  }
+  emri_comoving::ComputeMetric(2.1, -0.7, 0.9, isolated, metric);
+  for (int a=0; a<4; ++a) {
+    for (int b=0; b<4; ++b) {
+      if (std::abs(metric[a][b]-reference[a][b]) > tolerance) {
+        Fatal("tangent-embedded EMRI metric failed its isolated Kerr limit");
       }
     }
   }
@@ -561,9 +1028,9 @@ void InitializeInflowArrays(MeshBlockPack *pmbp) {
     u_in.h_view(IVY, face) = wind_tunnel.wind_u[1];
     u_in.h_view(IVZ, face) = wind_tunnel.wind_u[2];
     u_in.h_view(IPR, face) = wind_tunnel.pressure;
-    b_in.h_view(IBX, face) = wind_tunnel.magnetic_field[0];
-    b_in.h_view(IBY, face) = wind_tunnel.magnetic_field[1];
-    b_in.h_view(IBZ, face) = wind_tunnel.magnetic_field[2];
+    b_in.h_view(IBX, face) = wind_tunnel.densitized_magnetic_field[0];
+    b_in.h_view(IBY, face) = wind_tunnel.densitized_magnetic_field[1];
+    b_in.h_view(IBZ, face) = wind_tunnel.densitized_magnetic_field[2];
   }
   u_in.template modify<HostMemSpace>();
   u_in.template sync<DevExeSpace>();
@@ -578,13 +1045,13 @@ Real DistanceSquaredToBlock(const RegionSize &block) {
   return SQR(dx)+SQR(dy)+SQR(dz);
 }
 
-Real SecondaryEnclosingRadius() {
+Real SecondaryRestEnclosingRadius() {
   const Real horizon = emri_comoving::SecondaryRegularizationRadius(wind_tunnel.metric);
-  const Real rest_enclosing = std::sqrt(
-      SQR(wind_tunnel.metric.secondary_spin)+SQR(horizon));
-  const Real speed = wind_tunnel.metric.include_orbital_frame
-      ? wind_tunnel.metric.omega*wind_tunnel.metric.coordinate_radius : 0.0;
-  return rest_enclosing/std::sqrt(1.0-SQR(speed));
+  return std::sqrt(SQR(wind_tunnel.metric.secondary_spin)+SQR(horizon));
+}
+
+Real SecondaryEnclosingRadius() {
+  return wind_tunnel.secondary_coordinate_stretch*SecondaryRestEnclosingRadius();
 }
 
 Real RefinementRadius(const int physical_level) {
@@ -641,6 +1108,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   pmbp->pcoord->AugmentExcisionMasks = &AugmentEMRIExcisionMasks;
   user_ref_func = RefineSecondary;
   user_hist_func = EMRIHistory;
+  user_bcs_func = EMRIWindBoundary;
 
   auto &metric = wind_tunnel.metric;
   metric.primary_mass = pin->GetOrAddReal("problem", "primary_mass", 1.0e5);
@@ -666,6 +1134,15 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     metric.include_orbital_frame = false;
   } else {
     Fatal("unknown <problem> background_mode: "+background_mode);
+  }
+  const std::string secondary_embedding =
+      pin->GetOrAddString("problem", "secondary_embedding", "tangent_tetrad");
+  if (secondary_embedding == "tangent_tetrad") {
+    metric.embed_secondary_in_tetrad = true;
+  } else if (secondary_embedding == "global_boost") {
+    metric.embed_secondary_in_tetrad = false;
+  } else {
+    Fatal("unknown <problem> secondary_embedding: "+secondary_embedding);
   }
   const int orbit_direction = pin->GetOrAddInteger("problem", "orbit_direction", 1);
   const std::string omega_mode =
@@ -714,6 +1191,24 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   wind_tunnel.magnetic_field[0] = pin->GetOrAddReal("problem", "b1", 0.0);
   wind_tunnel.magnetic_field[1] = pin->GetOrAddReal("problem", "b2", 0.0);
   wind_tunnel.magnetic_field[2] = pin->GetOrAddReal("problem", "b3", 1.0e-6);
+  const std::string wind_frame =
+      pin->GetOrAddString("problem", "wind_frame", "source_tetrad");
+  if (wind_frame == "source_tetrad") {
+    wind_tunnel.wind_is_source_tetrad = true;
+  } else if (wind_frame == "normal_frame") {
+    wind_tunnel.wind_is_source_tetrad = false;
+  } else {
+    Fatal("unknown <problem> wind_frame: "+wind_frame);
+  }
+  const std::string force_frame =
+      pin->GetOrAddString("problem", "force_frame", "source_tetrad");
+  if (force_frame == "source_tetrad") {
+    wind_tunnel.force_is_source_tetrad = true;
+  } else if (force_frame == "coordinate") {
+    wind_tunnel.force_is_source_tetrad = false;
+  } else {
+    Fatal("unknown <problem> force_frame: "+force_frame);
+  }
   wind_tunnel.refinement_radius =
       pin->GetOrAddReal("problem", "refinement_radius", 6.0*metric.secondary_mass);
   wind_tunnel.refinement_radius_ratio =
@@ -801,29 +1296,52 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Fatal("extreme-mass-ratio wind tunnels require a double-precision build");
   }
 #endif
+  ConfigureSourceFrame();
+
+  bool has_user_boundary = false;
+  for (int face=0; face<6; ++face) {
+    has_user_boundary = has_user_boundary
+        || pmy_mesh_->mesh_bcs[face] == BoundaryFlag::user;
+    if (wind_tunnel.wind_is_source_tetrad
+        && pmy_mesh_->mesh_bcs[face] == BoundaryFlag::inflow) {
+      Fatal("wind_frame=source_tetrad requires spatially varying user boundaries; "
+            "replace each inflow boundary flag with user");
+    }
+  }
+  if (wind_tunnel.wind_is_source_tetrad && !has_user_boundary) {
+    Fatal("wind_frame=source_tetrad requires at least one user inflow boundary");
+  }
 
   if (!(domain.x1min < 0.0 && domain.x1max > 0.0
         && domain.x2min < 0.0 && domain.x2max > 0.0
         && domain.x3min < 0.0 && domain.x3max > 0.0)) {
     Fatal("the local wind-tunnel domain must contain the secondary at the origin");
   }
+  const Real source_surface_inner_bound = metric.embed_secondary_in_tetrad
+      ? SecondaryRestEnclosingRadius()
+      : wind_tunnel.source_tetrad_stretch*SecondaryEnclosingRadius();
+  const Real force_surface_inner_bound = wind_tunnel.force_is_source_tetrad
+      ? source_surface_inner_bound : SecondaryEnclosingRadius();
+  const Real force_domain_bound = wind_tunnel.force_is_source_tetrad
+      ? inscribed_domain_radius/wind_tunnel.source_coordinate_stretch
+      : inscribed_domain_radius;
   if (user_hist
-      && (!(wind_tunnel.force_surface_radius > SecondaryEnclosingRadius())
+      && (!(wind_tunnel.force_surface_radius > force_surface_inner_bound)
           || !(wind_tunnel.force_surface_radius
                < wind_tunnel.force_outer_radius[0])
           || !(wind_tunnel.force_outer_radius[0]
                < wind_tunnel.force_outer_radius[1])
           || !(wind_tunnel.force_outer_radius[1]
                < wind_tunnel.force_outer_radius[2])
-          || !(wind_tunnel.force_outer_radius[2] <= inscribed_domain_radius)
+          || !(wind_tunnel.force_outer_radius[2] <= force_domain_bound)
           || wind_tunnel.force_surface_nlevel < 0
           || wind_tunnel.force_surface_nlevel > 12)) {
     Fatal("EMRI force radii must enclose the secondary horizon, increase strictly, "
           "and fit inside the largest origin-centered sphere in the domain");
   }
   if (user_hist && std::abs(pmbp->pcoord->coord_data.bh_spin) > 0.0) {
-    Fatal("EMRI force extraction uses local Cartesian spheres and requires "
-          "<coord> bh_spin=0");
+    Fatal("EMRI source-frame force extraction requires <coord> bh_spin=0; "
+          "the secondary spin is supplied by <problem> secondary_chi");
   }
   if (metric.include_primary) {
     const Real primary_horizon = metric.primary_mass
@@ -870,9 +1388,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
 
   if (user_hist) {
+    const Real *surface_transform = wind_tunnel.force_is_source_tetrad
+        ? &wind_tunnel.source_spatial_inverse[0][0] : nullptr;
     spherical_grids.push_back(std::make_unique<SphericalGrid>(
         pmbp, wind_tunnel.force_surface_nlevel,
-        wind_tunnel.force_surface_radius));
+        wind_tunnel.force_surface_radius, -1, surface_transform));
   }
 
   ValidateOrStoreRestartContract(pin, restart);
@@ -887,10 +1407,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     std::cout << std::setprecision(std::numeric_limits<Real>::max_digits10)
               << "Local EMRI wind tunnel: q=" << q
               << ", background=" << background_mode
+              << ", secondary embedding=" << secondary_embedding
               << ", r/M=" << metric.orbital_radius/metric.primary_mass
               << ", Omega*M=" << metric.omega*metric.primary_mass
               << ", reference orbital KS speed=" << orbital_speed
               << ", active frame speed=" << active_frame_speed
+              << ", wind frame=" << wind_frame
+              << ", force frame=" << force_frame
               << ", r_H/m=" << hill_radius/metric.secondary_mass
               << ", box/orbit=" << largest_extent/metric.orbital_radius
               << ", metric_fd_step/m="
@@ -921,23 +1444,35 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   auto &w0 = pmbp->pmhd->w0;
   auto &b0 = pmbp->pmhd->b0;
   auto &bcc0 = pmbp->pmhd->bcc0;
+  auto &size = pmbp->pmb->mb_size;
   const WindTunnelParameters parameters = wind_tunnel;
 
   par_for("emri_uniform_wind", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
+                               size.d_view(m).x1max);
+    const Real y = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                               size.d_view(m).x2max);
+    const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                               size.d_view(m).x3max);
+    Real primitive_velocity[3];
+    ComputeWindPrimitive(x, y, z, parameters, primitive_velocity);
     w0(m, IDN, k, j, i) = parameters.rho;
-    w0(m, IVX, k, j, i) = parameters.wind_u[0];
-    w0(m, IVY, k, j, i) = parameters.wind_u[1];
-    w0(m, IVZ, k, j, i) = parameters.wind_u[2];
+    w0(m, IVX, k, j, i) = primitive_velocity[0];
+    w0(m, IVY, k, j, i) = primitive_velocity[1];
+    w0(m, IVZ, k, j, i) = primitive_velocity[2];
     w0(m, IPR, k, j, i) = parameters.pressure;
     for (int n=0; n<nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
-    bcc0(m, IBX, k, j, i) = parameters.magnetic_field[0];
-    bcc0(m, IBY, k, j, i) = parameters.magnetic_field[1];
-    bcc0(m, IBZ, k, j, i) = parameters.magnetic_field[2];
+    bcc0(m, IBX, k, j, i) = parameters.densitized_magnetic_field[0];
+    bcc0(m, IBY, k, j, i) = parameters.densitized_magnetic_field[1];
+    bcc0(m, IBZ, k, j, i) = parameters.densitized_magnetic_field[2];
   });
-  Kokkos::deep_copy(DevExeSpace(), b0.x1f, wind_tunnel.magnetic_field[0]);
-  Kokkos::deep_copy(DevExeSpace(), b0.x2f, wind_tunnel.magnetic_field[1]);
-  Kokkos::deep_copy(DevExeSpace(), b0.x3f, wind_tunnel.magnetic_field[2]);
+  Kokkos::deep_copy(DevExeSpace(), b0.x1f,
+                    wind_tunnel.densitized_magnetic_field[0]);
+  Kokkos::deep_copy(DevExeSpace(), b0.x2f,
+                    wind_tunnel.densitized_magnetic_field[1]);
+  Kokkos::deep_copy(DevExeSpace(), b0.x3f,
+                    wind_tunnel.densitized_magnetic_field[2]);
   pmbp->pdyngr->PrimToConInit(is, ie, js, je, ks, ke);
 }
 
@@ -984,6 +1519,118 @@ void SetADMVariablesToEMRI(MeshBlockPack *pmbp) {
   });
 }
 
+//! Fill every user face with the same source-frame wind.  The magnetic field is constant
+//! in densitized coordinate components, so the CT divergence constraint remains exact.
+void EMRIWindBoundary(Mesh *pm) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  auto &indcs = pm->mb_indcs;
+  const int ng = indcs.ng;
+  const int is = indcs.is;
+  const int ie = indcs.ie;
+  const int js = indcs.js;
+  const int je = indcs.je;
+  const int ks = indcs.ks;
+  const int ke = indcs.ke;
+  const int n1 = indcs.nx1+2*ng;
+  const int n2 = (indcs.nx2 > 1) ? indcs.nx2+2*ng : 1;
+  const int n3 = (indcs.nx3 > 1) ? indcs.nx3+2*ng : 1;
+  const int nmb = pmbp->nmb_thispack;
+  const int nscalars = pmbp->pmhd->nscalars;
+  auto &mb_bcs = pmbp->pmb->mb_bcs;
+  auto &size = pmbp->pmb->mb_size;
+  auto &w0 = pmbp->pmhd->w0;
+  auto &b0 = pmbp->pmhd->b0;
+  auto &bcc0 = pmbp->pmhd->bcc0;
+  const WindTunnelParameters parameters = wind_tunnel;
+
+  par_for("emri_user_b1", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const bool user_ghost =
+        (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
+        || (i > ie+1
+            && mb_bcs.d_view(m, BoundaryFace::outer_x1) == BoundaryFlag::user)
+        || (j < js
+            && mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::user)
+        || (j > je
+            && mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::user)
+        || (k < ks
+            && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
+        || (k > ke
+            && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
+    if (user_ghost) b0.x1f(m, k, j, i) = parameters.densitized_magnetic_field[0];
+  });
+  par_for("emri_user_b2", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2, 0, n1-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const bool user_ghost =
+        (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
+        || (i > ie
+            && mb_bcs.d_view(m, BoundaryFace::outer_x1) == BoundaryFlag::user)
+        || (j < js
+            && mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::user)
+        || (j > je+1
+            && mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::user)
+        || (k < ks
+            && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
+        || (k > ke
+            && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
+    if (user_ghost) b0.x2f(m, k, j, i) = parameters.densitized_magnetic_field[1];
+  });
+  par_for("emri_user_b3", DevExeSpace(), 0, nmb-1, 0, n3, 0, n2-1, 0, n1-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const bool user_ghost =
+        (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
+        || (i > ie
+            && mb_bcs.d_view(m, BoundaryFace::outer_x1) == BoundaryFlag::user)
+        || (j < js
+            && mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::user)
+        || (j > je
+            && mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::user)
+        || (k < ks
+            && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
+        || (k > ke+1
+            && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
+    if (user_ghost) b0.x3f(m, k, j, i) = parameters.densitized_magnetic_field[2];
+  });
+
+  par_for("emri_user_wind", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1-1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const bool user_ghost =
+        (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
+        || (i > ie
+            && mb_bcs.d_view(m, BoundaryFace::outer_x1) == BoundaryFlag::user)
+        || (j < js
+            && mb_bcs.d_view(m, BoundaryFace::inner_x2) == BoundaryFlag::user)
+        || (j > je
+            && mb_bcs.d_view(m, BoundaryFace::outer_x2) == BoundaryFlag::user)
+        || (k < ks
+            && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
+        || (k > ke
+            && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
+    if (!user_ghost) return;
+
+    const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
+                               size.d_view(m).x1max);
+    const Real y = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                               size.d_view(m).x2max);
+    const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                               size.d_view(m).x3max);
+    Real primitive_velocity[3];
+    ComputeWindPrimitive(x, y, z, parameters, primitive_velocity);
+    w0(m, IDN, k, j, i) = parameters.rho;
+    w0(m, IVX, k, j, i) = primitive_velocity[0];
+    w0(m, IVY, k, j, i) = primitive_velocity[1];
+    w0(m, IVZ, k, j, i) = primitive_velocity[2];
+    w0(m, IPR, k, j, i) = parameters.pressure;
+    for (int n=0; n<nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
+    bcc0(m, IBX, k, j, i) =
+        0.5*(b0.x1f(m, k, j, i)+b0.x1f(m, k, j, i+1));
+    bcc0(m, IBY, k, j, i) =
+        0.5*(b0.x2f(m, k, j, i)+b0.x2f(m, k, j+1, i));
+    bcc0(m, IBZ, k, j, i) =
+        0.5*(b0.x3f(m, k, j, i)+b0.x3f(m, k+1, j, i));
+  });
+}
+
 void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp) {
   auto &floor = pmbp->pcoord->excision_floor;
   auto &flux = pmbp->pcoord->excision_flux;
@@ -1020,19 +1667,16 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp) {
                        + parameters.metric_fd_step;
     const Real spin2 = SQR(parameters.metric.secondary_spin);
     const Real enclosing_radius = sqrt(spin2+SQR(regularization_radius));
-    const Real orbital_speed = parameters.metric.include_orbital_frame
-        ? parameters.metric.omega*parameters.metric.coordinate_radius : 0.0;
-    const Real gamma = 1.0/sqrt(1.0-SQR(orbital_speed));
-    const Real velocity[3] = {0.0, orbital_speed, 0.0};
-    const Real origin[3] = {0.0, 0.0, 0.0};
     Real rest_position[3];
-    binary_bh::RestFramePosition(x, y, z, origin, velocity, rest_position);
+    emri_comoving::SecondaryRestFramePosition(
+        x, y, z, parameters.metric, rest_position);
     const Real rest_distance = sqrt(SQR(rest_position[0])+SQR(rest_position[1])
                                   +SQR(rest_position[2]));
     floor(m, k, j, i) = floor(m, k, j, i)
                      || radius2 <= SQR(regularization_radius);
     flux(m, k, j, i) = flux(m, k, j, i)
-                    || rest_distance <= enclosing_radius+gamma*padding;
+                    || rest_distance <= enclosing_radius
+                                      +parameters.secondary_rest_stretch*padding;
   });
 }
 
@@ -1061,7 +1705,7 @@ void RefineSecondary(MeshBlockPack *pmbp) {
 
 void EMRIHistory(HistoryData *pdata, Mesh *pm) {
   pdata->nhist = 20;
-  const char *labels[20] = {
+  const char *coordinate_labels[20] = {
     "mass_ratio", "orbit_r_M", "omega_M", "mdot",
     "Fmom_x", "Fmom_y", "Fmom_z",
     "Fnewt_x", "Fnewt_y", "Fnewt_z",
@@ -1069,8 +1713,17 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     "Frel2_x", "Frel2_y", "Frel2_z",
     "Frel3_x", "Frel3_y", "Frel3_z", "geo_resid"
   };
+  const char *source_labels[20] = {
+    "mass_ratio", "orbit_r_M", "omega_M", "mdot_hat",
+    "FmomH_x", "FmomH_y", "FmomH_z",
+    "FnewtH_x", "FnewtH_y", "FnewtH_z",
+    "Frel1H_x", "Frel1H_y", "Frel1H_z",
+    "Frel2H_x", "Frel2H_y", "Frel2H_z",
+    "Frel3H_x", "Frel3H_y", "Frel3H_z", "geo_resid"
+  };
   for (int n=0; n<pdata->nhist; ++n) {
-    pdata->label[n] = labels[n];
+    pdata->label[n] = wind_tunnel.force_is_source_tetrad
+        ? source_labels[n] : coordinate_labels[n];
     pdata->hdata[n] = 0.0;
   }
 
@@ -1103,9 +1756,31 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     const Real x = grid.interp_coord.h_view(n, 0);
     const Real y = grid.interp_coord.h_view(n, 1);
     const Real z = grid.interp_coord.h_view(n, 2);
+    const Real coordinate[3] = {x, y, z};
     const Real inverse_radius = 1.0/parameters.force_surface_radius;
-    const Real normal[3] = {x*inverse_radius, y*inverse_radius,
-                            z*inverse_radius};
+    Real surface_covector[3];
+    if (parameters.force_is_source_tetrad) {
+      Real source_normal[3] = {0.0, 0.0, 0.0};
+      for (int source_axis=0; source_axis<3; ++source_axis) {
+        for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+          source_normal[source_axis] +=
+              parameters.metric.secondary_tetrad_covector[source_axis+1]
+                  [coordinate_axis+1]*coordinate[coordinate_axis]*inverse_radius;
+        }
+      }
+      for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+        surface_covector[coordinate_axis] = 0.0;
+        for (int source_axis=0; source_axis<3; ++source_axis) {
+          surface_covector[coordinate_axis] +=
+              parameters.source_surface_covector[source_axis][coordinate_axis]
+              *source_normal[source_axis];
+        }
+      }
+    } else {
+      for (int axis=0; axis<3; ++axis) {
+        surface_covector[axis] = coordinate[axis]*inverse_radius;
+      }
+    }
     const Real velocity[3] = {
       grid.interp_vals.h_view(n, IVX),
       grid.interp_vals.h_view(n, IVY),
@@ -1129,20 +1804,38 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     const Real area_weight = surface_radius2
         *grid.solid_angles.h_view(n)*sqrt_minus_g;
     Real radial_velocity = 0.0;
-    for (int j=0; j<3; ++j) radial_velocity += normal[j]*four_velocity[j+1];
+    for (int j=0; j<3; ++j) {
+      radial_velocity += surface_covector[j]*four_velocity[j+1];
+    }
     pdata->hdata[3] -= density*radial_velocity*area_weight;
 
-    for (int force_direction=0; force_direction<3; ++force_direction) {
-      Real radial_momentum = 0.0;
+    Real momentum_covector[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int covector_component=0; covector_component<4; ++covector_component) {
       for (int surface_direction=0; surface_direction<3; ++surface_direction) {
         Real mixed_stress = 0.0;
         for (int a=0; a<4; ++a) {
           mixed_stress += stress[surface_direction+1][a]
-                         *metric[a][force_direction+1];
+                         *metric[a][covector_component];
         }
-        radial_momentum += normal[surface_direction]*mixed_stress;
+        momentum_covector[covector_component] +=
+            surface_covector[surface_direction]*mixed_stress;
       }
-      pdata->hdata[4+force_direction] += radial_momentum*area_weight;
+    }
+    if (parameters.force_is_source_tetrad) {
+      for (int source_axis=0; source_axis<3; ++source_axis) {
+        Real source_momentum = 0.0;
+        for (int component=0; component<4; ++component) {
+          source_momentum += parameters.source_tetrad[source_axis+1][component]
+                           *momentum_covector[component];
+        }
+        pdata->hdata[4+source_axis] +=
+            parameters.source_dt_dtau*source_momentum*area_weight;
+      }
+    } else {
+      for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+        pdata->hdata[4+coordinate_axis] +=
+            momentum_covector[coordinate_axis+1]*area_weight;
+      }
     }
   }
 
@@ -1185,7 +1878,20 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
                                 size.d_view(m).x2max);
       const Real z = CellCenterX(k0, nx3, size.d_view(m).x3min,
                                 size.d_view(m).x3max);
-      const Real radius2 = SQR(x)+SQR(y)+SQR(z);
+      const Real coordinate[3] = {x, y, z};
+      Real force_position[3] = {x, y, z};
+      if (parameters.force_is_source_tetrad) {
+        for (int source_axis=0; source_axis<3; ++source_axis) {
+          force_position[source_axis] = 0.0;
+          for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+            force_position[source_axis] +=
+                parameters.metric.secondary_tetrad_covector[source_axis+1]
+                    [coordinate_axis+1]*coordinate[coordinate_axis];
+          }
+        }
+      }
+      const Real radius2 = SQR(force_position[0])+SQR(force_position[1])
+                         +SQR(force_position[2]);
       if (radius2 <= surface_radius2 || radius2 > outer_radius2[2]) return;
 
       const Real velocity[3] = {
@@ -1212,13 +1918,16 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
       const Real radius = sqrt(radius2);
       const Real source_density = parameters.force_subtract_background
           ? density-parameters.rho : density;
+      const Real newtonian_volume = parameters.force_is_source_tetrad
+          ? parameters.source_spatial_determinant*coordinate_volume
+          : sqrt_gamma*coordinate_volume;
       const Real newtonian_coefficient = parameters.metric.secondary_mass
-          *source_density*sqrt_gamma*coordinate_volume/(radius2*radius);
+          *source_density*newtonian_volume/(radius2*radius);
 
       array_sum::GlobalSum cell;
-      cell.the_array[7] = newtonian_coefficient*x;
-      cell.the_array[8] = newtonian_coefficient*y;
-      cell.the_array[9] = newtonian_coefficient*z;
+      cell.the_array[7] = newtonian_coefficient*force_position[0];
+      cell.the_array[8] = newtonian_coefficient*force_position[1];
+      cell.the_array[9] = newtonian_coefficient*force_position[2];
       for (int force_direction=0; force_direction<3; ++force_direction) {
         Real contraction = 0.0;
         for (int a=0; a<4; ++a) {
@@ -1240,6 +1949,26 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
 
   for (int n=7; n<=18; ++n) {
     pdata->hdata[n] += force_integrals.the_array[n];
+  }
+
+  if (wind_tunnel.force_is_source_tetrad) {
+    pdata->hdata[3] *= wind_tunnel.source_dt_dtau;
+    // Momentum flux and the Newtonian estimator are accumulated directly in the
+    // source frame; the relativistic generalized forces remain coordinate covectors.
+    const int vector_starts[3] = {10, 13, 16};
+    for (const int start : vector_starts) {
+      const Real coordinate_force[3] = {
+        pdata->hdata[start], pdata->hdata[start+1], pdata->hdata[start+2]
+      };
+      for (int source_axis=0; source_axis<3; ++source_axis) {
+        pdata->hdata[start+source_axis] = 0.0;
+        for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+          pdata->hdata[start+source_axis] +=
+              wind_tunnel.force_projection[source_axis][coordinate_axis]
+              *coordinate_force[coordinate_axis];
+        }
+      }
+    }
   }
 }
 

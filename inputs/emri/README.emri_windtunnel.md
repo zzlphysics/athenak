@@ -16,9 +16,9 @@ and run the small CPU smoke problem with
 ## Spacetime model
 
 The numerical domain is centered on the secondary black hole and does not contain the
-primary.  The prescribed metric nevertheless contains both Kerr-Schild terms.  At `t=0`
-the primary is at global Cartesian Kerr-Schild position `(0,0,0)` and the secondary is at
-`(R0,0,0)`, where
+primary.  The prescribed external metric nevertheless retains the primary Kerr field.
+At `t=0` the primary is at global Cartesian Kerr-Schild position `(0,0,0)` and the
+secondary orbit is anchored at `(R0,0,0)`, where
 
 ```text
 R0 = sqrt(orbital_radius^2 + (primary_chi*primary_mass)^2).
@@ -30,36 +30,46 @@ with the orbital z axis make the local metric stationary.  `omega_mode=kerr_geod
 uses the test-particle equatorial Kerr frequency; `omega_mode=custom` reads
 `orbital_omega` directly.
 
+The default `secondary_embedding=tangent_tetrad` constructs the small-hole Kerr-Schild
+perturbation in an orthonormal tetrad of the external metric at the orbital anchor, then
+maps that covariant perturbation into the numerical chart.  This is the appropriate
+local construction: the constant part of the primary field changes the tetrad, while
+only its gradients and curvature across the box can produce locally measurable
+corrections.  `secondary_embedding=global_boost` retains the earlier global
+Minkowski-boost prescription as a legacy control; it should not be used for EMRI science
+because it can turn an order-`M/r` coordinate potential into a spurious order-unity
+change of the secondary near field.
+
 Use `<adm> dynamic=false` for ordinary global-timestep evolution: the stationary metric
 is cached and is regenerated automatically after AMR topology changes.  The repository's
 strict `time/subcycling=level` scheduler currently requires `dynamic=true`; that mode
 re-evaluates the same stationary metric at RK stages and is therefore more expensive.
 
-This is an effective prescribed spacetime, not a constraint-solved EMRI metric.  It keeps
-the full primary Kerr field and all orders in local position present in the superposed
-Kerr-Schild approximation, but it neglects inspiral, radiation reaction, primary recoil,
-and the disk's gravitational backreaction.  Those assumptions are intentional for a
-one-way local wind tunnel.
+This is an effective prescribed spacetime, not a matched-asymptotic or constraint-solved
+EMRI metric.  It keeps the full primary Kerr field in the external sector and an exact
+small-hole Kerr perturbation in the anchor tetrad, but neglects nonlinear cross terms,
+inspiral, radiation reaction, primary recoil, and disk self-gravity.  Those assumptions
+are intentional for a one-way local wind tunnel.
 
 ## Controlled background modes
 
 `background_mode` defines three runs that keep the secondary, wind, magnetic field,
 domain, and diagnostic radii fixed:
 
-| mode | primary Kerr term | orbital pullback and secondary boost | role |
+| mode | primary Kerr term | orbital pullback | role |
 |---|---:|---:|---|
 | `full` | yes | yes | effective EMRI wind tunnel |
 | `frame_only` | no | yes | fixed-chart counterfactual for adding the primary metric |
 | `isolated` | no | no | inertial isolated-Kerr BHL control |
 
 The useful contrasts are `full-frame_only` and `frame_only-isolated`.  The first changes
-only the primary Kerr contribution while holding the coordinate map fixed.  The second
-shows the effect of the orbital non-inertial chart and boost.  In `frame_only`, centrifugal
+only the primary Kerr contribution while holding the raw orbital chart fixed.  The second
+shows the effect of the orbital non-inertial chart.  With the default source-tetrad wind,
+force components, and physical extraction spheres, the three runs specify the same
+locally measured upstream state and diagnostics.  In `frame_only`, centrifugal
 acceleration is intentionally not balanced by primary gravity, so its nonzero
-`geo_resid` is expected.  These are attribution experiments between prescribed
-spacetimes, not gauge-invariant observables that may be subtracted without qualification.
-In particular, the reported forces are coordinate components of a quasi-local generalized
-force.
+`geo_resid` is expected.  The contrasts remain attribution experiments between
+prescribed effective spacetimes, not globally gauge-invariant binary observables.
 
 Run the same input in three separate directories, changing only the mode and basename:
 
@@ -76,9 +86,9 @@ mkdir -p runs/emri/{full,frame_only,isolated}
   problem/background_mode=isolated job/basename=isolated
 ```
 
-The selected mode is part of the restart contract, so a checkpoint cannot silently be
-continued with another background.  Version-1 prototype checkpoints predate this field
-and are deliberately rejected.
+The selected mode, secondary embedding, and wind/force frame choices are part of the
+restart contract, so a checkpoint cannot silently be continued with another model.
+Prototype checkpoints with older contracts are deliberately rejected.
 
 ## Units and scale checks
 
@@ -113,14 +123,21 @@ not by a brute-force scan in `q`.
 ## Wind and boundaries
 
 `rho0`, `pgas0`, `u1..u3`, and `b1..b3` initialize a uniform magnetized wind.
-The velocity inputs are AthenaK's normal-frame spatial four-velocity components, not
-coordinate three-velocities.  Constant face-centered magnetic fields are divergence-free.
+With the default `wind_frame=source_tetrad`, `u1..u3` are the Eulerian orthonormal spatial
+four-velocity components and `b1..b3` are magnetic-field components in the
+secondary-comoving external-background tetrad at the anchor.  The code reconstructs the
+same tangent-chart GRMHD state point by point and maps it into each numerical slicing;
+the Lorentz factor therefore remains timelike near the small hole without confusing a
+coordinate boost with a physical change of wind.  `wind_frame=normal_frame` is the
+legacy coordinate-primitive interpretation.
 
-Use the built-in `inflow` flag on every upstream face and `outflow` downstream.  The
-sample has positive `u1` and therefore uses `ix1_bc=inflow`.  For oblique or sub-fast
-flows, more than one inflow face may be physically required.  A future replay boundary
-will replace these constants with tetrad-projected data from a global single-SMBH GRMHD
-run while preserving constrained-transport face fluxes.
+Source-frame wind uses a `user` flag on every face that supplies upstream data, because
+the coordinate primitive varies over the boundary even when the tangent-frame state is
+uniform.  The sample has positive `u1` and therefore uses `ix1_bc=user`; downstream faces
+remain `outflow`.  For oblique or sub-fast flows, more than one user face may be required.
+The face-centered magnetic field is stored in constant densitized coordinate components,
+which preserves the constrained-transport divergence exactly.  A future replay boundary
+can replace this state with tetrad-projected data from a global single-SMBH GRMHD run.
 
 ## Validation gates before science production
 
@@ -139,17 +156,33 @@ run while preserving constrained-transport face fluxes.
 Set `problem/user_hist=true` and add a history output with
 `user_hist_only=true`.  The online diagnostics follow the decomposition used in
 arXiv:2201.11753 and arXiv:2409.12359, but retain all three force components and add a
-relativistic source-force estimator.  On the extraction sphere `r=r_s`, the code computes
+relativistic source-force estimator.  The default `force_frame=source_tetrad` defines
+the extraction and cutoff radii by
 
 ```text
-mdot    = - integral rho u^j n_j sqrt(-g) r_s^2 dOmega,
-Fmom_i  =   integral T^j_i n_j sqrt(-g) r_s^2 dOmega.
+rhat^2 = sum_a (theta^a_i x^i)^2,
 ```
+
+where `theta^a_i` is the spatial source co-basis at the orbital anchor.  A source-frame
+sphere is generally an ellipsoid in the raw rotating coordinates.  The geodesic-grid
+sampling points and its covariant surface-area vector are both transformed; changing
+only the points is not sufficient.  The accretion rate is reported per source proper
+time, and the momentum flux uses the complete covariant four-momentum flux before
+projection:
+
+```text
+mdot_hat   = -(dt/dtau) integral rho u^i dSigma_i,
+Fmom_hat_a =  (dt/dtau) e_a^mu integral T^i_mu dSigma_i.
+```
+
+The `mu=0` energy-flux term in the second expression is essential: omitting it creates a
+large spurious tangential force in a rotating chart.  Set `force_frame=coordinate` only
+for legacy coordinate-sphere diagnostics.
 
 The paper-compatible far-field estimator is
 
 ```text
-Fnewt_i = m integral (rho-rho0) x_i/r^3 sqrt(gamma) d^3x,
+Fnewt_hat_a = m integral (rho-rho0) xhat_a/rhat^3 d^3xhat,
 ```
 
 over `r_s < r < force_outer_radius_3`.  Subtracting the uniform background removes a
@@ -171,24 +204,26 @@ of the rotating basis are not included.  It also includes gas pressure and magne
 stress, whereas `Fnewt_i` uses density alone.  Its weak-field limit is
 `m integral rho x_i/r^3 dV`.
 
-`Frel1_i`, `Frel2_i`, and `Frel3_i` are accumulated to the three configured outer radii.
-The corresponding total force estimates are formed in post-processing:
+For source-frame output, the generalized-force covector is converted to force per source
+proper time and projected on the source tetrad.  `Frel1H_i`, `Frel2H_i`, and `Frel3H_i`
+are accumulated to the three configured physical outer radii.  The corresponding total
+force estimates are formed in post-processing:
 
 ```text
-Ftotal_i(Rk) = -Fmom_i + Frelk_i.
+FtotalkH_i = -FmomH_i + FrelkH_i.
 ```
 
 The axes at the reported orbital phase are `x` radial from the primary through the
 secondary, `y` prograde tangential, and `z` normal to the orbital plane.  Consequently,
-`Ftotal_y` is the leading orbital-energy/angular-momentum drag channel, while `x` and `z`
-can drive eccentricity and inclination.  For a differently oriented imposed wind, use
-the full vector rather than identifying a component by name.
+`FtotalH_y` is the leading orbital-energy/angular-momentum drag channel, while `x` and
+`z` can drive eccentricity and inclination.  For a differently oriented imposed wind,
+use the full vector rather than identifying a component by name.
 
 Use `force_surface_radius >= 3m` as a starting point and repeat the calculation at other
 extraction radii: arXiv:2409.12359 showed that horizon-adjacent momentum fluxes can be
-contaminated by density floors.  The extraction sphere must enclose the boosted secondary
-horizon, and all outer radii must fit inside the largest origin-centered sphere in the
-box.  Dependence on `force_outer_radius_*` measures the missing far wake and is a physical
+contaminated by density floors.  The extraction sphere must enclose the secondary
+horizon in the selected frame, and its coordinate ellipsoid must fit inside the box.
+Dependence on `force_outer_radius_*` measures the missing far wake and is a physical
 systematic of a local wind tunnel, not merely a numerical error.  The force remains a
 quasi-local diagnostic in a prescribed effective metric; it is not fed back into the
 orbit.  Also converge `force_surface_nlevel`, which controls the geodesic-grid angular
@@ -197,10 +232,13 @@ quadrature independently of the Cartesian fluid resolution.
 The history columns are
 
 ```text
-mass_ratio orbit_r_M omega_M mdot
-Fmom_x..z Fnewt_x..z
-Frel1_x..z Frel2_x..z Frel3_x..z geo_resid
+mass_ratio orbit_r_M omega_M mdot_hat
+FmomH_x..z FnewtH_x..z
+Frel1H_x..z Frel2H_x..z Frel3H_x..z geo_resid
 ```
+
+The shorter `H` spelling is used because AthenaK history labels are limited to ten
+characters.  Coordinate-frame output retains the un-hatted legacy column names.
 
 ## Force averaging and controlled contrasts
 
@@ -218,12 +256,14 @@ python3 inputs/emri/analyze_force_history.py \
   --tmin 100 --blocks 8
 ```
 
-Use `--quantity Ftotal3_y` repeatedly to select columns and `--format csv` or
-`--format json` for downstream analysis.  The default averaging interval is the common
-time overlap.  Duplicate times from appended restart histories retain their last value.
-A block error is meaningful only after the flow is statistically stationary and each
-block is longer than the force autocorrelation time; the script caps the number of blocks
-at the number of sampled time intervals and reports `nan` when only one block is possible.
+Use `--quantity Ftotal3H_y` repeatedly for source-frame histories (or `Ftotal3_y` for
+legacy coordinate histories), and `--format csv` or `--format json` for downstream
+analysis.  The script detects either schema and rejects a mixed-schema comparison.  The
+default averaging interval is the common time overlap.  Duplicate times from appended
+restart histories retain their last value.  A block error is meaningful only after the
+flow is statistically stationary and each block is longer than the force autocorrelation
+time; the script caps the number of blocks at the number of sampled time intervals and
+reports `nan` when only one block is possible.
 
 ## Decision gate for the next science runs
 
@@ -244,6 +284,16 @@ tidal field is tiny.  Treat a primary-metric signal as resolved only if
                               resolution_change,
                               outer-radius_change).
 ```
+
+The one-step CPU consistency check at `q=10^-5`, `r/M=10` illustrates the required
+resolution test.  With the default source-tetrad embedding, state, and diagnostics,
+increasing the uniform grid from `16^3` to `64^3` reduced the initial
+`full-frame_only` contrast in `Ftotal3H_x` from about `8.7e-1` to `6.9e-3`, while the
+individual force was about `18.4`.  The large coarse-grid contrast was therefore
+coordinate-grid sampling of differently shaped physical ellipsoids, not a detected
+primary-curvature force.  These startup values are validation numbers, not stationary
+BHL results, but they show that realistic EMRI tidal corrections can lie far below the
+truncation floor of a cheap local run.
 
 The economical production sequence is:
 

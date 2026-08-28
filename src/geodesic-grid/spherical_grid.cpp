@@ -23,7 +23,8 @@
 //----------------------------------------------------------------------------------------
 // constructor, initializes data structures and parameters
 
-SphericalGrid::SphericalGrid(MeshBlockPack *ppack, int nlev, Real rad, int nintp):
+SphericalGrid::SphericalGrid(MeshBlockPack *ppack, int nlev, Real rad, int nintp,
+                             const Real *linear_transform):
     GeodesicGrid(nlev,true,false),
     pmy_pack(ppack),
     radius(rad),
@@ -31,6 +32,12 @@ SphericalGrid::SphericalGrid(MeshBlockPack *ppack, int nlev, Real rad, int nintp
     interp_indcs("interp_indcs",1,1),
     interp_wghts("interp_wghts",1,1,1),
     interp_vals("interp_vals",1,1) {
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      coordinate_transform[i][j] = (linear_transform == nullptr)
+          ? ((i == j) ? 1.0 : 0.0) : linear_transform[3*i+j];
+    }
+  }
   // reallocate and set interpolation coordinates, indices, and weights
   ninterp = (nintp <= 0) ? pmy_pack->pmesh->mb_indcs.ng*2 : nintp;
   if (ninterp > pmy_pack->pmesh->mb_indcs.ng*2+1) {
@@ -66,23 +73,26 @@ void SphericalGrid::SetInterpolationCoordinates() {
   // Schild data, the SphericalGrid radius is assumed to correspond to a spherical Kerr-
   // Schild radius, meaning that when setting the x1, x2, and x3 interpolation coordinates
   // we must translate between the two coordinate systems.
-  if (pmy_pack->pcoord->is_general_relativistic ||
-      pmy_pack->pcoord->is_dynamical_relativistic) {
-    for (int n=0; n<nangles; ++n) {
-      Real &spin = pmy_pack->pcoord->coord_data.bh_spin;
-      Real &theta = polar_pos.h_view(n,0);
-      Real &phi = polar_pos.h_view(n,1);
-      interp_coord.h_view(n,0) = (radius*cos(phi)-spin*sin(phi))*sin(theta);
-      interp_coord.h_view(n,1) = (radius*sin(phi)+spin*cos(phi))*sin(theta);
-      interp_coord.h_view(n,2) = radius*cos(theta);
+  for (int n=0; n<nangles; ++n) {
+    const Real theta = polar_pos.h_view(n,0);
+    const Real phi = polar_pos.h_view(n,1);
+    Real spherical_position[3];
+    if (pmy_pack->pcoord->is_general_relativistic
+        || pmy_pack->pcoord->is_dynamical_relativistic) {
+      const Real spin = pmy_pack->pcoord->coord_data.bh_spin;
+      spherical_position[0] = (radius*cos(phi)-spin*sin(phi))*sin(theta);
+      spherical_position[1] = (radius*sin(phi)+spin*cos(phi))*sin(theta);
+      spherical_position[2] = radius*cos(theta);
+    } else {
+      spherical_position[0] = radius*cos(phi)*sin(theta);
+      spherical_position[1] = radius*sin(phi)*sin(theta);
+      spherical_position[2] = radius*cos(theta);
     }
-  } else {
-    for (int n=0; n<nangles; ++n) {
-      Real &theta = polar_pos.h_view(n,0);
-      Real &phi = polar_pos.h_view(n,1);
-      interp_coord.h_view(n,0) = radius*cos(phi)*sin(theta);
-      interp_coord.h_view(n,1) = radius*sin(phi)*sin(theta);
-      interp_coord.h_view(n,2) = radius*cos(theta);
+    for (int i=0; i<3; ++i) {
+      interp_coord.h_view(n,i) = 0.0;
+      for (int j=0; j<3; ++j) {
+        interp_coord.h_view(n,i) += coordinate_transform[i][j]*spherical_position[j];
+      }
     }
   }
 

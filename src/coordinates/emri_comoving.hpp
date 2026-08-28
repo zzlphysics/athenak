@@ -9,12 +9,14 @@
 //! \file emri_comoving.hpp
 //! \brief Helically symmetric local coordinates centered on an EMRI secondary.
 //!
-//! The full effective spacetime is a stationary primary Kerr-Schild term plus a
-//! circularly moving secondary Kerr-Schild term.  Local coordinates rotate about the
-//! primary and are translated so that the secondary remains at x^i=0.  Controlled modes
-//! can omit the primary term and/or this orbital-frame pullback.  The primary can lie
-//! outside the numerical domain while its full metric contribution remains present.
-//! Spins are restricted to the orbital z axis in this first implementation.
+//! The external spacetime is a stationary primary Kerr-Schild term pulled back into
+//! coordinates that rotate about the primary and keep the secondary at x^i=0.  By
+//! default, the secondary Kerr perturbation is constructed in an orthonormal tangent
+//! frame of that external metric at the orbit and mapped back as a covariant tensor.
+//! This avoids interpreting a nearly constant primary potential as a global
+//! special-relativistic boost of the small hole.  A legacy global-boost embedding is
+//! retained as a controlled diagnostic.  Modes can omit the primary term and/or the
+//! orbital pullback, and spins are restricted to the orbital z axis in this first model.
 //!
 //! If X^i are asymptotically inertial Cartesian coordinates and x^i are local
 //! coordinates, the map at t=0 is
@@ -25,7 +27,8 @@
 //! with the spatial axes rotating at Omega.  Axisymmetry and aligned spins make the
 //! pulled-back metric independent of local time.  Evaluating at t=0 avoids subtracting
 //! the large orbital radius from the secondary position, which is important at extreme
-//! mass ratios.
+//! mass ratios.  The tangent embedding is a local effective metric, not a matched
+//! asymptotic or constraint-solved binary spacetime.
 
 #include "athena.hpp"
 #include "coordinates/superposed_bbh.hpp"
@@ -43,8 +46,10 @@ struct MetricParameters {
   Real spin_buffer_primary;
   Real spin_buffer_secondary;
   Real singularity_floor;
+  Real secondary_tetrad_covector[4][4]; // source-frame co-basis at the orbit
   bool include_primary;       // include the primary Kerr-Schild contribution
   bool include_orbital_frame; // apply the co-rotating/translated coordinate pullback
+  bool embed_secondary_in_tetrad;
 };
 
 //! Test-particle circular equatorial Kerr angular frequency.  direction=+1 and -1 select
@@ -119,6 +124,42 @@ void ComputeSecondaryMetricPerturbationAtDisplacement(
     const Real displacement_x, const Real displacement_y, const Real displacement_z,
     const Real basis_x, const Real basis_y, const MetricParameters &parameters,
     Real local_metric[4][4]) {
+  if (parameters.embed_secondary_in_tetrad) {
+    Real tetrad_position[3] = {0.0, 0.0, 0.0};
+    const Real displacement[4] = {
+      0.0, displacement_x, displacement_y, displacement_z
+    };
+    for (int axis=0; axis<3; ++axis) {
+      for (int component=0; component<4; ++component) {
+        tetrad_position[axis] +=
+            parameters.secondary_tetrad_covector[axis+1][component]
+            *displacement[component];
+      }
+    }
+    Real tetrad_metric[4][4] = {{0.0}};
+    const Real zero[3] = {0.0, 0.0, 0.0};
+    const Real secondary_spin[3] = {0.0, 0.0, parameters.secondary_spin};
+    binary_bh::AddBoostedKerrSchildTerm(
+        tetrad_position[0], tetrad_position[1], tetrad_position[2], zero, zero,
+        secondary_spin, parameters.secondary_mass, parameters.spin_buffer_secondary,
+        parameters.singularity_floor, tetrad_metric);
+    for (int mu=0; mu<4; ++mu) {
+      for (int nu=mu; nu<4; ++nu) {
+        Real value = 0.0;
+        for (int leg_a=0; leg_a<4; ++leg_a) {
+          for (int leg_b=0; leg_b<4; ++leg_b) {
+            value += tetrad_metric[leg_a][leg_b]
+                *parameters.secondary_tetrad_covector[leg_a][mu]
+                *parameters.secondary_tetrad_covector[leg_b][nu];
+          }
+        }
+        local_metric[mu][nu] = value;
+        local_metric[nu][mu] = value;
+      }
+    }
+    return;
+  }
+
   Real global_metric[4][4] = {{0.0}};
   const Real zero[3] = {0.0, 0.0, 0.0};
   // Translation invariance lets the secondary term be evaluated directly from its
@@ -158,12 +199,24 @@ void ComputeMetric(const Real x, const Real y, const Real z,
   }
 }
 
-//! Small-hole Kerr radius on a local t=constant slice.  At t=0 the local spatial axes
-//! coincide with the global axes, but the secondary Kerr-Schild term retains its orbital
-//! boost in the global asymptotic frame.
+//! Small-hole Kerr radius on a local t=constant slice, evaluated either through the
+//! source tangent co-basis or through the legacy global orbital boost.
 KOKKOS_INLINE_FUNCTION
 Real SecondaryKerrRadiusSquared(const Real x, const Real y, const Real z,
                                 const MetricParameters &parameters) {
+  if (parameters.embed_secondary_in_tetrad) {
+    const Real displacement[4] = {0.0, x, y, z};
+    Real tetrad_position[3] = {0.0, 0.0, 0.0};
+    for (int axis=0; axis<3; ++axis) {
+      for (int component=0; component<4; ++component) {
+        tetrad_position[axis] +=
+            parameters.secondary_tetrad_covector[axis+1][component]
+            *displacement[component];
+      }
+    }
+    const Real spin[3] = {0.0, 0.0, parameters.secondary_spin};
+    return binary_bh::KerrRadiusSquared(tetrad_position, spin);
+  }
   const Real position[3] = {0.0, 0.0, 0.0};
   const Real orbital_speed = parameters.include_orbital_frame
       ? parameters.omega*parameters.coordinate_radius : 0.0;
@@ -172,6 +225,29 @@ Real SecondaryKerrRadiusSquared(const Real x, const Real y, const Real z,
   Real rest_position[3];
   binary_bh::RestFramePosition(x, y, z, position, velocity, rest_position);
   return binary_bh::KerrRadiusSquared(rest_position, spin);
+}
+
+KOKKOS_INLINE_FUNCTION
+void SecondaryRestFramePosition(const Real x, const Real y, const Real z,
+                                const MetricParameters &parameters,
+                                Real rest_position[3]) {
+  if (parameters.embed_secondary_in_tetrad) {
+    const Real displacement[4] = {0.0, x, y, z};
+    for (int axis=0; axis<3; ++axis) {
+      rest_position[axis] = 0.0;
+      for (int component=0; component<4; ++component) {
+        rest_position[axis] +=
+            parameters.secondary_tetrad_covector[axis+1][component]
+            *displacement[component];
+      }
+    }
+    return;
+  }
+  const Real position[3] = {0.0, 0.0, 0.0};
+  const Real orbital_speed = parameters.include_orbital_frame
+      ? parameters.omega*parameters.coordinate_radius : 0.0;
+  const Real velocity[3] = {0.0, orbital_speed, 0.0};
+  binary_bh::RestFramePosition(x, y, z, position, velocity, rest_position);
 }
 
 KOKKOS_INLINE_FUNCTION

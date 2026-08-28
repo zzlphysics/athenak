@@ -13,7 +13,7 @@ nghost = 4
 nx1    = 16
 x1min  = -8.0
 x1max  =  8.0
-ix1_bc = inflow
+ix1_bc = user
 ox1_bc = outflow
 
 nx2    = 16
@@ -87,6 +87,8 @@ user_hist        = true
 # Effective spacetime.  background_mode is full, frame_only, or isolated.
 # orbital_radius is the primary Kerr/BL radial coordinate shared by the controls.
 background_mode   = full
+# Embed the small-hole Kerr perturbation in the primary-background tangent tetrad.
+secondary_embedding = tangent_tetrad
 primary_mass     = 1000.0
 secondary_mass   = 1.0
 primary_chi      = 0.5
@@ -96,7 +98,11 @@ orbit_direction  = 1
 omega_mode       = kerr_geodesic
 require_stable_orbit = true
 
-# The GRMHD primitive u1,u2,u3 are the normal-frame spatial four-velocity components.
+# With wind_frame=source_tetrad, u1,u2,u3 denote physical spatial four-velocity
+# components in the secondary-comoving external-background tetrad at the box origin.
+# The legacy normal_frame option instead interprets them as GRMHD primitive components.
+wind_frame        = source_tetrad
+force_frame       = source_tetrad
 rho0              = 1.0
 pgas0             = 1.0e-2
 u1                = 0.5

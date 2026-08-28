@@ -24,6 +24,8 @@ class ForceHistory:
         self.path = path
         self.times: list[float] = []
         self.values: dict[str, list[float]] = {}
+        self.force_is_source_tetrad = False
+        self.mdot_name = "mdot"
         self._read()
 
     def _read(self) -> None:
@@ -52,11 +54,14 @@ class ForceHistory:
                 row = dict(zip(columns, values))
                 rows_by_time[row["time"]] = row  # retain the last copy after a restart
 
-        required = {"time", "mdot", "geo_resid"}
+        self.force_is_source_tetrad = "FmomH_x" in columns
+        self.mdot_name = "mdot_hat" if self.force_is_source_tetrad else "mdot"
+        required = {"time", self.mdot_name, "geo_resid"}
         for axis in AXES:
-            required.update({f"Fmom_{axis}", f"Fnewt_{axis}"})
+            required.update({self.force_name("Fmom", axis),
+                             self.force_name("Fnewt", axis)})
             for radius in (1, 2, 3):
-                required.add(f"Frel{radius}_{axis}")
+                required.add(self.force_name(f"Frel{radius}", axis))
         missing = required.difference(columns)
         if missing:
             raise ValueError(f"{self.path}: missing columns: {', '.join(sorted(missing))}")
@@ -68,28 +73,34 @@ class ForceHistory:
         for name in columns:
             self.values[name] = [row[name] for row in rows]
         for axis in AXES:
-            momentum = self.values[f"Fmom_{axis}"]
-            newtonian = self.values[f"Fnewt_{axis}"]
-            self.values[f"Ftotal_newt_{axis}"] = [
+            momentum = self.values[self.force_name("Fmom", axis)]
+            newtonian = self.values[self.force_name("Fnewt", axis)]
+            self.values[self.force_name("Ftotal_newt", axis)] = [
                 -mom + grav for mom, grav in zip(momentum, newtonian)
             ]
             for radius in (1, 2, 3):
-                relativistic = self.values[f"Frel{radius}_{axis}"]
-                self.values[f"Ftotal{radius}_{axis}"] = [
+                relativistic = self.values[self.force_name(f"Frel{radius}", axis)]
+                self.values[self.force_name(f"Ftotal{radius}", axis)] = [
                     -mom + grav for mom, grav in zip(momentum, relativistic)
                 ]
-            self.values[f"dFrel21_{axis}"] = [
+            self.values[self.force_name("dFrel21", axis)] = [
                 outer - inner
                 for outer, inner in zip(
-                    self.values[f"Frel2_{axis}"], self.values[f"Frel1_{axis}"]
+                    self.values[self.force_name("Frel2", axis)],
+                    self.values[self.force_name("Frel1", axis)]
                 )
             ]
-            self.values[f"dFrel32_{axis}"] = [
+            self.values[self.force_name("dFrel32", axis)] = [
                 outer - inner
                 for outer, inner in zip(
-                    self.values[f"Frel3_{axis}"], self.values[f"Frel2_{axis}"]
+                    self.values[self.force_name("Frel3", axis)],
+                    self.values[self.force_name("Frel2", axis)]
                 )
             ]
+
+    def force_name(self, prefix: str, axis: str) -> str:
+        middle = "H_" if self.force_is_source_tetrad else "_"
+        return f"{prefix}{middle}{axis}"
 
     def value_at(self, quantity: str, time: float) -> float:
         values = self.values[quantity]
@@ -118,10 +129,10 @@ class ForceHistory:
         return integral/(stop-start)
 
 
-def default_quantities() -> list[str]:
-    names = ["mdot"]
+def default_quantities(history: ForceHistory) -> list[str]:
+    names = [history.mdot_name]
     for prefix in ("Ftotal1", "Ftotal2", "Ftotal3", "dFrel21", "dFrel32"):
-        names.extend(f"{prefix}_{axis}" for axis in AXES)
+        names.extend(history.force_name(prefix, axis) for axis in AXES)
     return names
 
 
@@ -252,7 +263,12 @@ def main() -> int:
                 raise ValueError(
                     f"averaging interval lies outside {history.label}'s time range"
                 )
-        quantities = args.quantities or default_quantities()
+        force_frames = {
+            history.force_is_source_tetrad for history in histories.values()
+        }
+        if len(force_frames) != 1:
+            raise ValueError("all cases must use the same coordinate or source-tetrad schema")
+        quantities = args.quantities or default_quantities(next(iter(histories.values())))
         results: list[dict[str, object]] = []
         for history in histories.values():
             results.extend(summarize(
