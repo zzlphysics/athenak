@@ -347,7 +347,7 @@ std::string MetricRestartContract() {
   const auto &metric = wind_tunnel.metric;
   std::ostringstream contract;
   contract << std::setprecision(std::numeric_limits<Real>::max_digits10)
-           << "emri-comoving-v1"
+           << "emri-comoving-v2"
            << ";primary_mass=" << metric.primary_mass
            << ";secondary_mass=" << metric.secondary_mass
            << ";primary_spin=" << metric.primary_spin
@@ -358,6 +358,8 @@ std::string MetricRestartContract() {
            << ";spin_buffer_primary=" << metric.spin_buffer_primary
            << ";spin_buffer_secondary=" << metric.spin_buffer_secondary
            << ";singularity_floor=" << metric.singularity_floor
+           << ";include_primary=" << metric.include_primary
+           << ";include_orbital_frame=" << metric.include_orbital_frame
            << ";metric_fd_step=" << wind_tunnel.metric_fd_step
            << ";external_metric_fd_step=" << wind_tunnel.external_metric_fd_step;
   return contract.str();
@@ -459,6 +461,7 @@ void ValidateMetricKernel() {
   emri_comoving::MetricParameters rotating{};
   rotating.coordinate_radius = 3.0;
   rotating.omega = 0.1;
+  rotating.include_orbital_frame = true;
   rotating.spin_buffer_primary = 0.05;
   rotating.spin_buffer_secondary = 0.05;
   rotating.singularity_floor = 1.0e-3;
@@ -540,7 +543,9 @@ void ValidateMetricKernel() {
 #else
   const Real geodesic_tolerance = 3.0e-7;
 #endif
-  if (omega_is_geodesic && primary_geodesic_residual > geodesic_tolerance) {
+  if (omega_is_geodesic && wind_tunnel.metric.include_primary
+      && wind_tunnel.metric.include_orbital_frame
+      && primary_geodesic_residual > geodesic_tolerance) {
     Fatal("the secondary-centered origin failed the circular-Kerr geodesic check");
   }
 }
@@ -577,7 +582,8 @@ Real SecondaryEnclosingRadius() {
   const Real horizon = emri_comoving::SecondaryRegularizationRadius(wind_tunnel.metric);
   const Real rest_enclosing = std::sqrt(
       SQR(wind_tunnel.metric.secondary_spin)+SQR(horizon));
-  const Real speed = wind_tunnel.metric.omega*wind_tunnel.metric.coordinate_radius;
+  const Real speed = wind_tunnel.metric.include_orbital_frame
+      ? wind_tunnel.metric.omega*wind_tunnel.metric.coordinate_radius : 0.0;
   return rest_enclosing/std::sqrt(1.0-SQR(speed));
 }
 
@@ -647,6 +653,20 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       "problem", "orbital_radius", 10.0*metric.primary_mass);
   metric.coordinate_radius = std::sqrt(
       SQR(metric.orbital_radius)+SQR(metric.primary_spin));
+  const std::string background_mode =
+      pin->GetOrAddString("problem", "background_mode", "full");
+  if (background_mode == "full") {
+    metric.include_primary = true;
+    metric.include_orbital_frame = true;
+  } else if (background_mode == "frame_only") {
+    metric.include_primary = false;
+    metric.include_orbital_frame = true;
+  } else if (background_mode == "isolated") {
+    metric.include_primary = false;
+    metric.include_orbital_frame = false;
+  } else {
+    Fatal("unknown <problem> background_mode: "+background_mode);
+  }
   const int orbit_direction = pin->GetOrAddInteger("problem", "orbit_direction", 1);
   const std::string omega_mode =
       pin->GetOrAddString("problem", "omega_mode", "kerr_geodesic");
@@ -764,6 +784,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Fatal("invalid emri_windtunnel parameter");
   }
   const Real orbital_speed = std::abs(metric.omega*metric.coordinate_radius);
+  const Real active_frame_speed = metric.include_orbital_frame ? orbital_speed : 0.0;
   if (!(orbital_speed < 1.0)) {
     Fatal("the effective secondary trajectory is superluminal in global KS coordinates");
   }
@@ -804,12 +825,14 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Fatal("EMRI force extraction uses local Cartesian spheres and requires "
           "<coord> bh_spin=0");
   }
-  const Real primary_horizon = metric.primary_mass
-      + std::sqrt(SQR(metric.primary_mass)-SQR(metric.primary_spin));
-  const Real primary_enclosing = std::sqrt(
-      SQR(metric.primary_spin)+SQR(primary_horizon));
-  if (domain.x1min <= -metric.coordinate_radius+primary_enclosing) {
-    Fatal("the local domain intersects the primary horizon; reduce its radial extent");
+  if (metric.include_primary) {
+    const Real primary_horizon = metric.primary_mass
+        + std::sqrt(SQR(metric.primary_mass)-SQR(metric.primary_spin));
+    const Real primary_enclosing = std::sqrt(
+        SQR(metric.primary_spin)+SQR(primary_horizon));
+    if (domain.x1min <= -metric.coordinate_radius+primary_enclosing) {
+      Fatal("the local domain intersects the primary horizon; reduce its radial extent");
+    }
   }
   const Real largest_extent = std::max({
       std::abs(domain.x1min), std::abs(domain.x1max),
@@ -863,9 +886,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real hill_radius = metric.orbital_radius*std::cbrt(q/3.0);
     std::cout << std::setprecision(std::numeric_limits<Real>::max_digits10)
               << "Local EMRI wind tunnel: q=" << q
+              << ", background=" << background_mode
               << ", r/M=" << metric.orbital_radius/metric.primary_mass
               << ", Omega*M=" << metric.omega*metric.primary_mass
-              << ", orbital KS speed=" << orbital_speed
+              << ", reference orbital KS speed=" << orbital_speed
+              << ", active frame speed=" << active_frame_speed
               << ", r_H/m=" << hill_radius/metric.secondary_mass
               << ", box/orbit=" << largest_extent/metric.orbital_radius
               << ", metric_fd_step/m="
@@ -995,8 +1020,8 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp) {
                        + parameters.metric_fd_step;
     const Real spin2 = SQR(parameters.metric.secondary_spin);
     const Real enclosing_radius = sqrt(spin2+SQR(regularization_radius));
-    const Real orbital_speed =
-        parameters.metric.omega*parameters.metric.coordinate_radius;
+    const Real orbital_speed = parameters.metric.include_orbital_frame
+        ? parameters.metric.omega*parameters.metric.coordinate_radius : 0.0;
     const Real gamma = 1.0/sqrt(1.0-SQR(orbital_speed));
     const Real velocity[3] = {0.0, orbital_speed, 0.0};
     const Real origin[3] = {0.0, 0.0, 0.0};

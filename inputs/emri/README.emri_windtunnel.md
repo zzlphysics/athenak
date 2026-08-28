@@ -41,6 +41,45 @@ Kerr-Schild approximation, but it neglects inspiral, radiation reaction, primary
 and the disk's gravitational backreaction.  Those assumptions are intentional for a
 one-way local wind tunnel.
 
+## Controlled background modes
+
+`background_mode` defines three runs that keep the secondary, wind, magnetic field,
+domain, and diagnostic radii fixed:
+
+| mode | primary Kerr term | orbital pullback and secondary boost | role |
+|---|---:|---:|---|
+| `full` | yes | yes | effective EMRI wind tunnel |
+| `frame_only` | no | yes | fixed-chart counterfactual for adding the primary metric |
+| `isolated` | no | no | inertial isolated-Kerr BHL control |
+
+The useful contrasts are `full-frame_only` and `frame_only-isolated`.  The first changes
+only the primary Kerr contribution while holding the coordinate map fixed.  The second
+shows the effect of the orbital non-inertial chart and boost.  In `frame_only`, centrifugal
+acceleration is intentionally not balanced by primary gravity, so its nonzero
+`geo_resid` is expected.  These are attribution experiments between prescribed
+spacetimes, not gauge-invariant observables that may be subtracted without qualification.
+In particular, the reported forces are coordinate components of a quasi-local generalized
+force.
+
+Run the same input in three separate directories, changing only the mode and basename:
+
+```sh
+mkdir -p runs/emri/{full,frame_only,isolated}
+./build_emri/src/athena -d runs/emri/full \
+  -i inputs/emri/emri_windtunnel_smoke.athinput \
+  problem/background_mode=full job/basename=full
+./build_emri/src/athena -d runs/emri/frame_only \
+  -i inputs/emri/emri_windtunnel_smoke.athinput \
+  problem/background_mode=frame_only job/basename=frame_only
+./build_emri/src/athena -d runs/emri/isolated \
+  -i inputs/emri/emri_windtunnel_smoke.athinput \
+  problem/background_mode=isolated job/basename=isolated
+```
+
+The selected mode is part of the restart contract, so a checkpoint cannot silently be
+continued with another background.  Version-1 prototype checkpoints predate this field
+and are deliberately rejected.
+
 ## Units and scale checks
 
 All masses and lengths use `G=c=1`.  The natural local choice is
@@ -162,3 +201,64 @@ mass_ratio orbit_r_M omega_M mdot
 Fmom_x..z Fnewt_x..z
 Frel1_x..z Frel2_x..z Frel3_x..z geo_resid
 ```
+
+## Force averaging and controlled contrasts
+
+`analyze_force_history.py` forms all three
+`Ftotal_k=-Fmom+Frel_k` estimates, the incremental outer-wake contributions
+`Frel2-Frel1` and `Frel3-Frel2`, trapezoidal time averages, and equal-duration block
+standard errors.  With all three conventional labels it also forms the three contrasts
+automatically:
+
+```sh
+python3 inputs/emri/analyze_force_history.py \
+  full=runs/emri/full/full.user.hst \
+  frame_only=runs/emri/frame_only/frame_only.user.hst \
+  isolated=runs/emri/isolated/isolated.user.hst \
+  --tmin 100 --blocks 8
+```
+
+Use `--quantity Ftotal3_y` repeatedly to select columns and `--format csv` or
+`--format json` for downstream analysis.  The default averaging interval is the common
+time overlap.  Duplicate times from appended restart histories retain their last value.
+A block error is meaningful only after the flow is statistically stationary and each
+block is longer than the force autocorrelation time; the script caps the number of blocks
+at the number of sampled time intervals and reports `nan` when only one block is possible.
+
+## Decision gate for the next science runs
+
+At a local scale of order the secondary mass, true primary-curvature effects are
+parametrically small:
+
+```text
+Omega*m ~ q/(r/M)^(3/2),
+|Riemann_primary|*m^2 ~ q^2/(r/M)^3.
+```
+
+Large differences seen in a `q=10^-3` smoke test therefore must not be extrapolated to a
+LISA EMRI; metric components can differ at order `M/r` even when the locally measurable
+tidal field is tiny.  Treat a primary-metric signal as resolved only if
+
+```text
+|mean(full-frame_only)| > max(2*block_error,
+                              resolution_change,
+                              outer-radius_change).
+```
+
+The economical production sequence is:
+
+1. Evolve one physically motivated, mostly tangential disk-wind setup in all three modes
+   until the wake has crossed the largest force radius, then establish a stationary
+   averaging window.
+2. Repeat `full` and `isolated` at one higher resolution and with a larger box/outer force
+   radius.  Converge `force_surface_nlevel` separately because it controls only the inner
+   momentum-flux quadrature.
+3. Only if the primary-metric contrast clears that numerical/systematic floor, repeat it
+   at a genuine EMRI ratio such as `q=10^-5` or `10^-6`.  If it does not, move effort to
+   tetrad-matched shear/gradient or global-GRMHD replay boundaries, where the disk
+   environment supplies information absent from a uniform wind.
+
+This gate avoids an expensive broad scan whose leading result could be a coordinate or
+finite-box effect.  A spin-sign pair for the secondary and a magnetic-field orientation
+pair are the next targeted tests for transverse/Magnus-like forces after the baseline is
+converged.

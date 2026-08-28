@@ -9,11 +9,12 @@
 //! \file emri_comoving.hpp
 //! \brief Helically symmetric local coordinates centered on an EMRI secondary.
 //!
-//! The global effective spacetime is a stationary primary Kerr-Schild term plus a
+//! The full effective spacetime is a stationary primary Kerr-Schild term plus a
 //! circularly moving secondary Kerr-Schild term.  Local coordinates rotate about the
-//! primary and are translated so that the secondary remains at x^i=0.  The primary can
-//! therefore lie outside the numerical domain while its full metric contribution remains
-//! present.  Spins are restricted to the orbital z axis in this first implementation.
+//! primary and are translated so that the secondary remains at x^i=0.  Controlled modes
+//! can omit the primary term and/or this orbital-frame pullback.  The primary can lie
+//! outside the numerical domain while its full metric contribution remains present.
+//! Spins are restricted to the orbital z axis in this first implementation.
 //!
 //! If X^i are asymptotically inertial Cartesian coordinates and x^i are local
 //! coordinates, the map at t=0 is
@@ -42,6 +43,8 @@ struct MetricParameters {
   Real spin_buffer_primary;
   Real spin_buffer_secondary;
   Real singularity_floor;
+  bool include_primary;       // include the primary Kerr-Schild contribution
+  bool include_orbital_frame; // apply the co-rotating/translated coordinate pullback
 };
 
 //! Test-particle circular equatorial Kerr angular frequency.  direction=+1 and -1 select
@@ -58,9 +61,10 @@ Real CircularKerrOmega(const Real primary_mass, const Real primary_spin,
 KOKKOS_INLINE_FUNCTION
 void PullBackMetric(const Real global_metric[4][4], const Real x, const Real y,
                     const MetricParameters &parameters, Real local_metric[4][4]) {
+  const Real frame_omega = parameters.include_orbital_frame ? parameters.omega : 0.0;
   const Real grid_velocity[3] = {
-    -parameters.omega*y,
-    parameters.omega*(parameters.coordinate_radius+x),
+    -frame_omega*y,
+    frame_omega*(parameters.coordinate_radius+x),
     0.0
   };
   const Real jacobian[4][4] = {
@@ -96,12 +100,14 @@ void ComputeExternalMetric(const Real x, const Real y, const Real z,
     { 0.0, 0.0, 0.0, 1.0}
   };
 
-  const Real zero[3] = {0.0, 0.0, 0.0};
-  const Real primary_spin[3] = {0.0, 0.0, parameters.primary_spin};
-  const Real primary_point_x = parameters.coordinate_radius+x;
-  binary_bh::AddBoostedKerrSchildTerm(
-      primary_point_x, y, z, zero, zero, primary_spin, parameters.primary_mass,
-      parameters.spin_buffer_primary, parameters.singularity_floor, global_metric);
+  if (parameters.include_primary) {
+    const Real zero[3] = {0.0, 0.0, 0.0};
+    const Real primary_spin[3] = {0.0, 0.0, parameters.primary_spin};
+    const Real primary_point_x = parameters.coordinate_radius+x;
+    binary_bh::AddBoostedKerrSchildTerm(
+        primary_point_x, y, z, zero, zero, primary_spin, parameters.primary_mass,
+        parameters.spin_buffer_primary, parameters.singularity_floor, global_metric);
+  }
   PullBackMetric(global_metric, x, y, parameters, local_metric);
 }
 
@@ -117,9 +123,9 @@ void ComputeSecondaryMetricPerturbationAtDisplacement(
   const Real zero[3] = {0.0, 0.0, 0.0};
   // Translation invariance lets the secondary term be evaluated directly from its
   // displacement (x,y,z), avoiding a loss of precision from (R_0+x)-R_0 when q << 1.
-  const Real secondary_velocity[3] = {
-    0.0, parameters.omega*parameters.coordinate_radius, 0.0
-  };
+  const Real orbital_speed = parameters.include_orbital_frame
+      ? parameters.omega*parameters.coordinate_radius : 0.0;
+  const Real secondary_velocity[3] = {0.0, orbital_speed, 0.0};
   const Real secondary_spin[3] = {0.0, 0.0, parameters.secondary_spin};
   binary_bh::AddBoostedKerrSchildTerm(
       displacement_x, displacement_y, displacement_z, zero, secondary_velocity,
@@ -159,9 +165,9 @@ KOKKOS_INLINE_FUNCTION
 Real SecondaryKerrRadiusSquared(const Real x, const Real y, const Real z,
                                 const MetricParameters &parameters) {
   const Real position[3] = {0.0, 0.0, 0.0};
-  const Real velocity[3] = {
-    0.0, parameters.omega*parameters.coordinate_radius, 0.0
-  };
+  const Real orbital_speed = parameters.include_orbital_frame
+      ? parameters.omega*parameters.coordinate_radius : 0.0;
+  const Real velocity[3] = {0.0, orbital_speed, 0.0};
   const Real spin[3] = {0.0, 0.0, parameters.secondary_spin};
   Real rest_position[3];
   binary_bh::RestFramePosition(x, y, z, position, velocity, rest_position);

@@ -84,7 +84,9 @@ enforce_maximum = false
 pgen_name        = emri_windtunnel
 user_hist        = true
 
-# Effective spacetime.  orbital_radius is the primary Kerr/BL radial coordinate.
+# Effective spacetime.  background_mode is full, frame_only, or isolated.
+# orbital_radius is the primary Kerr/BL radial coordinate shared by the controls.
+background_mode   = full
 primary_mass     = 1000.0
 secondary_mass   = 1.0
 primary_chi      = 0.5
