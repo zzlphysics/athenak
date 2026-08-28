@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,6 +44,11 @@ struct WindTunnelParameters {
   Real refinement_radius_ratio;
   Real refinement_hysteresis;
   Real refinement_horizon_factor;
+  Real force_surface_radius;
+  Real force_outer_radius[3];
+  Real adiabatic_index;
+  int force_surface_nlevel;
+  bool force_subtract_background;
 };
 
 struct MetricWithDerivatives {
@@ -128,6 +134,136 @@ void DifferentiateMetric(const Real x, const Real y, const Real z,
             (external_plus[a][b]-external_minus[a][b])*inverse_external_width
             +(secondary_plus[a][b]-secondary_minus[a][b])*inverse_secondary_width;
       }
+    }
+  }
+}
+
+//! Differentiate the secondary perturbation with respect to field-point displacement
+//! while holding the rotating-coordinate Jacobian fixed.  The negative of this
+//! derivative is the metric derivative with respect to the secondary's source position.
+KOKKOS_INLINE_FUNCTION
+void DifferentiateSecondaryDisplacement(
+    const Real x, const Real y, const Real z,
+    const WindTunnelParameters &parameters, Real derivative[3][4][4]) {
+  const Real coordinate[3] = {x, y, z};
+  for (int direction=0; direction<3; ++direction) {
+    Real lower[3] = {coordinate[0], coordinate[1], coordinate[2]};
+    Real upper[3] = {coordinate[0], coordinate[1], coordinate[2]};
+    lower[direction] -= parameters.metric_fd_step;
+    upper[direction] += parameters.metric_fd_step;
+    Real metric_lower[4][4];
+    Real metric_upper[4][4];
+    emri_comoving::ComputeSecondaryMetricPerturbationAtDisplacement(
+        lower[0], lower[1], lower[2], x, y, parameters.metric, metric_lower);
+    emri_comoving::ComputeSecondaryMetricPerturbationAtDisplacement(
+        upper[0], upper[1], upper[2], x, y, parameters.metric, metric_upper);
+    const Real inverse_width = 1.0/(upper[direction]-lower[direction]);
+    for (int a=0; a<4; ++a) {
+      for (int b=0; b<4; ++b) {
+        derivative[direction][a][b] =
+            (metric_upper[a][b]-metric_lower[a][b])*inverse_width;
+      }
+    }
+  }
+}
+
+//! Reconstruct T^{mu nu} from dynamical-GRMHD primitives.  The velocity primitive is
+//! W v^i measured by the Eulerian observer, while the CT magnetic field is densitized
+//! by sqrt(gamma).
+KOKKOS_INLINE_FUNCTION
+void ComputeStressEnergy(
+    const Real x, const Real y, const Real z,
+    const WindTunnelParameters &parameters, const Real density, const Real pressure,
+    const Real velocity[3], const Real densitized_field[3], Real metric[4][4],
+    Real four_velocity[4], Real stress[4][4], Real &sqrt_gamma,
+    Real &sqrt_minus_g) {
+  EvaluateMetric(x, y, z, parameters, metric);
+  const Real determinant = adm::SpatialDet(
+      metric[1][1], metric[1][2], metric[1][3], metric[2][2], metric[2][3],
+      metric[3][3]);
+  if (!(determinant > 0.0) || !isfinite(determinant)) {
+    Kokkos::abort("invalid metric determinant in EMRI force diagnostic");
+  }
+  sqrt_gamma = sqrt(determinant);
+
+  Real inverse_gamma[3][3];
+  adm::SpatialInv(1.0/determinant,
+      metric[1][1], metric[1][2], metric[1][3], metric[2][2], metric[2][3],
+      metric[3][3], &inverse_gamma[0][0], &inverse_gamma[0][1],
+      &inverse_gamma[0][2], &inverse_gamma[1][1], &inverse_gamma[1][2],
+      &inverse_gamma[2][2]);
+  inverse_gamma[1][0] = inverse_gamma[0][1];
+  inverse_gamma[2][0] = inverse_gamma[0][2];
+  inverse_gamma[2][1] = inverse_gamma[1][2];
+
+  Real beta[3] = {0.0, 0.0, 0.0};
+  Real beta_squared = 0.0;
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) beta[i] += inverse_gamma[i][j]*metric[0][j+1];
+    beta_squared += metric[0][i+1]*beta[i];
+  }
+  const Real alpha_squared = beta_squared-metric[0][0];
+  if (!(alpha_squared > 0.0) || !isfinite(alpha_squared)) {
+    Kokkos::abort("invalid lapse in EMRI force diagnostic");
+  }
+  const Real alpha = sqrt(alpha_squared);
+  sqrt_minus_g = alpha*sqrt_gamma;
+
+  Real inverse_metric[4][4] = {{0.0}};
+  inverse_metric[0][0] = -1.0/alpha_squared;
+  for (int i=0; i<3; ++i) {
+    inverse_metric[0][i+1] = beta[i]/alpha_squared;
+    inverse_metric[i+1][0] = inverse_metric[0][i+1];
+    for (int j=0; j<3; ++j) {
+      inverse_metric[i+1][j+1] = inverse_gamma[i][j]
+          - beta[i]*beta[j]/alpha_squared;
+    }
+  }
+
+  Real velocity_lower[3] = {0.0, 0.0, 0.0};
+  Real velocity_squared = 0.0;
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      velocity_lower[i] += metric[i+1][j+1]*velocity[j];
+    }
+    velocity_squared += velocity[i]*velocity_lower[i];
+  }
+  const Real lorentz = sqrt(1.0+velocity_squared);
+  four_velocity[0] = lorentz/alpha;
+  for (int i=0; i<3; ++i) {
+    four_velocity[i+1] = velocity[i]-lorentz*beta[i]/alpha;
+  }
+
+  Real field[3];
+  Real field_velocity = 0.0;
+  for (int i=0; i<3; ++i) {
+    field[i] = densitized_field[i]/sqrt_gamma;
+    field_velocity += field[i]*velocity_lower[i];
+  }
+  Real field_squared = 0.0;
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      field_squared += metric[i+1][j+1]*field[i]*field[j];
+    }
+  }
+  Real magnetic_four[4];
+  magnetic_four[0] = field_velocity/alpha;
+  for (int i=0; i<3; ++i) {
+    magnetic_four[i+1] =
+        (field[i]+alpha*magnetic_four[0]*four_velocity[i+1])/lorentz;
+  }
+
+  const Real magnetic_squared =
+      (field_squared+SQR(field_velocity))/SQR(lorentz);
+
+  const Real enthalpy_density = density
+      + parameters.adiabatic_index*pressure/(parameters.adiabatic_index-1.0);
+  const Real total_pressure = pressure+0.5*magnetic_squared;
+  for (int a=0; a<4; ++a) {
+    for (int b=0; b<4; ++b) {
+      stress[a][b] = (enthalpy_density+magnetic_squared)
+          *four_velocity[a]*four_velocity[b] + total_pressure*inverse_metric[a][b]
+          - magnetic_four[a]*magnetic_four[b];
     }
   }
 }
@@ -267,6 +403,57 @@ void ValidateMetricKernel() {
         Fatal("local EMRI metric failed its isolated Kerr limit");
       }
     }
+  }
+
+  WindTunnelParameters weak_field{};
+  weak_field.metric.secondary_mass = 1.0;
+  weak_field.metric.spin_buffer_primary = 0.05;
+  weak_field.metric.spin_buffer_secondary = 0.05;
+  weak_field.metric.singularity_floor = 1.0e-3;
+#if SINGLE_PRECISION_ENABLED
+  weak_field.metric_fd_step = 1.0e-2;
+  const Real force_kernel_tolerance = 2.0e-4;
+#else
+  weak_field.metric_fd_step = 1.0e-3;
+  const Real force_kernel_tolerance = 2.0e-8;
+#endif
+  Real displacement_derivative[3][4][4];
+  DifferentiateSecondaryDisplacement(
+      100.0, 0.0, 0.0, weak_field, displacement_derivative);
+  const Real newtonian_kernel = 1.0e-4;
+  const Real relativistic_kernel = -0.5*displacement_derivative[0][0][0];
+  if (std::abs(relativistic_kernel/newtonian_kernel-1.0)
+      > force_kernel_tolerance) {
+    Fatal("EMRI source-position force kernel failed its Newtonian limit");
+  }
+
+  WindTunnelParameters flat_fluid{};
+  flat_fluid.metric.spin_buffer_primary = 0.05;
+  flat_fluid.metric.spin_buffer_secondary = 0.05;
+  flat_fluid.metric.singularity_floor = 1.0e-3;
+  flat_fluid.adiabatic_index = 4.0/3.0;
+  const Real rest_velocity[3] = {0.0, 0.0, 0.0};
+  const Real test_field[3] = {0.4, 0.1, -0.2};
+  Real test_metric[4][4];
+  Real test_velocity[4];
+  Real test_stress[4][4];
+  Real test_sqrt_gamma;
+  Real test_sqrt_minus_g;
+  ComputeStressEnergy(0.2, -0.4, 0.1, flat_fluid, 2.0, 0.3,
+                      rest_velocity, test_field, test_metric, test_velocity,
+                      test_stress, test_sqrt_gamma, test_sqrt_minus_g);
+  const Real test_magnetic2 = SQR(test_field[0])+SQR(test_field[1])
+                            +SQR(test_field[2]);
+  const Real test_energy = 2.0+0.3/(flat_fluid.adiabatic_index-1.0)
+                         +0.5*test_magnetic2;
+  if (std::abs(test_stress[0][0]-test_energy) > tolerance
+      || std::abs(test_stress[1][1]
+                  -(0.3+0.5*test_magnetic2-SQR(test_field[0]))) > tolerance
+      || std::abs(test_stress[1][2]+test_field[0]*test_field[1]) > tolerance
+      || std::abs(test_velocity[0]-1.0) > tolerance
+      || std::abs(test_sqrt_gamma-1.0) > tolerance
+      || std::abs(test_sqrt_minus_g-1.0) > tolerance) {
+    Fatal("EMRI force diagnostic failed its flat-space stress-energy check");
   }
 
   emri_comoving::MetricParameters rotating{};
@@ -516,6 +703,29 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   wind_tunnel.refinement_horizon_factor =
       pin->GetOrAddReal("problem", "refinement_horizon_factor", 1.25);
 
+  const RegionSize &domain = pmy_mesh_->mesh_size;
+  const Real inscribed_domain_radius = std::min({
+      -domain.x1min, domain.x1max, -domain.x2min, domain.x2max,
+      -domain.x3min, domain.x3max});
+  wind_tunnel.force_surface_radius = pin->GetOrAddReal(
+      "problem", "force_surface_radius", 3.0*metric.secondary_mass);
+  wind_tunnel.force_outer_radius[0] = pin->GetOrAddReal(
+      "problem", "force_outer_radius_1", 0.5*inscribed_domain_radius);
+  wind_tunnel.force_outer_radius[1] = pin->GetOrAddReal(
+      "problem", "force_outer_radius_2", 0.75*inscribed_domain_radius);
+  wind_tunnel.force_outer_radius[2] = pin->GetOrAddReal(
+      "problem", "force_outer_radius_3", 0.95*inscribed_domain_radius);
+  wind_tunnel.force_surface_nlevel =
+      pin->GetOrAddInteger("problem", "force_surface_nlevel", 5);
+  wind_tunnel.force_subtract_background = pin->GetOrAddBoolean(
+      "problem", "force_subtract_background", true);
+  wind_tunnel.adiabatic_index = pin->GetOrAddReal("mhd", "gamma", 5.0/3.0);
+  const std::string dynamic_eos =
+      pin->GetOrAddString("mhd", "dyn_eos", "ideal");
+  if (user_hist && dynamic_eos != "ideal") {
+    Fatal("EMRI force history currently requires <mhd> dyn_eos=ideal");
+  }
+
   const Real finite_values[] = {
     metric.primary_mass, metric.secondary_mass, primary_chi, secondary_chi,
     metric.orbital_radius, metric.coordinate_radius, metric.omega,
@@ -526,7 +736,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     wind_tunnel.wind_u[2], wind_tunnel.magnetic_field[0],
     wind_tunnel.magnetic_field[1], wind_tunnel.magnetic_field[2],
     wind_tunnel.refinement_radius, wind_tunnel.refinement_radius_ratio,
-    wind_tunnel.refinement_hysteresis, wind_tunnel.refinement_horizon_factor
+    wind_tunnel.refinement_hysteresis, wind_tunnel.refinement_horizon_factor,
+    wind_tunnel.force_surface_radius, wind_tunnel.force_outer_radius[0],
+    wind_tunnel.force_outer_radius[1], wind_tunnel.force_outer_radius[2],
+    wind_tunnel.adiabatic_index
   };
   for (const Real value : finite_values) {
     if (!std::isfinite(value)) Fatal("emri_windtunnel parameters must be finite");
@@ -546,7 +759,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       || !(wind_tunnel.refinement_radius > 0.0)
       || !(wind_tunnel.refinement_radius_ratio >= 1.0)
       || !(wind_tunnel.refinement_hysteresis > 1.0)
-      || !(wind_tunnel.refinement_horizon_factor > 0.0)) {
+      || !(wind_tunnel.refinement_horizon_factor > 0.0)
+      || !(wind_tunnel.adiabatic_index > 1.0)) {
     Fatal("invalid emri_windtunnel parameter");
   }
   const Real orbital_speed = std::abs(metric.omega*metric.coordinate_radius);
@@ -567,11 +781,28 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
 #endif
 
-  const RegionSize &domain = pmy_mesh_->mesh_size;
   if (!(domain.x1min < 0.0 && domain.x1max > 0.0
         && domain.x2min < 0.0 && domain.x2max > 0.0
         && domain.x3min < 0.0 && domain.x3max > 0.0)) {
     Fatal("the local wind-tunnel domain must contain the secondary at the origin");
+  }
+  if (user_hist
+      && (!(wind_tunnel.force_surface_radius > SecondaryEnclosingRadius())
+          || !(wind_tunnel.force_surface_radius
+               < wind_tunnel.force_outer_radius[0])
+          || !(wind_tunnel.force_outer_radius[0]
+               < wind_tunnel.force_outer_radius[1])
+          || !(wind_tunnel.force_outer_radius[1]
+               < wind_tunnel.force_outer_radius[2])
+          || !(wind_tunnel.force_outer_radius[2] <= inscribed_domain_radius)
+          || wind_tunnel.force_surface_nlevel < 0
+          || wind_tunnel.force_surface_nlevel > 12)) {
+    Fatal("EMRI force radii must enclose the secondary horizon, increase strictly, "
+          "and fit inside the largest origin-centered sphere in the domain");
+  }
+  if (user_hist && std::abs(pmbp->pcoord->coord_data.bh_spin) > 0.0) {
+    Fatal("EMRI force extraction uses local Cartesian spheres and requires "
+          "<coord> bh_spin=0");
   }
   const Real primary_horizon = metric.primary_mass
       + std::sqrt(SQR(metric.primary_mass)-SQR(metric.primary_spin));
@@ -615,6 +846,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     }
   }
 
+  if (user_hist) {
+    spherical_grids.push_back(std::make_unique<SphericalGrid>(
+        pmbp, wind_tunnel.force_surface_nlevel,
+        wind_tunnel.force_surface_radius));
+  }
+
   ValidateOrStoreRestartContract(pin, restart);
   ValidateMetricKernel();
   InitializeInflowArrays(pmbp);
@@ -636,6 +873,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << ", external_fd_step/M="
               << wind_tunnel.external_metric_fd_step/metric.primary_mass
               << ", M|Gamma^i_00|=" << primary_geodesic_residual
+              << ", force_shell/m={"
+              << wind_tunnel.force_surface_radius/metric.secondary_mass << ","
+              << wind_tunnel.force_outer_radius[0]/metric.secondary_mass << ","
+              << wind_tunnel.force_outer_radius[1]/metric.secondary_mass << ","
+              << wind_tunnel.force_outer_radius[2]/metric.secondary_mass << "}"
               << ", ADM cache="
               << (pmbp->padm->is_dynamic ? "stage-refresh" : "stationary")
               << std::endl;
@@ -792,25 +1034,187 @@ void RefineSecondary(MeshBlockPack *pmbp) {
   refine_flag.template sync<DevExeSpace>();
 }
 
-void EMRIHistory(HistoryData *pdata, Mesh *) {
-  pdata->nhist = 7;
-  const char *labels[7] = {
-    "primary_m", "secondary_m", "mass_ratio", "orbit_r_M", "omega_M", "hill_r_m",
-    "geo_resid"
+void EMRIHistory(HistoryData *pdata, Mesh *pm) {
+  pdata->nhist = 20;
+  const char *labels[20] = {
+    "mass_ratio", "orbit_r_M", "omega_M", "mdot",
+    "Fmom_x", "Fmom_y", "Fmom_z",
+    "Fnewt_x", "Fnewt_y", "Fnewt_z",
+    "Frel1_x", "Frel1_y", "Frel1_z",
+    "Frel2_x", "Frel2_y", "Frel2_z",
+    "Frel3_x", "Frel3_y", "Frel3_z", "geo_resid"
   };
-  for (int n=0; n<7; ++n) pdata->label[n] = labels[n];
-  const auto &metric = wind_tunnel.metric;
-  const Real q = metric.secondary_mass/metric.primary_mass;
-  const Real hill_radius = metric.orbital_radius*std::cbrt(q/3.0);
-  const Real values[7] = {
-    metric.primary_mass, metric.secondary_mass, q,
-    metric.orbital_radius/metric.primary_mass,
-    metric.omega*metric.primary_mass,
-    hill_radius/metric.secondary_mass,
-    primary_geodesic_residual
+  for (int n=0; n<pdata->nhist; ++n) {
+    pdata->label[n] = labels[n];
+    pdata->hdata[n] = 0.0;
+  }
+
+  const auto &metric_parameters = wind_tunnel.metric;
+  if (global_variable::my_rank == 0) {
+    pdata->hdata[0] = metric_parameters.secondary_mass
+                    /metric_parameters.primary_mass;
+    pdata->hdata[1] = metric_parameters.orbital_radius
+                    /metric_parameters.primary_mass;
+    pdata->hdata[2] = metric_parameters.omega*metric_parameters.primary_mass;
+    pdata->hdata[19] = primary_geodesic_residual;
+  }
+
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  if (pm->pgen->spherical_grids.size() != 1) {
+    Fatal("EMRI force history requires exactly one momentum-flux sphere");
+  }
+  auto &grid = *pm->pgen->spherical_grids[0];
+  DualArray2D<Real> interpolated_field;
+  grid.InterpolateToSphere(3, pmbp->pmhd->bcc0);
+  Kokkos::realloc(interpolated_field, grid.nangles, 3);
+  Kokkos::deep_copy(interpolated_field, grid.interp_vals);
+  interpolated_field.template modify<DevExeSpace>();
+  interpolated_field.template sync<HostMemSpace>();
+  grid.InterpolateToSphere(0, IPR, pmbp->pmhd->w0);
+
+  const WindTunnelParameters parameters = wind_tunnel;
+  const Real surface_radius2 = SQR(parameters.force_surface_radius);
+  for (int n=0; n<grid.nangles; ++n) {
+    const Real x = grid.interp_coord.h_view(n, 0);
+    const Real y = grid.interp_coord.h_view(n, 1);
+    const Real z = grid.interp_coord.h_view(n, 2);
+    const Real inverse_radius = 1.0/parameters.force_surface_radius;
+    const Real normal[3] = {x*inverse_radius, y*inverse_radius,
+                            z*inverse_radius};
+    const Real velocity[3] = {
+      grid.interp_vals.h_view(n, IVX),
+      grid.interp_vals.h_view(n, IVY),
+      grid.interp_vals.h_view(n, IVZ)
+    };
+    const Real densitized_field[3] = {
+      interpolated_field.h_view(n, IBX),
+      interpolated_field.h_view(n, IBY),
+      interpolated_field.h_view(n, IBZ)
+    };
+    const Real density = grid.interp_vals.h_view(n, IDN);
+    const Real pressure = grid.interp_vals.h_view(n, IPR);
+    Real metric[4][4];
+    Real four_velocity[4];
+    Real stress[4][4];
+    Real sqrt_gamma;
+    Real sqrt_minus_g;
+    ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
+                        densitized_field, metric, four_velocity, stress,
+                        sqrt_gamma, sqrt_minus_g);
+    const Real area_weight = surface_radius2
+        *grid.solid_angles.h_view(n)*sqrt_minus_g;
+    Real radial_velocity = 0.0;
+    for (int j=0; j<3; ++j) radial_velocity += normal[j]*four_velocity[j+1];
+    pdata->hdata[3] -= density*radial_velocity*area_weight;
+
+    for (int force_direction=0; force_direction<3; ++force_direction) {
+      Real radial_momentum = 0.0;
+      for (int surface_direction=0; surface_direction<3; ++surface_direction) {
+        Real mixed_stress = 0.0;
+        for (int a=0; a<4; ++a) {
+          mixed_stress += stress[surface_direction+1][a]
+                         *metric[a][force_direction+1];
+        }
+        radial_momentum += normal[surface_direction]*mixed_stress;
+      }
+      pdata->hdata[4+force_direction] += radial_momentum*area_weight;
+    }
+  }
+
+  auto &w0 = pmbp->pmhd->w0;
+  auto &bcc = pmbp->pmhd->bcc0;
+  auto &excision_floor = pmbp->pcoord->excision_floor;
+  auto &size = pmbp->pmb->mb_size;
+  auto &indcs = pm->mb_indcs;
+  const int is = indcs.is;
+  const int js = indcs.js;
+  const int ks = indcs.ks;
+  const int nx1 = indcs.nx1;
+  const int nx2 = indcs.nx2;
+  const int nx3 = indcs.nx3;
+  const int nkji = nx3*nx2*nx1;
+  const int nji = nx2*nx1;
+  const int nmkji = pmbp->nmb_thispack*nkji;
+  const Real outer_radius2[3] = {
+    SQR(parameters.force_outer_radius[0]),
+    SQR(parameters.force_outer_radius[1]),
+    SQR(parameters.force_outer_radius[2])
   };
-  for (int n=0; n<7; ++n) {
-    pdata->hdata[n] = (global_variable::my_rank == 0) ? values[n] : 0.0;
+
+  array_sum::GlobalSum force_integrals;
+  Kokkos::parallel_reduce(
+    "emri_force_volume", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+    KOKKOS_LAMBDA(const int idx, array_sum::GlobalSum &sum) {
+      const int m = idx/nkji;
+      const int k0 = (idx-m*nkji)/nji;
+      const int j0 = (idx-m*nkji-k0*nji)/nx1;
+      const int i0 = idx-m*nkji-k0*nji-j0*nx1;
+      const int i = i0+is;
+      const int j = j0+js;
+      const int k = k0+ks;
+      if (excision_floor(m,k,j,i)) return;
+
+      const Real x = CellCenterX(i0, nx1, size.d_view(m).x1min,
+                                size.d_view(m).x1max);
+      const Real y = CellCenterX(j0, nx2, size.d_view(m).x2min,
+                                size.d_view(m).x2max);
+      const Real z = CellCenterX(k0, nx3, size.d_view(m).x3min,
+                                size.d_view(m).x3max);
+      const Real radius2 = SQR(x)+SQR(y)+SQR(z);
+      if (radius2 <= surface_radius2 || radius2 > outer_radius2[2]) return;
+
+      const Real velocity[3] = {
+        w0(m, IVX, k, j, i), w0(m, IVY, k, j, i), w0(m, IVZ, k, j, i)
+      };
+      const Real densitized_field[3] = {
+        bcc(m, IBX, k, j, i), bcc(m, IBY, k, j, i), bcc(m, IBZ, k, j, i)
+      };
+      const Real density = w0(m, IDN, k, j, i);
+      const Real pressure = w0(m, IPR, k, j, i);
+      Real local_metric[4][4];
+      Real four_velocity[4];
+      Real stress[4][4];
+      Real sqrt_gamma;
+      Real sqrt_minus_g;
+      ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
+                          densitized_field, local_metric, four_velocity, stress,
+                          sqrt_gamma, sqrt_minus_g);
+      Real metric_derivative[3][4][4];
+      DifferentiateSecondaryDisplacement(
+          x, y, z, parameters, metric_derivative);
+      const Real coordinate_volume = size.d_view(m).dx1*size.d_view(m).dx2
+                                   *size.d_view(m).dx3;
+      const Real radius = sqrt(radius2);
+      const Real source_density = parameters.force_subtract_background
+          ? density-parameters.rho : density;
+      const Real newtonian_coefficient = parameters.metric.secondary_mass
+          *source_density*sqrt_gamma*coordinate_volume/(radius2*radius);
+
+      array_sum::GlobalSum cell;
+      cell.the_array[7] = newtonian_coefficient*x;
+      cell.the_array[8] = newtonian_coefficient*y;
+      cell.the_array[9] = newtonian_coefficient*z;
+      for (int force_direction=0; force_direction<3; ++force_direction) {
+        Real contraction = 0.0;
+        for (int a=0; a<4; ++a) {
+          for (int b=0; b<4; ++b) {
+            contraction += stress[a][b]
+                         *metric_derivative[force_direction][a][b];
+          }
+        }
+        const Real relativistic_force = -0.5*contraction*sqrt_minus_g
+                                      *coordinate_volume;
+        for (int cutoff=0; cutoff<3; ++cutoff) {
+          if (radius2 <= outer_radius2[cutoff]) {
+            cell.the_array[10+3*cutoff+force_direction] = relativistic_force;
+          }
+        }
+      }
+      sum += cell;
+    }, Kokkos::Sum<array_sum::GlobalSum>(force_integrals));
+
+  for (int n=7; n<=18; ++n) {
+    pdata->hdata[n] += force_integrals.the_array[n];
   }
 }
 

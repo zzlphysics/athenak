@@ -105,11 +105,14 @@ void ComputeExternalMetric(const Real x, const Real y, const Real z,
   PullBackMetric(global_metric, x, y, parameters, local_metric);
 }
 
-//! Evaluate only the secondary Kerr-Schild perturbation in the local rotating chart.
+//! Evaluate the secondary perturbation at a chosen displacement while holding the local
+//! rotating-coordinate basis fixed.  This separation is needed when differentiating
+//! with respect to the source position rather than the field-point coordinates.
 KOKKOS_INLINE_FUNCTION
-void ComputeSecondaryMetricPerturbation(const Real x, const Real y, const Real z,
-                                        const MetricParameters &parameters,
-                                        Real local_metric[4][4]) {
+void ComputeSecondaryMetricPerturbationAtDisplacement(
+    const Real displacement_x, const Real displacement_y, const Real displacement_z,
+    const Real basis_x, const Real basis_y, const MetricParameters &parameters,
+    Real local_metric[4][4]) {
   Real global_metric[4][4] = {{0.0}};
   const Real zero[3] = {0.0, 0.0, 0.0};
   // Translation invariance lets the secondary term be evaluated directly from its
@@ -119,9 +122,19 @@ void ComputeSecondaryMetricPerturbation(const Real x, const Real y, const Real z
   };
   const Real secondary_spin[3] = {0.0, 0.0, parameters.secondary_spin};
   binary_bh::AddBoostedKerrSchildTerm(
-      x, y, z, zero, secondary_velocity, secondary_spin, parameters.secondary_mass,
-      parameters.spin_buffer_secondary, parameters.singularity_floor, global_metric);
-  PullBackMetric(global_metric, x, y, parameters, local_metric);
+      displacement_x, displacement_y, displacement_z, zero, secondary_velocity,
+      secondary_spin, parameters.secondary_mass, parameters.spin_buffer_secondary,
+      parameters.singularity_floor, global_metric);
+  PullBackMetric(global_metric, basis_x, basis_y, parameters, local_metric);
+}
+
+//! Evaluate only the secondary Kerr-Schild perturbation in the local rotating chart.
+KOKKOS_INLINE_FUNCTION
+void ComputeSecondaryMetricPerturbation(const Real x, const Real y, const Real z,
+                                        const MetricParameters &parameters,
+                                        Real local_metric[4][4]) {
+  ComputeSecondaryMetricPerturbationAtDisplacement(
+      x, y, z, x, y, parameters, local_metric);
 }
 
 //! Evaluate the complete covariant effective metric in the local rotating chart.

@@ -82,6 +82,7 @@ enforce_maximum = false
 
 <problem>
 pgen_name        = emri_windtunnel
+user_hist        = true
 
 # Effective spacetime.  orbital_radius is the primary Kerr/BL radial coordinate.
 primary_mass     = 1000.0
@@ -107,6 +108,16 @@ b3                = 1.0e-2
 spin_buffer_primary   = 0.05
 spin_buffer_secondary = 0.05
 singularity_floor     = 1.0e-3
+metric_fd_step        = 5.0e-5
+
+# Force diagnostics.  Fmom is measured on the inner sphere; Frel1..3 are the
+# relativistic secondary-source forces accumulated from that sphere to each outer radius.
+force_surface_radius    = 3.0
+force_outer_radius_1    = 4.0
+force_outer_radius_2    = 6.0
+force_outer_radius_3    = 7.5
+force_surface_nlevel    = 5
+force_subtract_background = true
 
 <output1>
 file_type = bin
@@ -121,3 +132,8 @@ dt        = 0.05
 <output3>
 file_type = rst
 dt        = 0.05
+
+<output4>
+file_type      = hst
+dt             = 0.025
+user_hist_only = true
