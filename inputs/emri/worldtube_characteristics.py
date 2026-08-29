@@ -155,6 +155,26 @@ class CharacteristicBasis:
     jacobian_residual: float
 
 
+@dataclass(frozen=True)
+class LinearHLLDiagnostics:
+    """Linear per-mode response of an HLL boundary flux at one reference state.
+
+    ``flux_gain`` compares the HLL flux perturbation with the physical flux
+    perturbation for the same eigenmode.  An outgoing perturbation is placed on the
+    interior side and an incoming perturbation on the exterior side.  A gain of one is
+    exact.  Stationary modes have undefined gain and are reported as ``nan``.
+
+    This is a local reflection-risk proxy, not a measured wave-packet reflection
+    coefficient: the latter also depends on reconstruction, resolution, and timestep.
+    """
+
+    speeds: np.ndarray
+    flux_gain: np.ndarray
+    gain_error: np.ndarray
+    minimum_signal_speed: float
+    maximum_signal_speed: float
+
+
 def characteristic_basis(
     face_primitive: object,
     normal_magnetic: float,
@@ -223,6 +243,73 @@ def characteristic_basis(
     if np.any(speeds < -1.0 - 2.0e-10) or np.any(speeds > 1.0 + 2.0e-10):
         raise RuntimeError("RMHD characteristic speed lies outside the light cone")
     return CharacteristicBasis(speeds, right, left, condition, residual)
+
+
+def linear_hll_mode_gains(
+    face_primitive: object,
+    normal_magnetic: float,
+    adiabatic_index: float,
+    speed_tolerance: float = 1.0e-10,
+) -> LinearHLLDiagnostics:
+    """Return the linear HLL boundary-flux gain for all seven RMHD modes.
+
+    The outward normal points from the inner simulation into the supplied worldtube
+    state.  Positive-speed perturbations therefore live on the interior side of the
+    Riemann problem, while negative-speed perturbations live on the exterior side.
+    The calculation uses the extremal speeds of the same reference state, matching the
+    local linear limit of a two-wave HLL solver.
+    """
+
+    if not math.isfinite(speed_tolerance) or speed_tolerance < 0.0:
+        raise ValueError("speed_tolerance must be finite and nonnegative")
+    basis = characteristic_basis(face_primitive, normal_magnetic, adiabatic_index)
+    return linear_hll_gains_from_speeds(basis.speeds, speed_tolerance)
+
+
+def linear_hll_gains_from_speeds(
+    characteristic_speeds: object,
+    speed_tolerance: float = 1.0e-10,
+) -> LinearHLLDiagnostics:
+    """Evaluate the linear two-wave HLL response from seven ordered speeds."""
+
+    if not math.isfinite(speed_tolerance) or speed_tolerance < 0.0:
+        raise ValueError("speed_tolerance must be finite and nonnegative")
+    speeds = np.asarray(
+        _finite_vector(characteristic_speeds, 7, "characteristic_speeds"),
+        dtype=np.float64,
+    )
+    if np.any(np.diff(speeds) < 0.0):
+        raise ValueError("characteristic_speeds must be ordered")
+    minimum = min(0.0, float(speeds[0]))
+    maximum = max(0.0, float(speeds[-1]))
+    gains = np.full(7, np.nan, dtype=np.float64)
+    moving = np.abs(speeds) > speed_tolerance
+    if minimum >= 0.0:
+        gains[moving & (speeds > 0.0)] = 1.0
+    elif maximum <= 0.0:
+        gains[moving & (speeds < 0.0)] = 1.0
+    else:
+        denominator = maximum - minimum
+        outgoing = moving & (speeds > 0.0)
+        incoming = moving & (speeds < 0.0)
+        gains[outgoing] = (
+            maximum
+            * (speeds[outgoing] - minimum)
+            / (denominator * speeds[outgoing])
+        )
+        gains[incoming] = (
+            minimum
+            * (maximum - speeds[incoming])
+            / (denominator * speeds[incoming])
+        )
+    errors = np.abs(gains - 1.0)
+    return LinearHLLDiagnostics(
+        speeds=speeds,
+        flux_gain=gains,
+        gain_error=errors,
+        minimum_signal_speed=minimum,
+        maximum_signal_speed=maximum,
+    )
 
 
 def face_basis(face_name: str) -> np.ndarray:

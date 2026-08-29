@@ -128,3 +128,60 @@ def test_source_state_wrapper_uses_outward_incoming_sign() -> None:
     expected = exterior.copy()
     expected[5] = -0.15
     np.testing.assert_allclose(boundary, expected, atol=3.0e-14)
+
+
+def test_hll_mode_gain_is_exact_at_extremal_modes_and_superfast_boundaries() -> None:
+    mixed = np.asarray((1.0, 0.1, 0.3, 0.05, -0.02, 0.2, 0.1))
+    diagnostics = characteristics.linear_hll_mode_gains(
+        mixed, 0.15, 4.0 / 3.0
+    )
+    assert diagnostics.minimum_signal_speed < 0.0
+    assert diagnostics.maximum_signal_speed > 0.0
+    np.testing.assert_allclose(diagnostics.flux_gain[[0, -1]], 1.0, atol=2.0e-14)
+    assert np.nanmax(diagnostics.gain_error[1:-1]) > 0.05
+
+    superfast = mixed.copy()
+    superfast[2] = 3.0
+    outgoing = characteristics.linear_hll_mode_gains(
+        superfast, 0.15, 4.0 / 3.0
+    )
+    assert outgoing.minimum_signal_speed == 0.0
+    np.testing.assert_allclose(outgoing.flux_gain, 1.0, atol=2.0e-14)
+
+
+def test_hll_mode_gain_matches_a_finite_amplitude_riemann_flux() -> None:
+    primitive = np.asarray((1.0, 0.1, 0.3, 0.05, -0.02, 0.2, 0.1))
+    normal_field = 0.15
+    gamma = 4.0 / 3.0
+    basis = characteristics.characteristic_basis(primitive, normal_field, gamma)
+    diagnostics = characteristics.linear_hll_mode_gains(
+        primitive, normal_field, gamma
+    )
+    _, reference_flux = characteristics.srmhd_conserved_flux(
+        primitive, normal_field, gamma
+    )
+    minimum = diagnostics.minimum_signal_speed
+    maximum = diagnostics.maximum_signal_speed
+    epsilon = 1.0e-7
+    observed = []
+    for mode, speed in enumerate(basis.speeds):
+        perturbation = epsilon * basis.right_eigenvectors[:, mode]
+        left = primitive + perturbation if speed > 0.0 else primitive
+        right = primitive if speed > 0.0 else primitive + perturbation
+        conserved_left, flux_left = characteristics.srmhd_conserved_flux(
+            left, normal_field, gamma
+        )
+        conserved_right, flux_right = characteristics.srmhd_conserved_flux(
+            right, normal_field, gamma
+        )
+        hll_flux = (
+            maximum * flux_left
+            - minimum * flux_right
+            + maximum * minimum * (conserved_right - conserved_left)
+        ) / (maximum - minimum)
+        physical_flux = flux_left if speed > 0.0 else flux_right
+        observed.append(
+            np.linalg.norm(hll_flux - reference_flux)
+            / np.linalg.norm(physical_flux - reference_flux)
+        )
+    np.testing.assert_allclose(observed, diagnostics.flux_gain, atol=1.0e-6)

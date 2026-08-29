@@ -741,6 +741,28 @@ silently falling back to primitive copying.  These choices follow the local-Riem
 construction of Antón et al. (2006) and prevent the replay from overconstraining outgoing
 modes.
 
+Before deciding whether that more expensive projector is necessary for a particular
+disk patch, audit the actual packed worldtube rather than relying only on the upstream
+Mach number:
+
+```bash
+python3 inputs/emri/audit_worldtube_boundary.py disk_patch.inner.bin \
+  --gamma 1.3333333333333333 --output disk_patch.boundary-audit.json
+```
+
+The audit reports the incoming-mode histogram separately on all six faces, the fraction
+of samples with a mixed HLL fan, the numerical eigenbasis condition number, and
+`max(|lambda| dt_worldtube/dx_face)` for the fluid sampling cadence.  It also reports a
+linear per-mode HLL flux-gain error.  The extremal fast modes and every genuinely
+super-fast face have zero error in this local test; slower modes in a mixed fan need not.
+This gain error is a screening diagnostic, not a wave-packet reflection coefficient.
+Inspect its median, 95th percentile, and maximum together: a very large maximum can be
+caused by an almost stationary mode.  Repeat the audit with a physically justified
+`--speed-tolerance` to expose that sensitivity, but do not discard a slow mode merely
+to improve the reported number.
+Any production choice of `fluid_boundary=riemann` must still pass a propagated
+outgoing-wave reflection test at the intended resolution and worldtube cadence.
+
 ## Validation gates before science production
 
 1. Recover the isolated Kerr BHL result as `primary_mass/orbital_radius -> 0` at fixed
