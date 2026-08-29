@@ -181,6 +181,49 @@ consistent.  User-boundary ghost faces sample the same trace-free analytic field
 face fluxes remain CT evolved.  A spatially varying profile therefore requires `user`
 rather than the built-in constant `inflow` boundary on every supplying face.
 
+## Static global-GRMHD Taylor extraction
+
+`extract_static_taylor_worldtube.py` provides the first one-way global-to-local path.  A
+global single-SMBH run must write co-temporal three-dimensional `mhd_w_bcc` and `adm`
+binary dumps.  For example,
+
+```bash
+python3 inputs/emri/extract_static_taylor_worldtube.py \
+  --state global.mhd_w_bcc.00100.bin \
+  --adm global.adm.00100.bin \
+  --output-prefix profiles/orbit-r10-t1000 \
+  --anchor 10 0 0 \
+  --primary-center 0 0 0 \
+  --disk-normal 0 0 1 \
+  --orbital-omega 0.03162277660168379 \
+  --fit-radius 0.5
+```
+
+`--source-velocity vx vy vz` can replace `--orbital-omega`; both are global coordinate
+velocities `dx^i/dt`, not physical three-velocities.  The extractor:
+
+1. volume-weight fits the ADM metric at the worldline anchor;
+2. constructs an orthonormal source tetrad with radial, prograde, and vertical axes;
+3. matches state and ADM leaf MeshBlocks by logical location, so differing file order is
+   harmless;
+4. projects AthenaK's `W v^i` and densitized `B^i` through four-vectors into the source
+   tetrad;
+5. Gaussian- and cell-volume-weight fits the scalar and velocity Taylor coefficients;
+6. jointly fits all magnetic components with `tr(dB_i/dxh_j)=0` imposed exactly.
+
+The output prefix produces an `.athinput` fragment and a `.json` manifest containing
+hashes, time/cycle, tetrad/coframe, fitted parameters, residuals, cell-volume range, and
+ready-to-use command-line overrides.  Copy the fragment values into the local
+`<problem>` block.  If the residuals are large or the fit spans a wide range of AMR cell
+volumes, the first-order model is not an adequate representation; use a smaller fitting
+radius or proceed to a spatial worldtube replay rather than treating interpolation as
+additional physical resolution.
+
+This extractor is intentionally static and one-way.  It holds the anchor tetrad fixed
+across the fitting sphere and replaces cell-centered magnetic samples with their best
+trace-free linear approximation.  Those limitations are recorded in every manifest and
+will be lifted by the time-dependent worldtube stage.
+
 ## Validation gates before science production
 
 1. Recover the isolated Kerr BHL result as `primary_mass/orbital_radius -> 0` at fixed
