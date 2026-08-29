@@ -61,6 +61,7 @@ class EmriInnerWorldtubeReplay {
   bool exhausted_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
+  bool has_cell_centered_magnetic_state_ = false;
   int nt_ = 0;
   int interval_ = 0;
   int last_stage_ = 0;

@@ -278,8 +278,12 @@ void EmriInnerWorldtubeReplay::ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm)
   interval_ = endpoint;
 
   mhd::MHD *pmhd = pm->pmb_pack->pmhd;
-  if (nvar_ != pmhd->nmhd + pmhd->nscalars) {
-    InnerFatal("inner replay primitive count does not match the compiled MHD state");
+  const int fluid_nvar = pmhd->nmhd + pmhd->nscalars;
+  has_cell_centered_magnetic_state_ = (nvar_ == fluid_nvar + 3);
+  if (nvar_ != fluid_nvar && !has_cell_centered_magnetic_state_) {
+    InnerFatal(
+        "inner replay state must contain the compiled MHD primitives, with optional "
+        "trailing bcc1,bcc2,bcc3");
   }
   const RegionSize &mesh = pm->mesh_size;
   dx_ = mesh.dx1;

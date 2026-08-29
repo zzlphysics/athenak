@@ -473,6 +473,10 @@ emf_v[time_interval, v_segment, u_edge]
 
 `normal_flux` is a face-cell integral, not a point value of `B`.  Each EMF is a line
 integral oriented along the face-local direction, and `u cross v` is the outward normal.
+The current outer writer declares and records `cell_state` in the order
+`rho,u1,u2,u3[,pgas][,scalars...],bcc1,bcc2,bcc3`.  These final three cell-centered
+samples supply the two tangential fields needed by an MHD characteristic projection;
+the CT-normal field is still taken from `normal_flux`, not from `bcc`.
 The EMF over one stored interval is the time average actually used by the outer CT
 update.  Therefore every face cell must satisfy
 

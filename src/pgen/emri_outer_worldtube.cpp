@@ -239,12 +239,18 @@ EmriOuterWorldtubeWriter::EmriOuterWorldtubeWriter(ParameterInput *pin, Mesh *pm
   }
 
   mhd::MHD *pmhd = pm->pmb_pack->pmhd;
-  nvar_ = pmhd->nmhd + pmhd->nscalars;
+  // CT supplies the face-normal field, but an MHD characteristic boundary also needs
+  // both tangential magnetic components at the same face cell.  Retain the ordinary
+  // AthenaK primitive layout and append all three cell-centered field components.
+  nvar_ = pmhd->nmhd + pmhd->nscalars + 3;
   state_names_ = {"rho", "u1", "u2", "u3"};
   if (pmhd->nmhd == 5) state_names_.push_back("pgas");
   for (int scalar = 0; scalar < pmhd->nscalars; ++scalar) {
     state_names_.push_back("scalar" + std::to_string(scalar));
   }
+  state_names_.push_back("bcc1");
+  state_names_.push_back("bcc2");
+  state_names_.push_back("bcc3");
   if (static_cast<int>(state_names_.size()) != nvar_) {
     WorldtubeFatal("unexpected MHD primitive layout in outer worldtube writer");
   }
@@ -569,12 +575,14 @@ void EmriOuterWorldtubeWriter::CaptureAndWriteEndpoint(Mesh *pm, Real time) {
   auto state = endpoint_state_;
   auto flux = endpoint_flux_;
   auto w0 = pmhd->w0;
+  auto bcc0 = pmhd->bcc0;
   auto b1 = pmhd->b0.x1f;
   auto b2 = pmhd->b0.x2f;
   auto b3 = pmhd->b0.x3f;
   const int local_cells = static_cast<int>(host_cells_.size());
   const int cells = cells_per_edge_;
   const int nvar = nvar_;
+  const int fluid_nvar = pmhd->nmhd + pmhd->nscalars;
   const Real area = dx_*dx_;
   Kokkos::deep_copy(state, 0.0);
   Kokkos::deep_copy(flux, 0.0);
@@ -589,9 +597,14 @@ void EmriOuterWorldtubeWriter::CaptureAndWriteEndpoint(Mesh *pm, Real time) {
       const int v = records(record_index, 5);
       const int u = records(record_index, 6);
       const int face_cell = (face*cells + v)*cells + u;
-      for (int variable = 0; variable < nvar; ++variable) {
+      for (int variable = 0; variable < fluid_nvar; ++variable) {
         const int state_index = ((face*nvar + variable)*cells + v)*cells + u;
         state(state_index) = w0(m, variable, k, j, i);
+      }
+      for (int component = 0; component < 3; ++component) {
+        const int variable = fluid_nvar + component;
+        const int state_index = ((face*nvar + variable)*cells + v)*cells + u;
+        state(state_index) = bcc0(m, component, k, j, i);
       }
       const int normal_axis = face/2;
       const int normal_sign = (face % 2 == 0) ? -1 : 1;
