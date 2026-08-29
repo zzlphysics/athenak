@@ -44,6 +44,17 @@ prolong_primitives = false
 <amr_criterion0>
 method = user
 
+# Optional static-refinement region used by the global-snapshot extraction
+# regression.  It is inactive for the default refinement=none smoke run.
+<refined_region1>
+level = 1
+x1min = -4.0
+x1max =  4.0
+x2min = -4.0
+x2max =  4.0
+x3min = -4.0
+x3max =  4.0
+
 <time>
 evolution  = dynamic
 integrator = rk2

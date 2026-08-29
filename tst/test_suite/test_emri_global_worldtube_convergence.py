@@ -12,6 +12,7 @@ if str(EMRI_INPUTS) not in sys.path:
     sys.path.insert(0, str(EMRI_INPUTS))
 
 import analyze_global_worldtube_convergence as convergence  # noqa: E402
+import run_global_worldtube_amr_check as amr_check  # noqa: E402
 import run_global_worldtube_convergence as campaign  # noqa: E402
 import worldtube_flux_emf as worldtube  # noqa: E402
 import worldtube_frame  # noqa: E402
@@ -125,3 +126,28 @@ def test_campaign_assessment_recovers_second_order_series() -> None:
     np.testing.assert_allclose(series["normal_flux"]["observed_orders"], (2.0,))
     np.testing.assert_allclose(series["emf"]["observed_orders"], (2.0,))
     assert assessment["smoke_gates"]["passed"]
+
+
+def test_amr_check_assessment_gates_reference_quality() -> None:
+    comparison = {
+        "state": {"relative_l2": 1.0e-8},
+        "normal_flux": {"relative_l2": 2.0e-8},
+        "emf": {"relative_l2": 3.0e-5},
+    }
+    projection = {"maximum_relative_edge_correction": 2.0e-3}
+    error = {"relative_l2": 4.0e-7}
+    replay = {
+        "projection_count": 1000,
+        "fallback_count": 0,
+        "maximum_boundary_flux_residual": 1.0e-16,
+        "closure": {
+            "variables": {"dens": error, "press": error},
+            "vector_groups": {"velocity": error, "magnetic": error},
+        },
+    }
+    assessment = amr_check._assessment(comparison, projection, replay)
+    assert assessment["passed"]
+    comparison["emf"]["relative_l2"] = 2.0e-3
+    assessment = amr_check._assessment(comparison, projection, replay)
+    assert not assessment["passed"]
+    assert not assessment["conditions"]["emf_relative_l2"]["passed"]

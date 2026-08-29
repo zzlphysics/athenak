@@ -477,9 +477,14 @@ def project_interval_edges(
     sampled = _finite_array(sampled_edges, (complex_.edge_count,), "sampled edges")
     if not math.isfinite(solver_tolerance) or solver_tolerance <= 0.0:
         raise ValueError("solver_tolerance must be finite and positive")
-    compatibility_scale = max(float(np.sum(np.abs(target))), 1.0)
+    compatibility_scale = max(float(np.max(np.abs(target))), 1.0)
     compatibility = abs(float(np.sum(target)))
-    compatibility_limit = 128.0 * np.finfo(float).eps * compatibility_scale
+    compatibility_limit = (
+        64.0
+        * np.finfo(float).eps
+        * complex_.face_count
+        * compatibility_scale
+    )
     if compatibility > compatibility_limit:
         raise ValueError(
             "endpoint closed-surface flux changes between samples; no edge EMF "

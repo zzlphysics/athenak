@@ -10,6 +10,7 @@
       "adm": "dumps/global.adm.00101.bin"
     }
   ],
+  "source_level": 0,
   "frame": {
     "classification": "athenak-emri-affine-worldtube-frame-series-v1",
     "times": [0.0, 1.0],

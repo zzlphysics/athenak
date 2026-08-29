@@ -176,6 +176,17 @@ def test_projection_rejects_changing_closed_surface_flux() -> None:
         raise AssertionError("an incompatible endpoint flux change was accepted")
 
 
+def test_projection_accepts_surface_summed_roundoff_compatibility() -> None:
+    complex_ = frame.CubeSurfaceComplex(4)
+    target = np.zeros(complex_.face_count)
+    target[0] = 1.0e-13
+    corrected, diagnostics = frame.project_interval_edges(
+        complex_, target, np.zeros(complex_.edge_count)
+    )
+    assert np.isfinite(corrected).all()
+    assert diagnostics["final_maximum_faraday_residual"] < 2.0e-15
+
+
 def test_endpoint_projection_removes_only_closed_flux_mean() -> None:
     times = np.asarray((0.0, 0.3, 0.8))
     faces = _constant_cube(4, times)

@@ -647,11 +647,22 @@ still the only sampler that records the source CT EMF recurrence exactly.
 
 `extract_global_worldtube.py` provides the complete one-way path for an existing global
 GRMHD time series.  Every sample pairs co-temporal `mhd_w_bcc` and `adm` binary dumps.
-The current reference implementation assembles any fixed-level MeshBlock tiling into a
-uniform Cartesian source grid, then uses trilinear spatial and linear temporal
-interpolation.  The target cube may have a different spacing, center, translation, or
-rotation and need not align with the source cells.  Source AMR/SMR is rejected until a
-leaf-level prolongation rule with a corresponding flux-form audit is implemented.
+A level-zero uniform tiling is assembled into a dense Cartesian source grid.  For an
+AMR/SMR output, set the manifest `source_level` to a leaf level that covers every sampled
+locus, including the exterior-adjacent state centers, plus its one-cell interpolation
+halo.  The extractor retains only that level's leaf MeshBlocks, interpolates across
+neighboring same-level block boundaries, and rejects any stencil that touches a
+coarse-fine interface.  It deliberately does not invent a cell-centered magnetic
+prolongation rule from `mhd_w_bcc` dumps.  A globally uniformly refined leaf tiling is
+recognized automatically even when its sole physical level is nonzero.
+
+The target cube may have a different spacing, center, translation, or rotation and need
+not align with the source cells.  The source and ADM leaf topology may change between
+snapshots, provided the selected level continues to cover every sampled stencil.  Each
+output records the selected level, all available leaf levels, the number of retained
+blocks, and whether dense or sparse source storage was used.  Production should place
+the matching surface at least one selected-level source cell away from an AMR interface;
+additional margin is advisable when the source refinement region moves between dumps.
 
 The frame table is cubic Hermite data for `z^mu(T)` and `e^mu_a(T)`: it contains their
 values and first derivatives at every knot.  At each sampled event the extractor
@@ -738,6 +749,30 @@ coincident global subvolume, its density, pressure, velocity-vector, and magneti
 L2 errors were `1.84e-5`, `6.78e-5`, `3.94e-5`, and `3.35e-5`.  The first three retain
 the online closure accuracy; the larger magnetic error isolates the snapshot-EMF
 approximation that must be converged with dump cadence.
+
+A real two-level DynGRMHD smoke output provides a separate AMR addressing test.  The
+source has 56 level-zero and 64 level-one leaf blocks; a `12^3`, half-width-three
+worldtube and its halo lie inside the centered fine region.  Relative to a uniform
+`32^3` source with the same local `dx=0.5`, the sparse level-one extraction differs by
+`4.69e-8` in state L2, `7.40e-9` in face-flux L2, and `9.57e-5` in EMF L2 after one
+`1e-4` step.  The maximum final edge-projection residual is `1.20e-18`.  Inner replay
+performs 3,456 characteristic projections with zero fallback and an `8.65e-19` boundary
+CT residual; density, pressure, velocity-vector, and magnetic-vector closure errors are
+`1.03e-7`, `3.11e-7`, `2.35e-7`, and `1.71e-7`.  Moving a stencil across the fine-region
+boundary is a hard error rather than an implicit coarse-fine interpolation.
+
+Reproduce the complete AMR source, equivalent uniform source, extraction comparison,
+and inner replay with
+
+```bash
+python3 inputs/emri/run_global_worldtube_amr_check.py \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/global_worldtube_amr_check \
+  --fail-on-gate
+```
+
+The default check uses the optional centered `refined_region1` in
+`emri_windtunnel_smoke.athinput`; ordinary smoke runs retain `refinement=none`.
 
 ### Offline extraction convergence campaign
 

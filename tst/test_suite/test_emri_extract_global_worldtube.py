@@ -50,6 +50,47 @@ def _snapshot(time: float, values: np.ndarray | None = None) -> extract.UniformS
     )
 
 
+def _fixed_level_snapshot(
+    time: float,
+    include_right_block: bool = True,
+    include_extra_block: bool = False,
+) -> extract.FixedLevelSnapshot:
+    logical = [(1, 1, 1)]
+    if include_right_block:
+        logical.append((2, 1, 1))
+    if include_extra_block:
+        logical.append((0, 0, 0))
+    block_shape = (2, 2, 2)
+    values = np.empty((len(logical), len(extract.ALL_VARIABLES), 2, 2, 2))
+    background = _constant_global_values()
+    for block, location in enumerate(logical):
+        for z in range(2):
+            for y in range(2):
+                for x in range(2):
+                    global_index = np.asarray(location) * 2 + (x, y, z)
+                    values[block, :, z, y, x] = background
+                    values[block, 0, z, y, x] = (
+                        2.0
+                        + 0.3 * global_index[0]
+                        - 0.2 * global_index[1]
+                        + 0.1 * global_index[2]
+                    )
+    return extract.FixedLevelSnapshot(
+        time=time,
+        cycle=round(10 * time),
+        lower=np.asarray((-2.0, -2.0, -2.0)),
+        spacing=np.asarray((0.5, 0.5, 0.5)),
+        shape_xyz=(8, 8, 8),
+        block_shape_xyz=block_shape,
+        block_logical=np.asarray(logical),
+        values=values,
+        state_path=Path(f"state-fixed-{time}.bin"),
+        adm_path=Path(f"adm-fixed-{time}.bin"),
+        source_level=1,
+        available_leaf_levels=(0, 1),
+    )
+
+
 def _frame_series(
     velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> extract.AffineFrameSeries:
@@ -88,6 +129,45 @@ def test_uniform_snapshot_trilinear_interpolation_crosses_cell_boundaries() -> N
         + 0.1 * cell_index[:, 2]
     )
     np.testing.assert_allclose(sampled, expected, rtol=0.0, atol=2.0e-14)
+
+
+def test_fixed_level_interpolation_crosses_same_level_meshblock_boundary() -> None:
+    snapshot = _fixed_level_snapshot(0.0)
+    cell_coordinate = np.asarray((3.25, 2.3, 2.6))
+    point = snapshot.lower + (cell_coordinate + 0.5) * snapshot.spacing
+    sampled = snapshot.sample(point[None, :])[0, 0]
+    expected = (
+        2.0
+        + 0.3 * cell_coordinate[0]
+        - 0.2 * cell_coordinate[1]
+        + 0.1 * cell_coordinate[2]
+    )
+    np.testing.assert_allclose(sampled, expected, rtol=0.0, atol=2.0e-14)
+
+
+def test_fixed_level_interpolation_rejects_coarse_fine_interface() -> None:
+    snapshot = _fixed_level_snapshot(0.0, include_right_block=False)
+    cell_coordinate = np.asarray((3.25, 2.3, 2.6))
+    point = snapshot.lower + (cell_coordinate + 0.5) * snapshot.spacing
+    try:
+        snapshot.sample(point[None, :])
+    except ValueError as error:
+        message = str(error)
+        assert "level-1 leaf MeshBlock" in message
+        assert "logical_block=(2, 1, 1)" in message
+    else:
+        raise AssertionError("coarse-fine interpolation stencil was accepted")
+
+
+def test_snapshot_series_allows_fixed_level_topology_change_with_coverage() -> None:
+    left = _fixed_level_snapshot(0.0)
+    right = _fixed_level_snapshot(1.0, include_extra_block=True)
+    series = extract.SnapshotSeries((left, right))
+    cell_coordinate = np.asarray((3.25, 2.3, 2.6))
+    point = left.lower + (cell_coordinate + 0.5) * left.spacing
+    event = np.asarray(((0.4, *point),))
+    expected = left.sample(point[None, :])
+    np.testing.assert_allclose(series.sample(event), expected, atol=2.0e-14)
 
 
 def test_unit_scaling_preserves_metric_and_rescales_grmhd_state() -> None:

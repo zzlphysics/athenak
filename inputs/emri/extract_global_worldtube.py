@@ -2,9 +2,11 @@
 """Extract a moving inner-coordinate CT worldtube from global GRMHD dumps.
 
 The source is a time series of co-temporal AthenaK ``mhd_w_bcc`` and ``adm``
-binary outputs on fixed, single-level Cartesian meshes.  A cubic-Hermite affine
-frame maps local events to the global chart.  Fluid four-velocity and the ideal
-MHD Faraday two-form are reconstructed in the global ADM geometry, sampled with
+binary outputs.  Uniform grids are assembled densely; AMR/SMR outputs are
+sampled sparsely on one explicitly selected leaf level and reject interpolation
+stencils that cross a refinement boundary.  A cubic-Hermite affine frame maps
+local events to the global chart.  Fluid four-velocity and the ideal MHD
+Faraday two-form are reconstructed in the global ADM geometry, sampled with
 linear spacetime interpolation, and transformed into the inner coordinates.
 
 Face fluxes and edge EMFs are integrated directly as pulled-back differential
@@ -16,7 +18,7 @@ they must converge toward zero with source, target, and quadrature resolution.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
@@ -194,6 +196,13 @@ class UniformSnapshot:
     values: np.ndarray
     state_path: Path
     adm_path: Path
+    source_level: int = 0
+    source_meshblock_count: int = 1
+    available_leaf_levels: tuple[int, ...] = (0,)
+
+    @property
+    def source_storage(self) -> str:
+        return "dense_uniform"
 
     def sample(self, positions: object) -> np.ndarray:
         points = np.asarray(positions, dtype=np.float64)
@@ -235,8 +244,150 @@ class UniformSnapshot:
 
 
 @dataclass(frozen=True)
+class FixedLevelSnapshot:
+    """Sparse same-level leaf blocks supporting cross-block interpolation."""
+
+    time: float
+    cycle: int
+    lower: np.ndarray
+    spacing: np.ndarray
+    shape_xyz: tuple[int, int, int]
+    block_shape_xyz: tuple[int, int, int]
+    block_logical: np.ndarray
+    values: np.ndarray
+    state_path: Path
+    adm_path: Path
+    source_level: int
+    available_leaf_levels: tuple[int, ...]
+    block_lookup: dict[tuple[int, int, int], int] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        lower = _finite_array(self.lower, (3,), "fixed-level lower bound")
+        spacing = _finite_array(self.spacing, (3,), "fixed-level spacing")
+        if np.any(spacing <= 0.0):
+            raise ValueError("fixed-level spacing must be positive")
+        if (
+            len(self.shape_xyz) != 3
+            or len(self.block_shape_xyz) != 3
+            or min(self.shape_xyz) < 2
+            or min(self.block_shape_xyz) < 1
+        ):
+            raise ValueError(
+                "fixed-level grid and block shapes must be three-dimensional"
+            )
+        if not isinstance(self.source_level, int) or self.source_level < 0:
+            raise ValueError("source_level must be a nonnegative integer")
+        if self.source_level not in self.available_leaf_levels:
+            raise ValueError("source_level is absent from available_leaf_levels")
+        logical = np.asarray(self.block_logical)
+        values = np.asarray(self.values)
+        expected = (
+            logical.shape[0],
+            len(ALL_VARIABLES),
+            self.block_shape_xyz[2],
+            self.block_shape_xyz[1],
+            self.block_shape_xyz[0],
+        )
+        if (
+            logical.ndim != 2
+            or logical.shape[1:] != (3,)
+            or not np.issubdtype(logical.dtype, np.integer)
+            or values.shape != expected
+            or not np.isfinite(values).all()
+        ):
+            raise ValueError("fixed-level logical blocks or values are incompatible")
+        lookup = {
+            tuple(int(value) for value in row): index
+            for index, row in enumerate(logical)
+        }
+        if len(lookup) != logical.shape[0]:
+            raise ValueError("fixed-level snapshot contains duplicate logical blocks")
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "spacing", spacing)
+        object.__setattr__(self, "block_logical", logical.astype(np.int64))
+        object.__setattr__(self, "values", np.asarray(values, dtype=np.float64))
+        object.__setattr__(self, "block_lookup", lookup)
+
+    @property
+    def source_storage(self) -> str:
+        return "sparse_fixed_leaf_level"
+
+    @property
+    def source_meshblock_count(self) -> int:
+        return int(self.block_logical.shape[0])
+
+    def sample(self, positions: object) -> np.ndarray:
+        points = np.asarray(positions, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+            raise ValueError("snapshot positions must have finite shape (N,3)")
+        count = points.shape[0]
+        lower_index = np.empty((count, 3), dtype=np.int64)
+        fraction = np.empty((count, 3), dtype=np.float64)
+        for axis, cells in enumerate(self.shape_xyz):
+            coordinate = (points[:, axis] - self.lower[axis]) / self.spacing[axis] - 0.5
+            tolerance = 128.0 * np.finfo(float).eps * np.maximum(
+                1.0, np.abs(coordinate)
+            )
+            outside = (coordinate < -tolerance) | (
+                coordinate > cells - 1 + tolerance
+            )
+            if np.any(outside):
+                first = int(np.flatnonzero(outside)[0])
+                raise ValueError(
+                    "worldtube sample lies outside the source cell-center envelope: "
+                    f"point={points[first].tolist()}, axis={axis + 1}, "
+                    f"coordinate_index={coordinate[first]:.17g}"
+                )
+            coordinate = np.clip(coordinate, 0.0, cells - 1.0)
+            index = np.floor(coordinate).astype(np.int64)
+            index = np.minimum(index, cells - 2)
+            lower_index[:, axis] = index
+            fraction[:, axis] = coordinate - index
+
+        result = np.zeros((count, self.values.shape[1]), dtype=np.float64)
+        for dz in (0, 1):
+            weight_z = fraction[:, 2] if dz else 1.0 - fraction[:, 2]
+            for dy in (0, 1):
+                weight_y = fraction[:, 1] if dy else 1.0 - fraction[:, 1]
+                for dx in (0, 1):
+                    weight_x = fraction[:, 0] if dx else 1.0 - fraction[:, 0]
+                    cell = lower_index + np.asarray((dx, dy, dz))
+                    block = cell // np.asarray(self.block_shape_xyz)
+                    local = cell % np.asarray(self.block_shape_xyz)
+                    unique, inverse = np.unique(block, axis=0, return_inverse=True)
+                    block_ids = np.empty(unique.shape[0], dtype=np.int64)
+                    for item, logical in enumerate(unique):
+                        key = tuple(int(value) for value in logical)
+                        if key not in self.block_lookup:
+                            first = int(np.flatnonzero(inverse == item)[0])
+                            raise ValueError(
+                                "fixed-level interpolation stencil is not covered by "
+                                f"a level-{self.source_level} leaf MeshBlock: "
+                                f"point={points[first].tolist()}, logical_block={key}; "
+                                "move the worldtube away from the AMR interface or "
+                                "choose another uniformly covering source_level"
+                            )
+                        block_ids[item] = self.block_lookup[key]
+                    corner = np.empty((count, self.values.shape[1]))
+                    for item, block_id in enumerate(block_ids):
+                        selected = inverse == item
+                        corner[selected] = self.values[
+                            block_id,
+                            :,
+                            local[selected, 2],
+                            local[selected, 1],
+                            local[selected, 0],
+                        ]
+                    weight = weight_x * weight_y * weight_z
+                    result += weight[:, None] * corner
+        return result
+
+
+@dataclass(frozen=True)
 class SnapshotSeries:
-    snapshots: tuple[UniformSnapshot, ...]
+    snapshots: tuple[UniformSnapshot | FixedLevelSnapshot, ...]
 
     def __post_init__(self) -> None:
         if len(self.snapshots) < 2:
@@ -246,6 +397,21 @@ class SnapshotSeries:
         times = np.asarray([snapshot.time for snapshot in self.snapshots])
         if not np.isfinite(times).all() or np.any(np.diff(times) <= 0.0):
             raise ValueError("global snapshot times must increase strictly")
+        reference = self.snapshots[0]
+        for snapshot in self.snapshots[1:]:
+            if (
+                snapshot.shape_xyz != reference.shape_xyz
+                or snapshot.source_level != reference.source_level
+                or not np.allclose(
+                    snapshot.lower, reference.lower, rtol=0.0, atol=2.0e-13
+                )
+                or not np.allclose(
+                    snapshot.spacing, reference.spacing, rtol=0.0, atol=2.0e-13
+                )
+            ):
+                raise ValueError(
+                    "global snapshot source level or Cartesian geometry changes in time"
+                )
 
     @property
     def times(self) -> np.ndarray:
@@ -366,14 +532,115 @@ class SamplingAudit:
         }
 
 
-def _load_snapshot(entry: dict[str, object], directory: Path) -> UniformSnapshot:
+def _fixed_level_snapshot(
+    state: dict[str, object],
+    adm: dict[str, object],
+    adm_alignment: list[int],
+    state_path: Path,
+    adm_path: Path,
+    source_level: int,
+) -> FixedLevelSnapshot:
+    logical_all = np.asarray(state["mb_logical"], dtype=np.int64)
+    selected = np.flatnonzero(logical_all[:, 3] == source_level)
+    if selected.size == 0:
+        available = sorted(set(int(value) for value in logical_all[:, 3]))
+        raise RuntimeError(
+            f"source_level={source_level} has no leaf MeshBlocks; "
+            f"available leaf levels are {available}"
+        )
+    variable_blocks = []
+    try:
+        for name in STATE_VARIABLES:
+            variable_blocks.append(
+                np.stack([state["mb_data"][name][index] for index in selected])
+            )
+        for name in ADM_VARIABLES:
+            variable_blocks.append(
+                np.stack(
+                    [
+                        adm["mb_data"][name][adm_alignment[index]]
+                        for index in selected
+                    ]
+                )
+            )
+        values = np.stack(variable_blocks, axis=1)
+    except ValueError as error:
+        raise RuntimeError(
+            "selected source-level MeshBlocks do not have a common output shape"
+        ) from error
+
+    block_shape_xyz = (
+        int(values.shape[4]),
+        int(values.shape[3]),
+        int(values.shape[2]),
+    )
+    lower = np.asarray(
+        (state["x1min"], state["x2min"], state["x3min"]), dtype=np.float64
+    )
+    upper = np.asarray(
+        (state["x1max"], state["x2max"], state["x3max"]), dtype=np.float64
+    )
+    root_shape = np.asarray(
+        (state["Nx1"], state["Nx2"], state["Nx3"]), dtype=np.int64
+    )
+    fine_shape = root_shape * (1 << source_level)
+    spacing = (upper - lower) / fine_shape
+    logical = logical_all[selected, :3]
+    geometries = np.asarray(state["mb_geometry"], dtype=np.float64)[selected]
+    for row, geometry in zip(logical, geometries, strict=True):
+        cell_begin = row * np.asarray(block_shape_xyz)
+        cell_end = cell_begin + np.asarray(block_shape_xyz)
+        if np.any(cell_begin < 0) or np.any(cell_end > fine_shape):
+            raise RuntimeError(
+                "source-level logical MeshBlock lies outside its declared root grid"
+            )
+        expected_lower = lower + cell_begin * spacing
+        expected_upper = lower + cell_end * spacing
+        stored_lower = geometry[[0, 2, 4]]
+        stored_upper = geometry[[1, 3, 5]]
+        scale = max(1.0, float(np.max(np.abs(geometry))))
+        if not np.allclose(
+            stored_lower,
+            expected_lower,
+            rtol=0.0,
+            atol=2.0e-12 * scale,
+        ) or not np.allclose(
+            stored_upper,
+            expected_upper,
+            rtol=0.0,
+            atol=2.0e-12 * scale,
+        ):
+            raise RuntimeError(
+                "source-level logical and physical MeshBlock geometries disagree"
+            )
+    return FixedLevelSnapshot(
+        time=float(state["time"]),
+        cycle=int(state["cycle"]),
+        lower=lower,
+        spacing=spacing,
+        shape_xyz=tuple(int(value) for value in fine_shape),
+        block_shape_xyz=block_shape_xyz,
+        block_logical=logical,
+        values=values,
+        state_path=state_path,
+        adm_path=adm_path,
+        source_level=source_level,
+        available_leaf_levels=tuple(
+            sorted(set(int(value) for value in logical_all[:, 3]))
+        ),
+    )
+
+
+def _load_snapshot(
+    entry: dict[str, object], directory: Path, source_level: int | None = None
+) -> UniformSnapshot | FixedLevelSnapshot:
     state_path = _resolve_path(entry.get("state"), directory, "snapshot state")
     adm_path = _resolve_path(entry.get("adm"), directory, "snapshot ADM")
     state = bin_convert.read_binary(str(state_path), variables=STATE_VARIABLES)
     adm = bin_convert.read_binary(str(adm_path), variables=ADM_VARIABLES)
     static._check_dump(state, STATE_VARIABLES, "state")
     static._check_dump(adm, ADM_VARIABLES, "ADM")
-    static._aligned_adm_blocks(state, adm)
+    adm_alignment = static._aligned_adm_blocks(state, adm)
     time_scale = max(abs(float(state["time"])), abs(float(adm["time"])), 1.0)
     if int(state["cycle"]) != int(adm["cycle"]) or not math.isclose(
         float(state["time"]),
@@ -405,6 +672,22 @@ def _load_snapshot(entry: dict[str, object], directory: Path) -> UniformSnapshot
             float(state[label]), float(adm[label]), rel_tol=0.0, abs_tol=2.0e-13
         ):
             raise RuntimeError(f"state and ADM source grids differ in {label}")
+    state_levels = np.asarray(state["mb_logical"], dtype=np.int64)[:, 3]
+    available_levels = sorted(set(int(value) for value in state_levels))
+    if source_level is None and len(available_levels) > 1:
+        raise RuntimeError(
+            "AMR/SMR snapshot requires an explicit manifest source_level; "
+            f"available leaf levels are {available_levels}"
+        )
+    if source_level is not None or available_levels[0] != 0:
+        return _fixed_level_snapshot(
+            state,
+            adm,
+            adm_alignment,
+            state_path,
+            adm_path,
+            available_levels[0] if source_level is None else source_level,
+        )
     values = np.stack(
         [
             closure.assemble_uniform_grid(state, name)
@@ -430,6 +713,9 @@ def _load_snapshot(entry: dict[str, object], directory: Path) -> UniformSnapshot
         values=values,
         state_path=state_path,
         adm_path=adm_path,
+        source_level=available_levels[0],
+        source_meshblock_count=int(state["n_mbs"]),
+        available_leaf_levels=tuple(available_levels),
     )
 
 
@@ -821,8 +1107,21 @@ def extract_manifest(
         isinstance(entry, dict) for entry in entries
     ):
         raise ValueError("manifest requires at least two snapshot objects")
+    source_level_value = document.get("source_level")
+    if source_level_value is None:
+        source_level = None
+    elif (
+        not isinstance(source_level_value, int)
+        or isinstance(source_level_value, bool)
+        or source_level_value < 0
+    ):
+        raise ValueError("source_level must be a nonnegative integer when provided")
+    else:
+        source_level = source_level_value
     snapshots = SnapshotSeries(
-        tuple(_load_snapshot(entry, path.parent) for entry in entries)
+        tuple(
+            _load_snapshot(entry, path.parent, source_level) for entry in entries
+        )
     )
     frame_document = _frame_document(document.get("frame"), path.parent)
     frames = AffineFrameSeries.from_document(frame_document)
@@ -866,6 +1165,10 @@ def extract_manifest(
             "adm_size_bytes": snapshot.adm_path.stat().st_size,
             "shape_xyz": list(snapshot.shape_xyz),
             "cell_spacing": snapshot.spacing.tolist(),
+            "source_level": snapshot.source_level,
+            "source_storage": snapshot.source_storage,
+            "selected_leaf_meshblocks": snapshot.source_meshblock_count,
+            "available_leaf_levels": list(snapshot.available_leaf_levels),
         }
         if hash_source_files:
             provenance["state_sha256"] = static.file_sha256(snapshot.state_path)
@@ -897,10 +1200,14 @@ def extract_manifest(
         ),
         "global_length_in_local_units": length_scale,
         "density_renormalization": density_scale,
+        "source_level": snapshots.snapshots[0].source_level,
         "sampling_diagnostics": diagnostics,
         "limitations": [
             "one-way coupling; the inner accretor does not modify the global disk",
-            "source snapshots must be fixed single-level Cartesian outputs",
+            (
+                "each trilinear stencil must remain on the selected fixed leaf level; "
+                "coarse-fine interpolation is deliberately rejected"
+            ),
             (
                 "linear temporal and trilinear spatial interpolation of primitive "
                 "plus ADM fields"
