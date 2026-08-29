@@ -192,10 +192,11 @@ scale, not for the temporal mean.
 
 ### Outer--inner matching contract
 
-The planner writes an explicit but not-yet-implemented spatial-worldtube contract.  The
-outer calculation has a secondary-centered cubical extraction worldtube and a sink
-strictly inside it.  The inner calculation replaces the sink region.  A trustworthy
-implementation must transfer:
+The planner writes an explicit spatial-worldtube contract.  Its host-side flux/EMF
+format, validator, and conservative regridder are implemented below; the AthenaK outer
+writer and inner replay driver are still pending.  The outer calculation has a
+secondary-centered cubical extraction worldtube and a sink strictly inside it.  The
+inner calculation replaces the sink region.  A trustworthy implementation must transfer:
 
 - incoming fluid characteristic amplitudes while leaving outgoing modes unconstrained;
 - face-integrated normal magnetic flux, conservatively regridded so fine-face sums equal
@@ -454,6 +455,73 @@ local source-tetrad fit, and the small simulation evaluates that continuous fit 
 own mesh.  If the local box spans enough global cells that first-order residuals are no
 longer small, the next extension should replay a spatial worldtube (preferably vector
 potential or face flux plus EMF), not silently increase the polynomial order.
+
+## Cubical face-flux/edge-EMF worldtube
+
+`worldtube_flux_emf.py` implements the topology and host-side transfer layer for the
+spatial replay.  Its strict NPZ container is classified as
+`athenak-emri-cubical-flux-emf-worldtube-v1` and stores, on each of the six outward
+oriented faces:
+
+```text
+cell_state[t, variable, v, u]
+normal_flux[t, v, u]
+emf_u[time_interval, v_edge, u_segment]
+emf_v[time_interval, v_segment, u_edge]
+```
+
+`normal_flux` is a face-cell integral, not a point value of `B`.  Each EMF is a line
+integral oriented along the face-local direction, and `u cross v` is the outward normal.
+The EMF over one stored interval is the time average actually used by the outer CT
+update.  Therefore every face cell must satisfy
+
+```text
+Phi[n+1] = Phi[n] - dt * (Eu_bottom + Ev_right - Eu_top - Ev_left).
+```
+
+The validator checks this relation on every cell and interval, pairs the two copies of
+all twelve cube-edge EMFs with the correct orientation, and checks zero net outward flux
+over the closed cube.  It rejects a file before any inner evolution if one of these
+topological identities fails:
+
+```bash
+python3 inputs/emri/worldtube_flux_emf.py validate outer_worldtube.npz
+```
+
+Different outer and inner face resolutions are handled without pointwise `B`
+interpolation:
+
+```bash
+python3 inputs/emri/worldtube_flux_emf.py resample \
+  outer_worldtube.npz inner_worldtube.npz --cells-per-face 128
+```
+
+Normal fluxes are transferred by exact area overlap; line EMFs use conservative overlap
+along their edge and nodal interpolation transverse to it.  These tensor-product
+operators commute with the discrete face curl, including non-integer changes in
+resolution.  Fluid face-cell values use area-average transfer.  Regridding preserves
+both total magnetic flux and the stored Faraday update to roundoff, but it assumes the
+same physical cube; changing the matching radius is a new outer extraction, not a grid
+interpolation.
+
+AthenaK now exposes two optional problem hooks at the required RK-stage locations.
+`user_efld_func` runs after built-in corner-EMF sources but before EMF communication; an
+inner injector writes there so block and AMR synchronization still see its data.
+`user_efld_observer_func` runs after `RecvE` and immediately before CT; an outer writer
+reads there so it records the synchronized EMF actually used by the update.  The writer
+must accumulate those `mhd::MHD::efld` values with the integrator recurrence.  Neither
+`mhd_w_bcc` snapshots nor `-v cross B` reconstructed afterward are equivalent.  In
+particular, constructing some `E=-dA/dt` from snapshot changes can satisfy a continuous
+Faraday equation yet produce a large first-cell artifact when stitched to the inner
+Riemann EMF.  That shortcut is deliberately not provided.
+
+The current container uses one interval-average EMF, which permits conservative
+piecewise-constant temporal replay at different local timesteps.  Higher-order temporal
+replay will require outer RK-stage samples or temporal moments in a later schema.  The
+remaining implementation steps are: write the six-face data from an outer AthenaK run,
+load/regrid it once on the host, keep the necessary slabs resident on the device, inject
+incoming fluid modes in the physical-boundary task, and inject the stored line EMFs in
+`user_efld_func` at every local RK stage.
 
 ## Validation gates before science production
 

@@ -420,7 +420,10 @@ def build_plan(
     overlap_low = (1.0 - settings.overlap_fraction) * match_radius
     overlap_high = (1.0 + settings.overlap_fraction) * match_radius
     transfer_contract = {
-        "status": "interface specification; spatial flux/EMF replay is not yet implemented",
+        "status": (
+            "host flux/EMF format, validation, and regridding implemented; outer "
+            "writer and inner RK-stage replay pending"
+        ),
         "geometry": "secondary-centered cubical worldtube in source-tetrad axes",
         "cube_half_width": match_radius,
         "radial_buffer_interval": [overlap_low, overlap_high],

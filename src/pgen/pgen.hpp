@@ -16,8 +16,11 @@
 #include "geodesic-grid/spherical_grid.hpp"
 #include "parameter_input.hpp"
 
+class Driver;
+
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
+using UserEFieldFnPtr = void (*)(Mesh* pm, Driver* pdrive, int stage);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
@@ -53,6 +56,11 @@ class ProblemGenerator {
   ProblemFinalizeFnPtr pgen_final_func=nullptr;
   // function pointer for user-enrolled BCs.  Called in ApplyPhysicalBCs in task list
   UserBoundaryFnPtr user_bcs_func=nullptr;
+  // Optional edge-electric-field hook, called after built-in E-field source terms and
+  // before EMF communication/CT at every explicit RK stage.
+  UserEFieldFnPtr user_efld_func=nullptr;
+  // Read the synchronized edge field after EMF communication and immediately before CT.
+  UserEFieldFnPtr user_efld_observer_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;

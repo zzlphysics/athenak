@@ -62,7 +62,8 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
   id.efldsrc   = tl["stagen"]->AddTask(&MHD::EFieldSrc, this, id.efld);
   id.sende     = tl["stagen"]->AddTask(&MHD::SendE, this, id.efldsrc);
   id.recve     = tl["stagen"]->AddTask(&MHD::RecvE, this, id.sende);
-  id.ct        = tl["stagen"]->AddTask(&MHD::CT, this, id.recve);
+  id.observee  = tl["stagen"]->AddTask(&MHD::ObserveEField, this, id.recve);
+  id.ct        = tl["stagen"]->AddTask(&MHD::CT, this, id.observee);
   id.sendb_oa  = tl["stagen"]->AddTask(&MHD::SendB_OA, this, id.ct);
   id.recvb_oa  = tl["stagen"]->AddTask(&MHD::RecvB_OA, this, id.sendb_oa);
   id.restb     = tl["stagen"]->AddTask(&MHD::RestrictB, this, id.recvb_oa);
@@ -468,6 +469,9 @@ TaskStatus MHD::EFieldSrc(Driver *pdrive, int stage) {
       psbox_b->SourceTermsFC(b0, efld);
     }
   }
+  if (pmy_pack->pmesh->pgen->user_efld_func != nullptr) {
+    (pmy_pack->pmesh->pgen->user_efld_func)(pmy_pack->pmesh, pdrive, stage);
+  }
   return TaskStatus::complete;
 }
 
@@ -497,6 +501,18 @@ TaskStatus MHD::RecvE(Driver *pdrive, int stage) {
     tstat = pbval_b->AccumulateFluxRegistersFC(efld, stage_weight);
   }
   return tstat;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MHD::ObserveEField
+//! \brief Call a problem observer on the synchronized edge EMF actually used by CT.
+
+TaskStatus MHD::ObserveEField(Driver *pdrive, int stage) {
+  if (pmy_pack->pmesh->pgen->user_efld_observer_func != nullptr) {
+    (pmy_pack->pmesh->pgen->user_efld_observer_func)(
+        pmy_pack->pmesh, pdrive, stage);
+  }
+  return TaskStatus::complete;
 }
 
 //----------------------------------------------------------------------------------------
