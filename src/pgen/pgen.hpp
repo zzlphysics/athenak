@@ -17,10 +17,16 @@
 #include "parameter_input.hpp"
 
 class Driver;
+class EmriOuterWorldtubeWriter;
+
+void EmriOuterWorldtubeObserveEField(Mesh *pm, Driver *pdrive, int stage);
+void EmriOuterWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
+void EmriOuterWorldtubeFinalize(Mesh *pm, Driver *pdrive);
 
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
 using UserEFieldFnPtr = void (*)(Mesh* pm, Driver* pdrive, int stage);
+using UserStepFnPtr = void (*)(Mesh* pm, Driver* pdrive);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
@@ -37,7 +43,7 @@ class ProblemGenerator {
   // constructor for restarts
   ProblemGenerator(ParameterInput *pin, Mesh *pmesh, IOWrapper resfile,
                    bool single_file_per_rank=false);
-  ~ProblemGenerator() = default;
+  ~ProblemGenerator();
 
   // true if user BCs are specified on any face
   bool user_bcs;
@@ -61,6 +67,10 @@ class ProblemGenerator {
   UserEFieldFnPtr user_efld_func=nullptr;
   // Read the synchronized edge field after EMF communication and immediately before CT.
   UserEFieldFnPtr user_efld_observer_func=nullptr;
+  // Observe a fully completed root step after Mesh::time and Mesh::ncycle are advanced.
+  UserStepFnPtr user_step_observer_func=nullptr;
+  // Flush problem-owned streaming diagnostics before final problem analysis runs.
+  UserStepFnPtr user_finalize_observer_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;
@@ -95,6 +105,13 @@ class ProblemGenerator {
   void UserProblem(ParameterInput *pin, const bool restart);
 
  private:
+  friend void EmriOuterWorldtubeObserveEField(Mesh*, Driver*, int);
+  friend void EmriOuterWorldtubeCompleteStep(Mesh*, Driver*);
+  friend void EmriOuterWorldtubeFinalize(Mesh*, Driver*);
+
+  void ConfigureEmriOuterWorldtube(ParameterInput *pin, bool is_restart);
+
+  std::unique_ptr<EmriOuterWorldtubeWriter> emri_outer_worldtube_;
   bool single_file_per_rank; // for restart file naming
   Mesh* pmy_mesh_;
 };

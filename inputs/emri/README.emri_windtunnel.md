@@ -193,8 +193,8 @@ scale, not for the temporal mean.
 ### Outer--inner matching contract
 
 The planner writes an explicit spatial-worldtube contract.  Its host-side flux/EMF
-format, validator, and conservative regridder are implemented below; the AthenaK outer
-writer and inner replay driver are still pending.  The outer calculation has a
+format, validator, conservative regridder, and first fixed-grid AthenaK outer writer are
+implemented below; the inner replay driver is still pending.  The outer calculation has a
 secondary-centered cubical extraction worldtube and a sink strictly inside it.  The
 inner calculation replaces the sink region.  A trustworthy implementation must transfer:
 
@@ -518,10 +518,56 @@ Riemann EMF.  That shortcut is deliberately not provided.
 The current container uses one interval-average EMF, which permits conservative
 piecewise-constant temporal replay at different local timesteps.  Higher-order temporal
 replay will require outer RK-stage samples or temporal moments in a later schema.  The
-remaining implementation steps are: write the six-face data from an outer AthenaK run,
-load/regrid it once on the host, keep the necessary slabs resident on the device, inject
-incoming fluid modes in the physical-boundary task, and inject the stored line EMFs in
-`user_efld_func` at every local RK stage.
+remaining inner-side steps are: load/regrid once on the host, keep the necessary slabs
+resident on the device, inject incoming fluid modes in the physical-boundary task, and
+inject the stored line EMFs in `user_efld_func` at every local RK stage.
+
+### First AthenaK outer writer
+
+The pgen-independent outer writer is enabled by an optional input block, so it can be
+attached to a global single-black-hole GRMHD problem without modifying that problem's
+initial-data code:
+
+```text
+<emri_worldtube>
+enabled       = true
+center_x1     = 20.0
+center_x2     = 0.0
+center_x3     = 0.0
+half_width    = 4.0
+dcycle        = 8
+overwrite     = false
+file_basename = disk_patch.outer_worldtube
+```
+
+At RK stage one it records the initial face flux and interior-adjacent primitive state.
+After EMF synchronization at every stage it advances a device-resident line-integral
+register with
+
+```text
+I_stage = gamma0_stage * I_previous + beta_stage * dt * E_stage * edge_length.
+```
+
+At each `dcycle` endpoint it sums the completed-step integrals, writes their interval
+average, and writes the new state and normal flux.  A final off-cadence interval is
+flushed by the driver finalize hook.  MPI ranks contribute disjoint surface cells/edges
+and reduce only the small surface arrays to rank zero; the full volume is never copied to
+the host.  Output is an incrementally updated JSON manifest plus little-endian float64
+streams.  Convert and validate it with
+
+```bash
+python3 inputs/emri/worldtube_flux_emf.py pack-outer \
+  disk_patch.outer_worldtube.cycle00000000.manifest.json disk_patch.worldtube.npz
+```
+
+This first writer deliberately enforces a fixed, grid-aligned cube on an isotropic,
+single-level Cartesian mesh and supports explicit RK1/RK2/RK3 without level subcycling.
+It rejects AMR/SMR, a moving cube, non-aligned faces, or an existing output segment
+unless `overwrite=true`.  These are correctness gates, not fundamental limitations.
+A continuously moving worldtube requires the motional edge term and a discrete geometric
+conservation law; merely changing `center_x*` each output would break the same Faraday
+identity the format is designed to preserve.  Static refinement can be added next by
+extracting on one uniform leaf level and using the existing mimetic regridder.
 
 ## Validation gates before science production
 

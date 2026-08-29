@@ -9,6 +9,7 @@
 //! reads data from restart file, as well as re-initializing problem-specific data.
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "pgen/emri_outer_worldtube.hpp"
 #include "pgen.hpp"
 
 
@@ -78,6 +80,7 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm) :
       exit(EXIT_FAILURE);
     }
   }
+  ConfigureEmriOuterWorldtube(pin, false);
 }
 
 //----------------------------------------------------------------------------------------
@@ -646,6 +649,33 @@ ProblemGenerator::ProblemGenerator(ParameterInput *pin, Mesh *pm, IOWrapper resf
       exit(EXIT_FAILURE);
     }
   }
+  ConfigureEmriOuterWorldtube(pin, true);
+}
+
+ProblemGenerator::~ProblemGenerator() = default;
+
+//----------------------------------------------------------------------------------------
+//! \brief Enroll the optional pgen-independent EMRI outer worldtube recorder.
+
+void ProblemGenerator::ConfigureEmriOuterWorldtube(ParameterInput *pin,
+                                                   bool is_restart) {
+  if (!pin->DoesBlockExist("emri_worldtube") ||
+      !pin->GetOrAddBoolean("emri_worldtube", "enabled", false)) {
+    return;
+  }
+  if (user_efld_observer_func != nullptr || user_step_observer_func != nullptr ||
+      user_finalize_observer_func != nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "<emri_worldtube> cannot replace a problem-owned EMF, step, or "
+              << "finalize observer." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  emri_outer_worldtube_ = std::make_unique<EmriOuterWorldtubeWriter>(
+      pin, pmy_mesh_, is_restart);
+  user_efld_observer_func = EmriOuterWorldtubeObserveEField;
+  user_step_observer_func = EmriOuterWorldtubeCompleteStep;
+  user_finalize_observer_func = EmriOuterWorldtubeFinalize;
 }
 
 //----------------------------------------------------------------------------------------

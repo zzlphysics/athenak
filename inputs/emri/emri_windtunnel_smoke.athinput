@@ -162,6 +162,18 @@ force_outer_radius_3    = 7.5
 force_surface_nlevel    = 5
 force_subtract_background = true
 
+<emri_worldtube>
+# Optional fixed, grid-aligned outer extractor.  It is disabled in the ordinary smoke
+# run; the end-to-end writer test enables it from the command line.
+enabled       = false
+center_x1     = 0.0
+center_x2     = 0.0
+center_x3     = 0.0
+half_width    = 4.0
+dcycle        = 1
+overwrite     = false
+file_basename = emri_windtunnel_smoke.outer_worldtube
+
 <output1>
 file_type = bin
 variable  = mhd_w

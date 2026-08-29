@@ -1,5 +1,6 @@
 """Tests for conservative EMRI cubical flux/EMF worldtube transfer."""
 
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -106,3 +107,44 @@ def test_mismatched_duplicate_cube_edge_is_rejected() -> None:
         assert "edge" in str(error)
     else:
         raise AssertionError("inconsistent duplicated cube edge was accepted")
+
+
+def test_outer_stream_binary_manifest_round_trip() -> None:
+    times = np.asarray((2.0, 2.25))
+    cells = 3
+    faces = _constant_cube(cells, times)
+    with tempfile.TemporaryDirectory() as directory_name:
+        directory = Path(directory_name)
+        times_file = directory / "times.bin"
+        np.asarray(times, dtype="<f8").tofile(times_file)
+        file_table = {}
+        for name, face in faces.items():
+            file_table[name] = {}
+            for field_name in ("cell_state", "normal_flux", "emf_u", "emf_v"):
+                filename = f"{name}.{field_name}.bin"
+                np.asarray(getattr(face, field_name), dtype="<f8").tofile(
+                    directory / filename
+                )
+                file_table[name][field_name] = filename
+        manifest = {
+            "classification": worldtube.OUTER_STREAM_CLASSIFICATION,
+            "target_classification": worldtube.CLASSIFICATION,
+            "complete": True,
+            "binary_dtype": "<f8",
+            "times_file": times_file.name,
+            "nt": 2,
+            "ninterval": 1,
+            "nvar": 2,
+            "cells_per_face_axis": cells,
+            "state_variables": ["a", "b"],
+            "faces": file_table,
+        }
+        manifest_path = directory / "stream.manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        loaded_times, loaded_faces, metadata = worldtube.read_outer_stream(
+            manifest_path
+        )
+    np.testing.assert_array_equal(loaded_times, times)
+    assert metadata["state_variables"] == ["a", "b"]
+    diagnostics = worldtube.validate_worldtube(loaded_times, loaded_faces)
+    assert diagnostics["maximum_shared_edge_emf_residual"] == 0.0

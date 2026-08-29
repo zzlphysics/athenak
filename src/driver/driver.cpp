@@ -936,6 +936,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       pmesh->time = pmesh->time + pmesh->dt;
       pmesh->ncycle++;
       pmesh->dt_last_completed = pmesh->dt;
+      if (pmesh->pgen->user_step_observer_func != nullptr) {
+        (pmesh->pgen->user_step_observer_func)(pmesh, this);
+      }
       if (LevelSubcyclingRequested()) {
         SetLevelSubcyclingContext(pmesh->root_level, 0, pmesh->time, pmesh->dt, true);
         // lloc_eachmb is replicated global metadata, so this count is correct on rank 0
@@ -1205,6 +1208,11 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
     if (!is_restart) {
       final_parameter_state_changed = true;
     }
+  }
+
+  // Flush streaming problem diagnostics while the evolved MeshBlock data are intact.
+  if (pmesh->pgen->user_finalize_observer_func != nullptr) {
+    (pmesh->pgen->user_finalize_observer_func)(pmesh, this);
   }
 
   // call any problem specific functions to do work after main loop

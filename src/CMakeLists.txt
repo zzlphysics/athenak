@@ -110,6 +110,7 @@ add_executable(
         outputs/pdf.cpp
 
         pgen/pgen.cpp
+        pgen/emri_outer_worldtube.cpp
         pgen/tests/advection.cpp
         pgen/tests/collapse.cpp
         pgen/tests/cpaw.cpp

@@ -21,6 +21,7 @@ import numpy as np
 
 
 CLASSIFICATION = "athenak-emri-cubical-flux-emf-worldtube-v1"
+OUTER_STREAM_CLASSIFICATION = "athenak-emri-outer-worldtube-stream-v1"
 FACE_NAMES = ("x1m", "x1p", "x2m", "x2p", "x3m", "x3p")
 
 
@@ -398,6 +399,102 @@ def resample_worldtube(
     return result
 
 
+def _read_exact_binary(path: Path, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
+    expected = math.prod(shape)
+    values = np.fromfile(path, dtype=np.dtype(dtype))
+    if values.size != expected:
+        raise ValueError(
+            f"{path} contains {values.size} values, expected exactly {expected}"
+        )
+    result = np.asarray(values.reshape(shape), dtype=np.float64)
+    if not np.isfinite(result).all():
+        raise ValueError(f"{path} contains a non-finite value")
+    return result
+
+
+def read_outer_stream(
+    manifest_path: Path,
+) -> tuple[np.ndarray, dict[str, FaceData], dict[str, object]]:
+    """Load the strict streaming files written by AthenaK's outer recorder."""
+
+    with manifest_path.open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("classification") != OUTER_STREAM_CLASSIFICATION:
+        raise ValueError("outer stream classification is missing or unsupported")
+    if manifest.get("target_classification") != CLASSIFICATION:
+        raise ValueError("outer stream targets an incompatible worldtube schema")
+    if manifest.get("complete") is not True:
+        raise ValueError("outer stream is incomplete; finalize the AthenaK run first")
+    if manifest.get("binary_dtype") != "<f8":
+        raise ValueError("outer stream must use little-endian float64 binary data")
+    nt = manifest.get("nt")
+    ninterval = manifest.get("ninterval")
+    nvar = manifest.get("nvar")
+    cells = manifest.get("cells_per_face_axis")
+    if (
+        not isinstance(nt, int)
+        or nt < 2
+        or not isinstance(ninterval, int)
+        or ninterval != nt - 1
+        or not isinstance(nvar, int)
+        or nvar < 1
+        or not isinstance(cells, int)
+        or cells < 1
+    ):
+        raise ValueError("outer stream dimensions or interval count are invalid")
+    face_files = manifest.get("faces")
+    if not isinstance(face_files, dict) or set(face_files) != set(FACE_NAMES):
+        raise ValueError("outer stream must name exactly the six cubical faces")
+
+    directory = manifest_path.resolve().parent
+
+    def resolve_file(filename: object) -> Path:
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("outer stream contains an invalid binary filename")
+        candidate = (directory / filename).resolve()
+        if candidate.parent != directory:
+            raise ValueError("outer stream binary filenames must stay beside the manifest")
+        return candidate
+
+    times = _read_exact_binary(
+        resolve_file(manifest.get("times_file")), "<f8", (nt,)
+    )
+    times = validate_times(times)
+    faces: dict[str, FaceData] = {}
+    expected_keys = {"cell_state", "normal_flux", "emf_u", "emf_v"}
+    for name in FACE_NAMES:
+        files = face_files[name]
+        if not isinstance(files, dict) or set(files) != expected_keys:
+            raise ValueError(f"outer stream file table for {name} is invalid")
+        faces[name] = FaceData(
+            cell_state=_read_exact_binary(
+                resolve_file(files["cell_state"]), "<f8", (nt, nvar, cells, cells)
+            ),
+            normal_flux=_read_exact_binary(
+                resolve_file(files["normal_flux"]), "<f8", (nt, cells, cells)
+            ),
+            emf_u=_read_exact_binary(
+                resolve_file(files["emf_u"]),
+                "<f8",
+                (ninterval, cells + 1, cells),
+            ),
+            emf_v=_read_exact_binary(
+                resolve_file(files["emf_v"]),
+                "<f8",
+                (ninterval, cells, cells + 1),
+            ),
+        )
+    validate_worldtube(times, faces)
+    metadata = {
+        "outer_stream_manifest": manifest,
+        "state_variables": manifest.get("state_variables", []),
+        "center": manifest.get("center"),
+        "half_width": manifest.get("half_width"),
+        "grid_spacing": manifest.get("grid_spacing"),
+    }
+    return times, faces, metadata
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -407,11 +504,19 @@ def parse_arguments() -> argparse.Namespace:
     resample_parser.add_argument("input", type=Path)
     resample_parser.add_argument("output", type=Path)
     resample_parser.add_argument("--cells-per-face", type=int, required=True)
+    pack_parser = subparsers.add_parser("pack-outer")
+    pack_parser.add_argument("manifest", type=Path)
+    pack_parser.add_argument("output", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     arguments = parse_arguments()
+    if arguments.command == "pack-outer":
+        times, faces, metadata = read_outer_stream(arguments.manifest)
+        diagnostics = write_worldtube(arguments.output, times, faces, metadata)
+        print(json.dumps(diagnostics, indent=2))
+        return
     times, faces, metadata = read_worldtube(arguments.input)
     if arguments.command == "validate":
         diagnostics = validate_worldtube(times, faces)
