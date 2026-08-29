@@ -165,3 +165,28 @@ def test_projection_rejects_changing_closed_surface_flux() -> None:
         assert "closed-surface flux changes" in str(error)
     else:
         raise AssertionError("an incompatible endpoint flux change was accepted")
+
+
+def test_endpoint_projection_removes_only_closed_flux_mean() -> None:
+    times = np.asarray((0.0, 0.3, 0.8))
+    faces = _constant_cube(4, times)
+    faces["x1p"].normal_flux[0, 1, 2] += 0.03
+    faces["x2m"].normal_flux[1, 0, 0] -= 0.02
+    original_states = {
+        name: values.cell_state.copy() for name, values in faces.items()
+    }
+    projected, diagnostics = frame.project_closed_surface_fluxes(times, faces)
+    for endpoint in range(times.size):
+        net = sum(
+            np.sum(projected[name].normal_flux[endpoint])
+            for name in worldtube.FACE_NAMES
+        )
+        assert abs(float(net)) < 3.0e-16
+    for name in worldtube.FACE_NAMES:
+        np.testing.assert_array_equal(projected[name].cell_state, original_states[name])
+        delta = projected[name].normal_flux - faces[name].normal_flux
+        for endpoint in range(times.size):
+            np.testing.assert_allclose(
+                delta[endpoint], delta[endpoint, 0, 0], rtol=0.0, atol=5.0e-18
+            )
+    assert diagnostics["endpoints"][0]["raw_closed_surface_flux"] != 0.0

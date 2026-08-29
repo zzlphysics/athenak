@@ -1,0 +1,43 @@
+{
+  "classification": "athenak-emri-global-worldtube-series-v1",
+  "snapshots": [
+    {
+      "state": "dumps/global.mhd_w_bcc.00100.bin",
+      "adm": "dumps/global.adm.00100.bin"
+    },
+    {
+      "state": "dumps/global.mhd_w_bcc.00101.bin",
+      "adm": "dumps/global.adm.00101.bin"
+    }
+  ],
+  "frame": {
+    "classification": "athenak-emri-affine-worldtube-frame-series-v1",
+    "times": [0.0, 1.0],
+    "worldline": [
+      [0.0, 10.0, 0.0, 0.0],
+      [1.0, 10.0, 0.1, 0.0]
+    ],
+    "worldline_tangent": [
+      [1.0, 0.0, 0.1, 0.0],
+      [1.0, 0.0, 0.1, 0.0]
+    ],
+    "spatial_legs": [
+      [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+      [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    ],
+    "spatial_leg_derivative": [
+      [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+      [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    ]
+  },
+  "sample_times": [0.0, 1.0],
+  "worldtube": {
+    "center": [0.0, 0.0, 0.0],
+    "half_width": 4.0,
+    "cells_per_edge": 8
+  },
+  "quadrature_order": 2,
+  "hash_source_files": false,
+  "global_length_in_local_units": 1.0,
+  "density_renormalization": 1.0
+}

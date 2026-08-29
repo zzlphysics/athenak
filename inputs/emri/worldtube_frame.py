@@ -619,6 +619,100 @@ def project_moving_samples(
     return result, diagnostics
 
 
+def project_closed_surface_fluxes(
+    times: object,
+    faces: dict[str, worldtube.FaceData],
+) -> tuple[dict[str, worldtube.FaceData], dict[str, object]]:
+    """Minimally remove sampled magnetic monopoles at every endpoint.
+
+    A pointwise interpolation of cell-centered magnetic data does not commute
+    with the divergence operator used by the source CT mesh.  Its cut-surface
+    quadrature can therefore have a small nonzero closed flux even when the
+    source face field is exactly divergence-free.  On an equal-area cubical
+    surface, subtracting the mean face-cell flux is the Euclidean minimum-norm
+    correction satisfying the one closed-surface compatibility constraint.
+
+    This projection is deliberately separate from ``project_moving_samples``:
+    endpoint face fluxes are corrected first, and the unique edge cochain is
+    then corrected to satisfy the resulting interval Faraday curls.
+    """
+
+    times_array = worldtube.validate_times(times)
+    if set(faces) != set(worldtube.FACE_NAMES):
+        raise ValueError("flux samples must contain exactly the six cube faces")
+    checked = {
+        name: worldtube.validate_face(faces[name], times_array, name)
+        for name in worldtube.FACE_NAMES
+    }
+    reference = checked[worldtube.FACE_NAMES[0]].normal_flux.shape
+    for name in worldtube.FACE_NAMES:
+        if checked[name].normal_flux.shape != reference:
+            raise ValueError("closed-flux projection requires one face resolution")
+
+    corrected_flux = {
+        name: checked[name].normal_flux.copy() for name in worldtube.FACE_NAMES
+    }
+    endpoint_diagnostics = []
+    face_cell_count = sum(
+        checked[name].normal_flux.shape[1]
+        * checked[name].normal_flux.shape[2]
+        for name in worldtube.FACE_NAMES
+    )
+    for endpoint in range(times_array.size):
+        net_flux = float(
+            sum(
+                np.sum(checked[name].normal_flux[endpoint], dtype=np.float64)
+                for name in worldtube.FACE_NAMES
+            )
+        )
+        correction = -net_flux / face_cell_count
+        for name in worldtube.FACE_NAMES:
+            corrected_flux[name][endpoint] += correction
+        final_flux = float(
+            sum(
+                np.sum(corrected_flux[name][endpoint], dtype=np.float64)
+                for name in worldtube.FACE_NAMES
+            )
+        )
+        flux_scale = max(
+            max(
+                float(np.max(np.abs(checked[name].normal_flux[endpoint])))
+                for name in worldtube.FACE_NAMES
+            ),
+            np.finfo(float).tiny,
+        )
+        endpoint_diagnostics.append(
+            {
+                "endpoint": endpoint,
+                "time": float(times_array[endpoint]),
+                "raw_closed_surface_flux": net_flux,
+                "final_closed_surface_flux": final_flux,
+                "face_cell_correction": correction,
+                "relative_maximum_flux_correction": abs(correction) / flux_scale,
+            }
+        )
+
+    result = {
+        name: worldtube.FaceData(
+            cell_state=checked[name].cell_state.copy(),
+            normal_flux=corrected_flux[name],
+            emf_u=checked[name].emf_u.copy(),
+            emf_v=checked[name].emf_v.copy(),
+        )
+        for name in worldtube.FACE_NAMES
+    }
+    return result, {
+        "classification": "athenak-emri-closed-flux-projection-v1",
+        "method": "equal-area Euclidean minimum-norm mean subtraction",
+        "endpoints": endpoint_diagnostics,
+        "warning": (
+            "topological projection is not a substitute for spatial convergence; "
+            "the relative correction must decrease as source and quadrature "
+            "resolution increase"
+        ),
+    }
+
+
 def _load_frame_contract(path: Path) -> AffineFrame:
     document = json.loads(path.read_text(encoding="utf-8"))
     if document.get("classification") != FRAME_CONTRACT_CLASSIFICATION:

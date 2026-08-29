@@ -525,9 +525,9 @@ piecewise-constant temporal replay at different local timesteps.  Higher-order t
 replay will require outer RK-stage samples or temporal moments in a later schema.  The
 implemented inner driver loads bounded slabs and injects stored line EMFs in
 `user_efld_func` at every local RK stage.  It also has validated flat-spacetime and
-ADM-face GRMHD seven-wave incoming-mode boundaries.  The remaining global-disk coupling
-step is upstream: sample and transform the global state/flux cochains into the inner
-coordinate chart before `prepare-inner`.
+ADM-face GRMHD seven-wave incoming-mode boundaries.  The offline global-snapshot path
+below now performs the upstream state/two-form transformation.  An online moving
+cut-surface writer remains preferable when exact source RK EMFs are available.
 
 ### First AthenaK outer writer
 
@@ -578,8 +578,8 @@ extracting on one uniform leaf level and using the existing mimetic regridder.
 
 ### Moving/source-tetrad frame contract
 
-`worldtube_frame.py` now supplies the geometry and discrete-constraint layer needed by a
-future cut-surface sampler.  For the affine local map
+`worldtube_frame.py` supplies the geometry and discrete-constraint layer used by the
+offline cut-surface sampler below.  For the affine local map
 
 ```text
 x^mu(T,X) = z^mu(T) + e^mu_a(T) X^a,
@@ -638,10 +638,106 @@ correction.  These corrections must decrease under outer spatial and temporal
 refinement; the projection restores topology but cannot rescue an under-resolved
 physical sample.
 
-The remaining implementation gap is consequently narrow and explicit: sample `F` and
-fluid four-vectors on the moving cut surface during the global run, then feed those raw
-integrals through this pullback/projection layer.  The existing fixed-grid observer is
-still the only production outer sampler.
+For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
+fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
+those raw integrals through this pullback/projection layer.  The fixed-grid observer is
+still the only sampler that records the source CT EMF recurrence exactly.
+
+### Offline global-snapshot cut-surface extraction
+
+`extract_global_worldtube.py` provides the complete one-way path for an existing global
+GRMHD time series.  Every sample pairs co-temporal `mhd_w_bcc` and `adm` binary dumps.
+The current reference implementation assembles any fixed-level MeshBlock tiling into a
+uniform Cartesian source grid, then uses trilinear spatial and linear temporal
+interpolation.  The target cube may have a different spacing, center, translation, or
+rotation and need not align with the source cells.  Source AMR/SMR is rejected until a
+leaf-level prolongation rule with a corresponding flux-form audit is implemented.
+
+The frame table is cubic Hermite data for `z^mu(T)` and `e^mu_a(T)`: it contains their
+values and first derivatives at every knot.  At each sampled event the extractor
+reconstructs
+
+```text
+W = sqrt(1 + gamma_ij u^i u^j),
+U^0 = W/alpha,
+U^i = u^i - beta^i U^0,
+v_transport^i = U^i/U^0,
+E_i = -(v_transport cross bcc)_i,
+F_0i = -E_i,  F_ij = epsilon_ijk bcc^k,
+```
+
+where `bcc^i=sqrt(gamma) B^i`.  It then transforms the spacetime metric, four-velocity,
+and Faraday two-form rather than rotating three-component arrays independently.  If one
+global length unit contains `L` local units and the optional density renormalization is
+`D`, the numerical-unit conversion is
+
+```text
+g_local = L^2 J^T g_global J,
+U_local = J^-1 U_global/L,
+F_local = L sqrt(D) J^T F_global J,
+(rho,p)_local = D (rho,p)_global/L^2.
+```
+
+For the common map `x_global=X_local/L`, this leaves a Minkowski metric unchanged and
+gives `B_local=sqrt(D) B_global/L`.  This separation is important: treating the
+mass-ratio unit conversion as only a coordinate pullback would introduce an extra
+erroneous power of `L`.
+
+The fluid state is sampled at the exterior-adjacent local cell center, exactly matching
+the operational outer-writer convention.  Magnetic flux is Gauss-integrated from the
+spatial pulled-back two-form on the geometrical face.  The time-edge part of the same
+two-form is Gauss-integrated along each edge and over each stored time interval, so
+translation and rotation automatically contribute the motional EMF.  Finally, the tool
+performs two small topological projections:
+
+1. subtract the equal-area minimum-norm mean face flux at each endpoint so the closed
+   cubical surface has zero magnetic monopole;
+2. minimally correct the unique edge cochain so its curl equals the endpoint flux
+   change on every face cell.
+
+Both relative corrections are written to the output metadata.  They are error
+estimators, not free accuracy: repeat the extraction with finer source dumps, target
+faces, temporal cadence, and quadrature, and require the corrections and observables to
+converge.  The complete frame contract, resolved source paths, sizes, and manifest hash
+are retained as provenance.  Set `hash_source_files=true` for a final production product
+to add SHA-256 for every large dump; it defaults to false so exploratory extraction does
+not perform a second full read of the source series.
+
+Start from `global_worldtube_manifest.example.json`, replace its dump paths and affine
+frame with the physical worldline/tetrad map, then run
+
+```bash
+python3 inputs/emri/extract_global_worldtube.py \
+  --manifest global_worldtube.json \
+  --output disk_patch.worldtube.npz \
+  --diagnostics disk_patch.extraction.json
+python3 inputs/emri/worldtube_flux_emf.py validate disk_patch.worldtube.npz
+python3 inputs/emri/worldtube_flux_emf.py prepare-inner \
+  disk_patch.worldtube.npz disk_patch.inner.bin
+```
+
+All mapped event times must lie inside the source snapshot range, including any temporal
+offset `e^0_a X^a`, and all mapped spatial points must lie inside the source cell-center
+envelope.  The latter is stricter than merely lying inside the domain because binary
+dumps do not contain source ghost cells.  The output declares
+`fluid_state_frame=inner_coordinate`, so it can be used with
+`fluid_boundary=characteristic_gr`; the inner total metric should nevertheless approach
+the transformed global metric at the replay boundary, otherwise the one-way matching
+surface is too close to the secondary.
+
+On the standard `16^3` DynGRMHD closure snapshot pair, a static `8x8` face extraction
+reconstructed the exterior state to `2.55e-8` relative L2 (the dump is float32), face
+flux to `1.61e-5`, and the exact-RK writer EMF to about `8e-3`.  Its closed-flux
+correction was `2.22e-17` relative and the maximum Faraday edge correction was
+`2.90e-5` in line-integral units.  The state/flux agreement validates coordinates and
+GR variable reconstruction; the larger EMF difference quantifies why sparse snapshots
+are an approximate fallback rather than a replacement for an online RK observer.
+Replaying this offline product through `characteristic_gr` completed 1,536 mode
+projections with zero fallback and a `3.42e-18` CT endpoint residual.  Relative to the
+coincident global subvolume, its density, pressure, velocity-vector, and magnetic-vector
+L2 errors were `1.84e-5`, `6.78e-5`, `3.94e-5`, and `3.35e-5`.  The first three retain
+the online closure accuracy; the larger magnetic error isolates the snapshot-EMF
+approximation that must be converged with dump cadence.
 
 ### Inner CT magnetic replay
 
@@ -683,15 +779,12 @@ flux to the stored next slab and aborts if the normalized discrepancy exceeds
 `flux_tolerance`.  Single-block, eight-block, equal-timestep, and five-inner-step per
 outer-interval tests close this check.
 
-The state slabs are loaded but remain inactive by default.  A production global disk to
-local-EMRI coupling must first transform density/pressure, four-velocity, magnetic flux
-2-forms, and EMF 1-forms into the same inner coordinate chart.  Copying global coordinate
-primitives into all ghost cells would use the wrong frame; likewise, a moving extraction
-cube needs the motional EMF in the discrete map.  The default magnetic-only replay is
-therefore the conservative CT/topology transport layer and end-to-end test bed.  Set
-`fluid_boundary=riemann` only after `cell_state` has been
-transformed into the inner simulation's coordinate primitive convention and contains
-the trailing `bcc1,bcc2,bcc3` fields.  This enables the first operational fluid replay:
+The state slabs are loaded but remain inactive by default.  Use the offline extractor
+above or a future equivalent online transformer before enabling a fluid boundary;
+copying global coordinate primitives into ghost cells uses the wrong frame, and a moving
+cube also needs the motional EMF.  Set `fluid_boundary=riemann` only after `cell_state`
+has the inner-coordinate primitive convention and trailing `bcc1,bcc2,bcc3` fields.
+This enables the first operational fluid replay:
 after every C2P cache refresh it linearly interpolates the exterior state in worldtube
 time, fills the face-normal ghost columns, replaces the ghost normal `bcc` by the CT
 flux value, and lets the ordinary GRMHD HLLE solver pose the boundary Riemann problem.
