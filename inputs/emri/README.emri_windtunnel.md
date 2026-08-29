@@ -120,6 +120,126 @@ r_H ~ orbital_radius * (q/3)^(1/3).
 The present uniform-wind stage is most informative when runs are organized by `r_a/r_H`,
 not by a brute-force scan in `q`.
 
+## Capture-scale and cost planner
+
+`plan_bhl_hierarchy.py` turns an upstream source-tetrad state into a reproducible decision
+between a direct relativistic calculation, a scale-separated outer--inner calculation,
+and a disk-scale outer model.  Run it before choosing a box:
+
+```bash
+python3 inputs/emri/plan_bhl_hierarchy.py \
+  --secondary-mass 1 \
+  --primary-mass 100000 \
+  --orbital-radius 1000000 \
+  --rho 1 --pgas 1e-4 --adiabatic-index 1.3333333333333333 \
+  --four-velocity 0.05 0 0 \
+  --magnetic-field 0.01 0 0 \
+  --coherence-scale disk_H=100000 \
+  --coherence-scale L_rho=200000 \
+  --output-prefix plans/slow-wind
+```
+
+All inputs must already use one common `G=c=1` unit system.  With
+`wind_frame=source_tetrad`, the velocity and magnetic arguments have exactly the same
+meaning as `u1..u3` and `b1..b3` in the local problem.  For an ideal relativistic gas the
+planner computes
+
+```text
+h = 1 + gamma p/[(gamma-1) rho],       cs^2 = gamma p/(rho h),
+b^2 = [B^2 + (B dot u)^2]/W^2,        vA^2 = b^2/(rho h+b^2),
+cf,proxy^2 = cs^2 + vA^2 - cs^2 vA^2.
+```
+
+It reports both `m/(v^2+cf,proxy^2)` and the conservative factor-two cost radius
+`2m/(v^2+cf,proxy^2)`.  The latter is used to size the default domain.  This is a cost
+proxy, not the exact directional GRMHD fast characteristic, which requires the full
+dispersion relation.  The default upstream extent of four capture radii follows the
+minimum scale commonly used in relativistic BHL calculations; the downstream side is
+longer to retain the wake.  See the
+[relativistic BHL domain discussion](https://academic.oup.com/mnras/article/471/3/3127/3979475)
+and the magnetized calculations in [arXiv:2201.11753](https://arxiv.org/abs/2201.11753)
+and [arXiv:2409.12359](https://arxiv.org/abs/2409.12359).
+
+The output consists of strict JSON plus a readable Markdown report.  It gives a uniform
+horizon-resolving cell count, an optimistic nested-box AMR count, the number of finest
+steps, and global-timestep zone updates.  The last quantity prevents a misleading result
+in which a modest resident mesh is evolved for millions of secondary-scale timesteps.
+All budgets are command-line controls and should be replaced by measured AthenaK
+throughput on the intended machine.
+
+The decision tree is:
+
+1. If the cost radius is smaller than the supplied disk/gradient scales and Hill radius,
+   and the direct cell, level, step, and zone-update budgets pass, use direct GRMHD.
+2. If direct evolution fails but
+   `r_inner << r_match=sqrt(r_inner*r_a) << r_a`, evolve a nonrelativistic or SRMHD outer
+   BHL problem with a finite sink, and replay a worldtube into the relativistic inner
+   problem.  Vary `r_match`; the geometric mean is only the first trial.
+3. If `r_a` approaches `H`, a fitted gradient scale, or `r_H`, the uniform BHL premise has
+   already failed.  Use a global-disk or shearing-patch outer calculation and retain the
+   relativistic inner calculation only if a smaller overlap still exists.  Enlarging a
+   uniform box cannot repair the missing disk geometry or tidal shear.
+4. For a weakly magnetized, sub-fast, nearly spherical state, a Bondi/Michel outer
+   solution is a useful reduced control.  It is not a generic replacement for a
+   magnetized disk wind.
+
+For analytic or extracted gradients, provide the smallest physically relevant coherence
+scale.  Useful estimates are `L_rho=1/|grad ln rho|`,
+`L_p=1/|grad ln p|`, `L_u=|u|/||grad u||`, and
+`L_B=|B|/||grad B||`, together with the disk height.  Run the auditor on every state in a
+time-dependent table and design for the largest capture radius and smallest coherence
+scale, not for the temporal mean.
+
+### Outer--inner matching contract
+
+The planner writes an explicit but not-yet-implemented spatial-worldtube contract.  The
+outer calculation has a secondary-centered cubical extraction worldtube and a sink
+strictly inside it.  The inner calculation replaces the sink region.  A trustworthy
+implementation must transfer:
+
+- incoming fluid characteristic amplitudes while leaving outgoing modes unconstrained;
+- face-integrated normal magnetic flux, conservatively regridded so fine-face sums equal
+  their parent-face flux;
+- one edge-integrated, time-centered EMF shared by every incident CT face;
+- the source tetrad, coordinate maps, and time-centering metadata.
+
+Pointwise interpolation of cell-centered `B` is insufficient: it neither preserves the
+discrete divergence constraint across different grids nor supplies Faraday-consistent
+time evolution.  For the initial inner volume, reconstruct a field from transferred face
+fluxes or a compatible vector potential; then use the imported edge EMFs at the six
+worldtube faces.  A closed six-face worldtube also removes the current assumption that a
+fixed Cartesian face remains upstream when the wind direction changes.
+
+The outer sink must be converged by reducing its radius or shown to lie downstream of a
+fast-magnetosonic critical surface; otherwise it can communicate with and alter the
+matching data.  This causal issue is demonstrated explicitly in magnetized BHL sink
+studies such as [Lee et al. 2017](https://academic.oup.com/mnras/article/468/1/717/3043736).
+
+For a mean force, first settle the cheap outer problem for several `r_a/v_eff`, then run
+the inner problem on a time-averaged boundary or on several separated stationary
+windows, each several `r_match/v_eff` long.  The second option measures nonlinear
+snapshot-to-snapshot scatter at much lower cost than replaying the complete outer
+settling interval.  It does not retain low-frequency outer--inner correlations; spectra,
+coherent variability, and feedback require continuous replay or a response model.
+
+Do not add the force on the outer sink to the inner accreted-momentum force.  A
+partition-of-unity overlap gives the intended bookkeeping,
+
+```text
+F_total = -Fmom_inner
+          + integral w_inner f_inner,rel dV
+          + integral w_outer f_outer,grav dV,
+w_inner + w_outer = 1.
+```
+
+Move the matching surface and overlap width to expose double counting or a gap.  If an
+inner jet or magnetic eruption reaches the matching surface and changes the outer wake,
+the one-way hierarchy is physically inconsistent; iterate outer and inner solutions or
+perform a two-way/global calculation.  The strong magnetic feedback seen in
+[arXiv:2201.11753](https://arxiv.org/abs/2201.11753) and
+[arXiv:2409.12359](https://arxiv.org/abs/2409.12359) makes this a production gate rather
+than a formal caveat.
+
 ## Wind and boundaries
 
 `rho0`, `pgas0`, `u1..u3`, and `b1..b3` set the magnetized wind at the source
