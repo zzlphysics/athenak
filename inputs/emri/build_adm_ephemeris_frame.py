@@ -922,10 +922,13 @@ def _default_acceleration_scale(document: dict[str, object]) -> float:
     return ephemeris_frame._document_float(document, "primary_mass", 1.0)
 
 
-def main() -> int:
-    arguments = parse_arguments()
-    scan = extract.scan_snapshot_manifest(arguments.manifest)
-    ephemeris_path = arguments.ephemeris.expanduser().resolve(strict=True)
+def build_frame_from_scan(
+    scan: extract.SnapshotManifestScan,
+    ephemeris_path: Path,
+    metric_fd_step_override: float | None = None,
+    hash_source_files_override: bool | None = None,
+) -> dict[str, object]:
+    ephemeris_path = ephemeris_path.expanduser().resolve(strict=True)
     source, ephemeris = ephemeris_frame.read_ephemeris_document(ephemeris_path)
 
     def load_snapshot(index: int) -> extract.Snapshot:
@@ -939,6 +942,13 @@ def main() -> int:
     default_fd_step = 0.25 * min(
         float(np.min(descriptor.spacing)) for descriptor in scan.descriptors
     )
+    metric_fd_step = (
+        ephemeris_frame._document_float(
+            source, "adm_metric_fd_step_global_units", default_fd_step
+        )
+        if metric_fd_step_override is None
+        else float(metric_fd_step_override)
+    )
     document = build_frame_document(
         ephemeris,
         snapshots,
@@ -950,9 +960,7 @@ def main() -> int:
             source, "global_length_in_local_units", 1.0
         ),
         acceleration_scale_global_units=_default_acceleration_scale(source),
-        metric_fd_step=ephemeris_frame._document_float(
-            source, "adm_metric_fd_step_global_units", default_fd_step
-        ),
+        metric_fd_step=metric_fd_step,
         integration_substeps_per_interval=ephemeris_frame._document_int(
             source, "integration_substeps_per_interval", 16
         ),
@@ -976,6 +984,13 @@ def main() -> int:
     generator["source_ephemeris_sha256"] = static.file_sha256(ephemeris_path)
     generator["source_level"] = scan.descriptors[0].source_level
     generator["source_snapshot_storage"] = scan.descriptors[0].source_storage
+    hash_source_files = (
+        scan.hash_source_files
+        if hash_source_files_override is None
+        else hash_source_files_override
+    )
+    if not isinstance(hash_source_files, bool):
+        raise ValueError("hash_source_files_override must be true or false")
     source_snapshots = []
     for descriptor in scan.descriptors:
         provenance: dict[str, object] = {
@@ -987,13 +1002,20 @@ def main() -> int:
             "source_storage": descriptor.source_storage,
             "selected_leaf_meshblocks": descriptor.source_meshblock_count,
         }
-        if scan.hash_source_files:
+        if hash_source_files:
             provenance["state_sha256"] = static.file_sha256(descriptor.state_path)
             provenance["adm_sha256"] = static.file_sha256(descriptor.adm_path)
         source_snapshots.append(provenance)
     generator["source_snapshots"] = source_snapshots
-    generator["source_file_hashes_recorded"] = scan.hash_source_files
+    generator["source_file_hashes_recorded"] = hash_source_files
     document["diagnostics"]["snapshot_loading"] = snapshots.loading_document()
+    return document
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    scan = extract.scan_snapshot_manifest(arguments.manifest)
+    document = build_frame_from_scan(scan, arguments.ephemeris)
     output = arguments.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(

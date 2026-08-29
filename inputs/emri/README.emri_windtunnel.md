@@ -756,6 +756,58 @@ the closed-flux and Faraday residuals at roundoff; its largest relative edge pro
 was `1.58e-3`.  A separate level-one AMR series loaded only its selected ADM leaf blocks
 and completed with exactly two cache misses for two snapshots.
 
+For a reproducible production matrix, run the complete path through one fail-closed
+driver:
+
+```bash
+python3 inputs/emri/run_adm_worldtube_campaign.py \
+  --manifest global_worldtube.json \
+  --ephemeris orbit.ephemeris.json \
+  --workdir runs/emri/adm_worldtube_campaign \
+  --half-width 64 \
+  --face-cells 32 48 \
+  --metric-fd-multipliers 1 0.5 \
+  --cadence-strides 1 2 \
+  --quadrature-orders 2 3 \
+  --fail-on-gate
+```
+
+The directory must not already exist.  Each metric-difference/cadence pair gets its own
+ADM-transported frame.  A cadence stride of two removes every other source GRMHD/ADM
+snapshot (while retaining the last one); it does not merely thin the output times.  The
+reference case uses the smallest metric-difference multiplier, full source cadence,
+largest face grid, and highest quadrature order.  Before comparing a coarser face grid,
+the reference cochains are conservatively transferred to that grid.  Comparisons across
+metric-difference variants necessarily include the small change in transported frame and
+physical sampling surface, which is why final acceptance must also use integrated force,
+accretion, and magnetic-flux observables.
+
+The driver initially proposes all knots from the full-cadence reference frame.  It runs
+the exact metadata preflight for every frame/cadence and quadrature family, trimming only
+leading or trailing times that fail global temporal coverage.  A spatial-domain or AMR
+stencil failure is never hidden by trimming.  If fewer than two safe times remain, extend
+the global dump sequence beyond the ephemeris window; this padding is often necessary
+when `e^0_a` is nonzero.
+
+Every case contains `manifest.json`, `worldtube.npz`, `inner.bin`, extraction diagnostics,
+and its comparison with the reference.  The top-level `summary.json` records the exact
+source indices used by every cadence stride.  Default gates cover tetrad Gram error, RK
+transport convergence, metric-difference sensitivity, source stencil halo, CT closure,
+and the relative edge projection.  They establish a structurally usable boundary, not a
+universal physics tolerance.  Set `--maximum-state-relative-change`,
+`--maximum-flux-relative-change`, and `--maximum-emf-relative-change` only after pilot
+runs determine tolerances appropriate to the desired force and accretion measurements.
+The campaign prepares and validates each inner binary but deliberately does not launch
+the expensive local AthenaK replay automatically.
+
+An eight-case smoke campaign on the six-snapshot numerical-ADM fixture exercised both
+metric-difference multipliers, both source-cadence strides, and quadrature orders two
+and three.  Exact preflight removed the two temporally tilted endpoint samples, all 44
+structural conditions passed, and the largest relative L2 changes from the finest
+reference were `3.12e-5` in state, `6.44e-6` in normal magnetic flux, and `3.16e-5` in
+edge EMF.  These values validate the driver path; they are not physical convergence
+tolerances for a production disk.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is
