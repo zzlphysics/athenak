@@ -1,0 +1,26 @@
+{
+  "classification": "athenak-emri-cartesian-ephemeris-v1",
+  "primary_center": [0.0, 0.0, 0.0],
+  "disk_normal": [0.0, 0.0, 1.0],
+  "global_length_in_local_units": 100000.0,
+  "acceleration_scale_global_units": 1.0,
+  "transport_mode": "fermi_walker",
+  "integration_substeps_per_interval": 16,
+  "geodesic_acceleration_tolerance_scaled": 1e-8,
+  "audit_subsamples_per_interval": 4,
+  "run_coarse_convergence_check": true,
+  "run_metric_fd_convergence_check": true,
+  "global_times": [0.0, 0.1, 0.2, 0.3],
+  "positions": [
+    [8.0, 0.0, 0.0],
+    [7.999, 0.03, 0.0],
+    [7.998, 0.06, 0.0],
+    [7.997, 0.09, 0.0]
+  ],
+  "coordinate_velocities": [
+    [-0.01, 0.3, 0.0],
+    [-0.01, 0.3, 0.0],
+    [-0.01, 0.3, 0.0],
+    [-0.01, 0.3, 0.0]
+  ]
+}

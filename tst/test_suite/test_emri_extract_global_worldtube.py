@@ -163,6 +163,29 @@ def test_fixed_level_interpolation_crosses_same_level_meshblock_boundary() -> No
     np.testing.assert_allclose(sampled, expected, rtol=0.0, atol=2.0e-14)
 
 
+def test_fixed_level_snapshot_accepts_an_adm_only_field_set() -> None:
+    source = _fixed_level_snapshot(0.0)
+    adm_only = extract.FixedLevelSnapshot(
+        time=source.time,
+        cycle=source.cycle,
+        lower=source.lower,
+        spacing=source.spacing,
+        shape_xyz=source.shape_xyz,
+        block_shape_xyz=source.block_shape_xyz,
+        block_logical=source.block_logical,
+        values=source.values[:, -len(extract.ADM_VARIABLES) :],
+        state_path=source.state_path,
+        adm_path=source.adm_path,
+        source_level=source.source_level,
+        available_leaf_levels=source.available_leaf_levels,
+    )
+    point = source.lower + np.asarray((3.5, 2.5, 2.5)) * source.spacing
+    assert adm_only.sample(point[None, :]).shape == (
+        1,
+        len(extract.ADM_VARIABLES),
+    )
+
+
 def test_fixed_level_interpolation_rejects_coarse_fine_interface() -> None:
     snapshot = _fixed_level_snapshot(0.0, include_right_block=False)
     cell_coordinate = np.asarray((3.25, 2.3, 2.6))
@@ -186,6 +209,26 @@ def test_snapshot_series_allows_fixed_level_topology_change_with_coverage() -> N
     event = np.asarray(((0.4, *point),))
     expected = left.sample(point[None, :])
     np.testing.assert_allclose(series.sample(event), expected, atol=2.0e-14)
+
+
+def test_snapshot_series_returns_piecewise_linear_time_derivative() -> None:
+    snapshots = []
+    for time, density in ((0.0, 2.0), (1.0, 3.0), (2.0, 5.0)):
+        values = _constant_global_values()
+        values[0] = density
+        snapshots.append(_snapshot(time, values))
+    series = extract.SnapshotSeries(tuple(snapshots))
+    events = np.asarray(((0.25, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)))
+    values, derivatives = series.sample_with_time_derivative(
+        events, source_intervals=np.asarray((0, 0))
+    )
+    np.testing.assert_allclose(values[:, 0], (2.25, 3.0), atol=2.0e-15)
+    np.testing.assert_allclose(derivatives[:, 0], (1.0, 1.0), atol=2.0e-15)
+
+    _, right_derivative = series.sample_with_time_derivative(
+        events[1:], source_intervals=np.asarray((1,))
+    )
+    np.testing.assert_allclose(right_derivative[:, 0], (2.0,), atol=2.0e-15)
 
 
 def test_unit_scaling_preserves_metric_and_rescales_grmhd_state() -> None:

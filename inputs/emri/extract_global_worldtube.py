@@ -286,7 +286,6 @@ class FixedLevelSnapshot:
         values = np.asarray(self.values)
         expected = (
             logical.shape[0],
-            len(ALL_VARIABLES),
             self.block_shape_xyz[2],
             self.block_shape_xyz[1],
             self.block_shape_xyz[0],
@@ -295,7 +294,10 @@ class FixedLevelSnapshot:
             logical.ndim != 2
             or logical.shape[1:] != (3,)
             or not np.issubdtype(logical.dtype, np.integer)
-            or values.shape != expected
+            or values.ndim != 5
+            or values.shape[0] != expected[0]
+            or values.shape[1] < 1
+            or values.shape[2:] != expected[1:]
             or not np.isfinite(values).all()
         ):
             raise ValueError("fixed-level logical blocks or values are incompatible")
@@ -465,14 +467,18 @@ def _validate_snapshot_sequence(snapshots: tuple[SnapshotMetadata, ...]) -> None
             )
 
 
-def _sample_snapshot_events(
+def _sample_snapshot_events_with_time_derivative(
     times: np.ndarray,
     snapshot_at: Callable[[int], Snapshot],
     events: object,
-) -> np.ndarray:
+    source_intervals: object | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     points = np.asarray(events, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 4 or not np.isfinite(points).all():
         raise ValueError("global events must have finite shape (N,4)")
+    if points.shape[0] == 0:
+        empty = snapshot_at(0).sample(np.empty((0, 3), dtype=np.float64))
+        return empty, np.zeros_like(empty)
     tolerance = 128.0 * np.finfo(float).eps * np.maximum(1.0, np.abs(points[:, 0]))
     outside = (points[:, 0] < times[0] - tolerance) | (
         points[:, 0] > times[-1] + tolerance
@@ -484,18 +490,59 @@ def _sample_snapshot_events(
             f"range [{times[0]:.17g}, {times[-1]:.17g}]"
         )
     event_times = np.clip(points[:, 0], times[0], times[-1])
-    intervals = np.searchsorted(times, event_times, side="right") - 1
-    intervals = np.clip(intervals, 0, times.size - 2)
-    result = np.empty((points.shape[0], len(ALL_VARIABLES)), dtype=np.float64)
+    if source_intervals is None:
+        intervals = np.searchsorted(times, event_times, side="right") - 1
+        intervals = np.clip(intervals, 0, times.size - 2)
+    else:
+        intervals = np.asarray(source_intervals)
+        if (
+            intervals.shape != event_times.shape
+            or not np.issubdtype(intervals.dtype, np.integer)
+            or np.any(intervals < 0)
+            or np.any(intervals >= times.size - 1)
+        ):
+            raise ValueError("source interval indices are invalid")
+        interval_tolerance = 128.0 * np.finfo(float).eps * np.maximum(
+            1.0, np.abs(event_times)
+        )
+        interval_left = times[intervals]
+        interval_right = times[intervals + 1]
+        if np.any(event_times < interval_left - interval_tolerance) or np.any(
+            event_times > interval_right + interval_tolerance
+        ):
+            raise ValueError("event time lies outside its requested source interval")
+    result = None
+    time_derivative = None
     for interval in np.unique(intervals):
         selected = intervals == interval
         left = snapshot_at(int(interval)).sample(points[selected, 1:])
         right = snapshot_at(int(interval) + 1).sample(points[selected, 1:])
-        fraction = (event_times[selected] - times[interval]) / (
-            times[interval + 1] - times[interval]
-        )
-        result[selected] = left + fraction[:, None] * (right - left)
-    return result
+        if left.shape != right.shape or left.ndim != 2:
+            raise RuntimeError("snapshot samples have inconsistent field shapes")
+        if result is None:
+            result = np.empty((points.shape[0], left.shape[1]), dtype=np.float64)
+            time_derivative = np.empty_like(result)
+        elif left.shape[1] != result.shape[1]:
+            raise RuntimeError("snapshot field count changes in time")
+        width = times[interval + 1] - times[interval]
+        fraction = np.clip((event_times[selected] - times[interval]) / width, 0.0, 1.0)
+        difference = right - left
+        result[selected] = left + fraction[:, None] * difference
+        time_derivative[selected] = difference / width
+    if result is None or time_derivative is None:
+        raise RuntimeError("snapshot sampler did not populate its output")
+    return result, time_derivative
+
+
+def _sample_snapshot_events(
+    times: np.ndarray,
+    snapshot_at: Callable[[int], Snapshot],
+    events: object,
+) -> np.ndarray:
+    values, _ = _sample_snapshot_events_with_time_derivative(
+        times, snapshot_at, events
+    )
+    return values
 
 
 @dataclass(frozen=True)
@@ -515,6 +562,16 @@ class SnapshotSeries:
 
     def sample(self, events: object) -> np.ndarray:
         return _sample_snapshot_events(self.times, self.snapshots.__getitem__, events)
+
+    def sample_with_time_derivative(
+        self, events: object, source_intervals: object | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return _sample_snapshot_events_with_time_derivative(
+            self.times,
+            self.snapshots.__getitem__,
+            events,
+            source_intervals,
+        )
 
     def loading_document(self) -> dict[str, object]:
         return {
@@ -606,6 +663,13 @@ class LazySnapshotSeries:
 
     def sample(self, events: object) -> np.ndarray:
         return _sample_snapshot_events(self.times, self._snapshot, events)
+
+    def sample_with_time_derivative(
+        self, events: object, source_intervals: object | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return _sample_snapshot_events_with_time_derivative(
+            self.times, self._snapshot, events, source_intervals
+        )
 
     def loading_document(self) -> dict[str, object]:
         return {
@@ -726,6 +790,8 @@ def _fixed_level_snapshot(
     state_path: Path,
     adm_path: Path,
     source_level: int,
+    state_variables: tuple[str, ...] = STATE_VARIABLES,
+    adm_variables: tuple[str, ...] = ADM_VARIABLES,
 ) -> FixedLevelSnapshot:
     logical_all = np.asarray(state["mb_logical"], dtype=np.int64)
     selected = np.flatnonzero(logical_all[:, 3] == source_level)
@@ -737,11 +803,11 @@ def _fixed_level_snapshot(
         )
     variable_blocks = []
     try:
-        for name in STATE_VARIABLES:
+        for name in state_variables:
             variable_blocks.append(
                 np.stack([state["mb_data"][name][index] for index in selected])
             )
-        for name in ADM_VARIABLES:
+        for name in adm_variables:
             variable_blocks.append(
                 np.stack(
                     [
@@ -750,6 +816,8 @@ def _fixed_level_snapshot(
                     ]
                 )
             )
+        if not variable_blocks:
+            raise RuntimeError("fixed-level snapshot requires at least one field")
         values = np.stack(variable_blocks, axis=1)
     except ValueError as error:
         raise RuntimeError(
@@ -822,13 +890,25 @@ def _read_snapshot_pair(
     entry: dict[str, object],
     directory: Path,
     load_variables: bool,
+    state_variables: tuple[str, ...] | None = None,
+    adm_variables: tuple[str, ...] | None = None,
 ) -> tuple[Path, Path, dict[str, object], dict[str, object], list[int]]:
     state_path = _resolve_path(entry.get("state"), directory, "snapshot state")
     adm_path = _resolve_path(entry.get("adm"), directory, "snapshot ADM")
-    state_variables = STATE_VARIABLES if load_variables else ()
-    adm_variables = ADM_VARIABLES if load_variables else ()
-    state = bin_convert.read_binary(str(state_path), variables=state_variables)
-    adm = bin_convert.read_binary(str(adm_path), variables=adm_variables)
+    selected_state_variables = (
+        STATE_VARIABLES
+        if state_variables is None and load_variables
+        else (() if state_variables is None else state_variables)
+    )
+    selected_adm_variables = (
+        ADM_VARIABLES
+        if adm_variables is None and load_variables
+        else (() if adm_variables is None else adm_variables)
+    )
+    state = bin_convert.read_binary(
+        str(state_path), variables=selected_state_variables
+    )
+    adm = bin_convert.read_binary(str(adm_path), variables=selected_adm_variables)
     missing_state = sorted(set(STATE_VARIABLES).difference(state["var_names"]))
     missing_adm = sorted(set(ADM_VARIABLES).difference(adm["var_names"]))
     if missing_state:
@@ -970,6 +1050,59 @@ def _load_snapshot(
     shape_xyz = (int(state["Nx1"]), int(state["Nx2"]), int(state["Nx3"]))
     if min(shape_xyz) < 2:
         raise RuntimeError("worldtube interpolation requires at least two cells per axis")
+    spacing = (upper - lower) / np.asarray(shape_xyz)
+    return UniformSnapshot(
+        time=float(state["time"]),
+        cycle=int(state["cycle"]),
+        lower=lower,
+        spacing=spacing,
+        shape_xyz=shape_xyz,
+        values=values,
+        state_path=state_path,
+        adm_path=adm_path,
+        source_level=selected_level,
+        source_meshblock_count=int(state["n_mbs"]),
+        available_leaf_levels=available_levels,
+    )
+
+
+def _load_adm_snapshot(
+    entry: dict[str, object], directory: Path, source_level: int | None = None
+) -> Snapshot:
+    """Load only ADM fields while retaining the state dump's source topology."""
+
+    state_path, adm_path, state, adm, adm_alignment = _read_snapshot_pair(
+        entry,
+        directory,
+        load_variables=False,
+        state_variables=(),
+        adm_variables=ADM_VARIABLES,
+    )
+    static._check_dump(adm, ADM_VARIABLES, "ADM")
+    selected_level, available_levels = _selected_source_level(state, source_level)
+    if source_level is not None or selected_level != 0:
+        return _fixed_level_snapshot(
+            state,
+            adm,
+            adm_alignment,
+            state_path,
+            adm_path,
+            selected_level,
+            state_variables=(),
+            adm_variables=ADM_VARIABLES,
+        )
+    values = np.stack(
+        [closure.assemble_uniform_grid(adm, name) for name in ADM_VARIABLES]
+    )
+    lower = np.asarray(
+        (state["x1min"], state["x2min"], state["x3min"]), dtype=float
+    )
+    upper = np.asarray(
+        (state["x1max"], state["x2max"], state["x3max"]), dtype=float
+    )
+    shape_xyz = (int(state["Nx1"]), int(state["Nx2"]), int(state["Nx3"]))
+    if min(shape_xyz) < 2:
+        raise RuntimeError("ADM interpolation requires at least two cells per axis")
     spacing = (upper - lower) / np.asarray(shape_xyz)
     return UniformSnapshot(
         time=float(state["time"]),

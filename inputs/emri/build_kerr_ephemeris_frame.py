@@ -24,6 +24,8 @@ import extract_static_taylor_worldtube as static
 
 
 INPUT_CLASSIFICATION = "athenak-emri-kerr-ephemeris-v1"
+GENERIC_INPUT_CLASSIFICATION = "athenak-emri-cartesian-ephemeris-v1"
+INPUT_CLASSIFICATIONS = (GENERIC_INPUT_CLASSIFICATION, INPUT_CLASSIFICATION)
 GENERATOR_CLASSIFICATION = "athenak-emri-kerr-ephemeris-frame-generator-v1"
 TRANSPORT_MODES = ("fermi_walker", "parallel")
 
@@ -696,9 +698,9 @@ def read_ephemeris_document(path: Path) -> tuple[dict[str, object], HermiteEphem
     document = json.loads(resolved.read_text(encoding="utf-8"))
     if (
         not isinstance(document, dict)
-        or document.get("classification") != INPUT_CLASSIFICATION
+        or document.get("classification") not in INPUT_CLASSIFICATIONS
     ):
-        raise ValueError("Kerr ephemeris classification is unsupported")
+        raise ValueError("Cartesian ephemeris classification is unsupported")
     times = np.asarray(document.get("global_times"), dtype=np.float64)
     if times.ndim != 1:
         raise ValueError("ephemeris global_times must be one-dimensional")

@@ -709,6 +709,53 @@ spatial basis.  It is not valid when the global ADM metric contains material tim
 dependence or a non-Kerr contribution large enough to affect tetrad transport; that case
 requires connection data extracted from the actual ADM time series.
 
+For that numerical-geometry case, use the same snapshot manifest that will later drive
+the fluid worldtube together with `adm_ephemeris.example.json`:
+
+```bash
+python3 inputs/emri/build_adm_ephemeris_frame.py \
+  --manifest global_worldtube.json \
+  --ephemeris inputs/emri/adm_ephemeris.example.json \
+  --output orbit.adm.frame.json
+```
+
+The builder reads only the ADM variables from each binary pair; the state dump is opened
+for its time and MeshBlock topology but its fluid arrays are not loaded.  It applies the
+same fixed-leaf-level and trilinear spatial interpolation rules as the fluid extractor.
+At every trajectory event it samples the metric at the center and at three centered
+offset pairs.  The default offset is one quarter of the smallest selected-level source
+cell; set `adm_metric_fd_step_global_units` to override it.  A second connection estimate
+at half that offset is reported as an independent finite-difference diagnostic.
+
+ADM fields are linear between source snapshots.  Their metric time derivative is
+computed analytically rather than by subtracting two nearly coincident times.  The
+transport grid is the union of ephemeris knots and all enclosed source-snapshot times,
+so an RK4 step never crosses a jump in the piecewise temporal derivative.  The output
+reports the connection jump across every such source knot.  Refine the dump cadence
+until that jump, the interpolated tetrad Gram error, and the resulting force/accretion
+observables converge.
+
+`fermi_walker` remains the default for a prescribed accelerated inspiral.  Numerical ADM
+data can make an analytically geodesic ephemeris weakly nongeodesic, so `parallel` still
+hard-fails against `geodesic_acceleration_tolerance_scaled`; the multiplier used to make
+`|a|` dimensionless is `acceleration_scale_global_units`, normally the primary mass in
+global units.
+
+Afterward, replace the extraction manifest's `frame` object with the path to
+`orbit.adm.frame.json`, then run the existing metadata-only preflight and worldtube
+extractor.  The frame, fluid state, Faraday tensor, face flux, and motional edge EMF are
+then all derived from the same ADM/GRMHD series.  The usual restriction remains: every
+orbit finite-difference stencil and every worldtube quadrature stencil must stay on the
+declared fixed leaf level; neither tool silently interpolates across an AMR interface.
+
+The implementation was exercised on the existing six-snapshot `16^3` DynGRMHD closure
+series.  With a two-snapshot cache, chronological fine/coarse transport plus diagnostics
+used 12 cache misses (two bounded passes through the series).  The generated tilted
+frame passed the exact worldtube preflight, and a subsequent real fluid extraction left
+the closed-flux and Faraday residuals at roundoff; its largest relative edge projection
+was `1.58e-3`.  A separate level-one AMR series loaded only its selected ADM leaf blocks
+and completed with exactly two cache misses for two snapshots.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is
