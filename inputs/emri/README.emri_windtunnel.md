@@ -122,7 +122,9 @@ not by a brute-force scan in `q`.
 
 ## Wind and boundaries
 
-`rho0`, `pgas0`, `u1..u3`, and `b1..b3` initialize a uniform magnetized wind.
+`rho0`, `pgas0`, `u1..u3`, and `b1..b3` set the magnetized wind at the source
+anchor.  With all `d*_dxh*` parameters zero this is the original uniform-wind
+configuration.
 With the default `wind_frame=source_tetrad`, `u1..u3` are the Eulerian orthonormal spatial
 four-velocity components and `b1..b3` are magnetic-field components in the
 secondary-comoving external-background tetrad at the anchor.  The code reconstructs the
@@ -135,9 +137,49 @@ Source-frame wind uses a `user` flag on every face that supplies upstream data, 
 the coordinate primitive varies over the boundary even when the tangent-frame state is
 uniform.  The sample has positive `u1` and therefore uses `ix1_bc=user`; downstream faces
 remain `outflow`.  For oblique or sub-fast flows, more than one user face may be required.
-The face-centered magnetic field is stored in constant densitized coordinate components,
-which preserves the constrained-transport divergence exactly.  A future replay boundary
-can replace this state with tetrad-projected data from a global single-SMBH GRMHD run.
+The zero-gradient face field has constant densitized coordinate components.  A future
+replay boundary can replace this state with tetrad-projected data from a global
+single-SMBH GRMHD run.
+
+### Controlled gradients and shear
+
+The analytic profile uses source-tangent coordinates
+`xh1,xh2,xh3 = radial, prograde tangential, vertical`.  Density and pressure are
+positive exponential profiles,
+
+```text
+rho  = rho0   * exp(sum_i dlnrho_dxhi  * xhi)
+pgas = pgas0 * exp(sum_i dlnpgas_dxhi * xhi).
+```
+
+`dui_dxhj` is the full gradient tensor of the source-frame Eulerian spatial
+four-velocity.  For a slow Newtonian Keplerian control, the leading shear is
+approximately `du2_dxh1 = -q_sh*Omega`, with `q_sh=3/2`; strong-field production
+values should instead be obtained from the chosen relativistic disk model.  These
+analytic profiles are not automatically in pressure/tidal equilibrium, so startup
+transients are part of the controlled experiment unless a balanced profile is supplied.
+`max_log_contrast` rejects an accidentally excessive density or pressure contrast at a
+domain corner.
+
+`dbi_dxhj` specifies a linear source-tangent magnetic-flux-density gradient.  It must be
+trace-free.  If `db3_dxh3` is omitted, its default is
+`-db1_dxh1-db2_dxh2`; if all nine entries are present, the code checks the trace rather
+than silently projecting it.  The source gradient is transformed as a contravariant
+vector density into the numerical chart.  The constant anchor field retains the exact
+legacy tetrad-to-slicing transformation.
+
+The coordinate densitized field is initialized from
+
+```text
+A = 0.5 * (B0 cross x) - (1/3) * x cross (G x),
+Bdens = curl(A) = B0 + G x,
+```
+
+using edge-centered vector potential values and the discrete CT curl.  Coarse edges
+touching finer neighbors use fine-edge averages, so shared coarse/fine face fluxes are
+consistent.  User-boundary ghost faces sample the same trace-free analytic field; active
+face fluxes remain CT evolved.  A spatially varying profile therefore requires `user`
+rather than the built-in constant `inflow` boundary on every supplying face.
 
 ## Validation gates before science production
 

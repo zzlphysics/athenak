@@ -112,6 +112,36 @@ b1                = 0.0
 b2                = 0.0
 b3                = 1.0e-2
 
+# Analytic source-tetrad profile.  xh1,xh2,xh3 are radial, prograde tangential,
+# and vertical.  Scalars use logarithmic gradients; du_i/dxh_j acts on the
+# source-frame spatial four-velocity.  The magnetic-flux gradient must be trace-free;
+# when db3_dxh3 is omitted its default is -db1_dxh1-db2_dxh2.
+dlnrho_dxh1       = 0.0
+dlnrho_dxh2       = 0.0
+dlnrho_dxh3       = 0.0
+dlnpgas_dxh1      = 0.0
+dlnpgas_dxh2      = 0.0
+dlnpgas_dxh3      = 0.0
+du1_dxh1          = 0.0
+du1_dxh2          = 0.0
+du1_dxh3          = 0.0
+du2_dxh1          = 0.0
+du2_dxh2          = 0.0
+du2_dxh3          = 0.0
+du3_dxh1          = 0.0
+du3_dxh2          = 0.0
+du3_dxh3          = 0.0
+db1_dxh1          = 0.0
+db1_dxh2          = 0.0
+db1_dxh3          = 0.0
+db2_dxh1          = 0.0
+db2_dxh2          = 0.0
+db2_dxh3          = 0.0
+db3_dxh1          = 0.0
+db3_dxh2          = 0.0
+db3_dxh3          = 0.0
+max_log_contrast  = 20.0
+
 # Metric regularization is compactly supported inside the component horizons.
 spin_buffer_primary   = 0.05
 spin_buffer_secondary = 0.05

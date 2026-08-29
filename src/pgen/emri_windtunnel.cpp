@@ -40,6 +40,12 @@ struct WindTunnelParameters {
   Real pressure;
   Real wind_u[3];
   Real magnetic_field[3];
+  Real log_density_gradient[3];
+  Real log_pressure_gradient[3];
+  Real velocity_gradient[3][3];
+  Real magnetic_gradient_source[3][3];
+  Real densitized_magnetic_gradient[3][3];
+  Real max_log_contrast;
   Real wind_eulerian_u[3];
   Real densitized_magnetic_field[3];
   Real source_tetrad[4][4];
@@ -93,6 +99,7 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp);
 void RefineSecondary(MeshBlockPack *pmbp);
 void EMRIHistory(HistoryData *pdata, Mesh *);
 void EMRIWindBoundary(Mesh *pm);
+void InitializeAnalyticMagneticField(MeshBlockPack *pmbp);
 
 KOKKOS_INLINE_FUNCTION
 void EvaluateMetric(const Real x, const Real y, const Real z,
@@ -235,6 +242,95 @@ void FourVelocityToPrimitive(const Real metric[4][4], const Real four_velocity[4
   }
 }
 
+//! Map a coordinate displacement at fixed numerical time into the spatial source
+//! tangent chart.  The axes are radial, prograde tangential, and vertical.
+KOKKOS_INLINE_FUNCTION
+void ComputeSourceDisplacement(const Real x, const Real y, const Real z,
+                               const WindTunnelParameters &parameters,
+                               Real source_position[3]) {
+  const Real coordinate[3] = {x, y, z};
+  for (int source_axis=0; source_axis<3; ++source_axis) {
+    source_position[source_axis] = 0.0;
+    for (int coordinate_axis=0; coordinate_axis<3; ++coordinate_axis) {
+      source_position[source_axis] +=
+          parameters.metric.secondary_tetrad_covector[source_axis+1]
+                                                        [coordinate_axis+1]
+          *coordinate[coordinate_axis];
+    }
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ComputeWindThermodynamics(const Real x, const Real y, const Real z,
+                               const WindTunnelParameters &parameters,
+                               Real &density, Real &pressure) {
+  Real source_position[3];
+  ComputeSourceDisplacement(x, y, z, parameters, source_position);
+  Real log_density_ratio = 0.0;
+  Real log_pressure_ratio = 0.0;
+  for (int axis=0; axis<3; ++axis) {
+    log_density_ratio +=
+        parameters.log_density_gradient[axis]*source_position[axis];
+    log_pressure_ratio +=
+        parameters.log_pressure_gradient[axis]*source_position[axis];
+  }
+  density = parameters.rho*exp(log_density_ratio);
+  pressure = parameters.pressure*exp(log_pressure_ratio);
+}
+
+//! Evaluate the analytic densitized magnetic field represented by the discrete curl
+//! initial data.  A trace-free gradient makes its coordinate divergence identically
+//! zero.  This evaluator is also used to extend the analytic state into user ghosts.
+KOKKOS_INLINE_FUNCTION
+void ComputeDensitizedMagneticField(const Real x, const Real y, const Real z,
+                                    const WindTunnelParameters &parameters,
+                                    Real field[3]) {
+  const Real coordinate[3] = {x, y, z};
+  for (int component=0; component<3; ++component) {
+    field[component] = parameters.densitized_magnetic_field[component];
+    for (int direction=0; direction<3; ++direction) {
+      field[component] +=
+          parameters.densitized_magnetic_gradient[component][direction]
+          *coordinate[direction];
+    }
+  }
+}
+
+//! Vector potential for B^i_dens = B0^i + G^i_j x^j with tr(G)=0:
+//! A = (B0 x x)/2 - x x (G x)/3.  Since AthenaK's CT variable is the densitized
+//! magnetic field, this ordinary coordinate curl is the required face flux density.
+KOKKOS_INLINE_FUNCTION
+void ComputeMagneticVectorPotential(const Real x, const Real y, const Real z,
+                                    const WindTunnelParameters &parameters,
+                                    Real potential[3]) {
+  const Real coordinate[3] = {x, y, z};
+  Real gradient_field[3] = {0.0, 0.0, 0.0};
+  for (int component=0; component<3; ++component) {
+    for (int direction=0; direction<3; ++direction) {
+      gradient_field[component] +=
+          parameters.densitized_magnetic_gradient[component][direction]
+          *coordinate[direction];
+    }
+  }
+  const Real base_cross[3] = {
+    parameters.densitized_magnetic_field[1]*coordinate[2]
+        - parameters.densitized_magnetic_field[2]*coordinate[1],
+    parameters.densitized_magnetic_field[2]*coordinate[0]
+        - parameters.densitized_magnetic_field[0]*coordinate[2],
+    parameters.densitized_magnetic_field[0]*coordinate[1]
+        - parameters.densitized_magnetic_field[1]*coordinate[0]
+  };
+  const Real position_cross_gradient[3] = {
+    coordinate[1]*gradient_field[2]-coordinate[2]*gradient_field[1],
+    coordinate[2]*gradient_field[0]-coordinate[0]*gradient_field[2],
+    coordinate[0]*gradient_field[1]-coordinate[1]*gradient_field[0]
+  };
+  for (int component=0; component<3; ++component) {
+    potential[component] =
+        0.5*base_cross[component]-position_cross_gradient[component]/3.0;
+  }
+}
+
 //! Convert the common source-frame wind to the normal-frame spatial four-velocity used
 //! by dynamical GRMHD.  Source-frame matching is exact at the orbital anchor.  Its
 //! Eulerian orthonormal components are held fixed in the source tangent chart and then
@@ -244,8 +340,19 @@ KOKKOS_INLINE_FUNCTION
 void ComputeWindPrimitive(const Real x, const Real y, const Real z,
                           const WindTunnelParameters &parameters,
                           Real primitive_velocity[3]) {
+  Real source_position[3];
+  ComputeSourceDisplacement(x, y, z, parameters, source_position);
+  Real local_wind_u[3];
+  for (int component=0; component<3; ++component) {
+    local_wind_u[component] = parameters.wind_u[component];
+    for (int direction=0; direction<3; ++direction) {
+      local_wind_u[component] +=
+          parameters.velocity_gradient[component][direction]
+          *source_position[direction];
+    }
+  }
   if (!parameters.wind_is_source_tetrad) {
-    for (int i=0; i<3; ++i) primitive_velocity[i] = parameters.wind_u[i];
+    for (int i=0; i<3; ++i) primitive_velocity[i] = local_wind_u[i];
     return;
   }
 
@@ -269,8 +376,7 @@ void ComputeWindPrimitive(const Real x, const Real y, const Real z,
   Real tangent_primitive[3] = {0.0, 0.0, 0.0};
   for (int axis=0; axis<3; ++axis) {
     for (int leg=0; leg<3; ++leg) {
-      tangent_primitive[axis] +=
-          parameters.wind_eulerian_u[leg]*tangent_triad[leg][axis];
+      tangent_primitive[axis] += local_wind_u[leg]*tangent_triad[leg][axis];
     }
   }
   Real tangent_velocity[4];
@@ -784,11 +890,106 @@ void ConfigureSourceFrame() {
   }
 }
 
+//! Convert a source-tangent magnetic-flux gradient into the numerical coordinate
+//! flux-density gradient.  For xhat=C x, a contravariant vector density transforms as
+//! Bdens=det(C) C^{-1} Bhat.  Consequently G=det(C) C^{-1} Ghat C and its trace remains
+//! zero.  The constant field keeps the exact legacy source-to-slicing transformation.
+void ConfigureMagneticGradient() {
+  auto &parameters = wind_tunnel;
+  const Real determinant = parameters.source_spatial_determinant;
+  for (int coordinate_component=0; coordinate_component<3;
+       ++coordinate_component) {
+    for (int coordinate_direction=0; coordinate_direction<3;
+         ++coordinate_direction) {
+      parameters.densitized_magnetic_gradient[coordinate_component]
+                                                [coordinate_direction] = 0.0;
+      for (int source_component=0; source_component<3; ++source_component) {
+        for (int source_direction=0; source_direction<3; ++source_direction) {
+          parameters.densitized_magnetic_gradient[coordinate_component]
+                                                  [coordinate_direction] +=
+              determinant
+              *parameters.source_spatial_inverse[coordinate_component]
+                                                   [source_component]
+              *parameters.magnetic_gradient_source[source_component]
+                                                    [source_direction]
+              *parameters.metric.secondary_tetrad_covector[source_direction+1]
+                                                            [coordinate_direction+1];
+        }
+      }
+    }
+  }
+
+  Real trace = 0.0;
+  Real scale = 0.0;
+  for (int component=0; component<3; ++component) {
+    trace += parameters.densitized_magnetic_gradient[component][component];
+    for (int direction=0; direction<3; ++direction) {
+      scale = std::max(scale, std::abs(
+          parameters.densitized_magnetic_gradient[component][direction]));
+    }
+  }
+  const Real tolerance = 256.0*std::numeric_limits<Real>::epsilon()
+                       *std::max(scale, Real(1.0));
+  if (std::abs(trace) > tolerance) {
+    Fatal("source-frame trace-free magnetic gradient lost zero divergence");
+  }
+}
+
+void ValidateSpatialProfiles(const RegionSize &domain) {
+  const auto &parameters = wind_tunnel;
+  Real maximum_density_exponent = 0.0;
+  Real maximum_pressure_exponent = 0.0;
+  for (int corner=0; corner<8; ++corner) {
+    const Real x = (corner & 1) ? domain.x1max : domain.x1min;
+    const Real y = (corner & 2) ? domain.x2max : domain.x2min;
+    const Real z = (corner & 4) ? domain.x3max : domain.x3min;
+    Real source_position[3];
+    ComputeSourceDisplacement(x, y, z, parameters, source_position);
+    Real density_exponent = 0.0;
+    Real pressure_exponent = 0.0;
+    Real local_wind[3] = {
+      parameters.wind_u[0], parameters.wind_u[1], parameters.wind_u[2]
+    };
+    for (int direction=0; direction<3; ++direction) {
+      density_exponent +=
+          parameters.log_density_gradient[direction]*source_position[direction];
+      pressure_exponent +=
+          parameters.log_pressure_gradient[direction]*source_position[direction];
+      for (int component=0; component<3; ++component) {
+        local_wind[component] +=
+            parameters.velocity_gradient[component][direction]
+            *source_position[direction];
+      }
+    }
+    maximum_density_exponent = std::max(
+        maximum_density_exponent, std::abs(density_exponent));
+    maximum_pressure_exponent = std::max(
+        maximum_pressure_exponent, std::abs(pressure_exponent));
+    for (const Real component : local_wind) {
+      if (!std::isfinite(component)) {
+        Fatal("velocity-gradient profile is non-finite at a domain corner");
+      }
+    }
+    Real field[3];
+    ComputeDensitizedMagneticField(x, y, z, parameters, field);
+    for (const Real component : field) {
+      if (!std::isfinite(component)) {
+        Fatal("magnetic-gradient profile is non-finite at a domain corner");
+      }
+    }
+  }
+  if (maximum_density_exponent > parameters.max_log_contrast
+      || maximum_pressure_exponent > parameters.max_log_contrast) {
+    Fatal("analytic density/pressure profile exceeds max_log_contrast at a domain "
+          "corner; reduce the gradient or increase the limit deliberately");
+  }
+}
+
 std::string MetricRestartContract() {
   const auto &metric = wind_tunnel.metric;
   std::ostringstream contract;
   contract << std::setprecision(std::numeric_limits<Real>::max_digits10)
-           << "emri-comoving-v3"
+           << "emri-comoving-v4"
            << ";primary_mass=" << metric.primary_mass
            << ";secondary_mass=" << metric.secondary_mass
            << ";primary_spin=" << metric.primary_spin
@@ -812,6 +1013,22 @@ std::string MetricRestartContract() {
            << ";magnetic_b1=" << wind_tunnel.magnetic_field[0]
            << ";magnetic_b2=" << wind_tunnel.magnetic_field[1]
            << ";magnetic_b3=" << wind_tunnel.magnetic_field[2]
+           << ";max_log_contrast=" << wind_tunnel.max_log_contrast;
+  for (int direction=0; direction<3; ++direction) {
+    contract << ";dlnrho_dxh" << direction+1 << "="
+             << wind_tunnel.log_density_gradient[direction]
+             << ";dlnpgas_dxh" << direction+1 << "="
+             << wind_tunnel.log_pressure_gradient[direction];
+  }
+  for (int component=0; component<3; ++component) {
+    for (int direction=0; direction<3; ++direction) {
+      contract << ";du" << component+1 << "_dxh" << direction+1 << "="
+               << wind_tunnel.velocity_gradient[component][direction]
+               << ";db" << component+1 << "_dxh" << direction+1 << "="
+               << wind_tunnel.magnetic_gradient_source[component][direction];
+    }
+  }
+  contract
            << ";wind_is_source_tetrad=" << wind_tunnel.wind_is_source_tetrad
            << ";force_is_source_tetrad=" << wind_tunnel.force_is_source_tetrad;
   return contract.str();
@@ -1015,6 +1232,103 @@ void ValidateMetricKernel() {
       && primary_geodesic_residual > geodesic_tolerance) {
     Fatal("the secondary-centered origin failed the circular-Kerr geodesic check");
   }
+
+  // Manufactured analytic-profile checks.  A quadratic vector potential must recover
+  // the requested linear field exactly up to floating-point differencing, and rotating
+  // x, B, and G together must commute with field evaluation.
+  WindTunnelParameters analytic{};
+  analytic.densitized_magnetic_field[0] = 0.4;
+  analytic.densitized_magnetic_field[1] = -0.2;
+  analytic.densitized_magnetic_field[2] = 0.1;
+  analytic.densitized_magnetic_gradient[0][0] = 0.03;
+  analytic.densitized_magnetic_gradient[0][1] = -0.02;
+  analytic.densitized_magnetic_gradient[0][2] = 0.01;
+  analytic.densitized_magnetic_gradient[1][0] = 0.04;
+  analytic.densitized_magnetic_gradient[1][1] = -0.01;
+  analytic.densitized_magnetic_gradient[1][2] = -0.03;
+  analytic.densitized_magnetic_gradient[2][0] = 0.02;
+  analytic.densitized_magnetic_gradient[2][1] = 0.05;
+  analytic.densitized_magnetic_gradient[2][2] = -0.02;
+  const Real profile_position[3] = {0.7, -0.4, 0.2};
+  Real expected_field[3];
+  ComputeDensitizedMagneticField(profile_position[0], profile_position[1],
+                                 profile_position[2], analytic, expected_field);
+#if SINGLE_PRECISION_ENABLED
+  const Real curl_step = 2.0e-2;
+  const Real profile_tolerance = 2.0e-5;
+#else
+  const Real curl_step = 1.0e-3;
+  const Real profile_tolerance = 2.0e-11;
+#endif
+  Real derivative[3][3];
+  for (int direction=0; direction<3; ++direction) {
+    Real lower_position[3] = {
+      profile_position[0], profile_position[1], profile_position[2]
+    };
+    Real upper_position[3] = {
+      profile_position[0], profile_position[1], profile_position[2]
+    };
+    lower_position[direction] -= curl_step;
+    upper_position[direction] += curl_step;
+    Real lower_potential[3];
+    Real upper_potential[3];
+    ComputeMagneticVectorPotential(lower_position[0], lower_position[1],
+                                   lower_position[2], analytic, lower_potential);
+    ComputeMagneticVectorPotential(upper_position[0], upper_position[1],
+                                   upper_position[2], analytic, upper_potential);
+    for (int component=0; component<3; ++component) {
+      derivative[component][direction] =
+          (upper_potential[component]-lower_potential[component])/(2.0*curl_step);
+    }
+  }
+  const Real recovered_field[3] = {
+    derivative[2][1]-derivative[1][2],
+    derivative[0][2]-derivative[2][0],
+    derivative[1][0]-derivative[0][1]
+  };
+  for (int component=0; component<3; ++component) {
+    if (std::abs(recovered_field[component]-expected_field[component])
+        > profile_tolerance) {
+      Fatal("analytic EMRI magnetic vector potential failed its curl check");
+    }
+  }
+
+  WindTunnelParameters rotated{};
+  const Real rotation[3][3] = {
+    {0.0, -1.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 1.0}
+  };
+  Real rotated_position[3] = {0.0, 0.0, 0.0};
+  for (int row=0; row<3; ++row) {
+    for (int column=0; column<3; ++column) {
+      rotated_position[row] += rotation[row][column]*profile_position[column];
+      rotated.densitized_magnetic_field[row] +=
+          rotation[row][column]*analytic.densitized_magnetic_field[column];
+    }
+  }
+  for (int row=0; row<3; ++row) {
+    for (int column=0; column<3; ++column) {
+      for (int left=0; left<3; ++left) {
+        for (int right=0; right<3; ++right) {
+          rotated.densitized_magnetic_gradient[row][column] +=
+              rotation[row][left]
+              *analytic.densitized_magnetic_gradient[left][right]
+              *rotation[column][right];
+        }
+      }
+    }
+  }
+  Real rotated_field[3];
+  ComputeDensitizedMagneticField(rotated_position[0], rotated_position[1],
+                                 rotated_position[2], rotated, rotated_field);
+  for (int row=0; row<3; ++row) {
+    Real rotated_expected = 0.0;
+    for (int column=0; column<3; ++column) {
+      rotated_expected += rotation[row][column]*expected_field[column];
+    }
+    if (std::abs(rotated_field[row]-rotated_expected) > profile_tolerance) {
+      Fatal("analytic EMRI magnetic profile failed its rotation-covariance check");
+    }
+  }
 }
 
 void InitializeInflowArrays(MeshBlockPack *pmbp) {
@@ -1036,6 +1350,136 @@ void InitializeInflowArrays(MeshBlockPack *pmbp) {
   u_in.template sync<DevExeSpace>();
   b_in.template modify<HostMemSpace>();
   b_in.template sync<DevExeSpace>();
+}
+
+//! Initialize CT face fluxes from a vector potential evaluated on grid edges.  The
+//! fine-neighbor correction makes the edge integral shared by coarse and fine faces
+//! identical, following the standard AthenaK vector-potential initialization pattern.
+void InitializeAnalyticMagneticField(MeshBlockPack *pmbp) {
+  auto &indcs = pmbp->pmesh->mb_indcs;
+  const int is = indcs.is;
+  const int ie = indcs.ie;
+  const int js = indcs.js;
+  const int je = indcs.je;
+  const int ks = indcs.ks;
+  const int ke = indcs.ke;
+  const int ncells1 = indcs.nx1+2*indcs.ng;
+  const int ncells2 = (indcs.nx2 > 1) ? indcs.nx2+2*indcs.ng : 2;
+  const int ncells3 = (indcs.nx3 > 1) ? indcs.nx3+2*indcs.ng : 2;
+  const int nmb = pmbp->nmb_thispack;
+  DvceArray4D<Real> a1;
+  DvceArray4D<Real> a2;
+  DvceArray4D<Real> a3;
+  Kokkos::realloc(a1, nmb, ncells3, ncells2, ncells1);
+  Kokkos::realloc(a2, nmb, ncells3, ncells2, ncells1);
+  Kokkos::realloc(a3, nmb, ncells3, ncells2, ncells1);
+
+  auto &size = pmbp->pmb->mb_size;
+  auto &nghbr = pmbp->pmb->nghbr;
+  auto &mblev = pmbp->pmb->mb_lev;
+  const WindTunnelParameters parameters = wind_tunnel;
+  par_for("emri_vector_potential", DevExeSpace(), 0, nmb-1, ks, ke+1,
+          js, je+1, is, ie+1,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real x1v = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
+                                 size.d_view(m).x1max);
+    const Real x1f = LeftEdgeX(i-is, indcs.nx1, size.d_view(m).x1min,
+                               size.d_view(m).x1max);
+    const Real x2v = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                                 size.d_view(m).x2max);
+    const Real x2f = LeftEdgeX(j-js, indcs.nx2, size.d_view(m).x2min,
+                               size.d_view(m).x2max);
+    const Real x3v = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                                 size.d_view(m).x3max);
+    const Real x3f = LeftEdgeX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                               size.d_view(m).x3max);
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    Real potential[3];
+    ComputeMagneticVectorPotential(x1v, x2f, x3f, parameters, potential);
+    a1(m, k, j, i) = potential[0];
+    ComputeMagneticVectorPotential(x1f, x2v, x3f, parameters, potential);
+    a2(m, k, j, i) = potential[1];
+    ComputeMagneticVectorPotential(x1f, x2f, x3v, parameters, potential);
+    a3(m, k, j, i) = potential[2];
+
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 1,
+        i, j, k, is, ie, js, je, ks, ke)) {
+      Real lower[3];
+      Real upper[3];
+      ComputeMagneticVectorPotential(x1v-0.25*dx1, x2f, x3f,
+                                     parameters, lower);
+      ComputeMagneticVectorPotential(x1v+0.25*dx1, x2f, x3f,
+                                     parameters, upper);
+      a1(m, k, j, i) = 0.5*(lower[0]+upper[0]);
+    }
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 2,
+        i, j, k, is, ie, js, je, ks, ke)) {
+      Real lower[3];
+      Real upper[3];
+      ComputeMagneticVectorPotential(x1f, x2v-0.25*dx2, x3f,
+                                     parameters, lower);
+      ComputeMagneticVectorPotential(x1f, x2v+0.25*dx2, x3f,
+                                     parameters, upper);
+      a2(m, k, j, i) = 0.5*(lower[1]+upper[1]);
+    }
+    if (EdgeTouchesFinerNeighbor(nghbr.d_view, m, mblev.d_view(m), 3,
+        i, j, k, is, ie, js, je, ks, ke)) {
+      Real lower[3];
+      Real upper[3];
+      ComputeMagneticVectorPotential(x1f, x2f, x3v-0.25*dx3,
+                                     parameters, lower);
+      ComputeMagneticVectorPotential(x1f, x2f, x3v+0.25*dx3,
+                                     parameters, upper);
+      a3(m, k, j, i) = 0.5*(lower[2]+upper[2]);
+    }
+  });
+
+  auto &b0 = pmbp->pmhd->b0;
+  par_for("emri_curl_vector_potential", DevExeSpace(), 0, nmb-1, ks, ke,
+          js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    const Real dx1 = size.d_view(m).dx1;
+    const Real dx2 = size.d_view(m).dx2;
+    const Real dx3 = size.d_view(m).dx3;
+    b0.x1f(m, k, j, i) =
+        (a3(m, k, j+1, i)-a3(m, k, j, i))/dx2
+        -(a2(m, k+1, j, i)-a2(m, k, j, i))/dx3;
+    b0.x2f(m, k, j, i) =
+        (a1(m, k+1, j, i)-a1(m, k, j, i))/dx3
+        -(a3(m, k, j, i+1)-a3(m, k, j, i))/dx1;
+    b0.x3f(m, k, j, i) =
+        (a2(m, k, j, i+1)-a2(m, k, j, i))/dx1
+        -(a1(m, k, j+1, i)-a1(m, k, j, i))/dx2;
+    if (i == ie) {
+      b0.x1f(m, k, j, i+1) =
+          (a3(m, k, j+1, i+1)-a3(m, k, j, i+1))/dx2
+          -(a2(m, k+1, j, i+1)-a2(m, k, j, i+1))/dx3;
+    }
+    if (j == je) {
+      b0.x2f(m, k, j+1, i) =
+          (a1(m, k+1, j+1, i)-a1(m, k, j+1, i))/dx3
+          -(a3(m, k, j+1, i+1)-a3(m, k, j+1, i))/dx1;
+    }
+    if (k == ke) {
+      b0.x3f(m, k+1, j, i) =
+          (a2(m, k+1, j, i+1)-a2(m, k+1, j, i))/dx1
+          -(a1(m, k+1, j+1, i)-a1(m, k+1, j, i))/dx2;
+    }
+  });
+
+  auto &bcc0 = pmbp->pmhd->bcc0;
+  par_for("emri_cell_centered_field", DevExeSpace(), 0, nmb-1, ks, ke,
+          js, je, is, ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    bcc0(m, IBX, k, j, i) =
+        0.5*(b0.x1f(m, k, j, i)+b0.x1f(m, k, j, i+1));
+    bcc0(m, IBY, k, j, i) =
+        0.5*(b0.x2f(m, k, j, i)+b0.x2f(m, k, j+1, i));
+    bcc0(m, IBZ, k, j, i) =
+        0.5*(b0.x3f(m, k, j, i)+b0.x3f(m, k+1, j, i));
+  });
 }
 
 Real DistanceSquaredToBlock(const RegionSize &block) {
@@ -1062,7 +1506,7 @@ Real RefinementRadius(const int physical_level) {
 } // namespace
 
 //----------------------------------------------------------------------------------------
-//! Configure the local metric and initialize a uniform magnetized wind.
+//! Configure the local metric and initialize an analytic magnetized wind profile.
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
@@ -1191,6 +1635,31 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   wind_tunnel.magnetic_field[0] = pin->GetOrAddReal("problem", "b1", 0.0);
   wind_tunnel.magnetic_field[1] = pin->GetOrAddReal("problem", "b2", 0.0);
   wind_tunnel.magnetic_field[2] = pin->GetOrAddReal("problem", "b3", 1.0e-6);
+  wind_tunnel.max_log_contrast =
+      pin->GetOrAddReal("problem", "max_log_contrast", 20.0);
+  for (int direction=0; direction<3; ++direction) {
+    const std::string suffix = std::to_string(direction+1);
+    wind_tunnel.log_density_gradient[direction] = pin->GetOrAddReal(
+        "problem", "dlnrho_dxh"+suffix, 0.0);
+    wind_tunnel.log_pressure_gradient[direction] = pin->GetOrAddReal(
+        "problem", "dlnpgas_dxh"+suffix, 0.0);
+  }
+  for (int component=0; component<3; ++component) {
+    for (int direction=0; direction<3; ++direction) {
+      const std::string component_suffix = std::to_string(component+1);
+      const std::string direction_suffix = std::to_string(direction+1);
+      wind_tunnel.velocity_gradient[component][direction] = pin->GetOrAddReal(
+          "problem", "du"+component_suffix+"_dxh"+direction_suffix, 0.0);
+      const Real magnetic_default = (component == 2 && direction == 2)
+          ? -wind_tunnel.magnetic_gradient_source[0][0]
+            -wind_tunnel.magnetic_gradient_source[1][1]
+          : 0.0;
+      wind_tunnel.magnetic_gradient_source[component][direction] =
+          pin->GetOrAddReal(
+              "problem", "db"+component_suffix+"_dxh"+direction_suffix,
+              magnetic_default);
+    }
+  }
   const std::string wind_frame =
       pin->GetOrAddString("problem", "wind_frame", "source_tetrad");
   if (wind_frame == "source_tetrad") {
@@ -1241,7 +1710,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     Fatal("EMRI force history currently requires <mhd> dyn_eos=ideal");
   }
 
-  const Real finite_values[] = {
+  std::vector<Real> finite_values = {
     metric.primary_mass, metric.secondary_mass, primary_chi, secondary_chi,
     metric.orbital_radius, metric.coordinate_radius, metric.omega,
     metric.spin_buffer_primary, metric.spin_buffer_secondary,
@@ -1250,12 +1719,22 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     wind_tunnel.wind_u[0], wind_tunnel.wind_u[1],
     wind_tunnel.wind_u[2], wind_tunnel.magnetic_field[0],
     wind_tunnel.magnetic_field[1], wind_tunnel.magnetic_field[2],
+    wind_tunnel.max_log_contrast,
     wind_tunnel.refinement_radius, wind_tunnel.refinement_radius_ratio,
     wind_tunnel.refinement_hysteresis, wind_tunnel.refinement_horizon_factor,
     wind_tunnel.force_surface_radius, wind_tunnel.force_outer_radius[0],
     wind_tunnel.force_outer_radius[1], wind_tunnel.force_outer_radius[2],
     wind_tunnel.adiabatic_index
   };
+  for (int direction=0; direction<3; ++direction) {
+    finite_values.push_back(wind_tunnel.log_density_gradient[direction]);
+    finite_values.push_back(wind_tunnel.log_pressure_gradient[direction]);
+    for (int component=0; component<3; ++component) {
+      finite_values.push_back(wind_tunnel.velocity_gradient[component][direction]);
+      finite_values.push_back(
+          wind_tunnel.magnetic_gradient_source[component][direction]);
+    }
+  }
   for (const Real value : finite_values) {
     if (!std::isfinite(value)) Fatal("emri_windtunnel parameters must be finite");
   }
@@ -1271,12 +1750,29 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       || !(wind_tunnel.metric_fd_step > 0.0)
       || !(wind_tunnel.external_metric_fd_step > 0.0)
       || !(wind_tunnel.rho > 0.0) || !(wind_tunnel.pressure > 0.0)
+      || !(wind_tunnel.max_log_contrast > 0.0)
       || !(wind_tunnel.refinement_radius > 0.0)
       || !(wind_tunnel.refinement_radius_ratio >= 1.0)
       || !(wind_tunnel.refinement_hysteresis > 1.0)
       || !(wind_tunnel.refinement_horizon_factor > 0.0)
       || !(wind_tunnel.adiabatic_index > 1.0)) {
     Fatal("invalid emri_windtunnel parameter");
+  }
+  Real source_magnetic_trace = 0.0;
+  Real source_magnetic_scale = 0.0;
+  for (int component=0; component<3; ++component) {
+    source_magnetic_trace +=
+        wind_tunnel.magnetic_gradient_source[component][component];
+    for (int direction=0; direction<3; ++direction) {
+      source_magnetic_scale = std::max(source_magnetic_scale, std::abs(
+          wind_tunnel.magnetic_gradient_source[component][direction]));
+    }
+  }
+  const Real magnetic_trace_tolerance =
+      256.0*std::numeric_limits<Real>::epsilon()
+      *std::max(source_magnetic_scale, Real(1.0));
+  if (std::abs(source_magnetic_trace) > magnetic_trace_tolerance) {
+    Fatal("dbi_dxhj must be trace-free: set db3_dxh3=-db1_dxh1-db2_dxh2");
   }
   const Real orbital_speed = std::abs(metric.omega*metric.coordinate_radius);
   const Real active_frame_speed = metric.include_orbital_frame ? orbital_speed : 0.0;
@@ -1297,19 +1793,34 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
 #endif
   ConfigureSourceFrame();
+  ConfigureMagneticGradient();
+  ValidateSpatialProfiles(domain);
+
+  bool has_analytic_gradient = false;
+  for (int direction=0; direction<3; ++direction) {
+    has_analytic_gradient = has_analytic_gradient
+        || wind_tunnel.log_density_gradient[direction] != 0.0
+        || wind_tunnel.log_pressure_gradient[direction] != 0.0;
+    for (int component=0; component<3; ++component) {
+      has_analytic_gradient = has_analytic_gradient
+          || wind_tunnel.velocity_gradient[component][direction] != 0.0
+          || wind_tunnel.magnetic_gradient_source[component][direction] != 0.0;
+    }
+  }
 
   bool has_user_boundary = false;
   for (int face=0; face<6; ++face) {
     has_user_boundary = has_user_boundary
         || pmy_mesh_->mesh_bcs[face] == BoundaryFlag::user;
-    if (wind_tunnel.wind_is_source_tetrad
+    if ((wind_tunnel.wind_is_source_tetrad || has_analytic_gradient)
         && pmy_mesh_->mesh_bcs[face] == BoundaryFlag::inflow) {
-      Fatal("wind_frame=source_tetrad requires spatially varying user boundaries; "
+      Fatal("source-frame or gradient winds require spatially varying user boundaries; "
             "replace each inflow boundary flag with user");
     }
   }
-  if (wind_tunnel.wind_is_source_tetrad && !has_user_boundary) {
-    Fatal("wind_frame=source_tetrad requires at least one user inflow boundary");
+  if ((wind_tunnel.wind_is_source_tetrad || has_analytic_gradient)
+      && !has_user_boundary) {
+    Fatal("source-frame or gradient winds require at least one user inflow boundary");
   }
 
   if (!(domain.x1min < 0.0 && domain.x1max > 0.0
@@ -1414,6 +1925,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << ", active frame speed=" << active_frame_speed
               << ", wind frame=" << wind_frame
               << ", force frame=" << force_frame
+              << ", analytic gradients=" << has_analytic_gradient
               << ", r_H/m=" << hill_radius/metric.secondary_mass
               << ", box/orbit=" << largest_extent/metric.orbital_radius
               << ", metric_fd_step/m="
@@ -1442,12 +1954,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int nmb = pmbp->nmb_thispack;
   const int nscalars = pmbp->pmhd->nscalars;
   auto &w0 = pmbp->pmhd->w0;
-  auto &b0 = pmbp->pmhd->b0;
-  auto &bcc0 = pmbp->pmhd->bcc0;
   auto &size = pmbp->pmb->mb_size;
   const WindTunnelParameters parameters = wind_tunnel;
 
-  par_for("emri_uniform_wind", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
+  par_for("emri_analytic_wind", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
                                size.d_view(m).x1max);
@@ -1455,24 +1965,19 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                                size.d_view(m).x2max);
     const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                size.d_view(m).x3max);
+    Real density;
+    Real pressure;
+    ComputeWindThermodynamics(x, y, z, parameters, density, pressure);
     Real primitive_velocity[3];
     ComputeWindPrimitive(x, y, z, parameters, primitive_velocity);
-    w0(m, IDN, k, j, i) = parameters.rho;
+    w0(m, IDN, k, j, i) = density;
     w0(m, IVX, k, j, i) = primitive_velocity[0];
     w0(m, IVY, k, j, i) = primitive_velocity[1];
     w0(m, IVZ, k, j, i) = primitive_velocity[2];
-    w0(m, IPR, k, j, i) = parameters.pressure;
+    w0(m, IPR, k, j, i) = pressure;
     for (int n=0; n<nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
-    bcc0(m, IBX, k, j, i) = parameters.densitized_magnetic_field[0];
-    bcc0(m, IBY, k, j, i) = parameters.densitized_magnetic_field[1];
-    bcc0(m, IBZ, k, j, i) = parameters.densitized_magnetic_field[2];
   });
-  Kokkos::deep_copy(DevExeSpace(), b0.x1f,
-                    wind_tunnel.densitized_magnetic_field[0]);
-  Kokkos::deep_copy(DevExeSpace(), b0.x2f,
-                    wind_tunnel.densitized_magnetic_field[1]);
-  Kokkos::deep_copy(DevExeSpace(), b0.x3f,
-                    wind_tunnel.densitized_magnetic_field[2]);
+  InitializeAnalyticMagneticField(pmbp);
   pmbp->pdyngr->PrimToConInit(is, ie, js, je, ks, ke);
 }
 
@@ -1519,8 +2024,9 @@ void SetADMVariablesToEMRI(MeshBlockPack *pmbp) {
   });
 }
 
-//! Fill every user face with the same source-frame wind.  The magnetic field is constant
-//! in densitized coordinate components, so the CT divergence constraint remains exact.
+//! Extend the analytic source-frame profile into every user ghost region.  Magnetic
+//! ghost faces are sampled from the same trace-free field whose active faces came from
+//! curl(A); CT continues to evolve the active face fluxes.
 void EMRIWindBoundary(Mesh *pm) {
   MeshBlockPack *pmbp = pm->pmb_pack;
   auto &indcs = pm->mb_indcs;
@@ -1557,7 +2063,17 @@ void EMRIWindBoundary(Mesh *pm) {
             && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
         || (k > ke
             && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
-    if (user_ghost) b0.x1f(m, k, j, i) = parameters.densitized_magnetic_field[0];
+    if (user_ghost) {
+      const Real x = LeftEdgeX(i-is, indcs.nx1, size.d_view(m).x1min,
+                               size.d_view(m).x1max);
+      const Real y = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                                 size.d_view(m).x2max);
+      const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                                 size.d_view(m).x3max);
+      Real field[3];
+      ComputeDensitizedMagneticField(x, y, z, parameters, field);
+      b0.x1f(m, k, j, i) = field[0];
+    }
   });
   par_for("emri_user_b2", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -1573,7 +2089,17 @@ void EMRIWindBoundary(Mesh *pm) {
             && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
         || (k > ke
             && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
-    if (user_ghost) b0.x2f(m, k, j, i) = parameters.densitized_magnetic_field[1];
+    if (user_ghost) {
+      const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
+                                 size.d_view(m).x1max);
+      const Real y = LeftEdgeX(j-js, indcs.nx2, size.d_view(m).x2min,
+                               size.d_view(m).x2max);
+      const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                                 size.d_view(m).x3max);
+      Real field[3];
+      ComputeDensitizedMagneticField(x, y, z, parameters, field);
+      b0.x2f(m, k, j, i) = field[1];
+    }
   });
   par_for("emri_user_b3", DevExeSpace(), 0, nmb-1, 0, n3, 0, n2-1, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
@@ -1589,7 +2115,17 @@ void EMRIWindBoundary(Mesh *pm) {
             && mb_bcs.d_view(m, BoundaryFace::inner_x3) == BoundaryFlag::user)
         || (k > ke+1
             && mb_bcs.d_view(m, BoundaryFace::outer_x3) == BoundaryFlag::user);
-    if (user_ghost) b0.x3f(m, k, j, i) = parameters.densitized_magnetic_field[2];
+    if (user_ghost) {
+      const Real x = CellCenterX(i-is, indcs.nx1, size.d_view(m).x1min,
+                                 size.d_view(m).x1max);
+      const Real y = CellCenterX(j-js, indcs.nx2, size.d_view(m).x2min,
+                                 size.d_view(m).x2max);
+      const Real z = LeftEdgeX(k-ks, indcs.nx3, size.d_view(m).x3min,
+                               size.d_view(m).x3max);
+      Real field[3];
+      ComputeDensitizedMagneticField(x, y, z, parameters, field);
+      b0.x3f(m, k, j, i) = field[2];
+    }
   });
 
   par_for("emri_user_wind", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1-1,
@@ -1614,13 +2150,16 @@ void EMRIWindBoundary(Mesh *pm) {
                                size.d_view(m).x2max);
     const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                size.d_view(m).x3max);
+    Real density;
+    Real pressure;
+    ComputeWindThermodynamics(x, y, z, parameters, density, pressure);
     Real primitive_velocity[3];
     ComputeWindPrimitive(x, y, z, parameters, primitive_velocity);
-    w0(m, IDN, k, j, i) = parameters.rho;
+    w0(m, IDN, k, j, i) = density;
     w0(m, IVX, k, j, i) = primitive_velocity[0];
     w0(m, IVY, k, j, i) = primitive_velocity[1];
     w0(m, IVZ, k, j, i) = primitive_velocity[2];
-    w0(m, IPR, k, j, i) = parameters.pressure;
+    w0(m, IPR, k, j, i) = pressure;
     for (int n=0; n<nscalars; ++n) w0(m, IYF+n, k, j, i) = 0.0;
     bcc0(m, IBX, k, j, i) =
         0.5*(b0.x1f(m, k, j, i)+b0.x1f(m, k, j, i+1));
