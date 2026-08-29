@@ -668,6 +668,47 @@ Generic inclined, eccentric, or inspiralling worldlines still require an externa
 ephemeris and transport prescription; they must not be approximated by this circular
 generator.
 
+For such a numerical worldline, start from `kerr_ephemeris.example.json`.  Its
+`global_times`, Cartesian Kerr-Schild `positions`, and `coordinate_velocities` define a
+cubic-Hermite trajectory.  Build the transported frame with
+
+```bash
+python3 inputs/emri/build_kerr_ephemeris_frame.py \
+  --ephemeris inputs/emri/kerr_ephemeris.example.json \
+  --output orbit.ephemeris.frame.json
+```
+
+The default `transport_mode=fermi_walker` computes the aligned-spin Cartesian Kerr-
+Schild connection by centered metric differences, reconstructs the four-velocity and
+four-acceleration, and integrates the spatial legs with fixed-substep RK4.  It is the
+appropriate nonrotating convention for an accelerated prescribed worldline.  The
+spatial legs are Gram-projected after each RK substep; the maximum projection correction
+is recorded and must remain small.  The generator also repeats the transport with half
+as many substeps and records the maximum coarse/fine leg difference.  Repeat production
+runs with a smaller `metric_fd_step_global_units` as an independent connection-
+differencing convergence check.
+
+`transport_mode=parallel` is reserved for a resolved geodesic ephemeris.  It hard-fails
+when the dimensionless proper acceleration `M|a|` exceeds
+`geodesic_acceleration_tolerance_Ma`; relaxing that threshold does not turn an
+accelerated inspiral into a geodesic.  Hermite acceleration can jump at ephemeris knots,
+so both its absolute and relative jump are reported.  Refine the ephemeris cadence until
+the acceleration jump, interpolated tetrad Gram error, RK coarse/fine difference, and
+science observables all converge.
+
+If `initial_spatial_basis` is omitted, the initial legs use cylindrical radial,
+prograde-tangential, and disk-normal coordinate directions before metric Gram-Schmidt.
+For an inclined or otherwise geometry-specific orbit, provide the desired three basis
+columns explicitly; Fermi-Walker transport then fixes their subsequent nonrotating
+evolution.  As in the circular generator, all output times and Jacobian columns include
+the declared extreme-mass-ratio unit conversion.
+
+This generator assumes a stationary Kerr background whose signed spin is along the
+Cartesian Kerr-Schild coordinate z axis; `disk_normal` controls only the default initial
+spatial basis.  It is not valid when the global ADM metric contains material time
+dependence or a non-Kerr contribution large enough to affect tetrad transport; that case
+requires connection data extracted from the actual ADM time series.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is

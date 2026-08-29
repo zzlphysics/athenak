@@ -1,0 +1,27 @@
+{
+  "classification": "athenak-emri-kerr-ephemeris-v1",
+  "primary_mass": 1.0,
+  "primary_dimensionless_spin": 0.5,
+  "primary_center": [0.0, 0.0, 0.0],
+  "disk_normal": [0.0, 0.0, 1.0],
+  "global_length_in_local_units": 100000.0,
+  "transport_mode": "fermi_walker",
+  "metric_fd_step_global_units": 0.00001,
+  "integration_substeps_per_interval": 16,
+  "geodesic_acceleration_tolerance_Ma": 1e-8,
+  "audit_subsamples_per_interval": 4,
+  "run_coarse_convergence_check": true,
+  "global_times": [0.0, 0.1, 0.2, 0.3],
+  "positions": [
+    [8.00, 0.00, 0.0],
+    [7.999, 0.03, 0.0],
+    [7.998, 0.06, 0.0],
+    [7.997, 0.09, 0.0]
+  ],
+  "coordinate_velocities": [
+    [-0.01, 0.30, 0.0],
+    [-0.01, 0.30, 0.0],
+    [-0.01, 0.30, 0.0],
+    [-0.01, 0.30, 0.0]
+  ]
+}
