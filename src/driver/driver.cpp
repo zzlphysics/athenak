@@ -832,6 +832,9 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
     } else {
       pmesh->NewTimeStep(tlim);
     }
+    if (pmesh->pgen->user_timestep_func != nullptr) {
+      (pmesh->pgen->user_timestep_func)(pmesh);
+    }
   }
 
   //---- Step 3.  Cycle through output Types and load data / write files.
@@ -1017,6 +1020,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
         SetLevelSubcyclingTimeStep(pmesh);
       } else {
         pmesh->NewTimeStep(tlim);
+      }
+      if (pmesh->pgen->user_timestep_func != nullptr) {
+        (pmesh->pgen->user_timestep_func)(pmesh);
       }
 
       // Update wall clock time if needed.

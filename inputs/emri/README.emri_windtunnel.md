@@ -194,7 +194,8 @@ scale, not for the temporal mean.
 
 The planner writes an explicit spatial-worldtube contract.  Its host-side flux/EMF
 format, validator, conservative regridder, and first fixed-grid AthenaK outer writer are
-implemented below; the inner replay driver is still pending.  The outer calculation has a
+implemented below.  The inner CT magnetic driver is also implemented; source-tetrad
+transformation and incoming-characteristic fluid replay remain.  The outer calculation has a
 secondary-centered cubical extraction worldtube and a sink strictly inside it.  The
 inner calculation replaces the sink region.  A trustworthy implementation must transfer:
 
@@ -518,9 +519,9 @@ Riemann EMF.  That shortcut is deliberately not provided.
 The current container uses one interval-average EMF, which permits conservative
 piecewise-constant temporal replay at different local timesteps.  Higher-order temporal
 replay will require outer RK-stage samples or temporal moments in a later schema.  The
-remaining inner-side steps are: load/regrid once on the host, keep the necessary slabs
-resident on the device, inject incoming fluid modes in the physical-boundary task, and
-inject the stored line EMFs in `user_efld_func` at every local RK stage.
+implemented inner driver loads bounded slabs and injects stored line EMFs in
+`user_efld_func` at every local RK stage.  Its remaining physics step is to inject only
+incoming fluid modes after the required global-to-source-tetrad transformation.
 
 ### First AthenaK outer writer
 
@@ -568,6 +569,52 @@ A continuously moving worldtube requires the motional edge term and a discrete g
 conservation law; merely changing `center_x*` each output would break the same Faraday
 identity the format is designed to preserve.  Static refinement can be added next by
 extracting on one uniform leaf level and using the existing mimetic regridder.
+
+### Inner CT magnetic replay
+
+Prepare the validated NPZ for bounded-memory C++ loading:
+
+```bash
+python3 inputs/emri/worldtube_flux_emf.py prepare-inner \
+  disk_patch.worldtube.npz disk_patch.inner.bin
+python3 inputs/emri/worldtube_flux_emf.py inspect-inner disk_patch.inner.bin
+```
+
+The binary has a fixed little-endian header, exact declared dimensions, and a CRC32 over
+the entire payload.  The C++ reader verifies all of these, the strictly increasing time
+array, MHD variable count, coincident cube center, and exact cube/grid match before
+changing a field.  `prepare-inner` only repacks already transformed data; it does not
+translate or rotate a global worldtube.  The driver keeps
+only the two endpoint state slabs, two endpoint flux slabs, and one interval EMF slab on
+the device; the full time series remains on disk.  Enable it with
+
+```text
+<emri_worldtube>
+enabled        = true
+mode           = inner
+file           = /absolute/path/disk_patch.inner.bin
+time_offset    = auto
+flux_tolerance = 1.0e-10
+```
+
+On a fresh run the replay initializes the six active boundary-normal face fields from
+the first flux slab.  At each local RK stage it replaces every physical-boundary edge
+EMF before communication, including every MeshBlock copy of an edge.  The ordinary CFL
+timestep is clipped so no step crosses an outer-data endpoint.  An interval-average EMF
+can therefore drive any number of smaller inner timesteps while preserving the exact
+integrated CT update.  At every outer endpoint the code compares the evolved boundary
+flux to the stored next slab and aborts if the normalized discrepancy exceeds
+`flux_tolerance`.  Single-block, eight-block, equal-timestep, and five-inner-step per
+outer-interval tests close this check.
+
+The state slabs are loaded but are intentionally not imposed yet.  A production global
+disk to local-EMRI coupling must first transform density/pressure, four-velocity, magnetic
+flux 2-forms, and EMF 1-forms into the same comoving source-tetrad chart, then prescribe
+only incoming GRMHD characteristic amplitudes.  Copying global coordinate primitives
+into all ghost cells would both use the wrong frame and overconstrain outgoing modes.
+Likewise, a moving extraction cube needs the motional EMF in the discrete map.  The
+current magnetic replay is consequently a complete CT/topology transport layer and an
+end-to-end test bed, not yet the final physical fluid boundary condition.
 
 ## Validation gates before science production
 

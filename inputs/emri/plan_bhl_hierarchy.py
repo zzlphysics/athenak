@@ -421,8 +421,8 @@ def build_plan(
     overlap_high = (1.0 + settings.overlap_fraction) * match_radius
     transfer_contract = {
         "status": (
-            "host transfer and fixed single-level AthenaK outer writer implemented; "
-            "moving/AMR extraction and inner RK-stage replay pending"
+            "fixed-grid outer writer and inner CT magnetic replay implemented; "
+            "moving/AMR extraction and characteristic fluid replay pending"
         ),
         "geometry": "secondary-centered cubical worldtube in source-tetrad axes",
         "cube_half_width": match_radius,

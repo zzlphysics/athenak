@@ -15,13 +15,19 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import struct
 from typing import Iterable
+import zlib
 
 import numpy as np
 
 
 CLASSIFICATION = "athenak-emri-cubical-flux-emf-worldtube-v1"
 OUTER_STREAM_CLASSIFICATION = "athenak-emri-outer-worldtube-stream-v1"
+INNER_BINARY_CLASSIFICATION = "athenak-emri-inner-worldtube-binary-v1"
+INNER_BINARY_MAGIC = b"AEMRIWTBIN0001\x00\x00"
+INNER_BINARY_VERSION = 1
+INNER_BINARY_HEADER = struct.Struct("<16sIIII4dQ")
 FACE_NAMES = ("x1m", "x1p", "x2m", "x2p", "x3m", "x3p")
 
 
@@ -495,6 +501,167 @@ def read_outer_stream(
     return times, faces, metadata
 
 
+def _crc32_update(value: int, payload: bytes) -> int:
+    return zlib.crc32(payload, value) & 0xFFFFFFFF
+
+
+def write_inner_binary(
+    path: Path,
+    times: Iterable[float],
+    faces: dict[str, FaceData],
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Write a strict little-endian stream for bounded-slab C++ device replay."""
+
+    times_array = validate_times(times)
+    diagnostics = validate_worldtube(times_array, faces)
+    checked = {
+        name: validate_face(faces[name], times_array, name) for name in FACE_NAMES
+    }
+    reference_shape = checked[FACE_NAMES[0]].cell_state.shape
+    _, nvar, cells_v, cells_u = reference_shape
+    if cells_u != cells_v:
+        raise ValueError("inner replay currently requires square face grids")
+    for name in FACE_NAMES:
+        if checked[name].cell_state.shape != reference_shape:
+            raise ValueError("inner replay requires one shared face resolution and nvar")
+    document = dict(metadata or {})
+    center = document.get("center", (0.0, 0.0, 0.0))
+    half_width = document.get("half_width", 1.0)
+    if (
+        not isinstance(center, (list, tuple))
+        or len(center) != 3
+        or not all(math.isfinite(float(value)) for value in center)
+        or not math.isfinite(float(half_width))
+        or float(half_width) <= 0.0
+    ):
+        raise ValueError("inner replay metadata requires finite center and half_width")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    checksum = 0
+    with path.open("w+b") as stream:
+        stream.write(
+            INNER_BINARY_HEADER.pack(
+                INNER_BINARY_MAGIC,
+                INNER_BINARY_VERSION,
+                cells_u,
+                nvar,
+                times_array.size,
+                float(center[0]),
+                float(center[1]),
+                float(center[2]),
+                float(half_width),
+                0,
+            )
+        )
+
+        def append(array: np.ndarray) -> None:
+            nonlocal checksum
+            payload = np.ascontiguousarray(array, dtype="<f8").tobytes(order="C")
+            checksum = _crc32_update(checksum, payload)
+            stream.write(payload)
+
+        append(times_array)
+        for name in FACE_NAMES:
+            append(checked[name].cell_state)
+            append(checked[name].normal_flux)
+            append(checked[name].emf_u)
+            append(checked[name].emf_v)
+        stream.seek(0)
+        stream.write(
+            INNER_BINARY_HEADER.pack(
+                INNER_BINARY_MAGIC,
+                INNER_BINARY_VERSION,
+                cells_u,
+                nvar,
+                times_array.size,
+                float(center[0]),
+                float(center[1]),
+                float(center[2]),
+                float(half_width),
+                checksum,
+            )
+        )
+
+    sidecar = {
+        "classification": INNER_BINARY_CLASSIFICATION,
+        "binary_file": path.name,
+        "format": "<16sIIII4dQ followed by little-endian float64 arrays",
+        "crc32_payload": f"{checksum:08x}",
+        "face_order": list(FACE_NAMES),
+        "array_order_per_face": ["cell_state", "normal_flux", "emf_u", "emf_v"],
+        "nt": int(times_array.size),
+        "nvar": int(nvar),
+        "cells_per_face_axis": int(cells_u),
+        "center": [float(value) for value in center],
+        "half_width": float(half_width),
+        "state_variables": document.get("state_variables", []),
+        "source_metadata": document,
+    }
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
+    diagnostics["binary_file"] = str(path)
+    diagnostics["payload_crc32"] = f"{checksum:08x}"
+    return diagnostics
+
+
+def read_inner_binary(
+    path: Path,
+) -> tuple[np.ndarray, dict[str, FaceData], dict[str, object]]:
+    """Reference reader used to verify files before the C++ replay consumes them."""
+
+    payload = path.read_bytes()
+    if len(payload) < INNER_BINARY_HEADER.size:
+        raise ValueError("inner replay binary is shorter than its header")
+    header = INNER_BINARY_HEADER.unpack_from(payload)
+    magic, version, cells, nvar, nt, *remaining = header
+    center = remaining[:3]
+    half_width = remaining[3]
+    expected_checksum = remaining[4]
+    if magic != INNER_BINARY_MAGIC or version != INNER_BINARY_VERSION:
+        raise ValueError("inner replay magic or version is unsupported")
+    if cells < 1 or nvar < 1 or nt < 2:
+        raise ValueError("inner replay dimensions are invalid")
+    binary_payload = payload[INNER_BINARY_HEADER.size :]
+    checksum = _crc32_update(0, binary_payload)
+    if checksum != expected_checksum:
+        raise ValueError("inner replay payload checksum mismatch")
+    values = np.frombuffer(binary_payload, dtype="<f8")
+    cursor = 0
+
+    def take(shape: tuple[int, ...]) -> np.ndarray:
+        nonlocal cursor
+        count = math.prod(shape)
+        if cursor + count > values.size:
+            raise ValueError("inner replay binary ended inside an array")
+        result = np.asarray(values[cursor : cursor + count].reshape(shape), dtype=np.float64)
+        cursor += count
+        if not np.isfinite(result).all():
+            raise ValueError("inner replay binary contains a non-finite value")
+        return result
+
+    times = validate_times(take((nt,)))
+    faces = {}
+    for name in FACE_NAMES:
+        faces[name] = FaceData(
+            cell_state=take((nt, nvar, cells, cells)),
+            normal_flux=take((nt, cells, cells)),
+            emf_u=take((nt - 1, cells + 1, cells)),
+            emf_v=take((nt - 1, cells, cells + 1)),
+        )
+    if cursor != values.size:
+        raise ValueError("inner replay binary has unclassified trailing data")
+    diagnostics = validate_worldtube(times, faces)
+    metadata = {
+        "classification": INNER_BINARY_CLASSIFICATION,
+        "center": list(center),
+        "half_width": half_width,
+        "payload_crc32": f"{checksum:08x}",
+        "diagnostics": diagnostics,
+    }
+    return times, faces, metadata
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -507,6 +674,11 @@ def parse_arguments() -> argparse.Namespace:
     pack_parser = subparsers.add_parser("pack-outer")
     pack_parser.add_argument("manifest", type=Path)
     pack_parser.add_argument("output", type=Path)
+    prepare_parser = subparsers.add_parser("prepare-inner")
+    prepare_parser.add_argument("input", type=Path)
+    prepare_parser.add_argument("output", type=Path)
+    inspect_parser = subparsers.add_parser("inspect-inner")
+    inspect_parser.add_argument("input", type=Path)
     return parser.parse_args()
 
 
@@ -517,8 +689,16 @@ def main() -> None:
         diagnostics = write_worldtube(arguments.output, times, faces, metadata)
         print(json.dumps(diagnostics, indent=2))
         return
+    if arguments.command == "inspect-inner":
+        times, faces, metadata = read_inner_binary(arguments.input)
+        diagnostics = validate_worldtube(times, faces)
+        diagnostics["metadata"] = metadata
+        print(json.dumps(diagnostics, indent=2))
+        return
     times, faces, metadata = read_worldtube(arguments.input)
-    if arguments.command == "validate":
+    if arguments.command == "prepare-inner":
+        diagnostics = write_inner_binary(arguments.output, times, faces, metadata)
+    elif arguments.command == "validate":
         diagnostics = validate_worldtube(times, faces)
     else:
         faces = resample_worldtube(times, faces, arguments.cells_per_face)

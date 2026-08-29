@@ -148,3 +148,31 @@ def test_outer_stream_binary_manifest_round_trip() -> None:
     assert metadata["state_variables"] == ["a", "b"]
     diagnostics = worldtube.validate_worldtube(loaded_times, loaded_faces)
     assert diagnostics["maximum_shared_edge_emf_residual"] == 0.0
+
+
+def test_inner_device_binary_round_trip_and_checksum() -> None:
+    times = np.asarray((3.0, 3.2, 3.5))
+    faces = _constant_cube(4, times)
+    with tempfile.TemporaryDirectory() as directory_name:
+        path = Path(directory_name) / "inner.bin"
+        worldtube.write_inner_binary(
+            path,
+            times,
+            faces,
+            {"center": [8.0, 0.0, 0.0], "half_width": 2.0},
+        )
+        loaded_times, loaded_faces, metadata = worldtube.read_inner_binary(path)
+        corrupted = bytearray(path.read_bytes())
+        corrupted[-1] ^= 1
+        corrupt_path = path.with_name("corrupt.bin")
+        corrupt_path.write_bytes(corrupted)
+        try:
+            worldtube.read_inner_binary(corrupt_path)
+        except ValueError as error:
+            assert "checksum" in str(error)
+        else:
+            raise AssertionError("corrupted inner replay binary was accepted")
+    np.testing.assert_array_equal(loaded_times, times)
+    assert metadata["center"] == [8.0, 0.0, 0.0]
+    diagnostics = worldtube.validate_worldtube(loaded_times, loaded_faces)
+    assert diagnostics["maximum_closed_surface_flux"] < 1.0e-15

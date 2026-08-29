@@ -28,6 +28,7 @@
 #include "z4c/z4c.hpp"
 #include "radiation/radiation.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "pgen/emri_inner_worldtube.hpp"
 #include "pgen/emri_outer_worldtube.hpp"
 #include "pgen.hpp"
 
@@ -663,19 +664,46 @@ void ProblemGenerator::ConfigureEmriOuterWorldtube(ParameterInput *pin,
       !pin->GetOrAddBoolean("emri_worldtube", "enabled", false)) {
     return;
   }
-  if (user_efld_observer_func != nullptr || user_step_observer_func != nullptr ||
-      user_finalize_observer_func != nullptr) {
+  const std::string mode = pin->GetOrAddString("emri_worldtube", "mode", "outer");
+  if (user_step_observer_func != nullptr || user_finalize_observer_func != nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
-              << "<emri_worldtube> cannot replace a problem-owned EMF, step, or "
-              << "finalize observer." << std::endl;
+              << "<emri_worldtube> cannot replace a problem-owned step or finalize "
+              << "observer." << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  emri_outer_worldtube_ = std::make_unique<EmriOuterWorldtubeWriter>(
-      pin, pmy_mesh_, is_restart);
-  user_efld_observer_func = EmriOuterWorldtubeObserveEField;
-  user_step_observer_func = EmriOuterWorldtubeCompleteStep;
-  user_finalize_observer_func = EmriOuterWorldtubeFinalize;
+  if (mode == "outer") {
+    if (user_efld_observer_func != nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "outer <emri_worldtube> cannot replace a problem-owned EMF "
+                << "observer." << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    emri_outer_worldtube_ = std::make_unique<EmriOuterWorldtubeWriter>(
+        pin, pmy_mesh_, is_restart);
+    user_efld_observer_func = EmriOuterWorldtubeObserveEField;
+    user_step_observer_func = EmriOuterWorldtubeCompleteStep;
+    user_finalize_observer_func = EmriOuterWorldtubeFinalize;
+  } else if (mode == "inner") {
+    if (user_efld_func != nullptr || user_timestep_func != nullptr) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "inner <emri_worldtube> cannot replace a problem-owned EMF or "
+                << "timestep hook." << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    emri_inner_worldtube_ = std::make_unique<EmriInnerWorldtubeReplay>(
+        pin, pmy_mesh_, is_restart);
+    user_efld_func = EmriInnerWorldtubeInjectEField;
+    user_step_observer_func = EmriInnerWorldtubeCompleteStep;
+    user_timestep_func = EmriInnerWorldtubeCapTimestep;
+  } else {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "unknown <emri_worldtube>/mode='" << mode
+              << "'; expected outer or inner." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 }
 
 //----------------------------------------------------------------------------------------

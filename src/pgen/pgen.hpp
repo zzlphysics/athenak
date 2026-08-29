@@ -17,16 +17,21 @@
 #include "parameter_input.hpp"
 
 class Driver;
+class EmriInnerWorldtubeReplay;
 class EmriOuterWorldtubeWriter;
 
 void EmriOuterWorldtubeObserveEField(Mesh *pm, Driver *pdrive, int stage);
 void EmriOuterWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriOuterWorldtubeFinalize(Mesh *pm, Driver *pdrive);
+void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage);
+void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
+void EmriInnerWorldtubeCapTimestep(Mesh *pm);
 
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
 using UserEFieldFnPtr = void (*)(Mesh* pm, Driver* pdrive, int stage);
 using UserStepFnPtr = void (*)(Mesh* pm, Driver* pdrive);
+using UserTimestepFnPtr = void (*)(Mesh* pm);
 using UserSrctermFnPtr = void (*)(Mesh* pm, const Real bdt);
 using UserRefinementFnPtr = void (*)(MeshBlockPack* pmbp);
 using UserHistoryFnPtr = void (*)(HistoryData *pdata, Mesh *pm);
@@ -71,6 +76,8 @@ class ProblemGenerator {
   UserStepFnPtr user_step_observer_func=nullptr;
   // Flush problem-owned streaming diagnostics before final problem analysis runs.
   UserStepFnPtr user_finalize_observer_func=nullptr;
+  // Apply a problem-specific upper bound after the ordinary CFL timestep is selected.
+  UserTimestepFnPtr user_timestep_func=nullptr;
   UserSrctermFnPtr user_srcs_func=nullptr;
   UserRefinementFnPtr user_ref_func=nullptr;
   UserHistoryFnPtr user_hist_func=nullptr;
@@ -108,9 +115,13 @@ class ProblemGenerator {
   friend void EmriOuterWorldtubeObserveEField(Mesh*, Driver*, int);
   friend void EmriOuterWorldtubeCompleteStep(Mesh*, Driver*);
   friend void EmriOuterWorldtubeFinalize(Mesh*, Driver*);
+  friend void EmriInnerWorldtubeInjectEField(Mesh*, Driver*, int);
+  friend void EmriInnerWorldtubeCompleteStep(Mesh*, Driver*);
+  friend void EmriInnerWorldtubeCapTimestep(Mesh*);
 
   void ConfigureEmriOuterWorldtube(ParameterInput *pin, bool is_restart);
 
+  std::unique_ptr<EmriInnerWorldtubeReplay> emri_inner_worldtube_;
   std::unique_ptr<EmriOuterWorldtubeWriter> emri_outer_worldtube_;
   bool single_file_per_rank; // for restart file naming
   Mesh* pmy_mesh_;
