@@ -6,9 +6,9 @@ conservative variables and fluxes in a local orthonormal frame.  This follows th
 local-characteristic route for GRMHD: geometry supplies an orthonormal tetrad at the
 boundary point, while the seven-wave RMHD projection is performed in that frame.
 
-This module is a reference/preprocessing implementation, not yet the AthenaK device
-boundary hook.  It establishes the state convention, incoming-wave sign, degeneracy
-checks, and manufactured tests that the later C++ implementation must reproduce.
+This module is the independent reference/preprocessing implementation for the AthenaK
+device boundary.  It establishes the state convention, incoming-wave sign, GR face
+frame, degeneracy checks, and manufactured tests that the C++ implementation reproduces.
 """
 
 from __future__ import annotations
@@ -173,6 +173,154 @@ class LinearHLLDiagnostics:
     gain_error: np.ndarray
     minimum_signal_speed: float
     maximum_signal_speed: float
+
+
+@dataclass(frozen=True)
+class GRFaceFrame:
+    """Eulerian orthonormal spatial frame aligned with a coordinate cube face."""
+
+    basis: np.ndarray
+    dual: np.ndarray
+    sqrt_determinant: float
+    sqrt_inverse_normal_metric: float
+
+
+def gr_face_frame(spatial_metric: object, face_name: str) -> GRFaceFrame:
+    """Construct the right-handed frame used by ``characteristic_gr``.
+
+    Rows of ``basis`` are the coordinate components ``e_(a)^i``.  Rows of ``dual``
+    are ``theta^(a)_i``, so a contravariant spatial vector transforms as
+    ``V_frame = dual @ V_coordinate``.
+    """
+
+    metric = np.asarray(spatial_metric, dtype=np.float64)
+    if metric.shape != (3, 3) or not np.isfinite(metric).all():
+        raise ValueError("spatial_metric must be a finite 3x3 matrix")
+    if not np.allclose(metric, metric.T, rtol=0.0, atol=2.0e-14):
+        raise ValueError("spatial_metric must be symmetric")
+    if face_name not in worldtube.ORIENTATIONS:
+        raise ValueError(f"unknown cubical face {face_name}")
+    orientation = worldtube.ORIENTATIONS[face_name]
+    determinant = float(np.linalg.det(metric))
+    try:
+        inverse = np.linalg.inv(metric)
+        np.linalg.cholesky(metric)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("spatial_metric must be positive definite") from error
+    normal_axis = orientation.normal_axis
+    normal_sign = orientation.normal_sign
+    sqrt_inverse_normal = math.sqrt(float(inverse[normal_axis, normal_axis]))
+    basis = np.zeros((3, 3), dtype=np.float64)
+    basis[0] = normal_sign * inverse[:, normal_axis] / sqrt_inverse_normal
+    tangent1 = orientation.u_axis
+    tangent2 = orientation.v_axis
+    basis[1, tangent1] = 1.0 / math.sqrt(float(metric[tangent1, tangent1]))
+    candidate = np.zeros(3, dtype=np.float64)
+    candidate[tangent2] = orientation.v_sign
+    candidate -= float(candidate @ metric @ basis[1]) * basis[1]
+    candidate_norm = math.sqrt(float(candidate @ metric @ candidate))
+    basis[2] = candidate / candidate_norm
+    dual = basis @ metric
+    if not np.allclose(
+        basis @ metric @ basis.T, np.eye(3), rtol=0.0, atol=3.0e-14
+    ):
+        raise RuntimeError("GR face frame failed its orthonormality check")
+    if float(np.linalg.det(basis)) <= 0.0:
+        raise RuntimeError("GR face frame is not right handed")
+    return GRFaceFrame(
+        basis=basis,
+        dual=dual,
+        sqrt_determinant=math.sqrt(determinant),
+        sqrt_inverse_normal_metric=sqrt_inverse_normal,
+    )
+
+
+def outward_grid_speed(
+    lapse: float,
+    shift: object,
+    face_name: str,
+    frame: GRFaceFrame,
+) -> float:
+    """Return fixed-coordinate face speed along the outward Eulerian frame normal."""
+
+    alpha = float(lapse)
+    beta = np.asarray(_finite_vector(shift, 3, "shift"), dtype=np.float64)
+    if not math.isfinite(alpha) or alpha <= 0.0:
+        raise ValueError("lapse must be finite and positive")
+    orientation = worldtube.ORIENTATIONS[face_name]
+    result = (
+        orientation.normal_sign
+        * float(beta[orientation.normal_axis])
+        / (alpha * frame.sqrt_inverse_normal_metric)
+    )
+    if not math.isfinite(result) or abs(result) >= 1.0:
+        raise ValueError("fixed-coordinate face must be timelike in the Eulerian frame")
+    return result
+
+
+def dyngrmhd_state_to_face_primitive(
+    state: object,
+    face_name: str,
+    spatial_metric: object,
+    outward_flux_density: float,
+) -> tuple[np.ndarray, float, GRFaceFrame]:
+    """Map ``rho,u^i,pgas,sqrt(gamma)B^i`` to the local seven-wave state."""
+
+    source = np.asarray(_finite_vector(state, 8, "DynGRMHD state"), dtype=np.float64)
+    if source[0] <= 0.0 or source[4] <= 0.0:
+        raise ValueError("DynGRMHD state density and pressure must be positive")
+    if not math.isfinite(outward_flux_density):
+        raise ValueError("outward_flux_density must be finite")
+    frame = gr_face_frame(spatial_metric, face_name)
+    orientation = worldtube.ORIENTATIONS[face_name]
+    densitized_magnetic = source[5:8].copy()
+    densitized_magnetic[orientation.normal_axis] = (
+        orientation.normal_sign * outward_flux_density
+    )
+    velocity_frame = frame.dual @ source[1:4]
+    magnetic_frame = frame.dual @ (
+        densitized_magnetic / frame.sqrt_determinant
+    )
+    primitive = np.asarray(
+        (
+            source[0],
+            source[4],
+            velocity_frame[0],
+            velocity_frame[1],
+            velocity_frame[2],
+            magnetic_frame[1],
+            magnetic_frame[2],
+        )
+    )
+    return primitive, float(magnetic_frame[0]), frame
+
+
+def face_primitive_to_dyngrmhd_state(
+    primitive: object,
+    normal_magnetic: float,
+    frame: GRFaceFrame,
+) -> np.ndarray:
+    """Map a local seven-wave state back to DynGRMHD coordinate primitives."""
+
+    face = np.asarray(
+        _finite_vector(primitive, 7, "face_primitive"), dtype=np.float64
+    )
+    if face[0] <= 0.0 or face[1] <= 0.0 or not math.isfinite(normal_magnetic):
+        raise ValueError("local density, pressure, and normal field must be physical")
+    coordinate_velocity = frame.basis.T @ face[2:5]
+    coordinate_magnetic = frame.basis.T @ np.asarray(
+        (normal_magnetic, face[5], face[6]), dtype=np.float64
+    )
+    return np.asarray(
+        (
+            face[0],
+            coordinate_velocity[0],
+            coordinate_velocity[1],
+            coordinate_velocity[2],
+            face[1],
+            *(frame.sqrt_determinant * coordinate_magnetic),
+        )
+    )
 
 
 def characteristic_basis(
@@ -396,6 +544,7 @@ def project_incoming_characteristics(
     adiabatic_index: float,
     speed_tolerance: float = 1.0e-10,
     positivity_floor: float = 1.0e-14,
+    outward_grid_velocity: float = 0.0,
 ) -> tuple[np.ndarray, ProjectionDiagnostics]:
     """Replace only modes propagating inward relative to the outward face normal."""
 
@@ -411,6 +560,8 @@ def project_incoming_characteristics(
         raise ValueError("speed_tolerance must be finite and nonnegative")
     if not math.isfinite(positivity_floor) or positivity_floor <= 0.0:
         raise ValueError("positivity_floor must be finite and positive")
+    if not math.isfinite(outward_grid_velocity) or abs(outward_grid_velocity) >= 1.0:
+        raise ValueError("outward_grid_velocity must be finite with magnitude below one")
 
     reference = 0.5 * (interior + exterior)
     # A logarithmic mean for positive thermodynamic variables is symmetric and remains
@@ -419,7 +570,7 @@ def project_incoming_characteristics(
     basis = characteristic_basis(reference, normal_magnetic, adiabatic_index)
     difference = exterior - interior
     amplitudes = basis.left_eigenvectors @ difference
-    incoming = basis.speeds < -speed_tolerance
+    incoming = basis.speeds - outward_grid_velocity < -speed_tolerance
     applied = basis.right_eigenvectors @ (incoming * amplitudes)
 
     fraction = 1.0
@@ -470,5 +621,47 @@ def characteristic_boundary_state(
     )
     return (
         face_primitive_to_state(boundary_face, face_name, normal_magnetic),
+        diagnostics,
+    )
+
+
+def characteristic_gr_boundary_state(
+    interior_state: object,
+    exterior_state: object,
+    face_name: str,
+    spatial_metric: object,
+    lapse: float,
+    shift: object,
+    outward_flux_density: float,
+    adiabatic_index: float,
+    speed_tolerance: float = 1.0e-10,
+) -> tuple[np.ndarray, ProjectionDiagnostics]:
+    """Reference ``characteristic_gr`` projection for one fixed-coordinate face."""
+
+    interior_face, normal_magnetic, frame = dyngrmhd_state_to_face_primitive(
+        interior_state, face_name, spatial_metric, outward_flux_density
+    )
+    exterior_face, exterior_normal, exterior_frame = (
+        dyngrmhd_state_to_face_primitive(
+            exterior_state, face_name, spatial_metric, outward_flux_density
+        )
+    )
+    if not math.isclose(exterior_normal, normal_magnetic, rel_tol=0.0, abs_tol=2.0e-14):
+        raise RuntimeError("normal CT field changed between identical GR face maps")
+    if not np.array_equal(exterior_frame.basis, frame.basis):
+        raise RuntimeError("identical GR metrics produced different face frames")
+    grid_velocity = outward_grid_speed(lapse, shift, face_name, frame)
+    boundary_face, diagnostics = project_incoming_characteristics(
+        interior_face,
+        exterior_face,
+        normal_magnetic,
+        adiabatic_index,
+        speed_tolerance=speed_tolerance,
+        outward_grid_velocity=grid_velocity,
+    )
+    return (
+        face_primitive_to_dyngrmhd_state(
+            boundary_face, normal_magnetic, frame
+        ),
         diagnostics,
     )

@@ -23,7 +23,9 @@
 #include <vector>
 
 #include "athena.hpp"
+#include "coordinates/adm.hpp"
 #include "driver/driver.hpp"
+#include "dyn_grmhd/dyn_grmhd.hpp"
 #include "globals.hpp"
 #include "mesh/mesh.hpp"
 #include "mesh/meshblock.hpp"
@@ -31,6 +33,7 @@
 #include "eos/eos.hpp"
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
+#include "pgen/emri_grmhd_tetrad.hpp"
 #include "pgen/pgen.hpp"
 #include "pgen/emri_srmhd_characteristics.hpp"
 
@@ -123,6 +126,52 @@ void ValidateSRCharacteristicReferenceBasis() {
     if (std::abs(std::abs(overlap) - 1.0) > 10.0*tolerance) {
       InnerFatal("SR characteristic analytic eigenvector regression failed");
     }
+  }
+}
+
+void ValidateGRFaceFrameReference() {
+  const Real metric[NSPMETRIC] = {2.0, 0.3, -0.2, 1.5, 0.25, 1.2};
+  const Real expected_basis[3][3] = {
+      {-0.7281555866966863, 0.1718237643428152, -0.1571558820208675},
+      {0.0, 0.8164965809277260, 0.0},
+      {0.0, 0.1548574032706278, -0.9291444196237665}};
+  const Real expected_dual[3][3] = {
+      {-1.373332867686355, 0.0, 0.0},
+      {0.2449489742783178, 1.224744871391589, 0.2041241452319315},
+      {0.2322861049059417, 0.0, -1.076258952730863}};
+  Real basis[3][3], dual[3][3], sqrt_determinant, sqrt_inverse_normal_metric;
+  if (!emri_grmhd::BuildFaceFrame(metric, 0, -1, basis, dual, sqrt_determinant,
+                                   sqrt_inverse_normal_metric)) {
+    InnerFatal("GR characteristic face-frame reference construction failed");
+  }
+  const Real tolerance = (sizeof(Real) == sizeof(float)) ? 3.0e-5 : 3.0e-12;
+  if (std::abs(sqrt_determinant - std::sqrt(3.277)) > tolerance ||
+      std::abs(sqrt_inverse_normal_metric - 0.7281555866966863) > tolerance) {
+    InnerFatal("GR characteristic face-frame metric regression failed");
+  }
+  for (int frame = 0; frame < 3; ++frame) {
+    for (int component = 0; component < 3; ++component) {
+      if (std::abs(basis[frame][component] - expected_basis[frame][component]) >
+              tolerance ||
+          std::abs(dual[frame][component] - expected_dual[frame][component]) >
+              tolerance) {
+        InnerFatal("GR characteristic face-frame basis regression failed");
+      }
+    }
+  }
+  const Real coordinate[3] = {0.4, -0.2, 0.7};
+  Real local[3], recovered[3];
+  emri_grmhd::CoordinateToFrame(dual, coordinate, local);
+  emri_grmhd::FrameToCoordinate(basis, local, recovered);
+  for (int component = 0; component < 3; ++component) {
+    if (std::abs(recovered[component] - coordinate[component]) > 10.0*tolerance) {
+      InnerFatal("GR characteristic face-frame round-trip regression failed");
+    }
+  }
+  const Real grid_speed = emri_grmhd::OutwardGridSpeed(
+      0.83, 0.15, -1, sqrt_inverse_normal_metric);
+  if (std::abs(grid_speed + 0.2481926869312688) > tolerance) {
+    InnerFatal("GR characteristic shift-speed regression failed");
   }
 }
 
@@ -224,9 +273,13 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
   } else if (fluid_boundary == "characteristic_sr") {
     fluid_boundary_enabled_ = true;
     characteristic_sr_boundary_ = true;
+  } else if (fluid_boundary == "characteristic_gr") {
+    fluid_boundary_enabled_ = true;
+    characteristic_gr_boundary_ = true;
   } else {
     InnerFatal(
-        "<emri_worldtube>/fluid_boundary must be off, riemann, or characteristic_sr");
+        "<emri_worldtube>/fluid_boundary must be off, riemann, characteristic_sr, "
+        "or characteristic_gr");
   }
   characteristic_speed_tolerance_ = pin->GetOrAddReal(
       "emri_worldtube", "characteristic_speed_tolerance", 1.0e-10);
@@ -248,7 +301,23 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
         !pm->pmb_pack->pcoord->is_special_relativistic) {
       InnerFatal("fluid_boundary=characteristic_sr requires special-relativistic MHD");
     }
-    if (characteristic_sr_boundary_) ValidateSRCharacteristicReferenceBasis();
+    if (characteristic_gr_boundary_ &&
+        (pm->pmb_pack->pdyngr == nullptr || pm->pmb_pack->padm == nullptr ||
+         pm->pmb_pack->pdyngr->eos_policy != DynGRMHD_EOS::eos_ideal)) {
+      InnerFatal(
+          "fluid_boundary=characteristic_gr requires ideal-gas DynGRMHD with ADM data");
+    }
+    if (characteristic_gr_boundary_ &&
+        pin->GetOrAddString("emri_worldtube", "fluid_state_frame", "unverified") !=
+            "inner_coordinate") {
+      InnerFatal(
+          "fluid_boundary=characteristic_gr requires fluid_state_frame=inner_coordinate; "
+          "prepare-inner does not perform the global-to-inner coordinate transform");
+    }
+    if (characteristic_sr_boundary_ || characteristic_gr_boundary_) {
+      ValidateSRCharacteristicReferenceBasis();
+      ValidateGRFaceFrameReference();
+    }
   }
   BuildBoundaryTopology(pm);
   LoadInterval(interval_);
@@ -688,7 +757,11 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
   const int nghost = pm->mb_indcs.ng;
   const Real inverse_area = 1.0/(dx_*dx_);
   const bool characteristic_sr = characteristic_sr_boundary_;
+  const bool characteristic_gr = characteristic_gr_boundary_;
+  const bool characteristic = characteristic_sr || characteristic_gr;
   const Real speed_tolerance = characteristic_speed_tolerance_;
+  adm::ADM::ADM_vars adm_fields;
+  if (characteristic_gr) adm_fields = pm->pmb_pack->padm->adm;
   if (local_faces == 0) return;
   par_for("emri_inner_fluid_boundary", DevExeSpace(), 0, local_faces - 1,
   KOKKOS_LAMBDA(int record_index) {
@@ -701,10 +774,6 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
     const int u = records(record_index, 6);
     const int normal_axis = face/2;
     const int normal_sign = (face % 2 == 0) ? -1 : 1;
-    const int u_axis = (normal_axis + 1)%3;
-    const int v_axis = (normal_axis + 2)%3;
-    const int u_sign = 1;
-    const int v_sign = normal_sign;
     const int face_cell = (face*cells + v)*cells + u;
     Real exterior_b[3];
     for (int component = 0; component < 3; ++component) {
@@ -715,59 +784,120 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
     const Real outward_flux =
         (1.0 - theta)*left_flux(face_cell) + theta*right_flux(face_cell);
     exterior_b[normal_axis] = normal_sign*outward_flux*inverse_area;
-    Real exterior_q[emri_srmhd::kModes];
-    Real interior_q[emri_srmhd::kModes];
-    Real predicted_q[emri_srmhd::kModes];
-    Real boundary_q[emri_srmhd::kModes];
-    Real exterior_u[3];
-    for (int component = 0; component < 3; ++component) {
-      const int input = ((face*nvar + IVX + component)*cells + v)*cells + u;
-      exterior_u[component] = (1.0 - theta)*left(input) + theta*right(input);
-    }
-    const int density_input = ((face*nvar + IDN)*cells + v)*cells + u;
-    const int energy_input = ((face*nvar + IEN)*cells + v)*cells + u;
-    exterior_q[0] = (1.0 - theta)*left(density_input) + theta*right(density_input);
-    exterior_q[1] = eos.IdealGasPressure(
-        (1.0 - theta)*left(energy_input) + theta*right(energy_input));
-    exterior_q[2] = normal_sign*exterior_u[normal_axis];
-    exterior_q[3] = u_sign*exterior_u[u_axis];
-    exterior_q[4] = v_sign*exterior_u[v_axis];
-    exterior_q[5] = u_sign*exterior_b[u_axis];
-    exterior_q[6] = v_sign*exterior_b[v_axis];
-    interior_q[0] = w0(m, IDN, k, j, i);
-    interior_q[1] = eos.IdealGasPressure(w0(m, IEN, k, j, i));
-    interior_q[2] = normal_sign*w0(m, IVX + normal_axis, k, j, i);
-    interior_q[3] = u_sign*w0(m, IVX + u_axis, k, j, i);
-    interior_q[4] = v_sign*w0(m, IVX + v_axis, k, j, i);
-    interior_q[5] = u_sign*bcc0(m, u_axis, k, j, i);
-    interior_q[6] = v_sign*bcc0(m, v_axis, k, j, i);
-    int inward[3] = {i, j, k};
-    inward[normal_axis] -= normal_sign;
-    Real inward_q[emri_srmhd::kModes];
-    inward_q[0] = w0(m, IDN, inward[2], inward[1], inward[0]);
-    inward_q[1] = eos.IdealGasPressure(
-        w0(m, IEN, inward[2], inward[1], inward[0]));
-    inward_q[2] = normal_sign*
-        w0(m, IVX + normal_axis, inward[2], inward[1], inward[0]);
-    inward_q[3] = u_sign*
-        w0(m, IVX + u_axis, inward[2], inward[1], inward[0]);
-    inward_q[4] = v_sign*
-        w0(m, IVX + v_axis, inward[2], inward[1], inward[0]);
-    inward_q[5] = u_sign*
-        bcc0(m, u_axis, inward[2], inward[1], inward[0]);
-    inward_q[6] = v_sign*
-        bcc0(m, v_axis, inward[2], inward[1], inward[0]);
-    for (int variable = 0; variable < emri_srmhd::kModes; ++variable) {
-      // A characteristic ghost state must retain the outgoing one-sided gradient;
-      // using the active boundary cell itself would flatten every outgoing mode.
-      predicted_q[variable] = 2.0*interior_q[variable] - inward_q[variable];
-    }
+    Real interior_q[emri_srmhd::kModes] = {0.0};
+    Real boundary_q[emri_srmhd::kModes] = {0.0};
+    Real basis[3][3] = {{0.0}};
+    Real normal_field = 0.0;
+    Real sqrt_determinant = 1.0;
     bool projected = false;
-    if (characteristic_sr) {
-      projected = emri_srmhd::ProjectIncoming(
-          predicted_q, exterior_q, outward_flux*inverse_area, eos.gamma,
-          speed_tolerance, fmax(eos.dfloor, Real(1.0e-14)),
-          fmax(eos.pfloor, Real(1.0e-14)), boundary_q);
+    if (characteristic) {
+      Real metric[NSPMETRIC] = {1.0, 0.0, 0.0, 1.0, 0.0, 1.0};
+      Real shift[3] = {0.0, 0.0, 0.0};
+      Real lapse = 1.0;
+      if (characteristic_gr) {
+        if (normal_axis == 0) {
+          adm::Face1Metric(m, k, j, i + (normal_sign > 0), adm_fields.g_dd,
+                           adm_fields.beta_u, adm_fields.alpha, metric, shift, lapse);
+        } else if (normal_axis == 1) {
+          adm::Face2Metric(m, k, j + (normal_sign > 0), i, adm_fields.g_dd,
+                           adm_fields.beta_u, adm_fields.alpha, metric, shift, lapse);
+        } else {
+          adm::Face3Metric(m, k + (normal_sign > 0), j, i, adm_fields.g_dd,
+                           adm_fields.beta_u, adm_fields.alpha, metric, shift, lapse);
+        }
+      }
+      Real dual[3][3];
+      Real sqrt_inverse_normal_metric = 1.0;
+      bool frame_valid = emri_grmhd::BuildFaceFrame(
+          metric, normal_axis, normal_sign, basis, dual, sqrt_determinant,
+          sqrt_inverse_normal_metric);
+      Real outward_grid_speed = 0.0;
+      if (characteristic_gr && frame_valid) {
+        frame_valid = isfinite(lapse) && lapse > 0.0;
+        if (frame_valid) {
+          outward_grid_speed = emri_grmhd::OutwardGridSpeed(
+              lapse, shift[normal_axis], normal_sign, sqrt_inverse_normal_metric);
+          frame_valid = isfinite(outward_grid_speed) && fabs(outward_grid_speed) < 1.0;
+        }
+      }
+      if (frame_valid) {
+        Real exterior_q[emri_srmhd::kModes];
+        Real exterior_u[3], exterior_b_undensitized[3];
+        for (int component = 0; component < 3; ++component) {
+          const int input = ((face*nvar + IVX + component)*cells + v)*cells + u;
+          exterior_u[component] = (1.0 - theta)*left(input) + theta*right(input);
+          exterior_b_undensitized[component] = exterior_b[component]/sqrt_determinant;
+        }
+        Real exterior_u_frame[3], exterior_b_frame[3];
+        emri_grmhd::CoordinateToFrame(dual, exterior_u, exterior_u_frame);
+        emri_grmhd::CoordinateToFrame(
+            dual, exterior_b_undensitized, exterior_b_frame);
+        const int density_input = ((face*nvar + IDN)*cells + v)*cells + u;
+        const int energy_input = ((face*nvar + IEN)*cells + v)*cells + u;
+        exterior_q[0] = (1.0 - theta)*left(density_input) + theta*right(density_input);
+        const Real exterior_thermodynamic =
+            (1.0 - theta)*left(energy_input) + theta*right(energy_input);
+        exterior_q[1] = characteristic_gr ? exterior_thermodynamic
+                                          : eos.IdealGasPressure(exterior_thermodynamic);
+        exterior_q[2] = exterior_u_frame[0];
+        exterior_q[3] = exterior_u_frame[1];
+        exterior_q[4] = exterior_u_frame[2];
+        exterior_q[5] = exterior_b_frame[1];
+        exterior_q[6] = exterior_b_frame[2];
+        normal_field = exterior_b_frame[0];
+
+        Real interior_u[3], interior_b_undensitized[3];
+        for (int component = 0; component < 3; ++component) {
+          interior_u[component] = w0(m, IVX + component, k, j, i);
+          interior_b_undensitized[component] =
+              bcc0(m, component, k, j, i)/sqrt_determinant;
+        }
+        Real interior_u_frame[3], interior_b_frame[3];
+        emri_grmhd::CoordinateToFrame(dual, interior_u, interior_u_frame);
+        emri_grmhd::CoordinateToFrame(
+            dual, interior_b_undensitized, interior_b_frame);
+        interior_q[0] = w0(m, IDN, k, j, i);
+        interior_q[1] = characteristic_gr ? w0(m, IEN, k, j, i)
+                                          : eos.IdealGasPressure(w0(m, IEN, k, j, i));
+        interior_q[2] = interior_u_frame[0];
+        interior_q[3] = interior_u_frame[1];
+        interior_q[4] = interior_u_frame[2];
+        interior_q[5] = interior_b_frame[1];
+        interior_q[6] = interior_b_frame[2];
+
+        int inward[3] = {i, j, k};
+        inward[normal_axis] -= normal_sign;
+        Real inward_q[emri_srmhd::kModes];
+        Real inward_u[3], inward_b_undensitized[3];
+        for (int component = 0; component < 3; ++component) {
+          inward_u[component] =
+              w0(m, IVX + component, inward[2], inward[1], inward[0]);
+          inward_b_undensitized[component] =
+              bcc0(m, component, inward[2], inward[1], inward[0])/sqrt_determinant;
+        }
+        Real inward_u_frame[3], inward_b_frame[3];
+        emri_grmhd::CoordinateToFrame(dual, inward_u, inward_u_frame);
+        emri_grmhd::CoordinateToFrame(dual, inward_b_undensitized, inward_b_frame);
+        inward_q[0] = w0(m, IDN, inward[2], inward[1], inward[0]);
+        inward_q[1] = characteristic_gr
+            ? w0(m, IEN, inward[2], inward[1], inward[0])
+            : eos.IdealGasPressure(w0(m, IEN, inward[2], inward[1], inward[0]));
+        inward_q[2] = inward_u_frame[0];
+        inward_q[3] = inward_u_frame[1];
+        inward_q[4] = inward_u_frame[2];
+        inward_q[5] = inward_b_frame[1];
+        inward_q[6] = inward_b_frame[2];
+        Real predicted_q[emri_srmhd::kModes];
+        for (int variable = 0; variable < emri_srmhd::kModes; ++variable) {
+          // Retain the outgoing one-sided physical-frame gradient.  Using the active
+          // boundary cell itself would flatten every outgoing characteristic mode.
+          predicted_q[variable] = 2.0*interior_q[variable] - inward_q[variable];
+        }
+        projected = emri_srmhd::ProjectIncoming(
+            predicted_q, exterior_q, normal_field, eos.gamma, speed_tolerance,
+            outward_grid_speed, fmax(eos.dfloor, Real(1.0e-14)),
+            fmax(eos.pfloor, Real(1.0e-14)), boundary_q);
+      }
       Kokkos::atomic_increment(&characteristic_diagnostics(projected ? 0 : 1));
     }
     for (int layer = 1; layer <= nghost; ++layer) {
@@ -790,20 +920,22 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
         layer_q[0] = fmax(layer_q[0], fmax(eos.dfloor, Real(1.0e-14)));
         layer_q[1] = fmax(layer_q[1], fmax(eos.pfloor, Real(1.0e-14)));
         w0(m, IDN, ghost[2], ghost[1], ghost[0]) = layer_q[0];
-        w0(m, IEN, ghost[2], ghost[1], ghost[0]) =
-            layer_q[1]/(eos.gamma - 1.0);
-        w0(m, IVX + normal_axis, ghost[2], ghost[1], ghost[0]) =
-            normal_sign*layer_q[2];
-        w0(m, IVX + u_axis, ghost[2], ghost[1], ghost[0]) =
-            u_sign*layer_q[3];
-        w0(m, IVX + v_axis, ghost[2], ghost[1], ghost[0]) =
-            v_sign*layer_q[4];
+        w0(m, IEN, ghost[2], ghost[1], ghost[0]) = characteristic_gr
+            ? layer_q[1] : layer_q[1]/(eos.gamma - 1.0);
+        const Real velocity_frame[3] = {layer_q[2], layer_q[3], layer_q[4]};
+        Real velocity_coordinate[3];
+        emri_grmhd::FrameToCoordinate(basis, velocity_frame, velocity_coordinate);
+        const Real magnetic_frame[3] = {normal_field, layer_q[5], layer_q[6]};
+        Real magnetic_coordinate[3];
+        emri_grmhd::FrameToCoordinate(basis, magnetic_frame, magnetic_coordinate);
+        for (int component = 0; component < 3; ++component) {
+          w0(m, IVX + component, ghost[2], ghost[1], ghost[0]) =
+              velocity_coordinate[component];
+          bcc0(m, component, ghost[2], ghost[1], ghost[0]) =
+              sqrt_determinant*magnetic_coordinate[component];
+        }
         bcc0(m, normal_axis, ghost[2], ghost[1], ghost[0]) =
             normal_sign*outward_flux*inverse_area;
-        bcc0(m, u_axis, ghost[2], ghost[1], ghost[0]) =
-            u_sign*layer_q[5];
-        bcc0(m, v_axis, ghost[2], ghost[1], ghost[0]) =
-            v_sign*layer_q[6];
       }
     }
   });
@@ -872,10 +1004,13 @@ void EmriInnerWorldtubeReplay::CompleteStep(Mesh *pm, Driver *pdrive) {
     LoadInterval(interval_ + 1);
   } else {
     exhausted_ = true;
-    if (characteristic_sr_boundary_ && global_variable::my_rank == 0) {
+    if ((characteristic_sr_boundary_ || characteristic_gr_boundary_) &&
+        global_variable::my_rank == 0) {
       auto diagnostics = Kokkos::create_mirror_view_and_copy(
           HostMemSpace(), characteristic_diagnostics_);
-      std::cout << "EMRI inner characteristic SR boundary: projections="
+      std::cout << "EMRI inner characteristic "
+                << (characteristic_gr_boundary_ ? "GR" : "SR")
+                << " boundary: projections="
                 << diagnostics(0) << ", fallbacks=" << diagnostics(1) << std::endl;
     }
   }

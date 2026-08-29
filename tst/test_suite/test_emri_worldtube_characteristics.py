@@ -117,6 +117,94 @@ def test_all_cubical_face_rotations_round_trip_and_preserve_normal_field() -> No
         )
 
 
+def test_gr_face_frame_is_orthonormal_and_matches_flat_limit() -> None:
+    identity = np.eye(3)
+    for name in worldtube.FACE_NAMES:
+        frame = characteristics.gr_face_frame(identity, name)
+        np.testing.assert_array_equal(frame.basis, characteristics.face_basis(name))
+        np.testing.assert_array_equal(frame.dual, frame.basis)
+        assert frame.sqrt_determinant == 1.0
+        assert frame.sqrt_inverse_normal_metric == 1.0
+
+    metric = np.asarray(
+        ((2.0, 0.3, -0.2), (0.3, 1.5, 0.25), (-0.2, 0.25, 1.2))
+    )
+    frame = characteristics.gr_face_frame(metric, "x1m")
+    expected = np.asarray(
+        (
+            (-0.7281555866966863, 0.1718237643428152, -0.1571558820208675),
+            (0.0, 0.8164965809277261, 0.0),
+            (0.0, 0.1548574032706278, -0.9291444196237665),
+        )
+    )
+    np.testing.assert_allclose(frame.basis, expected, atol=2.0e-15)
+    np.testing.assert_allclose(
+        frame.basis @ metric @ frame.basis.T, np.eye(3), atol=2.0e-15
+    )
+    coordinate = np.asarray((0.4, -0.2, 0.7))
+    np.testing.assert_allclose(frame.basis.T @ (frame.dual @ coordinate), coordinate)
+
+
+def test_dyngrmhd_densitized_magnetic_state_round_trip() -> None:
+    metric = np.asarray(
+        ((2.0, 0.3, -0.2), (0.3, 1.5, 0.25), (-0.2, 0.25, 1.2))
+    )
+    state = np.asarray((1.2, 0.4, -0.2, 0.1, 0.15, 0.3, -0.12, 0.08))
+    outward_flux_density = -state[5]
+    primitive, normal_field, frame = (
+        characteristics.dyngrmhd_state_to_face_primitive(
+            state, "x1m", metric, outward_flux_density
+        )
+    )
+    recovered = characteristics.face_primitive_to_dyngrmhd_state(
+        primitive, normal_field, frame
+    )
+    np.testing.assert_allclose(recovered, state, atol=2.0e-15)
+
+
+def test_gr_fixed_coordinate_shift_changes_incoming_mode_set() -> None:
+    metric = np.eye(3)
+    frame = characteristics.gr_face_frame(metric, "x1p")
+    grid_speed = characteristics.outward_grid_speed(
+        1.0, np.asarray((0.45, 0.0, 0.0)), "x1p", frame
+    )
+    assert grid_speed == 0.45
+    interior = np.asarray((1.0, 0.1, 0.3, 0.05, -0.02, 0.2, 0.1))
+    exterior = interior + np.asarray((0.01, 0.005, -0.01, 0.0, 0.0, 0.0, 0.0))
+    _, stationary = characteristics.project_incoming_characteristics(
+        interior, exterior, 0.15, 4.0 / 3.0
+    )
+    _, shifted = characteristics.project_incoming_characteristics(
+        interior,
+        exterior,
+        0.15,
+        4.0 / 3.0,
+        outward_grid_velocity=grid_speed,
+    )
+    assert np.count_nonzero(shifted.incoming) > np.count_nonzero(stationary.incoming)
+
+
+def test_characteristic_gr_wrapper_recovers_sr_boundary_in_flat_zero_shift() -> None:
+    interior = np.asarray((1.0, 0.3, -0.2, 0.1, 0.08, 0.4, 0.05, -0.07))
+    exterior = np.asarray((1.1, 0.28, -0.18, 0.12, 0.09, 0.37, 0.08, -0.05))
+    normal_field = 0.15
+    sr_boundary, sr_diagnostics = characteristics.characteristic_boundary_state(
+        interior, exterior, "x2m", normal_field, 4.0 / 3.0
+    )
+    gr_boundary, gr_diagnostics = characteristics.characteristic_gr_boundary_state(
+        interior,
+        exterior,
+        "x2m",
+        np.eye(3),
+        1.0,
+        np.zeros(3),
+        normal_field,
+        4.0 / 3.0,
+    )
+    np.testing.assert_allclose(gr_boundary, sr_boundary, atol=2.0e-14)
+    np.testing.assert_array_equal(gr_diagnostics.incoming, sr_diagnostics.incoming)
+
+
 def test_source_state_wrapper_uses_outward_incoming_sign() -> None:
     interior = np.asarray((1.0, 3.0, 0.05, -0.02, 0.1, 0.15, 0.2, 0.1))
     exterior = np.asarray((1.1, 3.2, 0.02, -0.01, 0.12, 0.15, 0.18, 0.13))

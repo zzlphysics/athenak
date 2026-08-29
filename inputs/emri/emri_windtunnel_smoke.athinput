@@ -49,6 +49,8 @@ evolution  = dynamic
 integrator = rk2
 subcycling = none
 cfl_number = 0.15
+# Positive synchronized-step ceiling; the GR worldtube closure campaign overrides it.
+root_dt_max = 0.05
 nlim       = 2
 tlim       = 0.05
 ndiag      = 1
@@ -179,7 +181,10 @@ time_offset   = auto
 flux_tolerance = 1.0e-10
 # off: magnetic CT replay only; riemann: time-interpolated exterior fluid ghost state
 # consumed by the ordinary GRMHD boundary Riemann solver (requires trailing bcc state).
+# characteristic_gr additionally requires fluid_state_frame=inner_coordinate after the
+# source data have actually been mapped into this simulation's coordinate components.
 fluid_boundary = off
+fluid_state_frame = unverified
 
 <output1>
 file_type = bin

@@ -70,6 +70,7 @@ class EmriOuterWorldtubeWriter {
   bool initialized_ = false;
   bool finalized_ = false;
   bool overwrite_ = false;
+  bool dyn_grmhd_state_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   int dcycle_ = 1;

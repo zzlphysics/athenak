@@ -243,13 +243,14 @@ EmriOuterWorldtubeWriter::EmriOuterWorldtubeWriter(ParameterInput *pin, Mesh *pm
   // both tangential magnetic components at the same face cell.  Retain the ordinary
   // AthenaK primitive layout and append all three cell-centered field components.
   nvar_ = pmhd->nmhd + pmhd->nscalars + 3;
+  dyn_grmhd_state_ = (pm->pmb_pack->pdyngr != nullptr);
   state_names_ = {"rho", "u1", "u2", "u3"};
   if (pmhd->nmhd == 5) {
     // DynGRMHD reconstructs pressure directly, while the ordinary ideal-gas MHD
     // modules reconstruct internal-energy density.  The binary values are replayed
     // without conversion, but preprocessing must know which thermodynamic primitive
     // it received before constructing a characteristic basis.
-    state_names_.push_back((pm->pmb_pack->pdyngr != nullptr) ? "pgas" : "eint");
+    state_names_.push_back(dyn_grmhd_state_ ? "pgas" : "eint");
   }
   for (int scalar = 0; scalar < pmhd->nscalars; ++scalar) {
     state_names_.push_back("scalar" + std::to_string(scalar));
@@ -707,6 +708,16 @@ void EmriOuterWorldtubeWriter::WriteManifest(bool complete) const {
          << "  \"restart_segment\": " << (is_restart_ ? "true" : "false") << ",\n"
          << "  \"state_sampling\": "
          << "\"exterior-adjacent primitive cell average\",\n"
+         << "  \"dynamical_grmhd_state\": "
+         << (dyn_grmhd_state_ ? "true" : "false") << ",\n"
+         << "  \"velocity_representation\": \""
+         << (dyn_grmhd_state_ ? "Eulerian spatial four-velocity u^i"
+                              : "native MHD primitive velocity components")
+         << "\",\n"
+         << "  \"magnetic_representation\": \""
+         << (dyn_grmhd_state_ ? "sqrt(gamma) B^i"
+                              : "native cell-centered magnetic components")
+         << "\",\n"
          << "  \"emf_sampling\": "
          << "\"synchronized CT line average with exact explicit-RK recurrence\",\n"
          << "  \"state_variables\": [";

@@ -295,7 +295,8 @@ bool Invert(const Real matrix[kModes][kModes], Real inverse[kModes][kModes]) {
 KOKKOS_INLINE_FUNCTION
 bool ProjectIncoming(const Real interior[kModes], const Real exterior[kModes],
                      Real normal_field, Real gamma_adi, Real speed_tolerance,
-                     Real density_floor, Real pressure_floor, Real result[kModes]) {
+                     Real outward_grid_speed, Real density_floor, Real pressure_floor,
+                     Real result[kModes]) {
   if (!(interior[0] > 0.0 && interior[1] > 0.0 && exterior[0] > 0.0 &&
         exterior[1] > 0.0)) return false;
   Real reference[kModes];
@@ -324,7 +325,7 @@ bool ProjectIncoming(const Real interior[kModes], const Real exterior[kModes],
       amplitudes[mode] += left[mode][variable]
                           *(exterior[variable] - interior[variable]);
     }
-    if (speeds[mode] >= -speed_tolerance) amplitudes[mode] = 0.0;
+    if (speeds[mode] - outward_grid_speed >= -speed_tolerance) amplitudes[mode] = 0.0;
   }
   Real applied[kModes] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   for (int variable = 0; variable < kModes; ++variable) {

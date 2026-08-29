@@ -63,6 +63,7 @@ class EmriInnerWorldtubeReplay {
   bool exhausted_ = false;
   bool fluid_boundary_enabled_ = false;
   bool characteristic_sr_boundary_ = false;
+  bool characteristic_gr_boundary_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   bool has_cell_centered_magnetic_state_ = false;

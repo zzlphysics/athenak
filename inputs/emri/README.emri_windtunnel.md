@@ -524,9 +524,10 @@ The current container uses one interval-average EMF, which permits conservative
 piecewise-constant temporal replay at different local timesteps.  Higher-order temporal
 replay will require outer RK-stage samples or temporal moments in a later schema.  The
 implemented inner driver loads bounded slabs and injects stored line EMFs in
-`user_efld_func` at every local RK stage.  It also has a validated flat-spacetime
-seven-wave incoming-mode boundary; extending that projector to GRMHD now requires the
-global-to-source-tetrad transformation at each boundary point.
+`user_efld_func` at every local RK stage.  It also has validated flat-spacetime and
+ADM-face GRMHD seven-wave incoming-mode boundaries.  The remaining global-disk coupling
+step is upstream: sample and transform the global state/flux cochains into the inner
+coordinate chart before `prepare-inner`.
 
 ### First AthenaK outer writer
 
@@ -669,6 +670,7 @@ time_offset    = auto
 flux_tolerance = 1.0e-10
 fluid_boundary = off
 characteristic_speed_tolerance = 1.0e-10
+fluid_state_frame = unverified
 ```
 
 On a fresh run the replay initializes the six active boundary-normal face fields from
@@ -703,16 +705,28 @@ than the seven-wave projector below and does not separately preserve every outgo
 Alfvén/contact/slow amplitude.  `fluid_boundary=off` remains the default until reflection
 and frame-transformation tests are passed.
 
-For flat special-relativistic validation, `fluid_boundary=characteristic_sr` enables a
-device-portable analytic seven-wave projector.  It first linearly extrapolates the
-active and next-inward cells to preserve every outgoing spatial gradient, then replaces
-only the negative-outward-speed amplitudes with the exterior worldtube data.  Deeper
+`fluid_boundary=characteristic_sr` enables the flat-spacetime device implementation;
+`fluid_boundary=characteristic_gr` applies the same analytic seven-wave projector in an
+Eulerian orthonormal face frame constructed from the current ADM metric.  Both first
+linearly extrapolate the active and next-inward cells to preserve every outgoing spatial
+gradient, then replace only incoming amplitudes with exterior worldtube data.  Deeper
 ghost layers continue the projected first-ghost slope.  Density and pressure are
-positivity limited, and every failed/degenerate basis construction falls back to the
-full exterior state and is counted in the final log.  A startup regression compares the
-analytic speeds and eigenvectors with the independent numerical-Jacobian reference.
-This option is intentionally rejected for GRMHD until the source-tetrad transformation
-is available on the device.
+positivity limited, and every failed/degenerate basis or non-timelike fixed-coordinate
+face falls back to the full exterior state and is counted in the final log.  Startup
+regressions compare the analytic RMHD basis with the independent numerical-Jacobian
+reference and the GR frame with a non-diagonal-metric reference.
+
+The GR option is deliberately opt-in twice:
+
+```text
+fluid_boundary    = characteristic_gr
+fluid_state_frame = inner_coordinate
+```
+
+The second line asserts that the stored `rho,u^i,pgas,sqrt(gamma)B^i` values have already
+been transformed into the inner simulation coordinates.  `prepare-inner` validates and
+repacks topology but does not perform that tensor transformation, so leaving the value
+as `unverified` aborts before evolution.
 
 ### Incoming-characteristic reference projector
 
@@ -730,7 +744,8 @@ while `B_normal` is supplied by the CT face flux and is not an independently pre
 wave variable.  The module differentiates the SRMHD conserved variables and normal
 fluxes, constructs the seven-wave primitive Jacobian, and projects
 `q_external-q_interior` onto its eigenvectors.  With an outward normal, only eigenvalues
-`lambda < 0` enter the domain.  The boundary state is therefore
+`lambda < 0` enter the domain in a zero-shift flat frame.  The boundary state is
+therefore
 
 ```text
 q_predict = 2 q_boundary-cell - q_next-inward,
@@ -745,14 +760,26 @@ relativistic hydrodynamic sound speeds when `B=0`, returns the complete exterior
 for super-fast inflow, retains the interior state for super-fast outflow, and replaces
 only the incoming amplitudes in a mixed fan.
 
-The operational `characteristic_sr` path uses the same convention and a closed-form
-RMHD eigenbasis on CPU/GPU.  The remaining GRMHD step is to construct the local
-orthonormal tetrad at every boundary cell and transform both the source state and the
-projected ghost state; until then `fluid_boundary=riemann` remains the curved-spacetime
-choice.  The host reference intentionally aborts on an ill-conditioned eigenbasis,
-while the device path records a conservative exterior-state fallback.  These choices
-follow the local-Riemann construction of Antón et al. (2006) and prevent the replay from
-overconstraining outgoing modes.
+The operational SR and GR paths use the same closed-form RMHD eigenbasis on CPU/GPU.
+For coordinate face `x^n=constant`, the GR path constructs
+
+```text
+e_normal^i = normal_sign gamma^{in}/sqrt(gamma^{nn}),
+B^i = bcc^i/sqrt(gamma),
+lambda_relative = lambda_Eulerian
+                  - normal_sign beta^n/(alpha sqrt(gamma^{nn})).
+```
+
+It injects a mode only when `lambda_relative` is negative, transforms the projected
+velocity and field back to coordinate components, re-densitizes the field, and then
+sets its normal component exactly from the CT flux.  The two tangent legs remain in the
+coordinate face and are Gram-Schmidt orthogonalized, so all six faces share a
+right-handed convention even for a non-diagonal spatial metric.  The metric is frozen at
+the Riemann face across the ghost reconstruction stencil; its truncation error is
+therefore controlled by `dx` relative to the curvature scale.  The host reference
+aborts on an ill-conditioned eigenbasis, while the device path records a conservative
+exterior-state fallback.  These choices follow the local-Riemann construction of Antón
+et al. (2006) and prevent the replay from overconstraining outgoing modes.
 
 Before deciding whether that more expensive projector is necessary for a particular
 disk patch, audit the actual packed worldtube rather than relying only on the upstream
@@ -821,6 +848,26 @@ coincident reference subvolume, and reports componentwise plus vector-group rela
 norms.  The CPU regression exercises a one-block `16^3` outer run against an eight-block
 `8^3` inner replay for five RK3 steps.  This measures the total decomposition error; a
 mode-resolved reflected wave amplitude remains a separate validation gate.
+
+The curved-spacetime closure campaign automates the corresponding DynGRMHD A/B test:
+
+```bash
+python3 inputs/emri/run_worldtube_gr_closure.py \
+  --athena build_emri/src/athena \
+  --workdir /tmp/emri-worldtube-gr-closure
+```
+
+On the standard full effective-EMRI metric, the `16^3` reference versus eight-block
+`8^3` replay gives relative L2 errors
+
+| boundary | density | pressure | velocity vector | magnetic vector |
+|---|---:|---:|---:|---:|
+| `riemann` | 3.48e-5 | 1.03e-4 | 5.75e-5 | 8.90e-6 |
+| `characteristic_gr` | 1.84e-5 | 6.77e-5 | 3.94e-5 | 8.89e-6 |
+
+The characteristic run performs 1,536 projections with zero fallback, while the CT
+endpoint residual remains approximately `3e-18`.  This is a curved-background domain
+decomposition closure result, not yet a physical reflected-energy coefficient.
 
 For that mode-resolved gate, `worldtube_linear_wave.athinput` uses AthenaK's native
 seven-wave SRMHD problem in a flat local orthonormal frame.  The worldtube transport is
