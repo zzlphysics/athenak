@@ -53,6 +53,20 @@ ADM_VARIABLES = (
     "adm_betay",
     "adm_betaz",
 )
+PROFILE_PARAMETER_ORDER = (
+    "rho0",
+    "pgas0",
+    "u1",
+    "u2",
+    "u3",
+    "b1",
+    "b2",
+    "b3",
+    *(f"dlnrho_dxh{i}" for i in range(1, 4)),
+    *(f"dlnpgas_dxh{i}" for i in range(1, 4)),
+    *(f"du{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)),
+    *(f"db{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)),
+)
 
 
 @dataclass(frozen=True)
@@ -535,6 +549,61 @@ def fit_static_profile(
     return parameters, diagnostics
 
 
+def rescale_profile_parameters(
+    parameters: dict[str, float],
+    global_length_in_local_units: float,
+    density_renormalization: float,
+) -> dict[str, float]:
+    """Convert a profile from global code units to local code units.
+
+    If one global length unit contains ``L`` local length units, then
+    ``x_local=L*x_global`` and ``t_local=L*t_global``.  Density and pressure have
+    dimensions length^-2 and magnetic field length^-1.  The optional density
+    renormalization preserves pressure/rho and magnetization by scaling B with
+    its square root.
+    """
+
+    length_scale = float(global_length_in_local_units)
+    density_scale = float(density_renormalization)
+    if not length_scale > 0.0 or not math.isfinite(length_scale):
+        raise ValueError("global length in local units must be finite and positive")
+    if not density_scale > 0.0 or not math.isfinite(density_scale):
+        raise ValueError("density renormalization must be finite and positive")
+    result = dict(parameters)
+    thermodynamic_factor = density_scale / length_scale**2
+    magnetic_factor = math.sqrt(density_scale) / length_scale
+    result["rho0"] *= thermodynamic_factor
+    result["pgas0"] *= thermodynamic_factor
+    for component in range(1, 4):
+        result[f"b{component}"] *= magnetic_factor
+    for direction in range(1, 4):
+        result[f"dlnrho_dxh{direction}"] /= length_scale
+        result[f"dlnpgas_dxh{direction}"] /= length_scale
+        for component in range(1, 4):
+            result[f"du{component}_dxh{direction}"] /= length_scale
+            result[f"db{component}_dxh{direction}"] *= (
+                magnetic_factor / length_scale
+            )
+    return result
+
+
+def rescale_profile_diagnostics(
+    diagnostics: dict[str, object],
+    global_length_in_local_units: float,
+    density_renormalization: float,
+) -> dict[str, object]:
+    result = dict(diagnostics)
+    magnetic_factor = (
+        math.sqrt(density_renormalization) / global_length_in_local_units
+    )
+    result["magnetic_weighted_rms"] = (
+        float(result["magnetic_weighted_rms"]) * magnetic_factor
+    )
+    result["profile_amplitude_units"] = "local"
+    result["cell_volume_units"] = "global_length_cubed"
+    return result
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -560,6 +629,8 @@ def write_outputs(
     coframe: np.ndarray,
     fit_radius: float,
     metric_fit_radius: float,
+    global_length_in_local_units: float,
+    density_renormalization: float,
     parameters: dict[str, float],
     diagnostics: dict[str, object],
     metric_errors: dict[str, float],
@@ -567,18 +638,22 @@ def write_outputs(
     prefix.parent.mkdir(parents=True, exist_ok=True)
     fragment_path = prefix.with_suffix(".athinput")
     manifest_path = prefix.with_suffix(".json")
-    ordered_parameters = ["rho0", "pgas0", "u1", "u2", "u3", "b1", "b2", "b3"]
-    ordered_parameters += [f"dlnrho_dxh{i}" for i in range(1, 4)]
-    ordered_parameters += [f"dlnpgas_dxh{i}" for i in range(1, 4)]
-    ordered_parameters += [f"du{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)]
-    ordered_parameters += [f"db{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)]
     lines = [
         "# Generated static first-order EMRI worldtube profile.",
         "# Copy these values into the <problem> block of an emri_windtunnel input.",
+        "# global_length_in_local_units = "
+        + _format_real(global_length_in_local_units),
+        "# density_renormalization = " + _format_real(density_renormalization),
     ]
-    lines.extend(f"{name:<18} = {_format_real(parameters[name])}" for name in ordered_parameters)
+    lines.extend(
+        f"{name:<18} = {_format_real(parameters[name])}"
+        for name in PROFILE_PARAMETER_ORDER
+    )
     fragment_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    overrides = [f"problem/{name}={_format_real(parameters[name])}" for name in ordered_parameters]
+    overrides = [
+        f"problem/{name}={_format_real(parameters[name])}"
+        for name in PROFILE_PARAMETER_ORDER
+    ]
     manifest = {
         "schema": 1,
         "classification": "athenak-emri-static-taylor-worldtube",
@@ -587,6 +662,9 @@ def write_outputs(
         "adm_file": str(adm_path),
         "adm_sha256": file_sha256(adm_path),
         "time": float(state["time"]),
+        "time_global_units": float(state["time"]),
+        "time_local_units": float(state["time"])
+        * global_length_in_local_units,
         "cycle": int(state["cycle"]),
         "anchor_global": anchor.tolist(),
         "primary_center_global": primary_center.tolist(),
@@ -594,6 +672,8 @@ def write_outputs(
         "source_coordinate_velocity": source_velocity.tolist(),
         "fit_radius_source": fit_radius,
         "metric_fit_radius_coordinate": metric_fit_radius,
+        "global_length_in_local_units": global_length_in_local_units,
+        "density_renormalization": density_renormalization,
         "source_tetrad_contravariant": tetrad.tolist(),
         "source_tetrad_coframe": coframe.tolist(),
         "parameters": parameters,
@@ -631,6 +711,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fit-radius", type=float, required=True)
     parser.add_argument("--metric-fit-radius", type=float)
+    parser.add_argument("--global-length-in-local-units", type=float, default=1.0)
+    parser.add_argument("--density-renormalization", type=float)
     return parser.parse_args()
 
 
@@ -646,6 +728,23 @@ def main() -> int:
     metric_fit_radius = args.metric_fit_radius or args.fit_radius
     if not metric_fit_radius > 0.0 or not math.isfinite(metric_fit_radius):
         raise SystemExit("--metric-fit-radius must be finite and positive")
+    if (
+        not args.global_length_in_local_units > 0.0
+        or not math.isfinite(args.global_length_in_local_units)
+    ):
+        raise SystemExit("--global-length-in-local-units must be finite and positive")
+    density_renormalization = args.density_renormalization
+    if density_renormalization is None:
+        if args.global_length_in_local_units != 1.0:
+            raise SystemExit(
+                "--density-renormalization must be chosen explicitly when global and "
+                "local length units differ"
+            )
+        density_renormalization = 1.0
+    if not density_renormalization > 0.0 or not math.isfinite(
+        density_renormalization
+    ):
+        raise SystemExit("--density-renormalization must be finite and positive")
     if args.source_velocity is not None:
         source_velocity = _vector(args.source_velocity, "source velocity")
     else:
@@ -677,6 +776,16 @@ def main() -> int:
         state, adm, adm_order, anchor, coframe, args.fit_radius
     )
     parameters, diagnostics = fit_static_profile(cloud, coframe, args.fit_radius)
+    parameters = rescale_profile_parameters(
+        parameters,
+        args.global_length_in_local_units,
+        density_renormalization,
+    )
+    diagnostics = rescale_profile_diagnostics(
+        diagnostics,
+        args.global_length_in_local_units,
+        density_renormalization,
+    )
     fragment, manifest = write_outputs(
         args.output_prefix.expanduser().resolve(),
         state_path,
@@ -690,6 +799,8 @@ def main() -> int:
         coframe,
         args.fit_radius,
         metric_fit_radius,
+        args.global_length_in_local_units,
+        density_renormalization,
         parameters,
         diagnostics,
         metric_errors,

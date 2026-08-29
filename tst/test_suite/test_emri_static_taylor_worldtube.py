@@ -116,3 +116,26 @@ def test_static_profile_recovers_manufactured_grmhd_state() -> None:
     assert diagnostics["density_log_weighted_rms"] < 1.0e-14
     assert diagnostics["velocity_weighted_rms"] < 1.0e-14
     assert diagnostics["magnetic_weighted_rms"] < 1.0e-14
+
+
+def test_global_to_local_unit_rescaling() -> None:
+    parameters = {name: 0.0 for name in extractor.PROFILE_PARAMETER_ORDER}
+    parameters.update(
+        rho0=8.0,
+        pgas0=4.0,
+        u1=0.25,
+        b1=6.0,
+        dlnrho_dxh1=10.0,
+        dlnpgas_dxh2=8.0,
+        du2_dxh3=12.0,
+        db1_dxh2=14.0,
+    )
+    scaled = extractor.rescale_profile_parameters(parameters, 2.0, 9.0)
+    np.testing.assert_allclose(scaled["rho0"], 18.0)
+    np.testing.assert_allclose(scaled["pgas0"], 9.0)
+    np.testing.assert_allclose(scaled["u1"], 0.25)
+    np.testing.assert_allclose(scaled["b1"], 9.0)
+    np.testing.assert_allclose(scaled["dlnrho_dxh1"], 5.0)
+    np.testing.assert_allclose(scaled["dlnpgas_dxh2"], 4.0)
+    np.testing.assert_allclose(scaled["du2_dxh3"], 6.0)
+    np.testing.assert_allclose(scaled["db1_dxh2"], 10.5)

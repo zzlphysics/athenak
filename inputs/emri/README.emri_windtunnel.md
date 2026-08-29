@@ -199,6 +199,17 @@ python3 inputs/emri/extract_static_taylor_worldtube.py \
   --fit-radius 0.5
 ```
 
+The extractor defaults to identical global/local code units.  When the global disk uses
+`M_primary=1` but the local tunnel uses `m_secondary=1`, pass
+`--global-length-in-local-units M_primary/m_secondary` (normally `1/q`).  If `L` is this
+ratio and `D` is `--density-renormalization`, conversion gives
+`t_local=L t_global`, `(rho,p)_local=D (rho,p)_global/L^2`,
+`B_local=sqrt(D) B_global/L`, scalar and velocity gradients divided by `L`, and magnetic
+gradients multiplied by `sqrt(D)/L^2`.  Choosing `D=L^2` keeps the density normalization
+near its global numerical value while preserving pressure-to-density ratio and
+magnetization.  Both factors are recorded in the manifest; relying on an implicit unit
+convention is not supported.
+
 `--source-velocity vx vy vz` can replace `--orbital-omega`; both are global coordinate
 velocities `dx^i/dt`, not physical three-velocities.  The extractor:
 
@@ -221,8 +232,108 @@ additional physical resolution.
 
 This extractor is intentionally static and one-way.  It holds the anchor tetrad fixed
 across the fitting sphere and replaces cell-centered magnetic samples with their best
-trace-free linear approximation.  Those limitations are recorded in every manifest and
-will be lifted by the time-dependent worldtube stage.
+trace-free linear approximation.  The profile-series stage below removes the
+time-independence; the one-way and first-order spatial limitations remain explicit in
+every manifest.
+
+## Time-dependent Taylor worldtube replay
+
+`build_taylor_worldtube_series.py` repeats the constrained extraction along a supplied
+circular-equatorial worldline.  Its input is a JSON manifest; dump paths may be absolute
+or relative to the manifest:
+
+```json
+{
+  "classification": "athenak-emri-worldline-v1",
+  "samples": [
+    {
+      "state": "dumps/global.mhd_w_bcc.00100.bin",
+      "adm": "dumps/global.adm.00100.bin",
+      "anchor": [10.0, 0.0, 0.0],
+      "source_velocity": [0.0, 0.0316, 0.0]
+    },
+    {
+      "state": "dumps/global.mhd_w_bcc.00101.bin",
+      "adm": "dumps/global.adm.00101.bin",
+      "anchor": [9.999, 0.141, 0.0],
+      "source_velocity": [-0.00045, 0.0316, 0.0]
+    }
+  ]
+}
+```
+
+Build the replay table and its provenance manifest with
+
+```bash
+python3 inputs/emri/build_taylor_worldtube_series.py \
+  --manifest profiles/worldline.json \
+  --output-prefix profiles/orbit-r10 \
+  --primary-center 0 0 0 \
+  --disk-normal 0 0 1 \
+  --fit-radius 0.5 \
+  --global-length-in-local-units 100000 \
+  --density-renormalization 1.0e10
+```
+
+The builder rejects non-increasing dump times and a worldline whose radius, height,
+angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is
+not merely a convenience check: the current local metric is circular and equatorial, so
+feeding it an eccentric or inclined trajectory would combine incompatible frames.  The
+converted coordinate radius and angular frequency are embedded in the table; the C++
+loader rejects a table that does not match the configured local orbit within the same
+tolerance.
+
+Enable online replay with
+
+```text
+<adm>
+dynamic = true
+
+<problem>
+profile_file          = profiles/orbit-r10.dat
+profile_time_offset   = 1000.0
+profile_extrapolation = error
+```
+
+The table time is `simulation_time + profile_time_offset`; use `auto` (the template
+default) to align local startup with the first table row.  The resolved numeric offset is
+written into restarts.  `profile_extrapolation=error` is the production-safe default,
+while `hold` clamps to the first or last state for controlled tests.  Dynamic ADM refresh
+supplies the RK-stage time, so the replay is synchronized with RK1/2/3.
+Level subcycling is rejected for now because a single process-global boundary profile
+cannot yet represent two simultaneously cached level times.
+
+The restart contract stores a compact versioned digest of all metric/profile controls
+and an FNV-1a digest of the table bytes.  A changed table is therefore rejected before
+restart evolution, while the short digest keeps AthenaK's parameter header below its
+fixed read limit.
+
+Density and pressure are interpolated logarithmically.  Velocity, magnetic field, and
+all gradients are interpolated linearly; interpolation of two trace-free magnetic
+gradients remains trace-free.  Initial magnetic faces still come from the discrete curl
+of the analytic vector potential, and replay only prescribes user ghost faces, leaving
+active faces under CT evolution.  Consequently the active-grid divergence constraint is
+preserved even when the upstream field changes in time.
+
+This divergence statement is numerical, not a claim that arbitrary snapshot-to-snapshot
+changes satisfy Faraday's law at the boundary.  The coefficient replay does not import a
+global edge EMF.  Use a dump cadence that resolves the shortest relevant eddy/advection
+time, check convergence after halving that cadence, and monitor boundary Poynting flux.
+Rapid magnetic variability requires the later face-flux-plus-EMF worldtube path.
+
+Every face marked `user` is prescribed by the analytic profile.  Mark only faces that
+remain upstream over the complete table and verify that the fitted normal velocity never
+reverses there.  If turbulence changes which face supplies the domain, the current fixed
+face contract is insufficient; making every face prescribed would also corrupt the
+downstream wake.  A characteristic inflow/outflow switch should be implemented before
+using such a dataset.
+
+This coefficient replay deliberately avoids pointwise interpolation between the global
+and local meshes.  Each global AMR leaf cell contributes with its physical volume to a
+local source-tetrad fit, and the small simulation evaluates that continuous fit on its
+own mesh.  If the local box spans enough global cells that first-order residuals are no
+longer small, the next extension should replay a spatial worldtube (preferably vector
+potential or face flux plus EMF), not silently increase the polynomial order.
 
 ## Validation gates before science production
 

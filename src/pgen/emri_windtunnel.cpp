@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -71,6 +73,18 @@ struct WindTunnelParameters {
   bool force_is_source_tetrad;
 };
 
+struct WindProfileSample {
+  Real time;
+  Real rho;
+  Real pressure;
+  Real wind_u[3];
+  Real magnetic_field[3];
+  Real log_density_gradient[3];
+  Real log_pressure_gradient[3];
+  Real velocity_gradient[3][3];
+  Real magnetic_gradient_source[3][3];
+};
+
 struct MetricWithDerivatives {
   Real g[4][4];
   Real dg[4][4][4];  // dg[coordinate][first metric index][second metric index]
@@ -86,6 +100,15 @@ struct ADMPoint {
 
 WindTunnelParameters wind_tunnel;
 std::vector<Real> refinement_shell_radii;
+std::vector<WindProfileSample> wind_profile_table;
+std::uint64_t wind_profile_hash = 0;
+Real wind_profile_time_offset = 0.0;
+Real wind_profile_current_table_time = std::numeric_limits<Real>::quiet_NaN();
+Real wind_profile_source_coordinate_radius = std::numeric_limits<Real>::quiet_NaN();
+Real wind_profile_source_omega = std::numeric_limits<Real>::quiet_NaN();
+Real wind_profile_orbit_tolerance = std::numeric_limits<Real>::quiet_NaN();
+bool wind_profile_enabled = false;
+bool wind_profile_hold_outside = false;
 bool omega_is_geodesic = false;
 Real primary_geodesic_residual = 0.0;
 
@@ -119,7 +142,8 @@ Real MetricInnerProduct(const Real metric[4][4], const Real left[4],
 
 //! Construct an orthonormal tetrad at the secondary's orbit using only the external
 //! background.  Its timelike leg follows the stationary source worldline x^i=0; the
-//! spatial legs are Gram-Schmidt aligned with local radial, tangential, and vertical axes.
+//! spatial legs are Gram-Schmidt aligned with local radial, tangential, and vertical
+//! axes.
 KOKKOS_INLINE_FUNCTION
 void BuildSourceTetrad(const emri_comoving::MetricParameters &parameters,
                        Real tetrad[4][4]) {
@@ -985,11 +1009,260 @@ void ValidateSpatialProfiles(const RegionSize &domain) {
   }
 }
 
-std::string MetricRestartContract() {
+std::string FormatFNV1a64(const std::uint64_t hash) {
+  std::ostringstream formatted;
+  formatted << std::hex << std::setfill('0') << std::setw(16) << hash;
+  return formatted.str();
+}
+
+std::string HashStringFNV1a64(const std::string &value) {
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  for (const unsigned char byte : value) {
+    hash ^= byte;
+    hash *= UINT64_C(1099511628211);
+  }
+  return FormatFNV1a64(hash);
+}
+
+std::uint64_t HashWindProfileFile(const std::string &path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) Fatal("cannot open <problem> profile_file: "+path);
+  std::uint64_t hash = UINT64_C(14695981039346656037);
+  char buffer[8192];
+  while (stream) {
+    stream.read(buffer, sizeof(buffer));
+    const std::streamsize count = stream.gcount();
+    for (std::streamsize index=0; index<count; ++index) {
+      hash ^= static_cast<unsigned char>(buffer[index]);
+      hash *= UINT64_C(1099511628211);
+    }
+  }
+  if (!stream.eof()) Fatal("failed while hashing <problem> profile_file: "+path);
+  return hash;
+}
+
+void ValidateWindProfileSample(const WindProfileSample &sample,
+                               const int line_number) {
+  std::vector<Real> values = {
+    sample.time, sample.rho, sample.pressure,
+    sample.wind_u[0], sample.wind_u[1], sample.wind_u[2],
+    sample.magnetic_field[0], sample.magnetic_field[1], sample.magnetic_field[2]
+  };
+  for (int direction=0; direction<3; ++direction) {
+    values.push_back(sample.log_density_gradient[direction]);
+    values.push_back(sample.log_pressure_gradient[direction]);
+    for (int component=0; component<3; ++component) {
+      values.push_back(sample.velocity_gradient[component][direction]);
+      values.push_back(sample.magnetic_gradient_source[component][direction]);
+    }
+  }
+  for (const Real value : values) {
+    if (!std::isfinite(value)) {
+      Fatal("non-finite value in EMRI profile table line "
+            +std::to_string(line_number));
+    }
+  }
+  if (!(sample.rho > 0.0) || !(sample.pressure > 0.0)) {
+    Fatal("non-positive density or pressure in EMRI profile table line "
+          +std::to_string(line_number));
+  }
+  Real trace = 0.0;
+  Real scale = 0.0;
+  for (int component=0; component<3; ++component) {
+    trace += sample.magnetic_gradient_source[component][component];
+    for (int direction=0; direction<3; ++direction) {
+      scale = std::max(scale, std::abs(
+          sample.magnetic_gradient_source[component][direction]));
+    }
+  }
+  const Real tolerance = 256.0*std::numeric_limits<Real>::epsilon()
+                       *std::max(scale, Real(1.0));
+  if (std::abs(trace) > tolerance) {
+    Fatal("magnetic gradient is not trace-free in EMRI profile table line "
+          +std::to_string(line_number));
+  }
+}
+
+bool ParseWindProfileMetadata(const std::string &line, const std::string &name,
+                              Real &value) {
+  const std::string prefix = "# "+name+":";
+  if (line.compare(0, prefix.size(), prefix) != 0) return false;
+  if (std::isfinite(value)) Fatal("duplicate EMRI profile metadata for "+name);
+  std::istringstream stream(line.substr(prefix.size()));
+  stream >> value >> std::ws;
+  if (!stream.eof() || !std::isfinite(value)) {
+    Fatal("invalid EMRI profile metadata value for "+name);
+  }
+  return true;
+}
+
+void LoadWindProfileTable(const std::string &path) {
+  std::ifstream stream(path);
+  if (!stream) Fatal("cannot open <problem> profile_file: "+path);
+  wind_profile_table.clear();
+  wind_profile_source_coordinate_radius = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_source_omega = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_orbit_tolerance = std::numeric_limits<Real>::quiet_NaN();
+  std::string line;
+  int line_number = 0;
+  bool has_table_contract = false;
+  while (std::getline(stream, line)) {
+    ++line_number;
+    const std::size_t first = line.find_first_not_of(" \t\r");
+    if (first == std::string::npos) continue;
+    if (line[first] == '#') {
+      const std::string metadata = line.substr(first);
+      has_table_contract = has_table_contract
+          || metadata == "# athenak-emri-taylor-series-v2";
+      ParseWindProfileMetadata(
+          metadata, "source_coordinate_radius_local_units",
+          wind_profile_source_coordinate_radius);
+      ParseWindProfileMetadata(
+          metadata, "source_coordinate_angular_frequency_local_units",
+          wind_profile_source_omega);
+      ParseWindProfileMetadata(
+          metadata, "orbit_tolerance", wind_profile_orbit_tolerance);
+      continue;
+    }
+    std::istringstream row(line);
+    std::vector<Real> values;
+    Real value;
+    while (row >> value) values.push_back(value);
+    row >> std::ws;
+    if (!row.eof() || values.size() != 33) {
+      Fatal("EMRI profile table line "+std::to_string(line_number)
+            +" must contain time plus 32 profile values");
+    }
+    WindProfileSample sample{};
+    int column = 0;
+    sample.time = values[column++];
+    sample.rho = values[column++];
+    sample.pressure = values[column++];
+    for (int component=0; component<3; ++component) {
+      sample.wind_u[component] = values[column++];
+    }
+    for (int component=0; component<3; ++component) {
+      sample.magnetic_field[component] = values[column++];
+    }
+    for (int direction=0; direction<3; ++direction) {
+      sample.log_density_gradient[direction] = values[column++];
+    }
+    for (int direction=0; direction<3; ++direction) {
+      sample.log_pressure_gradient[direction] = values[column++];
+    }
+    for (int component=0; component<3; ++component) {
+      for (int direction=0; direction<3; ++direction) {
+        sample.velocity_gradient[component][direction] = values[column++];
+      }
+    }
+    for (int component=0; component<3; ++component) {
+      for (int direction=0; direction<3; ++direction) {
+        sample.magnetic_gradient_source[component][direction] = values[column++];
+      }
+    }
+    ValidateWindProfileSample(sample, line_number);
+    if (!wind_profile_table.empty()
+        && !(sample.time > wind_profile_table.back().time)) {
+      Fatal("EMRI profile table times must increase strictly");
+    }
+    wind_profile_table.push_back(sample);
+  }
+  if (!stream.eof()) Fatal("failed while reading <problem> profile_file: "+path);
+  if (!has_table_contract) {
+    Fatal("EMRI profile table is missing the athenak-emri-taylor-series-v2 contract");
+  }
+  if (!(wind_profile_source_coordinate_radius > 0.0)
+      || !std::isfinite(wind_profile_source_omega)
+      || !(wind_profile_orbit_tolerance > 0.0)) {
+    Fatal("EMRI profile table is missing valid orbit metadata");
+  }
+  if (wind_profile_table.size() < 2) {
+    Fatal("EMRI profile table requires at least two data rows");
+  }
+  wind_profile_hash = HashWindProfileFile(path);
+  wind_profile_current_table_time = std::numeric_limits<Real>::quiet_NaN();
+}
+
+Real InterpolateProfileValue(const Real lower, const Real upper,
+                             const Real fraction) {
+  return lower+fraction*(upper-lower);
+}
+
+void UpdateWindProfileForTime(const Real simulation_time,
+                              const RegionSize &domain) {
+  if (!wind_profile_enabled) return;
+  Real table_time = simulation_time+wind_profile_time_offset;
+  const Real first_time = wind_profile_table.front().time;
+  const Real last_time = wind_profile_table.back().time;
+  const Real time_scale = std::max({Real(1.0), std::abs(table_time),
+                                    std::abs(first_time), std::abs(last_time)});
+  const Real tolerance = 64.0*std::numeric_limits<Real>::epsilon()*time_scale;
+  if (table_time < first_time-tolerance || table_time > last_time+tolerance) {
+    if (!wind_profile_hold_outside) {
+      Fatal("EMRI profile request lies outside the table time range: table_time="
+            +std::to_string(table_time));
+    }
+    table_time = std::min(std::max(table_time, first_time), last_time);
+  } else {
+    table_time = std::min(std::max(table_time, first_time), last_time);
+  }
+  if (table_time == wind_profile_current_table_time) return;
+
+  const auto upper = std::upper_bound(
+      wind_profile_table.begin(), wind_profile_table.end(), table_time,
+      [](const Real time, const WindProfileSample &sample) {
+        return time < sample.time;
+      });
+  const WindProfileSample *left = nullptr;
+  const WindProfileSample *right = nullptr;
+  Real fraction = 0.0;
+  if (upper == wind_profile_table.begin()) {
+    left = right = &wind_profile_table.front();
+  } else if (upper == wind_profile_table.end()) {
+    left = right = &wind_profile_table.back();
+  } else {
+    right = &(*upper);
+    left = &(*(upper-1));
+    fraction = (table_time-left->time)/(right->time-left->time);
+  }
+  wind_tunnel.rho = std::exp(InterpolateProfileValue(
+      std::log(left->rho), std::log(right->rho), fraction));
+  wind_tunnel.pressure = std::exp(InterpolateProfileValue(
+      std::log(left->pressure), std::log(right->pressure), fraction));
+  for (int component=0; component<3; ++component) {
+    wind_tunnel.wind_u[component] = InterpolateProfileValue(
+        left->wind_u[component], right->wind_u[component], fraction);
+    wind_tunnel.magnetic_field[component] = InterpolateProfileValue(
+        left->magnetic_field[component], right->magnetic_field[component], fraction);
+  }
+  for (int direction=0; direction<3; ++direction) {
+    wind_tunnel.log_density_gradient[direction] = InterpolateProfileValue(
+        left->log_density_gradient[direction],
+        right->log_density_gradient[direction], fraction);
+    wind_tunnel.log_pressure_gradient[direction] = InterpolateProfileValue(
+        left->log_pressure_gradient[direction],
+        right->log_pressure_gradient[direction], fraction);
+    for (int component=0; component<3; ++component) {
+      wind_tunnel.velocity_gradient[component][direction] = InterpolateProfileValue(
+          left->velocity_gradient[component][direction],
+          right->velocity_gradient[component][direction], fraction);
+      wind_tunnel.magnetic_gradient_source[component][direction] =
+          InterpolateProfileValue(
+              left->magnetic_gradient_source[component][direction],
+              right->magnetic_gradient_source[component][direction], fraction);
+    }
+  }
+  ConfigureSourceFrame();
+  ConfigureMagneticGradient();
+  ValidateSpatialProfiles(domain);
+  wind_profile_current_table_time = table_time;
+}
+
+std::string MetricRestartContractPayload() {
   const auto &metric = wind_tunnel.metric;
   std::ostringstream contract;
   contract << std::setprecision(std::numeric_limits<Real>::max_digits10)
-           << "emri-comoving-v4"
+           << "emri-comoving-v5"
            << ";primary_mass=" << metric.primary_mass
            << ";secondary_mass=" << metric.secondary_mass
            << ";primary_spin=" << metric.primary_spin
@@ -1005,27 +1278,36 @@ std::string MetricRestartContract() {
            << ";embed_secondary_in_tetrad=" << metric.embed_secondary_in_tetrad
            << ";metric_fd_step=" << wind_tunnel.metric_fd_step
            << ";external_metric_fd_step=" << wind_tunnel.external_metric_fd_step
-           << ";rho=" << wind_tunnel.rho
-           << ";pressure=" << wind_tunnel.pressure
-           << ";wind_u1=" << wind_tunnel.wind_u[0]
-           << ";wind_u2=" << wind_tunnel.wind_u[1]
-           << ";wind_u3=" << wind_tunnel.wind_u[2]
-           << ";magnetic_b1=" << wind_tunnel.magnetic_field[0]
-           << ";magnetic_b2=" << wind_tunnel.magnetic_field[1]
-           << ";magnetic_b3=" << wind_tunnel.magnetic_field[2]
            << ";max_log_contrast=" << wind_tunnel.max_log_contrast;
-  for (int direction=0; direction<3; ++direction) {
-    contract << ";dlnrho_dxh" << direction+1 << "="
-             << wind_tunnel.log_density_gradient[direction]
-             << ";dlnpgas_dxh" << direction+1 << "="
-             << wind_tunnel.log_pressure_gradient[direction];
-  }
-  for (int component=0; component<3; ++component) {
+  if (wind_profile_enabled) {
+    contract << ";profile_hash_fnv1a64=" << FormatFNV1a64(wind_profile_hash)
+             << ";profile_rows=" << wind_profile_table.size()
+             << ";profile_first_time=" << wind_profile_table.front().time
+             << ";profile_last_time=" << wind_profile_table.back().time
+             << ";profile_time_offset=" << wind_profile_time_offset
+             << ";profile_hold_outside=" << wind_profile_hold_outside;
+  } else {
+    contract << ";rho=" << wind_tunnel.rho
+             << ";pressure=" << wind_tunnel.pressure
+             << ";wind_u1=" << wind_tunnel.wind_u[0]
+             << ";wind_u2=" << wind_tunnel.wind_u[1]
+             << ";wind_u3=" << wind_tunnel.wind_u[2]
+             << ";magnetic_b1=" << wind_tunnel.magnetic_field[0]
+             << ";magnetic_b2=" << wind_tunnel.magnetic_field[1]
+             << ";magnetic_b3=" << wind_tunnel.magnetic_field[2];
     for (int direction=0; direction<3; ++direction) {
-      contract << ";du" << component+1 << "_dxh" << direction+1 << "="
-               << wind_tunnel.velocity_gradient[component][direction]
-               << ";db" << component+1 << "_dxh" << direction+1 << "="
-               << wind_tunnel.magnetic_gradient_source[component][direction];
+      contract << ";dlnrho_dxh" << direction+1 << "="
+               << wind_tunnel.log_density_gradient[direction]
+               << ";dlnpgas_dxh" << direction+1 << "="
+               << wind_tunnel.log_pressure_gradient[direction];
+    }
+    for (int direction=0; direction<3; ++direction) {
+      for (int component=0; component<3; ++component) {
+        contract << ";du" << component+1 << "_dxh" << direction+1 << "="
+                 << wind_tunnel.velocity_gradient[component][direction]
+                 << ";db" << component+1 << "_dxh" << direction+1 << "="
+                 << wind_tunnel.magnetic_gradient_source[component][direction];
+      }
     }
   }
   contract
@@ -1034,13 +1316,18 @@ std::string MetricRestartContract() {
   return contract.str();
 }
 
+std::string MetricRestartContract() {
+  return "emri-comoving-v5-fnv1a64="
+         +HashStringFNV1a64(MetricRestartContractPayload());
+}
+
 void ValidateOrStoreRestartContract(ParameterInput *pin, const bool restart) {
   constexpr const char *name = "emri_metric_restart_contract";
   const std::string current = MetricRestartContract();
   if (restart) {
     if (!pin->DoesParameterExist("problem", name)
         || pin->GetString("problem", name) != current) {
-      Fatal("EMRI metric parameters differ from the restart contract");
+      Fatal("EMRI metric/profile parameters differ from the restart contract");
     }
   } else {
     if (pin->DoesParameterExist("problem", name)) {
@@ -1510,6 +1797,15 @@ Real RefinementRadius(const int physical_level) {
 
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
+  wind_profile_table.clear();
+  wind_profile_hash = 0;
+  wind_profile_time_offset = 0.0;
+  wind_profile_current_table_time = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_source_coordinate_radius = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_source_omega = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_orbit_tolerance = std::numeric_limits<Real>::quiet_NaN();
+  wind_profile_enabled = false;
+  wind_profile_hold_outside = false;
   if (!pmbp->pcoord->is_dynamical_relativistic || pmbp->padm == nullptr
       || pmbp->pdyngr == nullptr || pmbp->pmhd == nullptr) {
     Fatal("emri_windtunnel requires <adm> and <mhd> blocks (dynamical GRMHD)");
@@ -1678,6 +1974,56 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   } else {
     Fatal("unknown <problem> force_frame: "+force_frame);
   }
+  const std::string profile_file =
+      pin->GetOrAddString("problem", "profile_file", "");
+  if (!profile_file.empty()) {
+    if (!wind_tunnel.wind_is_source_tetrad) {
+      Fatal("time-dependent EMRI profiles require <problem> wind_frame=source_tetrad");
+    }
+    if (!pmbp->padm->is_dynamic) {
+      Fatal("time-dependent EMRI profiles require <adm> dynamic=true for RK-stage "
+            "boundary synchronization");
+    }
+    if (pin->DoesParameterExist("time", "subcycling")
+        && pin->GetString("time", "subcycling") == "level") {
+      Fatal("time-dependent EMRI profiles do not yet support time/subcycling=level");
+    }
+    LoadWindProfileTable(profile_file);
+    const Real radius_scale = std::max(
+        std::abs(metric.coordinate_radius),
+        std::abs(wind_profile_source_coordinate_radius));
+    const Real omega_scale = std::max({
+        std::abs(metric.omega), std::abs(wind_profile_source_omega),
+        std::numeric_limits<Real>::min()});
+    if (std::abs(metric.coordinate_radius-wind_profile_source_coordinate_radius)
+            > wind_profile_orbit_tolerance*radius_scale
+        || std::abs(metric.omega-wind_profile_source_omega)
+            > wind_profile_orbit_tolerance*omega_scale) {
+      Fatal("EMRI profile orbit metadata is incompatible with the local metric");
+    }
+    wind_profile_enabled = true;
+    const std::string offset_setting = pin->GetOrAddString(
+        "problem", "profile_time_offset", "auto");
+    if (offset_setting == "auto") {
+      wind_profile_time_offset = wind_profile_table.front().time-pmy_mesh_->time;
+      pin->SetReal("problem", "profile_time_offset", wind_profile_time_offset);
+    } else {
+      std::istringstream offset_stream(offset_setting);
+      offset_stream >> wind_profile_time_offset >> std::ws;
+      if (!offset_stream.eof()) {
+        Fatal("<problem> profile_time_offset must be a finite real or auto");
+      }
+    }
+    const std::string extrapolation = pin->GetOrAddString(
+        "problem", "profile_extrapolation", "error");
+    if (extrapolation == "error") {
+      wind_profile_hold_outside = false;
+    } else if (extrapolation == "hold") {
+      wind_profile_hold_outside = true;
+    } else {
+      Fatal("unknown <problem> profile_extrapolation: "+extrapolation);
+    }
+  }
   wind_tunnel.refinement_radius =
       pin->GetOrAddReal("problem", "refinement_radius", 6.0*metric.secondary_mass);
   wind_tunnel.refinement_radius_ratio =
@@ -1726,6 +2072,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     wind_tunnel.force_outer_radius[1], wind_tunnel.force_outer_radius[2],
     wind_tunnel.adiabatic_index
   };
+  if (wind_profile_enabled) finite_values.push_back(wind_profile_time_offset);
   for (int direction=0; direction<3; ++direction) {
     finite_values.push_back(wind_tunnel.log_density_gradient[direction]);
     finite_values.push_back(wind_tunnel.log_pressure_gradient[direction]);
@@ -1794,9 +2141,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 #endif
   ConfigureSourceFrame();
   ConfigureMagneticGradient();
-  ValidateSpatialProfiles(domain);
+  if (wind_profile_enabled) {
+    UpdateWindProfileForTime(pmy_mesh_->time, domain);
+  } else {
+    ValidateSpatialProfiles(domain);
+  }
 
-  bool has_analytic_gradient = false;
+  bool has_analytic_gradient = wind_profile_enabled;
   for (int direction=0; direction<3; ++direction) {
     has_analytic_gradient = has_analytic_gradient
         || wind_tunnel.log_density_gradient[direction] != 0.0
@@ -1926,6 +2277,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << ", wind frame=" << wind_frame
               << ", force frame=" << force_frame
               << ", analytic gradients=" << has_analytic_gradient
+              << ", profile replay=" << wind_profile_enabled
               << ", r_H/m=" << hill_radius/metric.secondary_mass
               << ", box/orbit=" << largest_extent/metric.orbital_radius
               << ", metric_fd_step/m="
@@ -1941,6 +2293,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << ", ADM cache="
               << (pmbp->padm->is_dynamic ? "stage-refresh" : "stationary")
               << std::endl;
+    if (wind_profile_enabled) {
+      std::cout << "EMRI profile table: rows=" << wind_profile_table.size()
+                << ", time=[" << wind_profile_table.front().time << ","
+                << wind_profile_table.back().time << "]"
+                << ", offset=" << wind_profile_time_offset
+                << ", FNV1a64=" << FormatFNV1a64(wind_profile_hash) << std::endl;
+    }
   }
   if (restart) return;
 
@@ -1984,6 +2343,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 namespace {
 
 void SetADMVariablesToEMRI(MeshBlockPack *pmbp) {
+  UpdateWindProfileForTime(pmbp->pmesh->time, pmbp->pmesh->mesh_size);
   auto &adm_vars = pmbp->padm->adm;
   auto &size = pmbp->pmb->mb_size;
   auto &indcs = pmbp->pmesh->mb_indcs;

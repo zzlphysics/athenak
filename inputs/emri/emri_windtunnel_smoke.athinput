@@ -62,8 +62,8 @@ dexcise         = 1.0e-8
 pexcise         = 1.0e-10
 
 <adm>
-# The helically symmetric metric is stationary in the local chart.  Set true only when
-# required by strict level subcycling; ordinary AMR refreshes static ADM data on regrid.
+# The helically symmetric metric is stationary in the local chart.  Set true for
+# time-dependent profile replay or strict level subcycling; ordinary AMR can leave false.
 dynamic = false
 
 <mhd>
@@ -141,6 +141,11 @@ db3_dxh1          = 0.0
 db3_dxh2          = 0.0
 db3_dxh3          = 0.0
 max_log_contrast  = 20.0
+
+# Optional time-dependent Taylor replay.  A nonempty table requires adm/dynamic=true.
+profile_file          =
+profile_time_offset   = auto
+profile_extrapolation = error
 
 # Metric regularization is compactly supported inside the component horizons.
 spin_buffer_primary   = 0.05
