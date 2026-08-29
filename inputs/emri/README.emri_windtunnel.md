@@ -687,6 +687,44 @@ Likewise, a moving extraction cube needs the motional EMF in the discrete map.  
 current magnetic replay is consequently a complete CT/topology transport layer and an
 end-to-end test bed, not yet the final physical fluid boundary condition.
 
+### Incoming-characteristic reference projector
+
+`worldtube_characteristics.py` fixes the mathematical convention for the remaining
+fluid boundary.  At each face point the global/source-frame state must first be mapped
+to a local orthonormal frame whose first spatial axis is the outward normal.  In that
+frame the independent ideal-RMHD primitive vector is
+
+```text
+q = (rho, pgas, u_normal, u_tangent_u, u_tangent_v,
+     B_tangent_u, B_tangent_v),
+```
+
+while `B_normal` is supplied by the CT face flux and is not an independently prescribed
+wave variable.  The module differentiates the SRMHD conserved variables and normal
+fluxes, constructs the seven-wave primitive Jacobian, and projects
+`q_external-q_interior` onto its eigenvectors.  With an outward normal, only eigenvalues
+`lambda < 0` enter the domain.  The boundary state is therefore
+
+```text
+q_boundary = q_interior + R P_incoming L (q_external - q_interior).
+```
+
+This is the local-characteristic strategy for GRMHD: spacetime curvature enters through
+the boundary tetrad and coordinate wave-speed conversion, while the local wave fan is
+special relativistic.  The reference implementation uses complex-step Jacobians and a
+dense eigensolve so it is transparent and independently testable.  It recovers the exact
+relativistic hydrodynamic sound speeds when `B=0`, returns the complete exterior state
+for super-fast inflow, retains the interior state for super-fast outflow, and replaces
+only the incoming amplitudes in a mixed fan.
+
+It is not yet called by the AthenaK boundary task.  A production device implementation
+must use a degeneracy-safe RMHD eigenbasis (or a separately validated equivalent
+projector), interpolate the exterior state in time, construct the local orthonormal
+tetrad at every boundary cell, and update ghost conserved variables consistently.  The
+host reference intentionally aborts on an ill-conditioned eigenbasis instead of silently
+falling back to primitive copying.  These choices follow the local-Riemann construction
+of Antón et al. (2006) and prevent the replay from overconstraining outgoing modes.
+
 ## Validation gates before science production
 
 1. Recover the isolated Kerr BHL result as `primary_mass/orbital_radius -> 0` at fixed

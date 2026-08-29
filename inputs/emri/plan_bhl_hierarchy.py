@@ -423,7 +423,8 @@ def build_plan(
         "status": (
             "fixed-grid outer writer and inner CT magnetic replay implemented; "
             "moving/source-frame pullback and CT cochain projection implemented; "
-            "cut-surface/AMR sampling and characteristic fluid replay pending"
+            "cut-surface/AMR sampling pending; host incoming-characteristic reference "
+            "projector implemented, AthenaK device replay pending"
         ),
         "geometry": "secondary-centered cubical worldtube in source-tetrad axes",
         "cube_half_width": match_radius,
