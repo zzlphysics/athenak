@@ -152,6 +152,15 @@ def test_projection_repairs_sampled_edges_without_changing_flux() -> None:
     assert validated["maximum_shared_edge_emf_residual"] == 0.0
     assert max(validated["maximum_faraday_residual_by_face"].values()) < 2.0e-14
     assert diagnostics["intervals"][0]["maximum_edge_correction"] > 0.0
+    assert diagnostics["intervals"][0]["sampled_maximum_edge"] > 0.0
+    expected_relative = (
+        diagnostics["intervals"][0]["maximum_edge_correction"]
+        / diagnostics["intervals"][0]["sampled_maximum_edge"]
+    )
+    assert np.isclose(
+        diagnostics["intervals"][0]["relative_maximum_edge_correction"],
+        expected_relative,
+    )
     assert diagnostics["intervals"][0]["final_maximum_faraday_residual"] < 2.0e-14
 
 

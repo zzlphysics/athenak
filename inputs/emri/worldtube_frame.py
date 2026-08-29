@@ -504,7 +504,8 @@ def project_interval_edges(
     correction = complex_.transpose_curl(potential)
     corrected = sampled + correction
     final_residual = target - complex_.curl(corrected)
-    edge_scale = max(float(np.max(np.abs(sampled))), 1.0)
+    sampled_maximum = float(np.max(np.abs(sampled)))
+    edge_scale = max(sampled_maximum, np.finfo(float).tiny)
     return corrected, {
         "iterations": iterations,
         "solver_l2_residual": solver_residual,
@@ -512,6 +513,7 @@ def project_interval_edges(
         "final_maximum_faraday_residual": float(np.max(np.abs(final_residual))),
         "maximum_edge_correction": float(np.max(np.abs(correction))),
         "rms_edge_correction": float(np.sqrt(np.mean(correction**2))),
+        "sampled_maximum_edge": sampled_maximum,
         "relative_maximum_edge_correction": float(
             np.max(np.abs(correction)) / edge_scale
         ),

@@ -739,6 +739,77 @@ L2 errors were `1.84e-5`, `6.78e-5`, `3.94e-5`, and `3.35e-5`.  The first three 
 the online closure accuracy; the larger magnetic error isolates the snapshot-EMF
 approximation that must be converged with dump cadence.
 
+### Offline extraction convergence campaign
+
+`analyze_global_worldtube_convergence.py` compares an offline NPZ against the online
+outer-writer stream.  Candidate endpoint times may be a subset of the online times.  In
+that case the reference edge EMF is not subsampled: each group of fine intervals is
+combined with its exact `dt`-weighted temporal mean.  Consequently the coarsened
+reference retains the integrated discrete Faraday update and shared-edge orientation.
+
+The complete CPU campaign can be reproduced with
+
+```bash
+python3 inputs/emri/run_global_worldtube_convergence.py \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/offline_convergence \
+  --outer-cells 16 24 32 \
+  --cadence-strides 1 2 4 \
+  --quadrature-orders 1 2 3 \
+  --replay-quadrature 2 \
+  --tlim 0.08 --cfl 0.02 --fail-on-gate
+```
+
+For every source resolution, the driver evolves one DynGRMHD reference, writes
+co-temporal `mhd_w_bcc` and ADM dumps at every step, and records the exact online RK
+worldtube.  It then extracts all cadence/quadrature combinations, performs the two CT
+projections, compares against the conservatively coarsened online stream, replays the
+second-order products through `characteristic_gr`, and writes both per-case JSON and a
+global `summary.json`.  The input is a smooth short-duration regression problem; the
+reported gates are software acceptance criteria, not universal physics tolerances.
+
+The standard 27-case CPU result gives the following finest-cadence errors and extraction
+costs (wall time depends on the host):
+
+| source cells | Gauss order | flux relative L2 | EMF relative L2 | CPU seconds |
+|---:|---:|---:|---:|---:|
+| 16 | 2 | 5.61e-5 | 7.97e-3 | 1.93 |
+| 16 | 3 | 4.75e-5 | 5.32e-3 | 4.04 |
+| 24 | 2 | 2.76e-5 | 3.44e-3 | 6.48 |
+| 24 | 3 | 2.37e-5 | 2.29e-3 | 13.79 |
+| 32 | 2 | 1.59e-5 | 1.91e-3 | 14.02 |
+| 32 | 3 | 1.36e-5 | 1.26e-3 | 29.91 |
+
+At third order the measured adjacent spatial orders are `1.72, 1.93` for face flux and
+`2.08, 2.06` for EMF.  Cadence strides through four steps keep the EMF-error change
+below `1.5e-3` relative in this test; its largest snapshot interval is only about
+`0.066 dx` in light-crossing units, so this result must not be extrapolated to sparse
+disk dumps.  Across all nine second-order replays, 43 of 226,037 characteristic
+projections used the safe exterior-state fallback (`1.90e-4`), while the maximum CT
+boundary residual was `1.37e-17`.  The worst density, pressure, velocity-vector, and
+magnetic-vector closure errors were `7.22e-5`, `2.65e-4`, `1.56e-4`, and `1.34e-4`.
+
+For a global-disk production series, start with the following policy:
+
+1. Keep the matching cube on one fixed source level and use target spacing no finer than
+   the source spacing.  Repeat with both spacings reduced together and demand convergence
+   of the force, accretion rate, magnetic flux, and variability statistics used in the
+   paper.
+2. Choose dumps so the largest local characteristic displacement between snapshots is
+   initially below about `0.1 dx`; then halve the interval.  The halved-cadence change in
+   science observables, rather than the smoke-test field error, is the acceptance test.
+3. Use second-order Gauss integration for the broad survey and repeat representative
+   epochs at third order.  Here third order reduces the finest EMF error by one third but
+   costs about twice as much as second order.
+4. Require closed-flux and final Faraday residuals near roundoff.  Treat the true
+   relative edge correction (correction divided by the largest raw sampled edge EMF) as
+   an interpolation-error estimator: it should decrease under refinement and remain
+   below the tolerance dictated by magnetic-force observables.  The smooth campaign
+   remains below one percent.
+5. Track the characteristic fallback fraction and its spatial distribution.  A small
+   global fraction is insufficient if fallback cells form a coherent patch near the
+   downstream wake or a current sheet.
+
 ### Inner CT magnetic replay
 
 Prepare the validated NPZ for bounded-memory C++ loading:

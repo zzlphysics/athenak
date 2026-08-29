@@ -97,6 +97,45 @@ def test_worldtube_round_trip_and_noninteger_regrid() -> None:
     assert diagnostics["maximum_closed_surface_flux"] < 2.0e-15
 
 
+def test_temporal_coarsening_preserves_integrated_faraday_update() -> None:
+    times = np.asarray((0.0, 0.1, 0.35, 0.6, 1.0))
+    faces = _constant_cube(4, times)
+    generator = np.random.default_rng(4721)
+    for name in worldtube.FACE_NAMES:
+        face = faces[name]
+        face.emf_u[:] = generator.normal(size=face.emf_u.shape)
+        face.emf_v[:] = generator.normal(size=face.emf_v.shape)
+    # Make one unique, shared edge cochain per fine interval, then advance all
+    # face fluxes with that exact curl.
+    import worldtube_frame as moving_frame
+
+    complex_ = moving_frame.CubeSurfaceComplex(4)
+    for interval, dt in enumerate(np.diff(times)):
+        unique = generator.normal(size=complex_.edge_count)
+        unpacked_u, unpacked_v = complex_.unpack_edges(unique)
+        for name in worldtube.FACE_NAMES:
+            faces[name].emf_u[interval] = unpacked_u[name]
+            faces[name].emf_v[interval] = unpacked_v[name]
+            faces[name].normal_flux[interval + 1] = worldtube.faraday_update(
+                faces[name].normal_flux[interval],
+                unpacked_u[name],
+                unpacked_v[name],
+                float(dt),
+            )
+    worldtube.validate_worldtube(times, faces)
+    selected_times, selected = worldtube.coarsen_worldtube_time(
+        times, faces, (0, 2, 4)
+    )
+    diagnostics = worldtube.validate_worldtube(selected_times, selected)
+    np.testing.assert_array_equal(selected_times, times[[0, 2, 4]])
+    for name in worldtube.FACE_NAMES:
+        np.testing.assert_array_equal(
+            selected[name].normal_flux, faces[name].normal_flux[[0, 2, 4]]
+        )
+    assert max(diagnostics["maximum_faraday_residual_by_face"].values()) < 3.0e-14
+    assert diagnostics["maximum_shared_edge_emf_residual"] == 0.0
+
+
 def test_mismatched_duplicate_cube_edge_is_rejected() -> None:
     times = np.asarray((0.0, 0.5))
     faces = _constant_cube(4, times)

@@ -405,6 +405,74 @@ def resample_worldtube(
     return result
 
 
+def coarsen_worldtube_time(
+    times: Iterable[float],
+    faces: dict[str, FaceData],
+    endpoint_indices: Iterable[int],
+) -> tuple[np.ndarray, dict[str, FaceData]]:
+    """Select endpoint slabs and conservatively aggregate intervening EMFs.
+
+    The stored EMF is an interval time average.  Combining fine intervals
+    therefore requires a ``dt``-weighted mean; selecting only one interval or
+    taking an unweighted average would break the exact discrete Faraday update.
+    The first and final source endpoints are required so this operation retains
+    the complete physical time range.
+    """
+
+    times_array = validate_times(times)
+    indices = np.asarray(tuple(endpoint_indices))
+    if indices.ndim != 1 or indices.size < 2 or not np.issubdtype(
+        indices.dtype, np.integer
+    ):
+        raise ValueError("endpoint_indices must contain at least two integers")
+    indices = np.asarray(indices, dtype=np.int64)
+    if (
+        indices[0] != 0
+        or indices[-1] != times_array.size - 1
+        or np.any(np.diff(indices) <= 0)
+    ):
+        raise ValueError(
+            "endpoint_indices must increase strictly from the first through "
+            "the final source endpoint"
+        )
+    checked = {
+        name: validate_face(faces[name], times_array, name) for name in FACE_NAMES
+    }
+    result = {}
+    for name in FACE_NAMES:
+        source = checked[name]
+        emf_u = []
+        emf_v = []
+        for left, right in zip(indices[:-1], indices[1:], strict=True):
+            interval_widths = np.diff(times_array[left : right + 1])
+            total_width = float(times_array[right] - times_array[left])
+            emf_u.append(
+                np.tensordot(
+                    interval_widths,
+                    source.emf_u[left:right],
+                    axes=(0, 0),
+                )
+                / total_width
+            )
+            emf_v.append(
+                np.tensordot(
+                    interval_widths,
+                    source.emf_v[left:right],
+                    axes=(0, 0),
+                )
+                / total_width
+            )
+        result[name] = FaceData(
+            cell_state=source.cell_state[indices].copy(),
+            normal_flux=source.normal_flux[indices].copy(),
+            emf_u=np.stack(emf_u),
+            emf_v=np.stack(emf_v),
+        )
+    selected_times = times_array[indices].copy()
+    validate_worldtube(selected_times, result)
+    return selected_times, result
+
+
 def _read_exact_binary(path: Path, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
     expected = math.prod(shape)
     values = np.fromfile(path, dtype=np.dtype(dtype))
