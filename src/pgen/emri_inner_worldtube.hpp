@@ -30,6 +30,9 @@ class EmriInnerWorldtubeReplay {
   void CompleteStep(Mesh *pm, Driver *pdrive);
   void CapTimestep(Mesh *pm);
   bool FluidBoundaryEnabled() const { return fluid_boundary_enabled_; }
+  // CUDA extended lambdas require their enclosing member to be publicly accessible.
+  void SetInitialNormalFlux(Mesh *pm);
+  Real BoundaryFluxResidual(Mesh *pm, const DvceArray1D<Real> &expected) const;
 
  private:
   struct FaceRecord {
@@ -55,13 +58,11 @@ class EmriInnerWorldtubeReplay {
   void ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm);
   void BuildBoundaryTopology(Mesh *pm);
   void LoadInterval(int interval);
-  void SetInitialNormalFlux(Mesh *pm);
-  Real BoundaryFluxResidual(Mesh *pm, const DvceArray1D<Real> &expected) const;
-
   Mesh *pmesh_ = nullptr;
   bool is_restart_ = false;
   bool exhausted_ = false;
   bool fluid_boundary_enabled_ = false;
+  bool characteristic_sr_boundary_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   bool has_cell_centered_magnetic_state_ = false;
@@ -73,6 +74,7 @@ class EmriInnerWorldtubeReplay {
   Real dx_ = 0.0;
   Real time_offset_ = 0.0;
   Real flux_tolerance_ = 1.0e-10;
+  Real characteristic_speed_tolerance_ = 1.0e-10;
   std::string path_;
   std::vector<Real> times_;
   std::array<std::uint64_t, 6> state_offsets_{};
@@ -88,6 +90,7 @@ class EmriInnerWorldtubeReplay {
   DvceArray1D<Real> flux_left_;
   DvceArray1D<Real> flux_right_;
   DvceArray1D<Real> interval_emf_;
+  DvceArray1D<int> characteristic_diagnostics_;
 };
 
 void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage);

@@ -57,3 +57,23 @@ def test_audit_stride_reduces_spatial_and_temporal_samples() -> None:
         times, faces, metadata, 4.0 / 3.0, sample_stride=2
     )
     assert report["sample_count"] == 6
+
+
+def test_audit_converts_ordinary_mhd_internal_energy_to_pressure() -> None:
+    times, faces, metadata = _uniform_worldtube()
+    gamma = 4.0 / 3.0
+    for face in faces.values():
+        face.cell_state[:, 4] /= gamma - 1.0
+    metadata["state_variables"] = [
+        "rho",
+        "u1",
+        "u2",
+        "u3",
+        "eint",
+        "bcc1",
+        "bcc2",
+        "bcc3",
+    ]
+    report = audit.audit_worldtube(times, faces, metadata, gamma)
+    assert report["input_thermodynamic_variable"] == "eint"
+    assert report["eigensystem_failures"] == 0

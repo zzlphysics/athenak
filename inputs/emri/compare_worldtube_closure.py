@@ -102,9 +102,30 @@ def assemble_uniform_grid(data: dict[str, Any], variable: str) -> np.ndarray:
     return result
 
 
-def _reference_subvolume(
-    reference: dict[str, Any], candidate: dict[str, Any], variable: str
+def assemble_physical_grid(
+    data: dict[str, Any],
+    variable: str,
+    adiabatic_index: float = 4.0 / 3.0,
 ) -> np.ndarray:
+    """Assemble a canonical primitive, converting ``eint`` to pressure if needed."""
+
+    if variable != "press" or "press" in data["mb_data"]:
+        return assemble_uniform_grid(data, variable)
+    if "eint" not in data["mb_data"]:
+        raise ValueError("binary output contains neither press nor eint")
+    gamma = float(adiabatic_index)
+    if not math.isfinite(gamma) or gamma <= 1.0:
+        raise ValueError("adiabatic_index must be finite and greater than one")
+    return (gamma - 1.0) * assemble_uniform_grid(data, "eint")
+
+
+def reference_subvolume(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    variable: str,
+    adiabatic_index: float = 4.0 / 3.0,
+) -> np.ndarray:
+    """Extract the candidate-aligned subvolume from a uniform reference output."""
     reference_spacing = _axis_spacing(reference)
     candidate_spacing = _axis_spacing(candidate)
     starts = []
@@ -127,7 +148,7 @@ def _reference_subvolume(
         ):
             raise ValueError("candidate domain is not aligned inside the reference")
         starts.append(index)
-    array = assemble_uniform_grid(reference, variable)
+    array = assemble_physical_grid(reference, variable, adiabatic_index)
     counts = (int(candidate["Nx1"]), int(candidate["Nx2"]), int(candidate["Nx3"]))
     slices = tuple(
         slice(starts[axis], starts[axis] + counts[axis]) for axis in (2, 1, 0)
@@ -168,6 +189,7 @@ def compare_loaded_outputs(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     variables: tuple[str, ...] = DEFAULT_VARIABLES,
+    adiabatic_index: float = 4.0 / 3.0,
 ) -> dict[str, Any]:
     """Compare a candidate cube with its coincident reference subvolume."""
 
@@ -180,10 +202,14 @@ def compare_loaded_outputs(
     ):
         raise ValueError("reference and candidate output times differ")
     reference_arrays = {
-        name: _reference_subvolume(reference, candidate, name) for name in variables
+        name: reference_subvolume(
+            reference, candidate, name, adiabatic_index
+        )
+        for name in variables
     }
     candidate_arrays = {
-        name: assemble_uniform_grid(candidate, name) for name in variables
+        name: assemble_physical_grid(candidate, name, adiabatic_index)
+        for name in variables
     }
     variable_errors = {
         name: _error_norms(reference_arrays[name], candidate_arrays[name])
@@ -211,10 +237,15 @@ def compare_loaded_outputs(
     }
 
 
-def compare_files(reference: Path, candidate: Path) -> dict[str, Any]:
+def compare_files(
+    reference: Path,
+    candidate: Path,
+    adiabatic_index: float = 4.0 / 3.0,
+) -> dict[str, Any]:
     return compare_loaded_outputs(
         bin_convert.read_binary(str(reference)),
         bin_convert.read_binary(str(candidate)),
+        adiabatic_index=adiabatic_index,
     )
 
 
@@ -222,13 +253,16 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path)
     parser.add_argument("candidate", type=Path)
+    parser.add_argument("--gamma", type=float, default=4.0 / 3.0)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     arguments = parse_arguments()
-    report = compare_files(arguments.reference, arguments.candidate)
+    report = compare_files(
+        arguments.reference, arguments.candidate, arguments.gamma
+    )
     encoded = json.dumps(report, indent=2, sort_keys=True)
     if arguments.output is None:
         print(encoded)

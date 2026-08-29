@@ -28,6 +28,8 @@ class EmriOuterWorldtubeWriter {
   void ObserveEField(Mesh *pm, Driver *pdrive, int stage);
   void CompleteStep(Mesh *pm, Driver *pdrive);
   void Finalize(Mesh *pm, Driver *pdrive);
+  // CUDA extended lambdas require their enclosing member to be publicly accessible.
+  void CaptureAndWriteEndpoint(Mesh *pm, Real time);
 
  private:
   struct CellRecord {
@@ -59,7 +61,6 @@ class EmriOuterWorldtubeWriter {
 
   void BuildTopology(Mesh *pm);
   void OpenFiles(Mesh *pm, Driver *pdrive);
-  void CaptureAndWriteEndpoint(Mesh *pm, Real time);
   void WriteInterval(Mesh *pm, Real interval_dt);
   void WriteManifest(bool complete) const;
   void CloseFiles();

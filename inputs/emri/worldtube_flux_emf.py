@@ -659,6 +659,20 @@ def read_inner_binary(
         "payload_crc32": f"{checksum:08x}",
         "diagnostics": diagnostics,
     }
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    if sidecar_path.exists():
+        with sidecar_path.open(encoding="utf-8") as stream:
+            sidecar = json.load(stream)
+        sidecar_checksum = sidecar.get(
+            "crc32_payload", sidecar.get("payload_crc32")
+        )
+        if (
+            sidecar.get("classification") != INNER_BINARY_CLASSIFICATION
+            or sidecar_checksum != f"{checksum:08x}"
+        ):
+            raise ValueError("inner replay sidecar does not match its binary payload")
+        metadata["state_variables"] = sidecar.get("state_variables", [])
+        metadata["source_metadata"] = sidecar.get("source_metadata", {})
     return times, faces, metadata
 
 

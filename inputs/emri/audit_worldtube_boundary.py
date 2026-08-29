@@ -92,6 +92,16 @@ def audit_worldtube(
             "characteristic audit requires square faces and ideal-MHD state with "
             "rho,u1,u2,u3,pgas,...,bcc1,bcc2,bcc3"
         )
+    state_variables = metadata.get("state_variables", [])
+    if not state_variables and isinstance(metadata.get("source_metadata"), dict):
+        state_variables = metadata["source_metadata"].get("state_variables", [])
+    thermodynamic = "pgas"
+    if isinstance(state_variables, list) and len(state_variables) == first_shape[1]:
+        thermodynamic = str(state_variables[4])
+    if thermodynamic not in ("pgas", "eint"):
+        raise ValueError(
+            "characteristic audit requires state variable 5 to be pgas or eint"
+        )
     half_width = float(metadata.get("half_width", math.nan))
     if not math.isfinite(half_width) or half_width <= 0.0:
         outer = metadata.get("outer_stream_manifest")
@@ -124,6 +134,8 @@ def audit_worldtube(
                     face_samples += 1
                     state_raw = face.cell_state[time_index, :, v, u]
                     state = np.concatenate((state_raw[:5], state_raw[-3:]))
+                    if thermodynamic == "eint":
+                        state[4] *= gamma - 1.0
                     normal_field = float(
                         face.normal_flux[time_index, v, u] / area
                     )
@@ -188,6 +200,7 @@ def audit_worldtube(
         "adiabatic_index": gamma,
         "speed_tolerance": speed_tolerance,
         "sample_stride": sample_stride,
+        "input_thermodynamic_variable": thermodynamic,
         "sample_count": total_samples,
         "eigensystem_failures": total_failures,
         "mixed_fan_fraction": (

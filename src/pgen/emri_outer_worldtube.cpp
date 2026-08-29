@@ -244,7 +244,13 @@ EmriOuterWorldtubeWriter::EmriOuterWorldtubeWriter(ParameterInput *pin, Mesh *pm
   // AthenaK primitive layout and append all three cell-centered field components.
   nvar_ = pmhd->nmhd + pmhd->nscalars + 3;
   state_names_ = {"rho", "u1", "u2", "u3"};
-  if (pmhd->nmhd == 5) state_names_.push_back("pgas");
+  if (pmhd->nmhd == 5) {
+    // DynGRMHD reconstructs pressure directly, while the ordinary ideal-gas MHD
+    // modules reconstruct internal-energy density.  The binary values are replayed
+    // without conversion, but preprocessing must know which thermodynamic primitive
+    // it received before constructing a characteristic basis.
+    state_names_.push_back((pm->pmb_pack->pdyngr != nullptr) ? "pgas" : "eint");
+  }
   for (int scalar = 0; scalar < pmhd->nscalars; ++scalar) {
     state_names_.push_back("scalar" + std::to_string(scalar));
   }
@@ -298,7 +304,10 @@ void EmriOuterWorldtubeWriter::BuildTopology(Mesh *pm) {
           !NearlyEqual(plane, block_max[normal_axis], dx_)) continue;
       const int plane_index = AlignedInteger(
           (plane - block_min[normal_axis])/dx_, 1.0, "worldtube block-face plane");
-      const int normal_offset = (normal_sign < 0) ? plane_index : plane_index - 1;
+      // Fluid ghost data must come from the exterior side of the extraction surface.
+      // CT fluxes and EMFs still live exactly on the surface itself.  Choosing the
+      // exterior active-cell owner also avoids relying on synchronized MeshBlock ghosts.
+      const int normal_offset = (normal_sign < 0) ? plane_index - 1 : plane_index;
       if (normal_offset < 0 || normal_offset >= axis_cells[normal_axis]) continue;
 
       for (int v_offset = 0; v_offset < axis_cells[v_axis]; ++v_offset) {
@@ -353,7 +362,7 @@ void EmriOuterWorldtubeWriter::BuildTopology(Mesh *pm) {
     const int cross_axis = along_u ? kVAxis[face] : kUAxis[face];
     const int cross_sign = along_u ? kVSign[face] : kUSign[face];
     int indices[3] = {cell.i, cell.j, cell.k};
-    indices[kNormalAxis[face]] += (kNormalSign[face] > 0) ? 1 : 0;
+    indices[kNormalAxis[face]] += (kNormalSign[face] < 0) ? 1 : 0;
     const bool physical_lower = local_min ? (cross_sign > 0) : (cross_sign < 0);
     indices[cross_axis] += physical_lower ? 0 : 1;
     host_edges_.push_back(
@@ -609,9 +618,9 @@ void EmriOuterWorldtubeWriter::CaptureAndWriteEndpoint(Mesh *pm, Real time) {
       const int normal_axis = face/2;
       const int normal_sign = (face % 2 == 0) ? -1 : 1;
       Real normal_field = 0.0;
-      if (normal_axis == 0) normal_field = b1(m, k, j, i + (normal_sign > 0));
-      if (normal_axis == 1) normal_field = b2(m, k, j + (normal_sign > 0), i);
-      if (normal_axis == 2) normal_field = b3(m, k + (normal_sign > 0), j, i);
+      if (normal_axis == 0) normal_field = b1(m, k, j, i + (normal_sign < 0));
+      if (normal_axis == 1) normal_field = b2(m, k, j + (normal_sign < 0), i);
+      if (normal_axis == 2) normal_field = b3(m, k + (normal_sign < 0), j, i);
       flux(face_cell) = normal_sign*normal_field*area;
     });
   }
@@ -697,7 +706,7 @@ void EmriOuterWorldtubeWriter::WriteManifest(bool complete) const {
          << "  \"fixed_grid_aligned_cube\": true,\n"
          << "  \"restart_segment\": " << (is_restart_ ? "true" : "false") << ",\n"
          << "  \"state_sampling\": "
-         << "\"interior-adjacent primitive cell average\",\n"
+         << "\"exterior-adjacent primitive cell average\",\n"
          << "  \"emf_sampling\": "
          << "\"synchronized CT line average with exact explicit-RK recurrence\",\n"
          << "  \"state_variables\": [";

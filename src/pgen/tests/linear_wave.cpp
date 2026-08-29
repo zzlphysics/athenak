@@ -470,6 +470,17 @@ void ProblemGenerator::LinearWave(ParameterInput *pin, const bool restart) {
   }
   if (lwv.sin_a2 > 0.0) lx = std::min(lx, x3size*lwv.sin_a2);
 
+  // A worldtube closure test initializes a smaller non-periodic cube from the same
+  // absolute wave as a larger periodic reference domain.  Preserve the historical
+  // domain-derived wavelength unless an explicit common wavelength is requested.
+  lx = pin->GetOrAddReal("problem", "wavelength", lx);
+  if (!std::isfinite(lx) || lx <= 0.0) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl << "problem/wavelength must be finite and positive"
+              << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
   // Initialize k_parallel
   lwv.k_par = 2.0*(M_PI)/lx;
 

@@ -32,6 +32,7 @@
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
 #include "pgen/pgen.hpp"
+#include "pgen/emri_srmhd_characteristics.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
@@ -82,6 +83,47 @@ Real StageStateTime(Mesh *pm, Driver *pdrive, int stage) {
     return start + ((stage == 2) ? 0.5 : 1.0)*dt;
   }
   InnerFatal("fluid worldtube replay encountered an unsupported RK integrator");
+}
+
+void ValidateSRCharacteristicReferenceBasis() {
+  const Real lorentz = 1.0/std::sqrt(1.0 - (0.1*0.1 + 0.3*0.3 + 0.05*0.05));
+  const Real primitive[emri_srmhd::kModes] = {
+      4.0, 1.0, -0.1*lorentz, 0.3*lorentz, -0.05*lorentz, 1.8, -1.2};
+  const Real expected_speeds[emri_srmhd::kModes] = {
+      -0.7848755474024283, -0.6775953662109416, -0.3958024698080614,
+      -0.1, 0.1681193457906640, 0.3894059410810621, 0.7189814956447750};
+  const Real expected_right[emri_srmhd::kModes][emri_srmhd::kModes] = {
+      {0.5782928355320754, 0.0, 0.9412713619603429, 1.0,
+       0.9407335001623420, 0.0, 0.7452975389722657},
+      {0.1927642785106916, 0.0, 0.3137571206534470, 0.0,
+       0.3135778333874469, 0.0, 0.2484325129907554},
+      {-0.1374857352758566, -0.0281591855092123, -0.0680845482723261, 0.0,
+       0.0688822004851069, -0.0084968436978090, 0.1277011368582980},
+      {0.0790192264949366, 0.1591482519396228, -0.0614738525924780, 0.0,
+       0.0624394842443209, -0.1046879458929723, -0.1049287522806895},
+      {-0.0910428544104706, 0.1800574080985748, 0.0397054032977907, 0.0,
+       -0.0393066042700111, -0.1747336765432273, 0.0433738843454690},
+      {0.5615454558826656, 0.6723271183537233, -0.0591435123941768, 0.0,
+       -0.0680824551096638, 0.4377355357997133, 0.5194032697198726},
+      {-0.5288202562124930, 0.6995959333008033, 0.0455596094936173, 0.0,
+       0.0431942995194695, 0.8756848637561974, -0.2895413459974056}};
+  const Real tolerance = (sizeof(Real) == sizeof(float)) ? 3.0e-4 : 3.0e-9;
+  for (int mode = 0; mode < emri_srmhd::kModes; ++mode) {
+    Real speed = 0.0;
+    Real column[emri_srmhd::kModes];
+    if (!emri_srmhd::Eigenvector(
+            primitive, 2.5, 4.0/3.0, mode, speed, column) ||
+        std::abs(speed - expected_speeds[mode]) > tolerance) {
+      InnerFatal("SR characteristic analytic reference speed regression failed");
+    }
+    Real overlap = 0.0;
+    for (int variable = 0; variable < emri_srmhd::kModes; ++variable) {
+      overlap += column[variable]*expected_right[variable][mode];
+    }
+    if (std::abs(std::abs(overlap) - 1.0) > 10.0*tolerance) {
+      InnerFatal("SR characteristic analytic eigenvector regression failed");
+    }
+  }
 }
 
 std::uint32_t ReadLE32(const unsigned char *bytes) {
@@ -162,9 +204,8 @@ std::vector<Real> ReadDoublesAt(const std::string &path, std::uint64_t offset,
 EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm,
                                                    bool is_restart) :
     pmesh_(pm), is_restart_(is_restart) {
-  if (pm->pmb_pack == nullptr || pm->pmb_pack->pmhd == nullptr ||
-      pm->pmb_pack->pdyngr == nullptr) {
-    InnerFatal("inner worldtube replay currently requires dynamical GRMHD");
+  if (pm->pmb_pack == nullptr || pm->pmb_pack->pmhd == nullptr) {
+    InnerFatal("inner worldtube replay requires the MHD module");
   }
   if (!pm->three_d || pm->adaptive || pm->multilevel) {
     InnerFatal("inner worldtube replay currently requires a fixed single-level 3D mesh");
@@ -180,8 +221,18 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
     fluid_boundary_enabled_ = false;
   } else if (fluid_boundary == "riemann") {
     fluid_boundary_enabled_ = true;
+  } else if (fluid_boundary == "characteristic_sr") {
+    fluid_boundary_enabled_ = true;
+    characteristic_sr_boundary_ = true;
   } else {
-    InnerFatal("<emri_worldtube>/fluid_boundary must be off or riemann");
+    InnerFatal(
+        "<emri_worldtube>/fluid_boundary must be off, riemann, or characteristic_sr");
+  }
+  characteristic_speed_tolerance_ = pin->GetOrAddReal(
+      "emri_worldtube", "characteristic_speed_tolerance", 1.0e-10);
+  if (!(std::isfinite(characteristic_speed_tolerance_) &&
+        characteristic_speed_tolerance_ >= 0.0)) {
+    InnerFatal("characteristic_speed_tolerance must be finite and nonnegative");
   }
   ReadHeaderAndTimes(pin, pm);
   if (fluid_boundary_enabled_) {
@@ -191,8 +242,13 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
           "fluid_boundary=riemann requires trailing bcc1,bcc2,bcc3 state data");
     }
     if (pmhd->nmhd != 5 || !pmhd->peos->eos_data.is_ideal) {
-      InnerFatal("fluid_boundary=riemann currently requires ideal-gas MHD");
+      InnerFatal("fluid worldtube replay currently requires ideal-gas MHD");
     }
+    if (characteristic_sr_boundary_ &&
+        !pm->pmb_pack->pcoord->is_special_relativistic) {
+      InnerFatal("fluid_boundary=characteristic_sr requires special-relativistic MHD");
+    }
+    if (characteristic_sr_boundary_) ValidateSRCharacteristicReferenceBasis();
   }
   BuildBoundaryTopology(pm);
   LoadInterval(interval_);
@@ -476,6 +532,9 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
   flux_left_ = DvceArray1D<Real>("emri_inner_flux_left", face_cells);
   flux_right_ = DvceArray1D<Real>("emri_inner_flux_right", face_cells);
   interval_emf_ = DvceArray1D<Real>("emri_inner_interval_emf", face_edges);
+  characteristic_diagnostics_ = DvceArray1D<int>(
+      "emri_inner_characteristic_diagnostics", 2);
+  Kokkos::deep_copy(characteristic_diagnostics_, 0);
 }
 
 void EmriInnerWorldtubeReplay::LoadInterval(int interval) {
@@ -620,12 +679,16 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
   auto right_flux = flux_right_;
   auto w0 = pmhd->w0;
   auto bcc0 = pmhd->bcc0;
+  const EOS_Data eos = pmhd->peos->eos_data;
+  auto characteristic_diagnostics = characteristic_diagnostics_;
   const int local_faces = static_cast<int>(host_faces_.size());
   const int cells = cells_per_edge_;
   const int nvar = nvar_;
   const int fluid_nvar = pmhd->nmhd + pmhd->nscalars;
   const int nghost = pm->mb_indcs.ng;
   const Real inverse_area = 1.0/(dx_*dx_);
+  const bool characteristic_sr = characteristic_sr_boundary_;
+  const Real speed_tolerance = characteristic_speed_tolerance_;
   if (local_faces == 0) return;
   par_for("emri_inner_fluid_boundary", DevExeSpace(), 0, local_faces - 1,
   KOKKOS_LAMBDA(int record_index) {
@@ -636,8 +699,12 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
     const int i = records(record_index, 4);
     const int v = records(record_index, 5);
     const int u = records(record_index, 6);
-    const int normal_axis = kNormalAxis[face];
-    const int normal_sign = kNormalSign[face];
+    const int normal_axis = face/2;
+    const int normal_sign = (face % 2 == 0) ? -1 : 1;
+    const int u_axis = (normal_axis + 1)%3;
+    const int v_axis = (normal_axis + 2)%3;
+    const int u_sign = 1;
+    const int v_sign = normal_sign;
     const int face_cell = (face*cells + v)*cells + u;
     Real exterior_b[3];
     for (int component = 0; component < 3; ++component) {
@@ -648,6 +715,61 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
     const Real outward_flux =
         (1.0 - theta)*left_flux(face_cell) + theta*right_flux(face_cell);
     exterior_b[normal_axis] = normal_sign*outward_flux*inverse_area;
+    Real exterior_q[emri_srmhd::kModes];
+    Real interior_q[emri_srmhd::kModes];
+    Real predicted_q[emri_srmhd::kModes];
+    Real boundary_q[emri_srmhd::kModes];
+    Real exterior_u[3];
+    for (int component = 0; component < 3; ++component) {
+      const int input = ((face*nvar + IVX + component)*cells + v)*cells + u;
+      exterior_u[component] = (1.0 - theta)*left(input) + theta*right(input);
+    }
+    const int density_input = ((face*nvar + IDN)*cells + v)*cells + u;
+    const int energy_input = ((face*nvar + IEN)*cells + v)*cells + u;
+    exterior_q[0] = (1.0 - theta)*left(density_input) + theta*right(density_input);
+    exterior_q[1] = eos.IdealGasPressure(
+        (1.0 - theta)*left(energy_input) + theta*right(energy_input));
+    exterior_q[2] = normal_sign*exterior_u[normal_axis];
+    exterior_q[3] = u_sign*exterior_u[u_axis];
+    exterior_q[4] = v_sign*exterior_u[v_axis];
+    exterior_q[5] = u_sign*exterior_b[u_axis];
+    exterior_q[6] = v_sign*exterior_b[v_axis];
+    interior_q[0] = w0(m, IDN, k, j, i);
+    interior_q[1] = eos.IdealGasPressure(w0(m, IEN, k, j, i));
+    interior_q[2] = normal_sign*w0(m, IVX + normal_axis, k, j, i);
+    interior_q[3] = u_sign*w0(m, IVX + u_axis, k, j, i);
+    interior_q[4] = v_sign*w0(m, IVX + v_axis, k, j, i);
+    interior_q[5] = u_sign*bcc0(m, u_axis, k, j, i);
+    interior_q[6] = v_sign*bcc0(m, v_axis, k, j, i);
+    int inward[3] = {i, j, k};
+    inward[normal_axis] -= normal_sign;
+    Real inward_q[emri_srmhd::kModes];
+    inward_q[0] = w0(m, IDN, inward[2], inward[1], inward[0]);
+    inward_q[1] = eos.IdealGasPressure(
+        w0(m, IEN, inward[2], inward[1], inward[0]));
+    inward_q[2] = normal_sign*
+        w0(m, IVX + normal_axis, inward[2], inward[1], inward[0]);
+    inward_q[3] = u_sign*
+        w0(m, IVX + u_axis, inward[2], inward[1], inward[0]);
+    inward_q[4] = v_sign*
+        w0(m, IVX + v_axis, inward[2], inward[1], inward[0]);
+    inward_q[5] = u_sign*
+        bcc0(m, u_axis, inward[2], inward[1], inward[0]);
+    inward_q[6] = v_sign*
+        bcc0(m, v_axis, inward[2], inward[1], inward[0]);
+    for (int variable = 0; variable < emri_srmhd::kModes; ++variable) {
+      // A characteristic ghost state must retain the outgoing one-sided gradient;
+      // using the active boundary cell itself would flatten every outgoing mode.
+      predicted_q[variable] = 2.0*interior_q[variable] - inward_q[variable];
+    }
+    bool projected = false;
+    if (characteristic_sr) {
+      projected = emri_srmhd::ProjectIncoming(
+          predicted_q, exterior_q, outward_flux*inverse_area, eos.gamma,
+          speed_tolerance, fmax(eos.dfloor, Real(1.0e-14)),
+          fmax(eos.pfloor, Real(1.0e-14)), boundary_q);
+      Kokkos::atomic_increment(&characteristic_diagnostics(projected ? 0 : 1));
+    }
     for (int layer = 1; layer <= nghost; ++layer) {
       int ghost[3] = {i, j, k};
       ghost[normal_axis] += normal_sign*layer;
@@ -658,6 +780,30 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
       }
       for (int component = 0; component < 3; ++component) {
         bcc0(m, component, ghost[2], ghost[1], ghost[0]) = exterior_b[component];
+      }
+      if (projected) {
+        Real layer_q[emri_srmhd::kModes];
+        for (int variable = 0; variable < emri_srmhd::kModes; ++variable) {
+          layer_q[variable] = interior_q[variable]
+                              + layer*(boundary_q[variable] - interior_q[variable]);
+        }
+        layer_q[0] = fmax(layer_q[0], fmax(eos.dfloor, Real(1.0e-14)));
+        layer_q[1] = fmax(layer_q[1], fmax(eos.pfloor, Real(1.0e-14)));
+        w0(m, IDN, ghost[2], ghost[1], ghost[0]) = layer_q[0];
+        w0(m, IEN, ghost[2], ghost[1], ghost[0]) =
+            layer_q[1]/(eos.gamma - 1.0);
+        w0(m, IVX + normal_axis, ghost[2], ghost[1], ghost[0]) =
+            normal_sign*layer_q[2];
+        w0(m, IVX + u_axis, ghost[2], ghost[1], ghost[0]) =
+            u_sign*layer_q[3];
+        w0(m, IVX + v_axis, ghost[2], ghost[1], ghost[0]) =
+            v_sign*layer_q[4];
+        bcc0(m, normal_axis, ghost[2], ghost[1], ghost[0]) =
+            normal_sign*outward_flux*inverse_area;
+        bcc0(m, u_axis, ghost[2], ghost[1], ghost[0]) =
+            u_sign*layer_q[5];
+        bcc0(m, v_axis, ghost[2], ghost[1], ghost[0]) =
+            v_sign*layer_q[6];
       }
     }
   });
@@ -726,6 +872,12 @@ void EmriInnerWorldtubeReplay::CompleteStep(Mesh *pm, Driver *pdrive) {
     LoadInterval(interval_ + 1);
   } else {
     exhausted_ = true;
+    if (characteristic_sr_boundary_ && global_variable::my_rank == 0) {
+      auto diagnostics = Kokkos::create_mirror_view_and_copy(
+          HostMemSpace(), characteristic_diagnostics_);
+      std::cout << "EMRI inner characteristic SR boundary: projections="
+                << diagnostics(0) << ", fallbacks=" << diagnostics(1) << std::endl;
+    }
   }
 }
 

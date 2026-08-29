@@ -159,7 +159,11 @@ def test_inner_device_binary_round_trip_and_checksum() -> None:
             path,
             times,
             faces,
-            {"center": [8.0, 0.0, 0.0], "half_width": 2.0},
+            {
+                "center": [8.0, 0.0, 0.0],
+                "half_width": 2.0,
+                "state_variables": ["a", "b"],
+            },
         )
         loaded_times, loaded_faces, metadata = worldtube.read_inner_binary(path)
         corrupted = bytearray(path.read_bytes())
@@ -174,5 +178,7 @@ def test_inner_device_binary_round_trip_and_checksum() -> None:
             raise AssertionError("corrupted inner replay binary was accepted")
     np.testing.assert_array_equal(loaded_times, times)
     assert metadata["center"] == [8.0, 0.0, 0.0]
+    assert metadata["state_variables"] == ["a", "b"]
+    assert metadata["source_metadata"]["half_width"] == 2.0
     diagnostics = worldtube.validate_worldtube(loaded_times, loaded_faces)
     assert diagnostics["maximum_closed_surface_flux"] < 1.0e-15
