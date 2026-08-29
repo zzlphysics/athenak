@@ -638,6 +638,36 @@ correction.  These corrections must decrease under outer spatial and temporal
 refinement; the projection restores topology but cannot rescue an under-resolved
 physical sample.
 
+For an aligned-spin circular equatorial Kerr orbit, generate the full Hermite table
+directly on the binary-dump time axis:
+
+```bash
+python3 inputs/emri/build_kerr_circular_frame.py \
+  --snapshot-manifest global_worldtube.json \
+  --primary-mass 1.0 --primary-chi 0.7 --orbital-radius 8.0 \
+  --orbit-direction 1 --output orbit.frame.json
+```
+
+Set the extraction manifest `frame` field to `orbit.frame.json`.  The radius is the
+Kerr-Schild/Boyer-Lindquist radial coordinate; the Cartesian equatorial coordinate
+radius is `sqrt(r^2+a^2)`.  The generator uses the same test-particle Kerr frequency
+and ISCO convention as `emri_windtunnel`, rejects a superluminal or inside-ISCO orbit,
+and constructs an orthonormal radial, prograde-tangential, vertical source tetrad.  It
+uses a co-rotating tetrad convention, not a parallel-transported or Fermi-Walker frame.
+When a snapshot manifest is supplied, it reads `global_length_in_local_units`, converts
+dump times with `T_local=L t_global`, and scales every Jacobian column by `1/L`; this is
+required for an extreme mass ratio and is not merely provenance metadata.
+The output reports Hermite midpoint worldline error, interpolated tetrad Gram error,
+timelike margin, spatial-leg time-row norm, and Jacobian determinant/condition number.
+An orthonormal moving tetrad generally has nonzero `e^0_a`, so source dumps must extend
+beyond the requested local sample-time endpoints by the resulting worldtube time tilt;
+using every source time as an output time is not automatically valid.  The preflight
+below calculates this exactly.  Hermite interpolation errors must be reduced by adding
+frame knots when the orbital phase advance per dump is large.
+Generic inclined, eccentric, or inspiralling worldlines still require an external
+ephemeris and transport prescription; they must not be approximated by this circular
+generator.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is
@@ -732,7 +762,25 @@ therefore include that one-pair transient peak in addition to the cache and outp
 worldtube.
 
 Start from `global_worldtube_manifest.example.json`, replace its dump paths and affine
-frame with the physical worldline/tetrad map, then run
+frame with the physical worldline/tetrad map.  Before loading any fluid arrays, traverse
+the exact state-center, face-quadrature, edge-quadrature, and temporal-quadrature loci:
+
+```bash
+python3 inputs/emri/preflight_global_worldtube.py \
+  --manifest global_worldtube.json \
+  --output disk_patch.preflight.json
+```
+
+The preflight reads only headers and MeshBlock topology.  It checks both temporal
+interpolation endpoints for every mapped event, including temporal tetrad tilt, and
+hard-fails on the source cell-center envelope, a coarse-fine stencil, or a singular
+affine Jacobian.  `minimum_additional_stencil_halo_cells=0` is accepted but warned: the
+requested stencil is exactly covered with no spare selected-level cell.  Production
+should normally retain at least one additional cell, and more when the AMR region moves
+between dumps.  The reported envelope margin is also measured in selected-level source
+cells.
+
+After a passing preflight, run
 
 ```bash
 python3 inputs/emri/extract_global_worldtube.py \
@@ -777,6 +825,10 @@ performs 3,456 characteristic projections with zero fallback and an `8.65e-19` b
 CT residual; density, pressure, velocity-vector, and magnetic-vector closure errors are
 `1.03e-7`, `3.11e-7`, `2.35e-7`, and `1.71e-7`.  Moving a stencil across the fine-region
 boundary is a hard error rather than an implicit coarse-fine interpolation.
+The metadata-only preflight visits 16,128 local quadrature events.  It measures nine
+cells of source-domain envelope margin but zero additional level-one halo cells for the
+deliberately tight AMR regression region, and therefore emits the expected production
+margin warning; the equivalent uniform source has eight additional cells.
 
 Reproduce the complete AMR source, equivalent uniform source, extraction comparison,
 and inner replay with

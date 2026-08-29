@@ -14,6 +14,7 @@ import numpy as np
 
 import analyze_global_worldtube_convergence as analysis
 import extract_global_worldtube as extract
+import preflight_global_worldtube as preflight
 import run_global_worldtube_convergence as campaign
 import worldtube_flux_emf as worldtube
 
@@ -231,6 +232,7 @@ def run_check(arguments: argparse.Namespace) -> dict[str, object]:
             arguments,
             arguments.source_level if name == "amr" else None,
         )
+        preflight_report = preflight.audit_manifest(manifest)
         times, faces, metadata, wall = _extract(manifest, output)
         loaded[name] = (times, faces, metadata)
         products[name] = {
@@ -241,6 +243,19 @@ def run_check(arguments: argparse.Namespace) -> dict[str, object]:
             "snapshot_loading": metadata["sampling_diagnostics"][
                 "snapshot_loading"
             ],
+            "preflight": {
+                "passed": preflight_report["passed"],
+                "sampled_local_event_count": preflight_report[
+                    "sampled_local_event_count"
+                ],
+                "minimum_cell_center_envelope_margin_cells": preflight_report[
+                    "minimum_cell_center_envelope_margin_cells"
+                ],
+                "minimum_additional_stencil_halo_cells": preflight_report[
+                    "minimum_additional_stencil_halo_cells"
+                ],
+                "warnings": preflight_report["warnings"],
+            },
             "projection": campaign._projection_summary(metadata),
         }
 

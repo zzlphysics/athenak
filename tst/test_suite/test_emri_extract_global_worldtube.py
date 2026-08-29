@@ -63,6 +63,8 @@ def _descriptor(snapshot: extract.UniformSnapshot) -> extract.SnapshotDescriptor
         source_meshblock_count=snapshot.source_meshblock_count,
         available_leaf_levels=snapshot.available_leaf_levels,
         source_storage=snapshot.source_storage,
+        block_shape_xyz=snapshot.shape_xyz,
+        block_logical=np.asarray(((0, 0, 0),)),
     )
 
 

@@ -404,6 +404,8 @@ class SnapshotDescriptor:
     source_meshblock_count: int
     available_leaf_levels: tuple[int, ...]
     source_storage: str
+    block_shape_xyz: tuple[int, int, int]
+    block_logical: np.ndarray
 
     def __post_init__(self) -> None:
         lower = _finite_array(self.lower, (3,), "snapshot-descriptor lower bound")
@@ -426,8 +428,17 @@ class SnapshotDescriptor:
             "sparse_fixed_leaf_level",
         ):
             raise ValueError("snapshot descriptor has unsupported source storage")
+        logical = np.asarray(self.block_logical)
+        if (
+            len(self.block_shape_xyz) != 3
+            or min(self.block_shape_xyz) < 1
+            or logical.shape != (self.source_meshblock_count, 3)
+            or not np.issubdtype(logical.dtype, np.integer)
+        ):
+            raise ValueError("snapshot descriptor has invalid MeshBlock topology")
         object.__setattr__(self, "lower", lower)
         object.__setattr__(self, "spacing", spacing)
+        object.__setattr__(self, "block_logical", logical.astype(np.int64))
 
 
 SnapshotMetadata = Snapshot | SnapshotDescriptor
@@ -567,6 +578,15 @@ class LazySnapshotSeries:
             or snapshot.source_meshblock_count != descriptor.source_meshblock_count
             or snapshot.available_leaf_levels != descriptor.available_leaf_levels
             or snapshot.source_storage != descriptor.source_storage
+            or (
+                isinstance(snapshot, FixedLevelSnapshot)
+                and (
+                    snapshot.block_shape_xyz != descriptor.block_shape_xyz
+                    or not np.array_equal(
+                        snapshot.block_logical, descriptor.block_logical
+                    )
+                )
+            )
             or not np.allclose(
                 snapshot.lower, descriptor.lower, rtol=0.0, atol=2.0e-13
             )
@@ -601,6 +621,17 @@ class LazySnapshotSeries:
 
 
 SourceSeries = SnapshotSeries | LazySnapshotSeries
+
+
+@dataclass(frozen=True)
+class SnapshotManifestScan:
+    path: Path
+    document: dict[str, object]
+    entries: tuple[dict[str, object], ...]
+    source_level: int | None
+    snapshot_cache_size: int
+    hash_source_files: bool
+    descriptors: tuple[SnapshotDescriptor, ...]
 
 
 @dataclass
@@ -880,8 +911,15 @@ def _scan_snapshot(
         (state["x1max"], state["x2max"], state["x3max"]), dtype=np.float64
     )
     sparse = source_level is not None or selected_level != 0
-    levels = np.asarray(state["mb_logical"], dtype=np.int64)[:, 3]
-    selected_count = int(np.count_nonzero(levels == selected_level))
+    logical_all = np.asarray(state["mb_logical"], dtype=np.int64)
+    selected = np.flatnonzero(logical_all[:, 3] == selected_level)
+    retained = selected if sparse else np.arange(logical_all.shape[0])
+    indices = np.asarray(state["mb_index"], dtype=np.int64)[retained]
+    block_shapes = indices[:, (1, 3, 5)] - indices[:, (0, 2, 4)] + 1
+    if not np.all(block_shapes == block_shapes[0]):
+        raise RuntimeError(
+            "selected source-level MeshBlocks do not have a common output shape"
+        )
     return SnapshotDescriptor(
         time=float(state["time"]),
         cycle=int(state["cycle"]),
@@ -891,9 +929,11 @@ def _scan_snapshot(
         state_path=state_path,
         adm_path=adm_path,
         source_level=selected_level,
-        source_meshblock_count=(selected_count if sparse else int(state["n_mbs"])),
+        source_meshblock_count=int(retained.size),
         available_leaf_levels=available_levels,
         source_storage=("sparse_fixed_leaf_level" if sparse else "dense_uniform"),
+        block_shape_xyz=tuple(int(value) for value in block_shapes[0]),
+        block_logical=logical_all[retained, :3],
     )
 
 
@@ -943,6 +983,58 @@ def _load_snapshot(
         source_level=selected_level,
         source_meshblock_count=int(state["n_mbs"]),
         available_leaf_levels=available_levels,
+    )
+
+
+def scan_snapshot_manifest(manifest_path: Path) -> SnapshotManifestScan:
+    """Validate a source manifest and retain only per-snapshot metadata."""
+
+    path = manifest_path.expanduser().resolve(strict=True)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(document, dict)
+        or document.get("classification") != INPUT_CLASSIFICATION
+    ):
+        raise ValueError("global-worldtube manifest classification is unsupported")
+    hash_source_files = document.get("hash_source_files", False)
+    if not isinstance(hash_source_files, bool):
+        raise ValueError("hash_source_files must be true or false")
+    entries = document.get("snapshots")
+    if not isinstance(entries, list) or len(entries) < 2 or not all(
+        isinstance(entry, dict) for entry in entries
+    ):
+        raise ValueError("manifest requires at least two snapshot objects")
+    source_level_value = document.get("source_level")
+    if source_level_value is None:
+        source_level = None
+    elif (
+        not isinstance(source_level_value, int)
+        or isinstance(source_level_value, bool)
+        or source_level_value < 0
+    ):
+        raise ValueError("source_level must be a nonnegative integer when provided")
+    else:
+        source_level = source_level_value
+    snapshot_cache_size = document.get("snapshot_cache_size", 2)
+    if (
+        not isinstance(snapshot_cache_size, int)
+        or isinstance(snapshot_cache_size, bool)
+        or snapshot_cache_size < 2
+    ):
+        raise ValueError("snapshot_cache_size must be an integer of at least two")
+    snapshot_entries = tuple(entries)
+    descriptors = tuple(
+        _scan_snapshot(entry, path.parent, source_level)
+        for entry in snapshot_entries
+    )
+    return SnapshotManifestScan(
+        path=path,
+        document=document,
+        entries=snapshot_entries,
+        source_level=source_level,
+        snapshot_cache_size=snapshot_cache_size,
+        hash_source_files=hash_source_files,
+        descriptors=descriptors,
     )
 
 
@@ -1101,7 +1193,11 @@ class CubeGeometry:
     def __post_init__(self) -> None:
         center = _finite_array(self.center, (3,), "worldtube center")
         half_width = _finite_positive(self.half_width, "worldtube half_width")
-        if not isinstance(self.cells, int) or self.cells < 1:
+        if (
+            not isinstance(self.cells, int)
+            or isinstance(self.cells, bool)
+            or self.cells < 1
+        ):
             raise ValueError("worldtube cells_per_edge must be a positive integer")
         object.__setattr__(self, "center", center)
         object.__setattr__(self, "half_width", half_width)
@@ -1129,7 +1225,12 @@ class CubeGeometry:
 
 
 def _quadrature(order: int) -> tuple[np.ndarray, np.ndarray]:
-    if not isinstance(order, int) or order < 1 or order > 8:
+    if (
+        not isinstance(order, int)
+        or isinstance(order, bool)
+        or order < 1
+        or order > 8
+    ):
         raise ValueError("quadrature_order must be an integer from one through eight")
     nodes, weights = np.polynomial.legendre.leggauss(order)
     return np.asarray(nodes), np.asarray(weights)
@@ -1334,50 +1435,17 @@ def extract_manifest(
     dict[str, object],
     dict[str, object],
 ]:
-    path = manifest_path.expanduser().resolve(strict=True)
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(document, dict)
-        or document.get("classification") != INPUT_CLASSIFICATION
-    ):
-        raise ValueError("global-worldtube manifest classification is unsupported")
-    hash_source_files = document.get("hash_source_files", False)
-    if not isinstance(hash_source_files, bool):
-        raise ValueError("hash_source_files must be true or false")
-    entries = document.get("snapshots")
-    if not isinstance(entries, list) or len(entries) < 2 or not all(
-        isinstance(entry, dict) for entry in entries
-    ):
-        raise ValueError("manifest requires at least two snapshot objects")
-    source_level_value = document.get("source_level")
-    if source_level_value is None:
-        source_level = None
-    elif (
-        not isinstance(source_level_value, int)
-        or isinstance(source_level_value, bool)
-        or source_level_value < 0
-    ):
-        raise ValueError("source_level must be a nonnegative integer when provided")
-    else:
-        source_level = source_level_value
-    snapshot_cache_size = document.get("snapshot_cache_size", 2)
-    if (
-        not isinstance(snapshot_cache_size, int)
-        or isinstance(snapshot_cache_size, bool)
-        or snapshot_cache_size < 2
-    ):
-        raise ValueError("snapshot_cache_size must be an integer of at least two")
-    snapshot_entries = tuple(entries)
-    descriptors = tuple(
-        _scan_snapshot(entry, path.parent, source_level)
-        for entry in snapshot_entries
-    )
+    scan = scan_snapshot_manifest(manifest_path)
+    path = scan.path
+    document = scan.document
 
     def load_snapshot(index: int) -> Snapshot:
-        return _load_snapshot(snapshot_entries[index], path.parent, source_level)
+        return _load_snapshot(
+            scan.entries[index], path.parent, scan.source_level
+        )
 
     snapshots = LazySnapshotSeries(
-        descriptors, load_snapshot, cache_size=snapshot_cache_size
+        scan.descriptors, load_snapshot, cache_size=scan.snapshot_cache_size
     )
     frame_document = _frame_document(document.get("frame"), path.parent)
     frames = AffineFrameSeries.from_document(frame_document)
@@ -1387,7 +1455,7 @@ def extract_manifest(
     if not isinstance(target, dict):
         raise ValueError("manifest worldtube must be an object")
     cells = target.get("cells_per_edge")
-    if not isinstance(cells, int):
+    if not isinstance(cells, int) or isinstance(cells, bool):
         raise ValueError("worldtube cells_per_edge must be an integer")
     geometry = CubeGeometry(
         center=np.asarray(target.get("center", (0.0, 0.0, 0.0))),
@@ -1395,7 +1463,7 @@ def extract_manifest(
         cells=cells,
     )
     quadrature_order = document.get("quadrature_order", 2)
-    if not isinstance(quadrature_order, int):
+    if not isinstance(quadrature_order, int) or isinstance(quadrature_order, bool):
         raise ValueError("quadrature_order must be an integer")
     length_scale = _finite_positive(
         document.get("global_length_in_local_units", 1.0),
@@ -1426,7 +1494,7 @@ def extract_manifest(
             "selected_leaf_meshblocks": snapshot.source_meshblock_count,
             "available_leaf_levels": list(snapshot.available_leaf_levels),
         }
-        if hash_source_files:
+        if scan.hash_source_files:
             provenance["state_sha256"] = static.file_sha256(snapshot.state_path)
             provenance["adm_sha256"] = static.file_sha256(snapshot.adm_path)
         source_snapshots.append(provenance)
@@ -1435,7 +1503,7 @@ def extract_manifest(
         "source_manifest": str(path),
         "source_manifest_sha256": static.file_sha256(path),
         "frame_series_contract": frame_document,
-        "source_file_hashes_recorded": hash_source_files,
+        "source_file_hashes_recorded": scan.hash_source_files,
         "source_snapshots": source_snapshots,
         "state_variables": ["rho", "u1", "u2", "u3", "pgas", "bcc1", "bcc2", "bcc3"],
         "dynamical_grmhd_state": True,

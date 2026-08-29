@@ -100,6 +100,20 @@ def test_four_vector_round_trip_through_spacetime_jacobian() -> None:
     )
 
 
+def test_jacobian_singularity_check_is_invariant_under_emri_unit_scaling() -> None:
+    scale = 1.0e6
+    tangent = np.asarray((1.0, 0.2, -0.1, 0.05)) / scale
+    legs = np.vstack((np.zeros(3), np.eye(3))) / scale
+    affine = frame.AffineFrame(tangent, legs, np.zeros((4, 3)))
+    jacobian = affine.jacobian()
+    np.testing.assert_allclose(
+        jacobian * scale,
+        _static_frame((0.2, -0.1, 0.05)).jacobian(),
+        rtol=0.0,
+        atol=2.0e-16,
+    )
+
+
 def test_frame_audit_separates_static_moving_and_cut_surface_cases() -> None:
     static = frame.audit_frame(_static_frame())
     moving = frame.audit_frame(_static_frame((0.1, 0.0, 0.0)))

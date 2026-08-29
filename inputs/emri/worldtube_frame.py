@@ -84,9 +84,10 @@ class AffineFrame:
         result = np.empty((4, 4), dtype=np.float64)
         result[:, 0] = self.worldline_tangent + self.spatial_leg_derivative @ position
         result[:, 1:] = self.spatial_legs
-        determinant = float(np.linalg.det(result))
-        scale = max(float(np.linalg.norm(result, ord=2)), 1.0)
-        if abs(determinant) <= 64.0 * np.finfo(float).eps * scale**4:
+        singular_values = np.linalg.svd(result, compute_uv=False)
+        if singular_values[-1] <= (
+            64.0 * np.finfo(float).eps * singular_values[0]
+        ):
             raise ValueError("affine frame has a singular spacetime Jacobian")
         return result
 
