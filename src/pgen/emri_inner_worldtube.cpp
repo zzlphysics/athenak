@@ -28,6 +28,7 @@
 #include "mesh/mesh.hpp"
 #include "mesh/meshblock.hpp"
 #include "mesh/meshblock_pack.hpp"
+#include "eos/eos.hpp"
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
 #include "pgen/pgen.hpp"
@@ -64,6 +65,23 @@ bool NearlyEqual(Real a, Real b, Real scale = 1.0) {
   const Real tolerance = 256.0*std::numeric_limits<Real>::epsilon()*
       std::max({std::abs(a), std::abs(b), std::abs(scale), Real(1.0)});
   return std::abs(a - b) <= tolerance;
+}
+
+Real StageStateTime(Mesh *pm, Driver *pdrive, int stage) {
+  Real start = pm->time;
+  Real dt = pm->dt;
+  if (pdrive->LevelSubcyclingRequested()) {
+    start = pdrive->level_subcycling.time;
+    dt = pdrive->level_subcycling.dt;
+  }
+  if (stage <= 0) return start;
+  if (pdrive->integrator == "rk1" || pdrive->integrator == "rk2") {
+    return start + dt;
+  }
+  if (pdrive->integrator == "rk3") {
+    return start + ((stage == 2) ? 0.5 : 1.0)*dt;
+  }
+  InnerFatal("fluid worldtube replay encountered an unsupported RK integrator");
 }
 
 std::uint32_t ReadLE32(const unsigned char *bytes) {
@@ -156,7 +174,26 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
   if (!(std::isfinite(flux_tolerance_) && flux_tolerance_ > 0.0)) {
     InnerFatal("<emri_worldtube>/flux_tolerance must be finite and positive");
   }
+  const std::string fluid_boundary =
+      pin->GetOrAddString("emri_worldtube", "fluid_boundary", "off");
+  if (fluid_boundary == "off") {
+    fluid_boundary_enabled_ = false;
+  } else if (fluid_boundary == "riemann") {
+    fluid_boundary_enabled_ = true;
+  } else {
+    InnerFatal("<emri_worldtube>/fluid_boundary must be off or riemann");
+  }
   ReadHeaderAndTimes(pin, pm);
+  if (fluid_boundary_enabled_) {
+    mhd::MHD *pmhd = pm->pmb_pack->pmhd;
+    if (!has_cell_centered_magnetic_state_) {
+      InnerFatal(
+          "fluid_boundary=riemann requires trailing bcc1,bcc2,bcc3 state data");
+    }
+    if (pmhd->nmhd != 5 || !pmhd->peos->eos_data.is_ideal) {
+      InnerFatal("fluid_boundary=riemann currently requires ideal-gas MHD");
+    }
+  }
   BuildBoundaryTopology(pm);
   LoadInterval(interval_);
   if (!is_restart_) {
@@ -560,6 +597,72 @@ Real EmriInnerWorldtubeReplay::BoundaryFluxResidual(
   return maximum;
 }
 
+void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
+                                                       int stage) {
+  if (!fluid_boundary_enabled_ || exhausted_) return;
+  const Real data_time = StageStateTime(pm, pdrive, stage) + time_offset_;
+  const Real left_time = times_[interval_];
+  const Real right_time = times_[interval_ + 1];
+  const Real time_scale = times_.back() - times_.front();
+  if (data_time < left_time && !NearlyEqual(data_time, left_time, time_scale)) {
+    InnerFatal("fluid replay stage time precedes the loaded worldtube interval");
+  }
+  if (data_time > right_time && !NearlyEqual(data_time, right_time, time_scale)) {
+    InnerFatal("fluid replay stage time exceeds the loaded worldtube interval");
+  }
+  const Real theta = std::clamp(
+      (data_time - left_time)/(right_time - left_time), Real(0.0), Real(1.0));
+  mhd::MHD *pmhd = pm->pmb_pack->pmhd;
+  auto records = face_records_;
+  auto left = state_left_;
+  auto right = state_right_;
+  auto left_flux = flux_left_;
+  auto right_flux = flux_right_;
+  auto w0 = pmhd->w0;
+  auto bcc0 = pmhd->bcc0;
+  const int local_faces = static_cast<int>(host_faces_.size());
+  const int cells = cells_per_edge_;
+  const int nvar = nvar_;
+  const int fluid_nvar = pmhd->nmhd + pmhd->nscalars;
+  const int nghost = pm->mb_indcs.ng;
+  const Real inverse_area = 1.0/(dx_*dx_);
+  if (local_faces == 0) return;
+  par_for("emri_inner_fluid_boundary", DevExeSpace(), 0, local_faces - 1,
+  KOKKOS_LAMBDA(int record_index) {
+    const int face = records(record_index, 0);
+    const int m = records(record_index, 1);
+    const int k = records(record_index, 2);
+    const int j = records(record_index, 3);
+    const int i = records(record_index, 4);
+    const int v = records(record_index, 5);
+    const int u = records(record_index, 6);
+    const int normal_axis = kNormalAxis[face];
+    const int normal_sign = kNormalSign[face];
+    const int face_cell = (face*cells + v)*cells + u;
+    Real exterior_b[3];
+    for (int component = 0; component < 3; ++component) {
+      const int variable = fluid_nvar + component;
+      const int input = ((face*nvar + variable)*cells + v)*cells + u;
+      exterior_b[component] = (1.0 - theta)*left(input) + theta*right(input);
+    }
+    const Real outward_flux =
+        (1.0 - theta)*left_flux(face_cell) + theta*right_flux(face_cell);
+    exterior_b[normal_axis] = normal_sign*outward_flux*inverse_area;
+    for (int layer = 1; layer <= nghost; ++layer) {
+      int ghost[3] = {i, j, k};
+      ghost[normal_axis] += normal_sign*layer;
+      for (int variable = 0; variable < fluid_nvar; ++variable) {
+        const int input = ((face*nvar + variable)*cells + v)*cells + u;
+        w0(m, variable, ghost[2], ghost[1], ghost[0]) =
+            (1.0 - theta)*left(input) + theta*right(input);
+      }
+      for (int component = 0; component < 3; ++component) {
+        bcc0(m, component, ghost[2], ghost[1], ghost[0]) = exterior_b[component];
+      }
+    }
+  });
+}
+
 void EmriInnerWorldtubeReplay::InjectEField(Mesh *pm, Driver *pdrive, int stage) {
   if (exhausted_) InnerFatal("inner evolution advanced beyond the replay table");
   if (pdrive->LevelSubcyclingRequested() || pdrive->nimp_stages != 0 ||
@@ -649,6 +752,14 @@ void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage) {
     InnerFatal("invalid inner-worldtube EMF callback state");
   }
   pm->pgen->emri_inner_worldtube_->InjectEField(pm, pdrive, stage);
+}
+
+void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stage) {
+  if (pm == nullptr || pm->pgen == nullptr ||
+      pm->pgen->emri_inner_worldtube_ == nullptr) {
+    InnerFatal("invalid inner-worldtube primitive-boundary callback state");
+  }
+  pm->pgen->emri_inner_worldtube_->ApplyPrimitiveBoundary(pm, pdrive, stage);
 }
 
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive) {

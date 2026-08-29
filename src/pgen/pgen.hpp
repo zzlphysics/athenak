@@ -24,11 +24,13 @@ void EmriOuterWorldtubeObserveEField(Mesh *pm, Driver *pdrive, int stage);
 void EmriOuterWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriOuterWorldtubeFinalize(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage);
+void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stage);
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeCapTimestep(Mesh *pm);
 
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
+using UserPrimitiveBoundaryFnPtr = void (*)(Mesh* pm, Driver* pdrive, int stage);
 using UserEFieldFnPtr = void (*)(Mesh* pm, Driver* pdrive, int stage);
 using UserStepFnPtr = void (*)(Mesh* pm, Driver* pdrive);
 using UserTimestepFnPtr = void (*)(Mesh* pm);
@@ -67,6 +69,10 @@ class ProblemGenerator {
   ProblemFinalizeFnPtr pgen_final_func=nullptr;
   // function pointer for user-enrolled BCs.  Called in ApplyPhysicalBCs in task list
   UserBoundaryFnPtr user_bcs_func=nullptr;
+  // Optional primitive-cache boundary hook.  It runs after C2P, so a boundary Riemann
+  // problem can supply an exterior primitive state without rewriting outgoing conserved
+  // modes before the ordinary solver sees the interface.
+  UserPrimitiveBoundaryFnPtr user_primitive_bcs_func=nullptr;
   // Optional edge-electric-field hook, called after built-in E-field source terms and
   // before EMF communication/CT at every explicit RK stage.
   UserEFieldFnPtr user_efld_func=nullptr;
@@ -116,6 +122,7 @@ class ProblemGenerator {
   friend void EmriOuterWorldtubeCompleteStep(Mesh*, Driver*);
   friend void EmriOuterWorldtubeFinalize(Mesh*, Driver*);
   friend void EmriInnerWorldtubeInjectEField(Mesh*, Driver*, int);
+  friend void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh*, Driver*, int);
   friend void EmriInnerWorldtubeCompleteStep(Mesh*, Driver*);
   friend void EmriInnerWorldtubeCapTimestep(Mesh*);
 

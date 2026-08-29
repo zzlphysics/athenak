@@ -666,6 +666,7 @@ mode           = inner
 file           = /absolute/path/disk_patch.inner.bin
 time_offset    = auto
 flux_tolerance = 1.0e-10
+fluid_boundary = off
 ```
 
 On a fresh run the replay initializes the six active boundary-normal face fields from
@@ -678,14 +679,27 @@ flux to the stored next slab and aborts if the normalized discrepancy exceeds
 `flux_tolerance`.  Single-block, eight-block, equal-timestep, and five-inner-step per
 outer-interval tests close this check.
 
-The state slabs are loaded but are intentionally not imposed yet.  A production global
-disk to local-EMRI coupling must first transform density/pressure, four-velocity, magnetic
-flux 2-forms, and EMF 1-forms into the same comoving source-tetrad chart, then prescribe
-only incoming GRMHD characteristic amplitudes.  Copying global coordinate primitives
-into all ghost cells would both use the wrong frame and overconstrain outgoing modes.
-Likewise, a moving extraction cube needs the motional EMF in the discrete map.  The
-current magnetic replay is consequently a complete CT/topology transport layer and an
-end-to-end test bed, not yet the final physical fluid boundary condition.
+The state slabs are loaded but remain inactive by default.  A production global disk to
+local-EMRI coupling must first transform density/pressure, four-velocity, magnetic flux
+2-forms, and EMF 1-forms into the same inner coordinate chart.  Copying global coordinate
+primitives into all ghost cells would use the wrong frame; likewise, a moving extraction
+cube needs the motional EMF in the discrete map.  The default magnetic-only replay is
+therefore the conservative CT/topology transport layer and end-to-end test bed.  Set
+`fluid_boundary=riemann` only after `cell_state` has been
+transformed into the inner simulation's coordinate primitive convention and contains
+the trailing `bcc1,bcc2,bcc3` fields.  This enables the first operational fluid replay:
+after every C2P cache refresh it linearly interpolates the exterior state in worldtube
+time, fills the face-normal ghost columns, replaces the ghost normal `bcc` by the CT
+flux value, and lets the ordinary GRMHD HLLE solver pose the boundary Riemann problem.
+It never overwrites active cells or the evolved CT face field.
+
+This HLL boundary is characteristic-compatible in the two-wave sense.  If the entire
+HLL fan leaves the box, the solver uses the interior flux exactly; if the entire fan
+enters, it uses the exterior flux; a mixed fan gets the standard HLL combination.  It
+is substantially safer than overwriting active primitives, but it is more diffusive
+than the seven-wave projector below and does not separately preserve every outgoing
+Alfvén/contact/slow amplitude.  `fluid_boundary=off` remains the default until reflection
+and frame-transformation tests are passed.
 
 ### Incoming-characteristic reference projector
 
@@ -717,13 +731,15 @@ relativistic hydrodynamic sound speeds when `B=0`, returns the complete exterior
 for super-fast inflow, retains the interior state for super-fast outflow, and replaces
 only the incoming amplitudes in a mixed fan.
 
-It is not yet called by the AthenaK boundary task.  A production device implementation
-must use a degeneracy-safe RMHD eigenbasis (or a separately validated equivalent
-projector), interpolate the exterior state in time, construct the local orthonormal
-tetrad at every boundary cell, and update ghost conserved variables consistently.  The
-host reference intentionally aborts on an ill-conditioned eigenbasis instead of silently
-falling back to primitive copying.  These choices follow the local-Riemann construction
-of Antón et al. (2006) and prevent the replay from overconstraining outgoing modes.
+It is not yet the projector used by the AthenaK boundary task: the operational
+`fluid_boundary=riemann` path currently delegates the wave split to HLLE.  A higher
+fidelity device implementation must use a degeneracy-safe RMHD eigenbasis (or a
+separately validated equivalent projector), construct the local orthonormal tetrad at
+every boundary cell, and replace the HLL aggregate split by the seven individual modes.
+The host reference intentionally aborts on an ill-conditioned eigenbasis instead of
+silently falling back to primitive copying.  These choices follow the local-Riemann
+construction of Antón et al. (2006) and prevent the replay from overconstraining outgoing
+modes.
 
 ## Validation gates before science production
 

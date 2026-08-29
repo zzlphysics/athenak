@@ -77,6 +77,7 @@ struct MHDTaskIDs {
   TaskID bcs;
   TaskID prol;
   TaskID c2p;
+  TaskID primbcs;
   TaskID newdt;
   TaskID csend;
   TaskID crecv;
@@ -204,6 +205,7 @@ class MHD {
   TaskStatus ApplyPhysicalBCs(Driver* pdrive, int stage);
   TaskStatus Prolongate(Driver* pdrive, int stage);
   TaskStatus ConToPrim(Driver *d, int stage);
+  TaskStatus ApplyUserPrimitiveBCs(Driver *d, int stage);
   TaskStatus NewTimeStep(Driver *d, int stage);
   // ...in "after_stagen_tl" task list
   TaskStatus ClearSend(Driver *d, int stage);

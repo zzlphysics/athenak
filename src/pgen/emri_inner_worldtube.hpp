@@ -26,8 +26,10 @@ class EmriInnerWorldtubeReplay {
   ~EmriInnerWorldtubeReplay() = default;
 
   void InjectEField(Mesh *pm, Driver *pdrive, int stage);
+  void ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stage);
   void CompleteStep(Mesh *pm, Driver *pdrive);
   void CapTimestep(Mesh *pm);
+  bool FluidBoundaryEnabled() const { return fluid_boundary_enabled_; }
 
  private:
   struct FaceRecord {
@@ -59,6 +61,7 @@ class EmriInnerWorldtubeReplay {
   Mesh *pmesh_ = nullptr;
   bool is_restart_ = false;
   bool exhausted_ = false;
+  bool fluid_boundary_enabled_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   bool has_cell_centered_magnetic_state_ = false;
@@ -88,6 +91,7 @@ class EmriInnerWorldtubeReplay {
 };
 
 void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage);
+void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stage);
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeCapTimestep(Mesh *pm);
 

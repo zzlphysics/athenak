@@ -1396,6 +1396,7 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm) {
       }
       (void) pdyngr->ConToPrim(this, 0);
     }
+    (void) pmhd->ApplyUserPrimitiveBCs(this, 0);
   }
 
   // Initialize radiation: ghost zones and intensity (everywhere)

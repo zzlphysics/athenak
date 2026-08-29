@@ -262,7 +262,10 @@ void DynGRMHDPS<EOSPolicy, ErrorPolicy>::QueueDynGRMHDTasks() {
   pnr->QueueTask(&MHD::Prolongate, pmhd, MHD_Prolong, "MHD_Prolong", Task_Run, {MHD_BCS});
   pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
                  "MHD_C2P", Task_Run, {MHD_Prolong}, {Z4c_Excise});
-  pnr->QueueTask(&MHD::NewTimeStep, pmhd, MHD_Newdt, "MHD_Newdt", Task_Run, {MHD_C2P});
+  pnr->QueueTask(&MHD::ApplyUserPrimitiveBCs, pmhd, MHD_PrimBC, "MHD_PrimBC",
+                 Task_Run, {MHD_C2P});
+  pnr->QueueTask(&MHD::NewTimeStep, pmhd, MHD_Newdt, "MHD_Newdt", Task_Run,
+                 {MHD_PrimBC});
 
   // End task list
   pnr->QueueTask(&MHD::ClearSend, pmhd, MHD_ClearS, "MHD_ClearS", Task_End);

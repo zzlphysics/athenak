@@ -177,6 +177,9 @@ file_basename = emri_windtunnel_smoke.outer_worldtube
 file          =
 time_offset   = auto
 flux_tolerance = 1.0e-10
+# off: magnetic CT replay only; riemann: time-interpolated exterior fluid ghost state
+# consumed by the ordinary GRMHD boundary Riemann solver (requires trailing bcc state).
+fluid_boundary = off
 
 <output1>
 file_type = bin

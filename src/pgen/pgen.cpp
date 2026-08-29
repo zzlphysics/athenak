@@ -686,16 +686,20 @@ void ProblemGenerator::ConfigureEmriOuterWorldtube(ParameterInput *pin,
     user_step_observer_func = EmriOuterWorldtubeCompleteStep;
     user_finalize_observer_func = EmriOuterWorldtubeFinalize;
   } else if (mode == "inner") {
-    if (user_efld_func != nullptr || user_timestep_func != nullptr) {
+    if (user_efld_func != nullptr || user_timestep_func != nullptr ||
+        user_primitive_bcs_func != nullptr) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                 << std::endl
-                << "inner <emri_worldtube> cannot replace a problem-owned EMF or "
-                << "timestep hook." << std::endl;
+                << "inner <emri_worldtube> cannot replace a problem-owned EMF, "
+                << "primitive-boundary, or timestep hook." << std::endl;
       std::exit(EXIT_FAILURE);
     }
     emri_inner_worldtube_ = std::make_unique<EmriInnerWorldtubeReplay>(
         pin, pmy_mesh_, is_restart);
     user_efld_func = EmriInnerWorldtubeInjectEField;
+    if (emri_inner_worldtube_->FluidBoundaryEnabled()) {
+      user_primitive_bcs_func = EmriInnerWorldtubeApplyPrimitiveBoundary;
+    }
     user_step_observer_func = EmriInnerWorldtubeCompleteStep;
     user_timestep_func = EmriInnerWorldtubeCapTimestep;
   } else {

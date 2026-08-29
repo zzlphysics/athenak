@@ -54,6 +54,7 @@ enum TaskName {
   MHD_SetADM,
   MHD_Excise,
   MHD_C2P,
+  MHD_PrimBC,
   MHD_Newdt,
   MHD_ClearS,
   MHD_ClearR,

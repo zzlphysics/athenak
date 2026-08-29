@@ -74,7 +74,8 @@ void MHD::AssembleMHDTasks(std::map<std::string, std::shared_ptr<TaskList>> tl) 
   id.bcs       = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, this, id.recvb_shr);
   id.prol      = tl["stagen"]->AddTask(&MHD::Prolongate, this, id.bcs);
   id.c2p       = tl["stagen"]->AddTask(&MHD::ConToPrim, this, id.prol);
-  id.newdt     = tl["stagen"]->AddTask(&MHD::NewTimeStep, this, id.c2p);
+  id.primbcs   = tl["stagen"]->AddTask(&MHD::ApplyUserPrimitiveBCs, this, id.c2p);
+  id.newdt     = tl["stagen"]->AddTask(&MHD::NewTimeStep, this, id.primbcs);
 
   // assemble "after_stagen" task list
   id.csend = tl["after_stagen"]->AddTask(&MHD::ClearSend, this, none);
@@ -668,6 +669,18 @@ TaskStatus MHD::ConToPrim(Driver *pdrive, int stage) {
   int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
   int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
   peos->ConsToPrim(u0, b0, w0, bcc0, false, 0, n1m1, 0, n2m1, 0, n3m1);
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MHD::ApplyUserPrimitiveBCs
+//! \brief Apply a problem-owned exterior primitive state after the C2P cache refresh.
+
+TaskStatus MHD::ApplyUserPrimitiveBCs(Driver *pdrive, int stage) {
+  auto *pgen = pmy_pack->pmesh->pgen.get();
+  if (pgen->user_primitive_bcs_func != nullptr) {
+    (pgen->user_primitive_bcs_func)(pmy_pack->pmesh, pdrive, stage);
+  }
   return TaskStatus::complete;
 }
 
