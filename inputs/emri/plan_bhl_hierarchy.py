@@ -422,7 +422,8 @@ def build_plan(
     transfer_contract = {
         "status": (
             "fixed-grid outer writer and inner CT magnetic replay implemented; "
-            "moving/AMR extraction and characteristic fluid replay pending"
+            "moving/source-frame pullback and CT cochain projection implemented; "
+            "cut-surface/AMR sampling and characteristic fluid replay pending"
         ),
         "geometry": "secondary-centered cubical worldtube in source-tetrad axes",
         "cube_half_width": match_radius,

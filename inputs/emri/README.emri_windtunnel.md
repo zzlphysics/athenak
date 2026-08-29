@@ -570,6 +570,73 @@ conservation law; merely changing `center_x*` each output would break the same F
 identity the format is designed to preserve.  Static refinement can be added next by
 extracting on one uniform leaf level and using the existing mimetic regridder.
 
+### Moving/source-tetrad frame contract
+
+`worldtube_frame.py` now supplies the geometry and discrete-constraint layer needed by a
+future cut-surface sampler.  For the affine local map
+
+```text
+x^mu(T,X) = z^mu(T) + e^mu_a(T) X^a,
+```
+
+it constructs the full Jacobian, including the position-dependent time leg
+`dz^mu/dT + (de^mu_a/dT) X^a`, and pulls back the Faraday two-form.  When the global and
+local time coordinates agree, the electric edge one-form reduces to
+
+```text
+E_local,a = e^i_a [E_i + (w cross B)_i].
+```
+
+Thus both the translation of the secondary and rotation of its spatial tetrad enter the
+EMF.  The same module transforms contravariant four-vectors with the inverse spacetime
+Jacobian.  Magnetic components come from the spatial part of the pulled-back two-form,
+so no separate, ambiguous vector-component rotation is used.
+
+An instantaneous frame contract can be audited before a run:
+
+```json
+{
+  "classification": "athenak-emri-affine-worldtube-frame-v1",
+  "worldline_tangent": [1.0, 0.0, 0.2, 0.0],
+  "spatial_legs": [[0,0,0], [1,0,0], [0,1,0], [0,0,1]],
+  "spatial_leg_derivative": [[0,0,0], [0,-0.01,0], [0.01,0,0], [0,0,0]]
+}
+```
+
+```bash
+python3 inputs/emri/worldtube_frame.py audit frame.json
+```
+
+Only a stationary signed permutation of the Cartesian axes is an exact relabeling of
+the current fixed cube.  A translating axis-aligned cube needs an ALE surface sampler;
+a general tetrad rotation needs cut-face/cut-edge geometry as well.  The audit reports
+these cases separately and never treats ordinary array interpolation as a tensor
+transformation.
+
+Even a correct moving-surface quadrature will generally leave small inconsistencies
+between interpolated endpoint fluxes and interpolated edge EMFs.  Given a raw NPZ with
+the usual arrays, apply the unique-edge surface-cochain projection with
+
+```bash
+python3 inputs/emri/worldtube_frame.py project-moving \
+  sampled_moving_worldtube.npz projected_worldtube.npz
+```
+
+The projection first merges the two samples of each of the twelve physical cube-edge
+segments in a common orientation.  On every interval it then finds the minimum-norm
+edge correction whose discrete curl equals `(Phi[n]-Phi[n+1])/dt` on all six face
+grids.  Endpoint fluxes and fluid states are not changed.  A changing net flux through
+the closed surface is rejected because no edge field can repair it.  The output records
+the raw Faraday error, shared-edge mismatch, iteration residual, and maximum/RMS edge
+correction.  These corrections must decrease under outer spatial and temporal
+refinement; the projection restores topology but cannot rescue an under-resolved
+physical sample.
+
+The remaining implementation gap is consequently narrow and explicit: sample `F` and
+fluid four-vectors on the moving cut surface during the global run, then feed those raw
+integrals through this pullback/projection layer.  The existing fixed-grid observer is
+still the only production outer sampler.
+
 ### Inner CT magnetic replay
 
 Prepare the validated NPZ for bounded-memory C++ loading:
