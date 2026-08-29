@@ -714,6 +714,23 @@ are retained as provenance.  Set `hash_source_files=true` for a final production
 to add SHA-256 for every large dump; it defaults to false so exploratory extraction does
 not perform a second full read of the source series.
 
+Long series are scanned once in metadata-only mode and loaded through a bounded LRU
+cache.  `snapshot_cache_size` defaults to two, the minimum needed for linear time
+interpolation.  Sampling is ordered by time interval across all six faces, so a
+time-orthogonal frame whose output times follow the dump times normally loads every
+source snapshot exactly once.  A frame with temporal tilt `e^0_a X^a` can span several
+source intervals on one face; increase the cache if the recorded miss and eviction
+counts show repeated loads.  The output metadata records capacity, hits, misses,
+evictions, and peak resident snapshots.
+
+Consequently, resident source data scale as
+`O(snapshot_cache_size * selected-level snapshot size)` rather than with the number of
+dumps.  This does not yet make a single dump block-streaming: the binary reader loads
+the requested state and ADM variables for one complete snapshot pair before the
+extractor keeps only the selected leaf-level blocks.  Production memory estimates must
+therefore include that one-pair transient peak in addition to the cache and output
+worldtube.
+
 Start from `global_worldtube_manifest.example.json`, replace its dump paths and affine
 frame with the physical worldline/tetrad map, then run
 

@@ -11,6 +11,7 @@
     }
   ],
   "source_level": 0,
+  "snapshot_cache_size": 2,
   "frame": {
     "classification": "athenak-emri-affine-worldtube-frame-series-v1",
     "times": [0.0, 1.0],

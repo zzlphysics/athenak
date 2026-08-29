@@ -656,6 +656,7 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, object]:
                     "comparison": comparison,
                     "projection": _projection_summary(metadata),
                     "raw_sampling": diagnostics["raw_sampling"],
+                    "snapshot_loading": diagnostics["snapshot_loading"],
                 }
                 if (
                     not arguments.skip_replay

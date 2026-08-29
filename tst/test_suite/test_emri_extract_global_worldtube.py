@@ -50,6 +50,22 @@ def _snapshot(time: float, values: np.ndarray | None = None) -> extract.UniformS
     )
 
 
+def _descriptor(snapshot: extract.UniformSnapshot) -> extract.SnapshotDescriptor:
+    return extract.SnapshotDescriptor(
+        time=snapshot.time,
+        cycle=snapshot.cycle,
+        lower=snapshot.lower,
+        spacing=snapshot.spacing,
+        shape_xyz=snapshot.shape_xyz,
+        state_path=snapshot.state_path,
+        adm_path=snapshot.adm_path,
+        source_level=snapshot.source_level,
+        source_meshblock_count=snapshot.source_meshblock_count,
+        available_leaf_levels=snapshot.available_leaf_levels,
+        source_storage=snapshot.source_storage,
+    )
+
+
 def _fixed_level_snapshot(
     time: float,
     include_right_block: bool = True,
@@ -264,6 +280,51 @@ def test_constant_global_state_builds_exact_static_ct_worldtube() -> None:
     assert validation["maximum_shared_edge_emf_residual"] == 0.0
     assert validation["maximum_closed_surface_flux"] < 2.0e-16
     assert diagnostics["raw_sampling"]["maximum_ideal_mhd_residual"] < 2.0e-16
+
+
+def test_lazy_snapshot_series_matches_eager_and_loads_each_snapshot_once() -> None:
+    source_snapshots = tuple(_snapshot(time) for time in (0.0, 0.5, 1.0))
+    loader_calls = []
+
+    def loader(index: int) -> extract.UniformSnapshot:
+        loader_calls.append(index)
+        return source_snapshots[index]
+
+    lazy = extract.LazySnapshotSeries(
+        tuple(_descriptor(snapshot) for snapshot in source_snapshots),
+        loader,
+        cache_size=2,
+    )
+    eager_sampler = extract.GlobalWorldtubeSampler(
+        extract.SnapshotSeries(source_snapshots), _frame_series(), 1.0, 1.0
+    )
+    lazy_sampler = extract.GlobalWorldtubeSampler(
+        lazy, _frame_series(), 1.0, 1.0
+    )
+    geometry = extract.CubeGeometry(np.zeros(3), 0.5, 2)
+    times = np.asarray((0.0, 0.5, 1.0))
+    eager_faces, _ = extract.sample_worldtube(
+        eager_sampler, geometry, times, quadrature_order=1
+    )
+    lazy_faces, lazy_diagnostics = extract.sample_worldtube(
+        lazy_sampler, geometry, times, quadrature_order=1
+    )
+    for name in worldtube.FACE_NAMES:
+        np.testing.assert_array_equal(
+            lazy_faces[name].cell_state, eager_faces[name].cell_state
+        )
+        np.testing.assert_array_equal(
+            lazy_faces[name].normal_flux, eager_faces[name].normal_flux
+        )
+        np.testing.assert_array_equal(lazy_faces[name].emf_u, eager_faces[name].emf_u)
+        np.testing.assert_array_equal(lazy_faces[name].emf_v, eager_faces[name].emf_v)
+    loading = lazy_diagnostics["snapshot_loading"]
+    assert loader_calls == [0, 1, 2]
+    assert loading["cache_misses"] == 3
+    assert loading["cache_evictions"] == 1
+    assert loading["peak_cached_snapshots"] == 2
+    assert loading["resident_snapshot_count"] == 2
+    assert loading["cache_hits"] > 0
 
 
 def test_moving_frame_includes_motional_emf_and_eulerian_velocity() -> None:

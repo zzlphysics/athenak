@@ -238,6 +238,9 @@ def run_check(arguments: argparse.Namespace) -> dict[str, object]:
             "worldtube": str(output),
             "wall_seconds": wall,
             "source_level": metadata["source_level"],
+            "snapshot_loading": metadata["sampling_diagnostics"][
+                "snapshot_loading"
+            ],
             "projection": campaign._projection_summary(metadata),
         }
 

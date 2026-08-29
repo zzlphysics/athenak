@@ -18,12 +18,13 @@ they must converge toward zero with source, target, and quadrature resolution.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
 import sys
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -385,66 +386,221 @@ class FixedLevelSnapshot:
         return result
 
 
+Snapshot = UniformSnapshot | FixedLevelSnapshot
+
+
 @dataclass(frozen=True)
-class SnapshotSeries:
-    snapshots: tuple[UniformSnapshot | FixedLevelSnapshot, ...]
+class SnapshotDescriptor:
+    """Lightweight source metadata retained for a long snapshot series."""
+
+    time: float
+    cycle: int
+    lower: np.ndarray
+    spacing: np.ndarray
+    shape_xyz: tuple[int, int, int]
+    state_path: Path
+    adm_path: Path
+    source_level: int
+    source_meshblock_count: int
+    available_leaf_levels: tuple[int, ...]
+    source_storage: str
 
     def __post_init__(self) -> None:
-        if len(self.snapshots) < 2:
-            raise ValueError(
-                "global worldtube extraction requires at least two snapshots"
+        lower = _finite_array(self.lower, (3,), "snapshot-descriptor lower bound")
+        spacing = _finite_array(self.spacing, (3,), "snapshot-descriptor spacing")
+        if np.any(spacing <= 0.0):
+            raise ValueError("snapshot-descriptor spacing must be positive")
+        if (
+            not math.isfinite(self.time)
+            or len(self.shape_xyz) != 3
+            or min(self.shape_xyz) < 2
+            or not isinstance(self.source_level, int)
+            or self.source_level < 0
+            or self.source_meshblock_count < 1
+        ):
+            raise ValueError("snapshot descriptor has invalid scalar metadata")
+        if self.source_level not in self.available_leaf_levels:
+            raise ValueError("descriptor source_level is absent from leaf levels")
+        if self.source_storage not in (
+            "dense_uniform",
+            "sparse_fixed_leaf_level",
+        ):
+            raise ValueError("snapshot descriptor has unsupported source storage")
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "spacing", spacing)
+
+
+SnapshotMetadata = Snapshot | SnapshotDescriptor
+
+
+def _validate_snapshot_sequence(snapshots: tuple[SnapshotMetadata, ...]) -> None:
+    if len(snapshots) < 2:
+        raise ValueError("global worldtube extraction requires at least two snapshots")
+    times = np.asarray([snapshot.time for snapshot in snapshots])
+    if not np.isfinite(times).all() or np.any(np.diff(times) <= 0.0):
+        raise ValueError("global snapshot times must increase strictly")
+    reference = snapshots[0]
+    for snapshot in snapshots[1:]:
+        if (
+            snapshot.shape_xyz != reference.shape_xyz
+            or snapshot.source_level != reference.source_level
+            or not np.allclose(snapshot.lower, reference.lower, rtol=0.0, atol=2.0e-13)
+            or not np.allclose(
+                snapshot.spacing, reference.spacing, rtol=0.0, atol=2.0e-13
             )
-        times = np.asarray([snapshot.time for snapshot in self.snapshots])
-        if not np.isfinite(times).all() or np.any(np.diff(times) <= 0.0):
-            raise ValueError("global snapshot times must increase strictly")
-        reference = self.snapshots[0]
-        for snapshot in self.snapshots[1:]:
-            if (
-                snapshot.shape_xyz != reference.shape_xyz
-                or snapshot.source_level != reference.source_level
-                or not np.allclose(
-                    snapshot.lower, reference.lower, rtol=0.0, atol=2.0e-13
-                )
-                or not np.allclose(
-                    snapshot.spacing, reference.spacing, rtol=0.0, atol=2.0e-13
-                )
-            ):
-                raise ValueError(
-                    "global snapshot source level or Cartesian geometry changes in time"
-                )
+        ):
+            raise ValueError(
+                "global snapshot source level or Cartesian geometry changes in time"
+            )
+
+
+def _sample_snapshot_events(
+    times: np.ndarray,
+    snapshot_at: Callable[[int], Snapshot],
+    events: object,
+) -> np.ndarray:
+    points = np.asarray(events, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 4 or not np.isfinite(points).all():
+        raise ValueError("global events must have finite shape (N,4)")
+    tolerance = 128.0 * np.finfo(float).eps * np.maximum(1.0, np.abs(points[:, 0]))
+    outside = (points[:, 0] < times[0] - tolerance) | (
+        points[:, 0] > times[-1] + tolerance
+    )
+    if np.any(outside):
+        first = int(np.flatnonzero(outside)[0])
+        raise ValueError(
+            f"mapped global time {points[first, 0]:.17g} lies outside snapshot "
+            f"range [{times[0]:.17g}, {times[-1]:.17g}]"
+        )
+    event_times = np.clip(points[:, 0], times[0], times[-1])
+    intervals = np.searchsorted(times, event_times, side="right") - 1
+    intervals = np.clip(intervals, 0, times.size - 2)
+    result = np.empty((points.shape[0], len(ALL_VARIABLES)), dtype=np.float64)
+    for interval in np.unique(intervals):
+        selected = intervals == interval
+        left = snapshot_at(int(interval)).sample(points[selected, 1:])
+        right = snapshot_at(int(interval) + 1).sample(points[selected, 1:])
+        fraction = (event_times[selected] - times[interval]) / (
+            times[interval + 1] - times[interval]
+        )
+        result[selected] = left + fraction[:, None] * (right - left)
+    return result
+
+
+@dataclass(frozen=True)
+class SnapshotSeries:
+    snapshots: tuple[Snapshot, ...]
+
+    def __post_init__(self) -> None:
+        _validate_snapshot_sequence(self.snapshots)
 
     @property
     def times(self) -> np.ndarray:
         return np.asarray([snapshot.time for snapshot in self.snapshots])
 
+    @property
+    def provenance_snapshots(self) -> tuple[Snapshot, ...]:
+        return self.snapshots
+
     def sample(self, events: object) -> np.ndarray:
-        points = np.asarray(events, dtype=np.float64)
-        if points.ndim != 2 or points.shape[1] != 4 or not np.isfinite(points).all():
-            raise ValueError("global events must have finite shape (N,4)")
-        times = self.times
-        tolerance = 128.0 * np.finfo(float).eps * np.maximum(1.0, np.abs(points[:, 0]))
-        outside = (points[:, 0] < times[0] - tolerance) | (
-            points[:, 0] > times[-1] + tolerance
+        return _sample_snapshot_events(self.times, self.snapshots.__getitem__, events)
+
+    def loading_document(self) -> dict[str, object]:
+        return {
+            "mode": "eager",
+            "snapshot_count": len(self.snapshots),
+            "resident_snapshot_count": len(self.snapshots),
+            "peak_cached_snapshots": len(self.snapshots),
+        }
+
+
+@dataclass
+class LazySnapshotSeries:
+    """Metadata-resident series with a bounded least-recently-used data cache."""
+
+    descriptors: tuple[SnapshotDescriptor, ...]
+    loader: Callable[[int], Snapshot]
+    cache_size: int = 2
+    _cache: OrderedDict[int, Snapshot] = field(
+        init=False, default_factory=OrderedDict, repr=False
+    )
+    _cache_hits: int = field(init=False, default=0, repr=False)
+    _cache_misses: int = field(init=False, default=0, repr=False)
+    _cache_evictions: int = field(init=False, default=0, repr=False)
+    _peak_cached_snapshots: int = field(init=False, default=0, repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.cache_size, int)
+            or isinstance(self.cache_size, bool)
+            or self.cache_size < 2
+        ):
+            raise ValueError("snapshot cache size must be an integer of at least two")
+        _validate_snapshot_sequence(self.descriptors)
+
+    @property
+    def times(self) -> np.ndarray:
+        return np.asarray([snapshot.time for snapshot in self.descriptors])
+
+    @property
+    def provenance_snapshots(self) -> tuple[SnapshotDescriptor, ...]:
+        return self.descriptors
+
+    def _snapshot(self, index: int) -> Snapshot:
+        if index in self._cache:
+            self._cache_hits += 1
+            snapshot = self._cache.pop(index)
+            self._cache[index] = snapshot
+            return snapshot
+        if len(self._cache) >= self.cache_size:
+            self._cache.popitem(last=False)
+            self._cache_evictions += 1
+        snapshot = self.loader(index)
+        descriptor = self.descriptors[index]
+        if (
+            snapshot.time != descriptor.time
+            or snapshot.cycle != descriptor.cycle
+            or snapshot.state_path != descriptor.state_path
+            or snapshot.adm_path != descriptor.adm_path
+            or snapshot.shape_xyz != descriptor.shape_xyz
+            or snapshot.source_level != descriptor.source_level
+            or snapshot.source_meshblock_count != descriptor.source_meshblock_count
+            or snapshot.available_leaf_levels != descriptor.available_leaf_levels
+            or snapshot.source_storage != descriptor.source_storage
+            or not np.allclose(
+                snapshot.lower, descriptor.lower, rtol=0.0, atol=2.0e-13
+            )
+            or not np.allclose(
+                snapshot.spacing, descriptor.spacing, rtol=0.0, atol=2.0e-13
+            )
+        ):
+            raise RuntimeError(
+                f"snapshot {index} metadata changed after its initial scan"
+            )
+        self._cache_misses += 1
+        self._cache[index] = snapshot
+        self._peak_cached_snapshots = max(
+            self._peak_cached_snapshots, len(self._cache)
         )
-        if np.any(outside):
-            first = int(np.flatnonzero(outside)[0])
-            raise ValueError(
-                f"mapped global time {points[first, 0]:.17g} lies outside snapshot "
-                f"range [{times[0]:.17g}, {times[-1]:.17g}]"
-            )
-        event_times = np.clip(points[:, 0], times[0], times[-1])
-        intervals = np.searchsorted(times, event_times, side="right") - 1
-        intervals = np.clip(intervals, 0, times.size - 2)
-        result = np.empty((points.shape[0], len(ALL_VARIABLES)), dtype=np.float64)
-        for interval in np.unique(intervals):
-            selected = intervals == interval
-            left = self.snapshots[int(interval)].sample(points[selected, 1:])
-            right = self.snapshots[int(interval) + 1].sample(points[selected, 1:])
-            fraction = (event_times[selected] - times[interval]) / (
-                times[interval + 1] - times[interval]
-            )
-            result[selected] = left + fraction[:, None] * (right - left)
-        return result
+        return snapshot
+
+    def sample(self, events: object) -> np.ndarray:
+        return _sample_snapshot_events(self.times, self._snapshot, events)
+
+    def loading_document(self) -> dict[str, object]:
+        return {
+            "mode": "lazy_lru",
+            "snapshot_count": len(self.descriptors),
+            "cache_capacity": self.cache_size,
+            "resident_snapshot_count": len(self._cache),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "cache_evictions": self._cache_evictions,
+            "peak_cached_snapshots": self._peak_cached_snapshots,
+        }
+
+
+SourceSeries = SnapshotSeries | LazySnapshotSeries
 
 
 @dataclass
@@ -631,15 +787,25 @@ def _fixed_level_snapshot(
     )
 
 
-def _load_snapshot(
-    entry: dict[str, object], directory: Path, source_level: int | None = None
-) -> UniformSnapshot | FixedLevelSnapshot:
+def _read_snapshot_pair(
+    entry: dict[str, object],
+    directory: Path,
+    load_variables: bool,
+) -> tuple[Path, Path, dict[str, object], dict[str, object], list[int]]:
     state_path = _resolve_path(entry.get("state"), directory, "snapshot state")
     adm_path = _resolve_path(entry.get("adm"), directory, "snapshot ADM")
-    state = bin_convert.read_binary(str(state_path), variables=STATE_VARIABLES)
-    adm = bin_convert.read_binary(str(adm_path), variables=ADM_VARIABLES)
-    static._check_dump(state, STATE_VARIABLES, "state")
-    static._check_dump(adm, ADM_VARIABLES, "ADM")
+    state_variables = STATE_VARIABLES if load_variables else ()
+    adm_variables = ADM_VARIABLES if load_variables else ()
+    state = bin_convert.read_binary(str(state_path), variables=state_variables)
+    adm = bin_convert.read_binary(str(adm_path), variables=adm_variables)
+    missing_state = sorted(set(STATE_VARIABLES).difference(state["var_names"]))
+    missing_adm = sorted(set(ADM_VARIABLES).difference(adm["var_names"]))
+    if missing_state:
+        raise RuntimeError(
+            f"state dump is missing fields: {', '.join(missing_state)}"
+        )
+    if missing_adm:
+        raise RuntimeError(f"ADM dump is missing fields: {', '.join(missing_adm)}")
     adm_alignment = static._aligned_adm_blocks(state, adm)
     time_scale = max(abs(float(state["time"])), abs(float(adm["time"])), 1.0)
     if int(state["cycle"]) != int(adm["cycle"]) or not math.isclose(
@@ -672,21 +838,82 @@ def _load_snapshot(
             float(state[label]), float(adm[label]), rel_tol=0.0, abs_tol=2.0e-13
         ):
             raise RuntimeError(f"state and ADM source grids differ in {label}")
+    return state_path, adm_path, state, adm, adm_alignment
+
+
+def _selected_source_level(
+    state: dict[str, object], source_level: int | None
+) -> tuple[int, tuple[int, ...]]:
     state_levels = np.asarray(state["mb_logical"], dtype=np.int64)[:, 3]
-    available_levels = sorted(set(int(value) for value in state_levels))
+    available_levels = tuple(sorted(set(int(value) for value in state_levels)))
     if source_level is None and len(available_levels) > 1:
         raise RuntimeError(
             "AMR/SMR snapshot requires an explicit manifest source_level; "
-            f"available leaf levels are {available_levels}"
+            f"available leaf levels are {list(available_levels)}"
         )
-    if source_level is not None or available_levels[0] != 0:
+    selected_level = available_levels[0] if source_level is None else source_level
+    if selected_level not in available_levels:
+        raise RuntimeError(
+            f"source_level={selected_level} has no leaf MeshBlocks; "
+            f"available leaf levels are {list(available_levels)}"
+        )
+    return selected_level, available_levels
+
+
+def _scan_snapshot(
+    entry: dict[str, object], directory: Path, source_level: int | None = None
+) -> SnapshotDescriptor:
+    state_path, adm_path, state, _, _ = _read_snapshot_pair(
+        entry, directory, load_variables=False
+    )
+    selected_level, available_levels = _selected_source_level(state, source_level)
+    root_shape = np.asarray(
+        (state["Nx1"], state["Nx2"], state["Nx3"]), dtype=np.int64
+    )
+    if np.any(root_shape < 2):
+        raise RuntimeError("worldtube interpolation requires at least two cells per axis")
+    shape = root_shape * (1 << selected_level)
+    lower = np.asarray(
+        (state["x1min"], state["x2min"], state["x3min"]), dtype=np.float64
+    )
+    upper = np.asarray(
+        (state["x1max"], state["x2max"], state["x3max"]), dtype=np.float64
+    )
+    sparse = source_level is not None or selected_level != 0
+    levels = np.asarray(state["mb_logical"], dtype=np.int64)[:, 3]
+    selected_count = int(np.count_nonzero(levels == selected_level))
+    return SnapshotDescriptor(
+        time=float(state["time"]),
+        cycle=int(state["cycle"]),
+        lower=lower,
+        spacing=(upper - lower) / shape,
+        shape_xyz=tuple(int(value) for value in shape),
+        state_path=state_path,
+        adm_path=adm_path,
+        source_level=selected_level,
+        source_meshblock_count=(selected_count if sparse else int(state["n_mbs"])),
+        available_leaf_levels=available_levels,
+        source_storage=("sparse_fixed_leaf_level" if sparse else "dense_uniform"),
+    )
+
+
+def _load_snapshot(
+    entry: dict[str, object], directory: Path, source_level: int | None = None
+) -> Snapshot:
+    state_path, adm_path, state, adm, adm_alignment = _read_snapshot_pair(
+        entry, directory, load_variables=True
+    )
+    static._check_dump(state, STATE_VARIABLES, "state")
+    static._check_dump(adm, ADM_VARIABLES, "ADM")
+    selected_level, available_levels = _selected_source_level(state, source_level)
+    if source_level is not None or selected_level != 0:
         return _fixed_level_snapshot(
             state,
             adm,
             adm_alignment,
             state_path,
             adm_path,
-            available_levels[0] if source_level is None else source_level,
+            selected_level,
         )
     values = np.stack(
         [
@@ -713,9 +940,9 @@ def _load_snapshot(
         values=values,
         state_path=state_path,
         adm_path=adm_path,
-        source_level=available_levels[0],
+        source_level=selected_level,
         source_meshblock_count=int(state["n_mbs"]),
-        available_leaf_levels=tuple(available_levels),
+        available_leaf_levels=available_levels,
     )
 
 
@@ -815,7 +1042,7 @@ def transform_grmhd_sample(
 class GlobalWorldtubeSampler:
     def __init__(
         self,
-        snapshots: SnapshotSeries,
+        snapshots: SourceSeries,
         frames: AffineFrameSeries,
         global_length_in_local_units: float,
         density_renormalization: float,
@@ -1021,43 +1248,57 @@ def sample_worldtube(
 ) -> tuple[dict[str, worldtube.FaceData], dict[str, object]]:
     times_array = worldtube.validate_times(times)
     _quadrature(quadrature_order)
-    faces: dict[str, worldtube.FaceData] = {}
-    for name in worldtube.FACE_NAMES:
-        state = np.empty((times_array.size, 8, geometry.cells, geometry.cells))
-        flux = np.empty((times_array.size, geometry.cells, geometry.cells))
-        for endpoint, local_time in enumerate(times_array):
-            state[endpoint] = _sample_endpoint_state(
-                sampler, geometry, name, float(local_time)
-            )
-            flux[endpoint] = _sample_endpoint_flux(
-                sampler, geometry, name, float(local_time), quadrature_order
-            )
-        emf_u = np.empty(
-            (times_array.size - 1, geometry.cells + 1, geometry.cells)
+    faces = {
+        name: worldtube.FaceData(
+            np.empty((times_array.size, 8, geometry.cells, geometry.cells)),
+            np.empty((times_array.size, geometry.cells, geometry.cells)),
+            np.empty(
+                (times_array.size - 1, geometry.cells + 1, geometry.cells)
+            ),
+            np.empty(
+                (times_array.size - 1, geometry.cells, geometry.cells + 1)
+            ),
         )
-        emf_v = np.empty(
-            (times_array.size - 1, geometry.cells, geometry.cells + 1)
-        )
-        for interval in range(times_array.size - 1):
-            emf_u[interval] = _sample_interval_emf(
+        for name in worldtube.FACE_NAMES
+    }
+    for interval in range(times_array.size - 1):
+        local_time = float(times_array[interval])
+        for name in worldtube.FACE_NAMES:
+            faces[name].cell_state[interval] = _sample_endpoint_state(
+                sampler, geometry, name, local_time
+            )
+            faces[name].normal_flux[interval] = _sample_endpoint_flux(
+                sampler, geometry, name, local_time, quadrature_order
+            )
+        for name in worldtube.FACE_NAMES:
+            faces[name].emf_u[interval] = _sample_interval_emf(
                 sampler,
                 geometry,
                 name,
-                float(times_array[interval]),
+                local_time,
                 float(times_array[interval + 1]),
                 quadrature_order,
                 True,
             )
-            emf_v[interval] = _sample_interval_emf(
+            faces[name].emf_v[interval] = _sample_interval_emf(
                 sampler,
                 geometry,
                 name,
-                float(times_array[interval]),
+                local_time,
                 float(times_array[interval + 1]),
                 quadrature_order,
                 False,
             )
-        faces[name] = worldtube.FaceData(state, flux, emf_u, emf_v)
+
+    final = times_array.size - 1
+    final_time = float(times_array[final])
+    for name in worldtube.FACE_NAMES:
+        faces[name].cell_state[final] = _sample_endpoint_state(
+            sampler, geometry, name, final_time
+        )
+        faces[name].normal_flux[final] = _sample_endpoint_flux(
+            sampler, geometry, name, final_time, quadrature_order
+        )
 
     flux_projected, flux_diagnostics = frame.project_closed_surface_fluxes(
         times_array, faces
@@ -1069,6 +1310,7 @@ def sample_worldtube(
         "classification": OUTPUT_CLASSIFICATION,
         "quadrature_order": quadrature_order,
         "raw_sampling": sampler.audit.document(),
+        "snapshot_loading": sampler.snapshots.loading_document(),
         "closed_flux_projection": flux_diagnostics,
         "edge_emf_projection": emf_diagnostics,
     }
@@ -1118,10 +1360,24 @@ def extract_manifest(
         raise ValueError("source_level must be a nonnegative integer when provided")
     else:
         source_level = source_level_value
-    snapshots = SnapshotSeries(
-        tuple(
-            _load_snapshot(entry, path.parent, source_level) for entry in entries
-        )
+    snapshot_cache_size = document.get("snapshot_cache_size", 2)
+    if (
+        not isinstance(snapshot_cache_size, int)
+        or isinstance(snapshot_cache_size, bool)
+        or snapshot_cache_size < 2
+    ):
+        raise ValueError("snapshot_cache_size must be an integer of at least two")
+    snapshot_entries = tuple(entries)
+    descriptors = tuple(
+        _scan_snapshot(entry, path.parent, source_level)
+        for entry in snapshot_entries
+    )
+
+    def load_snapshot(index: int) -> Snapshot:
+        return _load_snapshot(snapshot_entries[index], path.parent, source_level)
+
+    snapshots = LazySnapshotSeries(
+        descriptors, load_snapshot, cache_size=snapshot_cache_size
     )
     frame_document = _frame_document(document.get("frame"), path.parent)
     frames = AffineFrameSeries.from_document(frame_document)
@@ -1155,7 +1411,7 @@ def extract_manifest(
         sampler, geometry, times, quadrature_order
     )
     source_snapshots = []
-    for snapshot in snapshots.snapshots:
+    for snapshot in snapshots.provenance_snapshots:
         provenance = {
             "time": snapshot.time,
             "cycle": snapshot.cycle,
@@ -1200,7 +1456,7 @@ def extract_manifest(
         ),
         "global_length_in_local_units": length_scale,
         "density_renormalization": density_scale,
-        "source_level": snapshots.snapshots[0].source_level,
+        "source_level": snapshots.provenance_snapshots[0].source_level,
         "sampling_diagnostics": diagnostics,
         "limitations": [
             "one-way coupling; the inner accretor does not modify the global disk",
@@ -1215,6 +1471,10 @@ def extract_manifest(
             (
                 "inner total metric should approach the transformed global metric "
                 "at the replay boundary"
+            ),
+            (
+                "snapshot data use a bounded lazy cache, but the current binary "
+                "reader still has a one-snapshot-pair parsing memory peak"
             ),
         ],
     }
