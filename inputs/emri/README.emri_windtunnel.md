@@ -763,6 +763,23 @@ to improve the reported number.
 Any production choice of `fluid_boundary=riemann` must still pass a propagated
 outgoing-wave reflection test at the intended resolution and worldtube cadence.
 
+An end-to-end domain-decomposition closure test is now available before that more
+selective wave test.  Evolve a larger reference domain while recording a cubical
+worldtube, replay its coincident inner cube at identical `dx`, output `mhd_w_bcc` at the
+same time, then run
+
+```bash
+python3 inputs/emri/compare_worldtube_closure.py \
+  outer.mhd_w_bcc.00001.bin inner.mhd_w_bcc.00001.bin \
+  --output closure.json
+```
+
+The tool assembles arbitrary fixed-level MeshBlock tilings, extracts the geometrically
+coincident reference subvolume, and reports componentwise plus vector-group relative
+norms.  The CPU regression exercises a one-block `16^3` outer run against an eight-block
+`8^3` inner replay for five RK3 steps.  This measures the total decomposition error; a
+mode-resolved reflected wave amplitude remains a separate validation gate.
+
 ## Validation gates before science production
 
 1. Recover the isolated Kerr BHL result as `primary_mass/orbital_radius -> 0` at fixed

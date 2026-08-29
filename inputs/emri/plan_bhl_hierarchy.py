@@ -425,8 +425,8 @@ def build_plan(
             "moving/source-frame pullback and CT cochain projection implemented; "
             "cut-surface/AMR sampling pending; operational HLLE boundary replay and "
             "host seven-wave reference projector plus packed-data characteristic audit "
-            "implemented, propagated reflection test and device seven-wave projection "
-            "pending"
+            "implemented; fixed-grid outer-to-inner closure audit implemented; "
+            "mode-resolved reflection test and device seven-wave projection pending"
         ),
         "geometry": "secondary-centered cubical worldtube in source-tetrad axes",
         "cube_half_width": match_radius,

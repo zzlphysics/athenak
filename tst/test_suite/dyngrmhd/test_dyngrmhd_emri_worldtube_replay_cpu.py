@@ -15,14 +15,11 @@ if str(EMRI_INPUTS) not in sys.path:
     sys.path.insert(0, str(EMRI_INPUTS))
 
 import worldtube_flux_emf as worldtube  # noqa: E402
+import compare_worldtube_closure as closure  # noqa: E402
 
 
 INPUT_FILE = str(EMRI_INPUTS / "emri_windtunnel_smoke.athinput")
 MAX_DIVB = 1.0e-11
-
-
-def _disable_ordinary_outputs() -> list[str]:
-    return ["output1/dt=0", "output2/dt=0", "output3/dt=0", "output4/dt=0"]
 
 
 def test_emri_outer_to_inner_hll_fluid_replay(tmp_path: Path) -> None:
@@ -32,13 +29,21 @@ def test_emri_outer_to_inner_hll_fluid_replay(tmp_path: Path) -> None:
         "-d",
         str(outer),
         "job/basename=outer",
-        "time/nlim=1",
+        "time/integrator=rk3",
+        "time/cfl_number=0.005",
+        "time/nlim=20",
         "time/tlim=0.02",
         "emri_worldtube/enabled=true",
         "emri_worldtube/mode=outer",
         "emri_worldtube/overwrite=true",
         f"emri_worldtube/file_basename={stream_stem}",
-    ] + _disable_ordinary_outputs()
+        "output1/variable=mhd_w_bcc",
+        "output1/dt=0.02",
+        "output2/variable=mhd_divb",
+        "output2/dt=0.02",
+        "output3/dt=0",
+        "output4/dt=0",
+    ]
     assert testutils.run(INPUT_FILE, outer_flags)
 
     manifest = next(outer.glob("tube.cycle*.manifest.json"))
@@ -97,3 +102,10 @@ def test_emri_outer_to_inner_hll_fluid_replay(tmp_path: Path) -> None:
     divb = bin_convert.read_binary(str(divb_path))["mb_data"]["divb"]
     maximum_divb = max(float(np.max(np.abs(values))) for values in divb)
     assert maximum_divb < MAX_DIVB
+
+    outer_state_path = max((outer / "bin").glob("outer.mhd_w_bcc.*.bin"))
+    report = closure.compare_files(outer_state_path, state_path)
+    assert report["variables"]["dens"]["relative_l2"] < 2.0e-4
+    assert report["variables"]["press"]["relative_l2"] < 3.0e-4
+    assert report["vector_groups"]["velocity"]["relative_l2"] < 3.0e-4
+    assert report["vector_groups"]["magnetic"]["relative_l2"] < 2.0e-4
