@@ -13,7 +13,7 @@ import extract_static_taylor_worldtube as static
 import plan_bhl_hierarchy as hierarchy
 
 
-CLASSIFICATION = "athenak-emri-frozen-direct-pilot-v1"
+CLASSIFICATION = "athenak-emri-frozen-direct-pilot-v2"
 
 
 def _case(campaign: dict[str, object], identifier: str) -> dict[str, object]:
@@ -193,6 +193,7 @@ def build_pilot(
             f"problem/orbital_radius={local_orbital_radius:.17g}",
             f"problem/orbit_direction={int(primary['orbit_direction'])}",
             f"mhd/gamma={float(gamma):.17g}",
+            "mhd/reconstruct=ppm4",
             "output1/dt=0",
             "output2/dt=0",
             "output3/dt=0",
@@ -237,6 +238,13 @@ def build_pilot(
             "minimum_user_boundary_refinement_clearance": minimum_user_clearance,
         },
         "calibration_cycles": calibration_cycles,
+        "numerical_method": {
+            "integrator": "rk2",
+            "reconstruction": "ppm4",
+            "riemann_solver": "hlle",
+            "first_order_flux_correction": True,
+            "subcycling": "level",
+        },
         "athena_input": "inputs/emri/emri_windtunnel_smoke.athinput",
         "athena_overrides": overrides,
         "production_warning": (

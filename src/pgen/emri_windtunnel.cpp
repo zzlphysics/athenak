@@ -124,6 +124,7 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp);
 void RefineSecondary(MeshBlockPack *pmbp);
 void EMRIHistory(HistoryData *pdata, Mesh *);
 void EMRIWindBoundary(Mesh *pm);
+bool EMRIOutputRegionCenter(const std::string &name, Real time, Real center[3]);
 void InitializeAnalyticMagneticField(MeshBlockPack *pmbp);
 
 KOKKOS_INLINE_FUNCTION
@@ -1922,6 +1923,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   pmbp->pcoord->AugmentExcisionMasks = &AugmentEMRIExcisionMasks;
   user_ref_func = RefineSecondary;
   user_hist_func = EMRIHistory;
+  user_output_region_func = EMRIOutputRegionCenter;
   user_bcs_func = EMRIWindBoundary;
   user_bcs_level_subcycling_safe = true;
 
@@ -2466,9 +2468,20 @@ void SetADMVariablesToEMRI(MeshBlockPack *pmbp) {
   });
 }
 
+//! Resolve the fixed small-hole center for filtered local binary output.
+bool EMRIOutputRegionCenter(const std::string &name, const Real time,
+                            Real center[3]) {
+  (void)time;
+  if (name != "secondary") return false;
+  for (int axis=0; axis<3; ++axis) center[axis] = 0.0;
+  return true;
+}
+
+//----------------------------------------------------------------------------------------
 //! Extend the analytic source-frame profile into every user ghost region.  Magnetic
 //! ghost faces are sampled from the same trace-free field whose active faces came from
 //! curl(A); CT continues to evolve the active face fluxes.
+
 void EMRIWindBoundary(Mesh *pm) {
   MeshBlockPack *pmbp = pm->pmb_pack;
   auto &indcs = pm->mb_indcs;

@@ -521,7 +521,8 @@ python3 inputs/emri/prepare_frozen_direct_pilot.py \
 
 The emitted JSON contains exact command-line overrides but does not launch AthenaK.
 The preflight disables force/output work, chooses every incoming `user` face from the
-measured velocity, sets `time/subcycling=level`, and demands that the level-one refined
+measured velocity, sets `time/subcycling=level`, fixes the fluid method to
+`RK2 + PPM4 + HLLE + FOFC`, and demands that the level-one refined
 region remain at least one root MeshBlock away from every user physical boundary.  The
 EMRI boundary callback is active-level aware; other user-boundary problems remain
 fail-closed under level subcycling unless they explicitly implement the same contract.
@@ -556,16 +557,39 @@ policy with
 ```bash
 python3 inputs/emri/prepare_frozen_production_campaign.py \
   --pilot profiles/r56-direct-calibration.json \
-  --calibration inputs/emri/validation/frozen_r56_direct_a100_20260830.json \
-  --qualification inputs/emri/validation/frozen_production_io_a100_20260830.json \
-  --restart-qualification \
-    inputs/emri/validation/frozen_production_restart_read_a100_20260830.json \
-  --lifecycle-qualification \
-    inputs/emri/validation/frozen_production_retained_data_disk_a100_20260830.json \
+  --calibration profiles/validation/r56-ppm4-calibration.json \
+  --qualification profiles/validation/r56-ppm4-io.json \
+  --restart-qualification profiles/validation/r56-ppm4-restart.json \
+  --lifecycle-qualification profiles/validation/r56-ppm4-disk.json \
+  --history-dt-in-secondary-masses 1 \
+  --field-dt-in-secondary-masses 10 \
+  --provisioned-data-disk-GiB 500 \
   --output profiles/r56-direct-production.json
 ```
 
-With all three production qualifications, the default policy uses 89 measured root steps
+Output scheduling occurs only after a time-consistent root synchronization.  Therefore
+the cadence targets above are quantized to measured root steps.  For the archived
+`r56_p000_t5000` timing (`dt_root=5.03425m`), a requested `1m` force history becomes one
+row per root synchronization (`5.03425m`), while a requested `10m` primitive/`divB`
+pair becomes `10.0685m` (two root steps).  The manifest records both requested and
+effective cadences instead of implying unavailable sub-root samples.  That dense field
+policy needs an estimated 359 GiB working set on the archived 2779-block topology, so a
+500 GiB data disk is a reasonable first allocation before filesystem overhead and
+unexpected retention are measured.
+
+`output6` and `output7` provide optional secondary-centered `mhd_w_bcc` and `mhd_divb`
+cutouts.  Enable them with `dcycle=1` and set `region_half_width`; selection retains
+whole leaf MeshBlocks and can therefore pad each requested face by one block.  They are
+disabled in the template because their exact size depends on the frozen production
+tree; measure the selected block count at the warmup handoff before budgeting a long
+high-cadence sequence.
+
+The PPM4 pilot and production schemas use version-two classifications.  The validation
+files dated 2026-08-30 document the earlier PLM version-one path and remain useful as
+performance evidence, but the version-two planner deliberately refuses to reuse them.
+PPM4 requires a new calibration, output/restart qualification, and retained-disk test.
+
+With all three archived version-one production qualifications, the historical policy used 89 measured root steps
 per segment (about 2.97 A100 hours), a 45-root-step restart cadence (about 1.50 hours), a
 nominal force-history interval of one measured root timestep, and four primitive/`divB`
 field dumps per capture crossing.  Later segments must inspect the newest completed

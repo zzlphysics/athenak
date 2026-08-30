@@ -136,6 +136,44 @@ def test_emri_user_boundary_is_active_level_safe(tmp_path: Path) -> None:
     assert testutils.run(INPUT_FILE, flags)
 
 
+def test_emri_secondary_centered_region_selects_only_overlapping_blocks(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "local_region"
+    basename = "emri_secondary_region"
+    flags = [
+        "-d",
+        str(run_dir),
+        f"job/basename={basename}",
+        "mesh/nx1=32",
+        "mesh/nx2=32",
+        "mesh/nx3=32",
+        "meshblock/nx1=8",
+        "meshblock/nx2=8",
+        "meshblock/nx3=8",
+        "time/nlim=0",
+        "problem/user_hist=false",
+        "output1/dt=0",
+        "output2/dt=0",
+        "output3/dt=0",
+        "output4/dt=0",
+        "output5/dt=0",
+        "output6/dcycle=1",
+        "output6/region_half_width=2",
+        "output7/dcycle=0",
+    ]
+    assert testutils.run(INPUT_FILE, flags)
+    output = min((run_dir / "bin").glob(
+        f"{basename}.secondary_local_w.*.bin"
+    ))
+    dump = bin_convert.read_binary(str(output))
+    assert dump["n_mbs"] == 8
+    geometry = np.asarray(dump["mb_geometry"])
+    for axis in range(3):
+        assert np.all(geometry[:, 2 * axis + 1] > -2.0)
+        assert np.all(geometry[:, 2 * axis] < 2.0)
+
+
 def test_emri_relativistic_force_subtracts_local_taylor_stress(
     tmp_path: Path,
 ) -> None:

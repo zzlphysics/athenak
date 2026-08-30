@@ -252,3 +252,22 @@ user_hist_only = true
 file_type = bin
 variable  = adm
 dt        = 0.0
+
+<output6>
+# Optional high-cadence secondary-centered primitive cutout.  Selection is by whole
+# leaf MeshBlocks, so the emitted box is padded by at most one block on each face.
+file_type         = bin
+variable          = mhd_w_bcc
+id                = secondary_local_w
+dcycle            = 0
+region_center     = secondary
+region_half_width = 48.0
+
+<output7>
+# Matching local magnetic-constraint audit for output6.
+file_type         = bin
+variable          = mhd_divb
+id                = secondary_local_divb
+dcycle            = 0
+region_center     = secondary
+region_half_width = 48.0

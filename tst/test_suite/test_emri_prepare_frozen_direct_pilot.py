@@ -71,6 +71,14 @@ def test_reduced_pilot_has_runnable_mesh_and_source_eos() -> None:
     )
     assert any(value == "mhd/gamma=1.4444444444444444"
                for value in result["athena_overrides"])
+    assert "mhd/reconstruct=ppm4" in result["athena_overrides"]
+    assert result["numerical_method"] == {
+        "integrator": "rk2",
+        "reconstruction": "ppm4",
+        "riemann_solver": "hlle",
+        "first_order_flux_correction": True,
+        "subcycling": "level",
+    }
     assert math.isfinite(result["bhl_plan"]["scales"]["capture_radius_factor_two_for_cost"])
 
     root_blocks = math.prod(value // 8 for value in mesh["root_dimensions"])

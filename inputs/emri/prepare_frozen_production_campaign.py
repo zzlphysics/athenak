@@ -18,17 +18,17 @@ import re
 import prepare_frozen_direct_pilot as direct_pilot
 
 
-CLASSIFICATION = "athenak-emri-frozen-direct-production-campaign-v1"
+CLASSIFICATION = "athenak-emri-frozen-direct-production-campaign-v2"
 FORCE_DIAGNOSTIC_CONTRACT = "local-upstream-deltaT-v1"
-CALIBRATION_CLASSIFICATION = "athenak-emri-frozen-direct-cloud-calibration-v1"
+CALIBRATION_CLASSIFICATION = "athenak-emri-frozen-direct-cloud-calibration-v2"
 QUALIFICATION_CLASSIFICATION = (
-    "athenak-emri-frozen-production-io-qualification-v1"
+    "athenak-emri-frozen-production-io-qualification-v2"
 )
 RESTART_QUALIFICATION_CLASSIFICATION = (
-    "athenak-emri-frozen-production-restart-read-qualification-v1"
+    "athenak-emri-frozen-production-restart-read-qualification-v2"
 )
 LIFECYCLE_QUALIFICATION_CLASSIFICATION = (
-    "athenak-emri-frozen-production-retained-data-disk-lifecycle-qualification-v1"
+    "athenak-emri-frozen-production-retained-data-disk-lifecycle-qualification-v2"
 )
 REAL_BYTES = 8
 MHD_CONSERVED_VARIABLES = 5
@@ -102,8 +102,9 @@ def _validate_identity(
     source = calibration.get("source")
     physical = calibration.get("physical_case")
     mesh = pilot.get("mesh")
+    numerical_method = pilot.get("numerical_method")
     if not isinstance(source, dict) or not isinstance(physical, dict) \
-            or not isinstance(mesh, dict):
+            or not isinstance(mesh, dict) or not isinstance(numerical_method, dict):
         raise ValueError("pilot/calibration identity metadata is incomplete")
     exact_pairs = (
         (pilot.get("case_id"), source.get("campaign_case"), "case id"),
@@ -118,6 +119,8 @@ def _validate_identity(
         (mesh.get("maximum_meshblocks_per_rank"),
          physical.get("configured_maximum_meshblocks_per_rank"),
          "MeshBlock capacity"),
+        (numerical_method, physical.get("numerical_method"),
+         "numerical method"),
     )
     for left, right, label in exact_pairs:
         if left != right:
@@ -256,6 +259,8 @@ def build_production_campaign(
     checkpoint_wall_hours: float = 1.5,
     history_root_steps: int = 1,
     field_outputs_per_crossing: int = 4,
+    history_dt_target: float | None = None,
+    field_dt_target: float | None = None,
     force_outer_capture_fractions: tuple[float, float, float] = (0.5, 1.0, 2.0),
     retained_restart_generations: int = 2,
     provisioned_data_disk_GiB: int = 100,
@@ -289,6 +294,12 @@ def build_production_campaign(
     field_outputs_per_crossing = _positive_integer(
         field_outputs_per_crossing, "field outputs per crossing"
     )
+    if history_dt_target is not None:
+        history_dt_target = _positive(
+            history_dt_target, "history dt target"
+        )
+    if field_dt_target is not None:
+        field_dt_target = _positive(field_dt_target, "field dt target")
     retained_restart_generations = _positive_integer(
         retained_restart_generations, "retained restart generations"
     )
@@ -405,10 +416,19 @@ def build_production_campaign(
         round(checkpoint_wall_hours * 3600.0 / budget_root_cycle_seconds),
     )
     checkpoint_root_steps = min(checkpoint_root_steps, segment_root_steps)
-    field_root_steps = max(
-        1, round(crossing_time / field_outputs_per_crossing / measured_root_dt)
+    requested_history_dt = (
+        history_root_steps * measured_root_dt
+        if history_dt_target is None else history_dt_target
     )
-    history_dt = history_root_steps * measured_root_dt
+    requested_field_dt = (
+        crossing_time / field_outputs_per_crossing
+        if field_dt_target is None else field_dt_target
+    )
+    effective_history_root_steps = max(
+        1, round(requested_history_dt / measured_root_dt)
+    )
+    field_root_steps = max(1, round(requested_field_dt / measured_root_dt))
+    history_dt = effective_history_root_steps * measured_root_dt
     checkpoint_dt = checkpoint_root_steps * measured_root_dt
     field_dt = field_root_steps * measured_root_dt
     segment_duration_proxy = segment_root_steps * measured_root_dt
@@ -736,13 +756,18 @@ def build_production_campaign(
             ),
         },
         "outputs": {
-            "history_root_steps_proxy": history_root_steps,
+            "requested_history_dt_in_secondary_masses": requested_history_dt,
+            "history_root_steps_proxy": effective_history_root_steps,
             "history_dt_in_secondary_masses": history_dt,
-            "history_cadence_mode": "physical_time_from_calibrated_root_dt",
+            "history_target_is_sync_limited":
+                requested_history_dt < measured_root_dt,
+            "history_cadence_mode": "synchronized_root_steps",
             "history_cadence_note": (
-                "analyze actual timestamps; floating time scheduling and forced segment "
-                "endpoints do not guarantee one record at every nominal root cycle"
+                "all force shells require a time-consistent AMR hierarchy, so history "
+                "cannot be more frequent than a completed root synchronization; "
+                "analyze actual timestamps at segment and restart boundaries"
             ),
+            "requested_field_dt_in_secondary_masses": requested_field_dt,
             "field_root_steps": field_root_steps,
             "field_dt_in_secondary_masses": field_dt,
             "field_outputs_per_crossing_proxy": crossing_time / field_dt,
@@ -935,6 +960,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-wall-hours", type=float, default=1.5)
     parser.add_argument("--history-root-steps", type=int, default=1)
     parser.add_argument("--field-outputs-per-crossing", type=int, default=4)
+    parser.add_argument("--history-dt-in-secondary-masses", type=float)
+    parser.add_argument("--field-dt-in-secondary-masses", type=float)
     parser.add_argument(
         "--force-outer-capture-fractions", type=float, nargs=3,
         default=(0.5, 1.0, 2.0), metavar=("R1", "R2", "R3"),
@@ -979,6 +1006,8 @@ def main() -> int:
         checkpoint_wall_hours=arguments.checkpoint_wall_hours,
         history_root_steps=arguments.history_root_steps,
         field_outputs_per_crossing=arguments.field_outputs_per_crossing,
+        history_dt_target=arguments.history_dt_in_secondary_masses,
+        field_dt_target=arguments.field_dt_in_secondary_masses,
         force_outer_capture_fractions=tuple(arguments.force_outer_capture_fractions),
         retained_restart_generations=arguments.retained_restart_generations,
         provisioned_data_disk_GiB=arguments.provisioned_data_disk_GiB,

@@ -69,6 +69,13 @@ def _pilot() -> dict[str, object]:
             "physical_refinement_levels": 9,
             "maximum_meshblocks_per_rank": 3500,
         },
+        "numerical_method": {
+            "integrator": "rk2",
+            "reconstruction": "ppm4",
+            "riemann_solver": "hlle",
+            "first_order_flux_correction": True,
+            "subcycling": "level",
+        },
         "bhl_plan": {
             "scales": {
                 "capture_radius_factor_two_for_cost": 329.0412309432926,
@@ -98,6 +105,13 @@ def _calibration() -> dict[str, object]:
             "meshblock_dimensions": [16, 16, 16],
             "physical_refinement_levels": 9,
             "configured_maximum_meshblocks_per_rank": 3500,
+            "numerical_method": {
+                "integrator": "rk2",
+                "reconstruction": "ppm4",
+                "riemann_solver": "hlle",
+                "first_order_flux_correction": True,
+                "subcycling": "level",
+            },
         },
         "build": {"athena_sha256": "a" * 64},
         "result": {
@@ -329,6 +343,35 @@ def test_passed_production_qualification_controls_runtime_and_resources() -> Non
     assert resources["restart_size_estimate_relative_error"] \
         == pytest.approx(-1.05043110258e-5)
     assert campaign["source_qualification"]["evidence_summary_sha256"] == "c" * 64
+
+
+def test_requested_science_cadence_is_quantized_to_root_synchronization() -> None:
+    campaign = production.build_production_campaign(
+        _pilot(),
+        _calibration(),
+        history_dt_target=1.0,
+        field_dt_target=10.0,
+        provisioned_data_disk_GiB=500,
+    )
+
+    outputs = campaign["outputs"]
+    assert outputs["requested_history_dt_in_secondary_masses"] == 1.0
+    assert outputs["history_target_is_sync_limited"] is True
+    assert outputs["history_root_steps_proxy"] == 1
+    assert outputs["history_dt_in_secondary_masses"] == pytest.approx(5.03425)
+    assert outputs["requested_field_dt_in_secondary_masses"] == 10.0
+    assert outputs["field_root_steps"] == 2
+    assert outputs["field_dt_in_secondary_masses"] == pytest.approx(10.0685)
+    assert "output4/dt=5.0342500000000001" in campaign["fresh_overrides"]
+    assert "output1/dt=10.0685" in campaign["fresh_overrides"]
+    assert campaign["resource_envelope"]["minimum_working_disk_GiB"] > 350
+
+
+def test_calibration_must_match_the_pilot_numerical_method() -> None:
+    calibration = _calibration()
+    calibration["physical_case"]["numerical_method"]["reconstruction"] = "plm"
+    with pytest.raises(ValueError, match="numerical method"):
+        production.build_production_campaign(_pilot(), calibration)
 
 
 def test_restart_qualification_closes_read_budget_and_shortens_segment() -> None:
