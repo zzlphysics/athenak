@@ -27,6 +27,7 @@ void EmriInnerWorldtubeInjectEField(Mesh *pm, Driver *pdrive, int stage);
 void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stage);
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeCapTimestep(Mesh *pm);
+void EmriInnerWorldtubeSetADMVariables(MeshBlockPack *pmbp);
 
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
@@ -125,6 +126,7 @@ class ProblemGenerator {
   friend void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh*, Driver*, int);
   friend void EmriInnerWorldtubeCompleteStep(Mesh*, Driver*);
   friend void EmriInnerWorldtubeCapTimestep(Mesh*);
+  friend void EmriInnerWorldtubeSetADMVariables(MeshBlockPack*);
 
   void ConfigureEmriOuterWorldtube(ParameterInput *pin, bool is_restart);
 

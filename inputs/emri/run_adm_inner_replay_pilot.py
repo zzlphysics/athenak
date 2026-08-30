@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run a fail-closed isolated-secondary pilot from an ADM worldtube campaign.
+"""Run a fail-closed inner replay pilot from an ADM worldtube campaign.
 
-This is a structural replay, not a numerical-ADM metric replay.  The exterior
-worldtube state is used in inner affine coordinates, while the volume metric is
-an isolated analytic secondary Kerr metric.  Production science must replace or
-validate that approximation before interpreting force or accretion histories.
+The default structural mode retains the isolated analytic secondary metric.  With
+``--numerical-adm-volume``, the pilot instead pulls back the numerical primary ADM
+background and adds the analytic secondary Kerr perturbation in its tangent frame.
+Force history remains disabled in that mode until its off-grid metric sampler uses
+the same replayed metric.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import time
 
 import numpy as np
 
+import adm_volume_replay as adm_volume
 import analyze_force_history as force_history
 import extract_global_worldtube as extract
 import run_adm_worldtube_campaign as campaign
@@ -27,7 +29,26 @@ import worldtube_flux_emf as worldtube
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = ROOT / "inputs" / "emri" / "emri_windtunnel_smoke.athinput"
-CLASSIFICATION = "athenak-emri-adm-inner-replay-pilot-v1"
+CLASSIFICATION = "athenak-emri-adm-inner-replay-pilot-v2"
+ATHENA_ADM_FIELDS = (
+    "adm_gxx",
+    "adm_gxy",
+    "adm_gxz",
+    "adm_gyy",
+    "adm_gyz",
+    "adm_gzz",
+    "adm_Kxx",
+    "adm_Kxy",
+    "adm_Kxz",
+    "adm_Kyy",
+    "adm_Kyz",
+    "adm_Kzz",
+    "adm_psi4",
+    "adm_alpha",
+    "adm_betax",
+    "adm_betay",
+    "adm_betaz",
+)
 
 
 def _read_campaign(path: Path) -> tuple[Path, dict[str, object]]:
@@ -310,6 +331,113 @@ def _field_summary(path: Path) -> dict[str, object]:
     return result
 
 
+def _expected_adm_fields(
+    volume: adm_volume.ADMVolume,
+    table_time: float,
+    cells: int,
+    halo: int,
+) -> dict[str, np.ndarray]:
+    """Reproduce the C++ time interpolation and ADM decomposition on active cells."""
+
+    tolerance = 128.0 * np.finfo(float).eps * max(
+        abs(table_time), abs(float(volume.times[0])), abs(float(volume.times[-1])), 1.0
+    )
+    if (
+        table_time < volume.times[0] - tolerance
+        or table_time > volume.times[-1] + tolerance
+    ):
+        raise ValueError("Athena output time lies outside the ADM replay table")
+    interval = int(np.searchsorted(volume.times, table_time, side="right") - 1)
+    interval = min(max(interval, 0), volume.times.size - 2)
+    fraction = (table_time - volume.times[interval]) / (
+        volume.times[interval + 1] - volume.times[interval]
+    )
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    fields = (
+        (1.0 - fraction) * volume.fields[interval]
+        + fraction * volume.fields[interval + 1]
+    )
+    active = fields[
+        :,
+        halo : halo + cells,
+        halo : halo + cells,
+        halo : halo + cells,
+    ]
+    if active.shape != (len(adm_volume.FIELD_NAMES), cells, cells, cells):
+        raise ValueError("ADM volume does not contain the requested active-cell cube")
+    metric = np.zeros((cells, cells, cells, 4, 4), dtype=np.float64)
+    for field, (left, right) in enumerate(adm_volume.METRIC_COMPONENTS):
+        metric[..., left, right] = active[field]
+        metric[..., right, left] = active[field]
+    adm, _ = adm_volume.decompose_four_metric(metric)
+    gamma = adm["gamma"]
+    curvature = active[len(adm_volume.METRIC_COMPONENTS) :]
+    expected = {
+        "adm_gxx": gamma[..., 0, 0],
+        "adm_gxy": gamma[..., 0, 1],
+        "adm_gxz": gamma[..., 0, 2],
+        "adm_gyy": gamma[..., 1, 1],
+        "adm_gyz": gamma[..., 1, 2],
+        "adm_gzz": gamma[..., 2, 2],
+        "adm_Kxx": curvature[0],
+        "adm_Kxy": curvature[1],
+        "adm_Kxz": curvature[2],
+        "adm_Kyy": curvature[3],
+        "adm_Kyz": curvature[4],
+        "adm_Kzz": curvature[5],
+        "adm_psi4": np.cbrt(np.linalg.det(gamma)),
+        "adm_alpha": adm["alpha"],
+        "adm_betax": adm["beta"][..., 0],
+        "adm_betay": adm["beta"][..., 1],
+        "adm_betaz": adm["beta"][..., 2],
+    }
+    return expected
+
+
+def _adm_replay_comparison(
+    paths: list[Path],
+    volume: adm_volume.ADMVolume,
+    cells: int,
+    halo: int,
+) -> dict[str, object]:
+    if not paths:
+        raise ValueError("numerical ADM pilot produced no ADM output")
+    samples = []
+    maximum_relative_error = 0.0
+    maximum_absolute_error = 0.0
+    for path in paths:
+        data = extract.bin_convert.read_binary(str(path))
+        athena_time = float(data["time"])
+        table_time = float(volume.times[0]) + athena_time
+        expected = _expected_adm_fields(volume, table_time, cells, halo)
+        field_errors = {}
+        for name in ATHENA_ADM_FIELDS:
+            observed = extract.closure.assemble_uniform_grid(data, name)
+            difference = observed - expected[name]
+            absolute = float(np.max(np.abs(difference)))
+            scale = max(float(np.max(np.abs(expected[name]))), np.finfo(float).tiny)
+            relative = absolute / scale
+            field_errors[name] = {
+                "maximum_absolute": absolute,
+                "relative_linf": relative,
+            }
+            maximum_absolute_error = max(maximum_absolute_error, absolute)
+            maximum_relative_error = max(maximum_relative_error, relative)
+        samples.append(
+            {
+                "path": str(path),
+                "athena_time": athena_time,
+                "replay_table_time": table_time,
+                "fields": field_errors,
+            }
+        )
+    return {
+        "samples": samples,
+        "maximum_absolute_error": maximum_absolute_error,
+        "maximum_relative_linf": maximum_relative_error,
+    }
+
+
 def _history_summary(paths: list[Path]) -> dict[str, object]:
     if not paths:
         return {
@@ -346,6 +474,19 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     half_width = float(metadata["half_width"])
     profile = fit_initial_affine_profile(faces, metadata)
     assessment = structural_assessment(arguments, case, cells, half_width)
+    if arguments.numerical_adm_volume:
+        assessment.update(
+            {
+                "metric_model": (
+                    "transformed numerical primary ADM plus analytic secondary Kerr"
+                ),
+                "science_ready": False,
+                "science_blocker": (
+                    "the off-grid force/accretion diagnostic is not yet connected "
+                    "to the replayed numerical metric"
+                ),
+            }
+        )
     boundary_state = case["boundary_state"]
     if not isinstance(boundary_state, dict):
         raise ValueError("campaign case has no boundary-state audit")
@@ -373,6 +514,9 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "floor_controls": floor_controls,
         "inner_validation": inner_validation,
         "structural_assessment": assessment,
+        "adm_volume_status": (
+            "pending" if arguments.numerical_adm_volume else "disabled"
+        ),
         "run_status": "refused",
     }
     if not assessment["passed"] and not arguments.allow_unsafe_structural_smoke:
@@ -386,6 +530,41 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     tlim = duration if arguments.tlim is None else arguments.tlim
     if tlim > duration * (1.0 + 128.0 * np.finfo(float).eps):
         raise ValueError("pilot tlim extends beyond the replay time table")
+    metric_volume = None
+    metric_path = workdir / "adm.bin"
+    if arguments.numerical_adm_volume:
+        try:
+            manifest_path = Path(case["manifest"]).expanduser().resolve(strict=True)
+            metric_volume = adm_volume.build_volume(
+                manifest_path,
+                times,
+                half_width,
+                cells,
+                arguments.metric_halo,
+                arguments.secondary_mass,
+                arguments.secondary_chi,
+            )
+            metric_validation = adm_volume.write_binary(metric_path, metric_volume)
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            report.update(
+                {
+                    "adm_volume_status": "failed",
+                    "adm_volume_error": str(error),
+                    "refusal_reason": (
+                        "numerical ADM volume extraction or validation failed"
+                    ),
+                }
+            )
+            return report
+        report.update(
+            {
+                "adm_volume_status": "validated",
+                "adm_volume": str(metric_path),
+                "adm_volume_validation": metric_validation,
+                "metric_halo": arguments.metric_halo,
+                "mesh_nghost": arguments.mesh_nghost,
+            }
+        )
     horizon = float(assessment["secondary_horizon_radius"])
     force_radii = (
         max(1.5 * horizon, 0.25 * half_width),
@@ -407,6 +586,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         str(output),
         "job/basename=inner",
         *_mesh_arguments(cells, half_width),
+        f"mesh/nghost={arguments.mesh_nghost}",
         *_profile_arguments(profile),
         "time/integrator=rk3",
         f"time/cfl_number={arguments.cfl:.17g}",
@@ -422,7 +602,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         f"problem/secondary_chi={arguments.secondary_chi:.17g}",
         "problem/orbital_radius=10",
         "problem/require_stable_orbit=false",
-        "problem/user_hist=true",
+        f"problem/user_hist={'false' if metric_volume is not None else 'true'}",
         "problem/force_frame=coordinate",
         f"problem/force_surface_radius={force_radii[0]:.17g}",
         f"problem/force_outer_radius_1={force_radii[1]:.17g}",
@@ -438,9 +618,19 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "output2/variable=mhd_divb",
         f"output2/dt={tlim:.17g}",
         "output3/dt=0",
-        f"output4/dt={history_dt:.17g}",
+        f"output4/dt={history_dt:.17g}" if metric_volume is None else "output4/dt=0",
         "output4/user_hist_only=true",
+        "output5/variable=adm",
+        f"output5/dt={tlim:.17g}" if metric_volume is not None else "output5/dt=0",
     ]
+    if metric_volume is not None:
+        command.extend(
+            (
+                "adm/dynamic=true",
+                "emri_adm_replay/enabled=true",
+                f"emri_adm_replay/file={metric_path}",
+            )
+        )
     wall_seconds = _run(command, log_path)
     states = sorted((output / "bin").glob("inner.mhd_w_bcc.*.bin"))
     divergences = sorted((output / "bin").glob("inner.mhd_divb.*.bin"))
@@ -483,13 +673,34 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "passed": finite_state and positive_state,
     }
     histories = sorted(output.rglob("*.hst"))
-    history_summary = _history_summary(histories)
-    runtime_conditions["force_accretion_history"] = {
-        "relation": "required",
-        "observed": history_summary["valid"],
-        "threshold": True,
-        "passed": history_summary["valid"],
-    }
+    if metric_volume is None:
+        history_summary = _history_summary(histories)
+        runtime_conditions["force_accretion_history"] = {
+            "relation": "required",
+            "observed": history_summary["valid"],
+            "threshold": True,
+            "passed": history_summary["valid"],
+        }
+        adm_comparison = None
+    else:
+        history_summary = {
+            "valid": False,
+            "disabled_reason": (
+                "force/accretion diagnostic still samples the analytic off-grid metric"
+            ),
+        }
+        adm_outputs = sorted((output / "bin").glob("inner.adm.*.bin"))
+        adm_comparison = _adm_replay_comparison(
+            adm_outputs,
+            metric_volume,
+            cells,
+            arguments.metric_halo,
+        )
+        runtime_conditions["adm_endpoint_replay"] = _condition(
+            "maximum",
+            float(adm_comparison["maximum_relative_linf"]),
+            arguments.maximum_adm_replay_relative_error,
+        )
     report.update(
         {
             "run_status": "completed",
@@ -500,6 +711,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
             "final_divb": str(divergences[-1]),
             "history_files": [str(path) for path in histories],
             "history_summary": history_summary,
+            "adm_replay_comparison": adm_comparison,
             "log_diagnostics": log_diagnostics,
             "final_state_summary": state_summary,
             "final_divb_summary": divergence_summary,
@@ -524,6 +736,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--tlim", type=float)
     parser.add_argument("--cfl", type=float, default=0.02)
     parser.add_argument("--history-samples", type=int, default=16)
+    parser.add_argument("--numerical-adm-volume", action="store_true")
+    parser.add_argument("--metric-halo", type=int, default=4)
+    parser.add_argument("--mesh-nghost", type=int, default=4)
     parser.add_argument("--minimum-horizon-cells", type=float, default=4.0)
     parser.add_argument(
         "--minimum-boundary-horizon-radii", type=float, default=5.0
@@ -539,6 +754,9 @@ def parse_arguments() -> argparse.Namespace:
         "--maximum-boundary-flux-residual", type=float, default=1.0e-10
     )
     parser.add_argument("--maximum-divb", type=float, default=1.0e-10)
+    parser.add_argument(
+        "--maximum-adm-replay-relative-error", type=float, default=1.0e-5
+    )
     parser.add_argument("--allow-unsafe-structural-smoke", action="store_true")
     parser.add_argument("--fail-on-gate", action="store_true")
     arguments = parser.parse_args()
@@ -551,6 +769,7 @@ def parse_arguments() -> argparse.Namespace:
         "maximum_initial_volume_flux_divergence",
         "maximum_boundary_flux_residual",
         "maximum_divb",
+        "maximum_adm_replay_relative_error",
     )
     for name in positive:
         value = getattr(arguments, name)
@@ -564,6 +783,10 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--tlim must be finite and positive")
     if arguments.history_samples < 1:
         parser.error("--history-samples must be positive")
+    if arguments.metric_halo < 1 or arguments.mesh_nghost < 1:
+        parser.error("--metric-halo and --mesh-nghost must be positive")
+    if arguments.metric_halo < arguments.mesh_nghost:
+        parser.error("--metric-halo must be at least --mesh-nghost")
     if (
         not math.isfinite(arguments.maximum_fallback_fraction)
         or not 0.0 <= arguments.maximum_fallback_fraction <= 1.0

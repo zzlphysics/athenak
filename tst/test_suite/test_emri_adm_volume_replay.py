@@ -1,0 +1,99 @@
+"""Tests for numerical-background plus secondary ADM volume extraction."""
+
+from pathlib import Path
+import sys
+import tempfile
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parents[2]
+EMRI_INPUTS = ROOT / "inputs" / "emri"
+if str(EMRI_INPUTS) not in sys.path:
+    sys.path.insert(0, str(EMRI_INPUTS))
+
+import adm_volume_replay as replay  # noqa: E402
+
+
+def _minkowski_series(times: np.ndarray, nodes: int = 3) -> np.ndarray:
+    metric = np.zeros((times.size, nodes, nodes, nodes, 4, 4))
+    metric[..., 0, 0] = -1.0
+    metric[..., 1, 1] = 1.0
+    metric[..., 2, 2] = 1.0
+    metric[..., 3, 3] = 1.0
+    return metric
+
+
+def test_extrinsic_curvature_vanishes_for_minkowski() -> None:
+    times = np.asarray((0.0, 0.5, 1.0))
+    metric = _minkowski_series(times)
+    curvature, diagnostics = replay.extrinsic_curvature(
+        metric, times, np.ones(3)
+    )
+    assert np.max(np.abs(curvature)) == 0.0
+    assert diagnostics["minimum_lapse"] == 1.0
+    assert diagnostics["minimum_spatial_metric_eigenvalue"] == 1.0
+
+
+def test_extrinsic_curvature_recovers_linear_scale_factor() -> None:
+    times = np.asarray((0.0, 0.5, 1.0))
+    metric = _minkowski_series(times)
+    scale = 1.0 + 0.1 * times
+    for index, value in enumerate(scale):
+        for axis in range(1, 4):
+            metric[index, ..., axis, axis] = value**2
+    curvature, _ = replay.extrinsic_curvature(metric, times, np.ones(3))
+    for index, value in enumerate(scale):
+        expected = -0.1 * value
+        for axis in range(3):
+            np.testing.assert_allclose(
+                curvature[index, ..., axis, axis], expected, atol=2.0e-15
+            )
+
+
+def test_secondary_kerr_term_is_symmetric_and_tapered() -> None:
+    positions = np.asarray(((0.0, 0.0, 0.0), (3.0, 0.2, -0.1)))
+    perturbation = replay.secondary_kerr_perturbation(
+        positions, 1.0, 0.3, np.eye(4)
+    )
+    assert np.max(np.abs(perturbation[0])) == 0.0
+    np.testing.assert_allclose(
+        perturbation, perturbation.transpose(0, 2, 1), atol=0.0
+    )
+    assert np.max(np.abs(perturbation[1])) > 0.0
+
+
+def test_adm_volume_binary_round_trip_and_checksum() -> None:
+    times = np.asarray((0.0, 0.5, 1.0))
+    metric = _minkowski_series(times)
+    curvature, _ = replay.extrinsic_curvature(metric, times, np.ones(3))
+    fields = np.empty((3, len(replay.FIELD_NAMES), 3, 3, 3))
+    for field, (left, right) in enumerate(replay.METRIC_COMPONENTS):
+        fields[:, field] = metric[..., left, right]
+    for offset, (left, right) in enumerate(replay.CURVATURE_COMPONENTS):
+        fields[:, len(replay.METRIC_COMPONENTS) + offset] = curvature[
+            ..., left, right
+        ]
+    volume = replay.ADMVolume(
+        times,
+        np.asarray((-1.0, -1.0, -1.0)),
+        np.ones(3),
+        fields,
+        {"classification": replay.CLASSIFICATION},
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "adm.bin"
+        replay.write_binary(path, volume)
+        loaded = replay.read_binary(path)
+        np.testing.assert_array_equal(loaded.times, times)
+        np.testing.assert_array_equal(loaded.fields, fields)
+        corrupted = bytearray(path.read_bytes())
+        corrupted[-1] ^= 1
+        bad = Path(directory) / "bad.bin"
+        bad.write_bytes(corrupted)
+        try:
+            replay.read_binary(bad)
+        except ValueError as error:
+            assert "checksum" in str(error)
+        else:
+            raise AssertionError("corrupt ADM volume binary was accepted")

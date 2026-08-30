@@ -821,7 +821,8 @@ edge EMF.  Version two adds an initial-volume-divergence gate to every case.  Th
 values validate the driver path; they are not physical convergence tolerances for a
 production disk.
 
-The isolated-secondary structural replay pilot is deliberately separate:
+The inner replay pilot has two deliberately distinct metric modes.  Its default is
+the inexpensive isolated-secondary structural check:
 
 ```bash
 python3 inputs/emri/run_adm_inner_replay_pilot.py \
@@ -838,16 +839,68 @@ horizon is resolved while the matching surface remains several horizon radii awa
 also rejects excessive boundary `B^2/rho` and initial volume divergence before launching
 AthenaK.  A completed run records characteristic fallback fraction, boundary-flux
 residual, final `divB`, finite/positive state checks, and the force/accretion history
-path.  `--allow-unsafe-structural-smoke` exists only for implementation debugging.
+path.  `--allow-unsafe-structural-smoke` exists only for implementation debugging.  The
+default analytic-volume summary remains `science_ready=false` because it does not contain
+the numerical primary background.
 
-This pilot uses an isolated analytic secondary Kerr metric in the volume.  Its summary
-therefore always sets `science_ready=false`: the transformed numerical ADM metric is not
-yet replayed through the volume, so force and accretion histories from this mode must not
-be interpreted as the final numerical-ADM result.  On the smooth self-consistent
-outer-to-inner regression, binary version two produced two characteristic fallbacks in
-6144 attempts, a `1.20e-17` boundary-flux residual, and retained all closure gates.  The
-small tilted-ADM fixture was correctly refused because the horizon had only `0.08` cell
-and its coordinate magnetization proxy was `1.51e4`.
+For the numerical metric path, add:
+
+```bash
+python3 inputs/emri/run_adm_inner_replay_pilot.py \
+  --campaign runs/emri/adm_worldtube_campaign/summary.json \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/adm_numerical_inner_pilot \
+  --secondary-mass 1e-5 \
+  --numerical-adm-volume \
+  --metric-halo 4 \
+  --mesh-nghost 4 \
+  --fail-on-gate
+```
+
+`adm_volume_replay.py` samples the global run's numerical primary ADM snapshots at every
+local volume node through the same affine map as the fluid worldtube.  It pulls back the
+four-metric, constructs an orthonormal tangent coframe at the local origin, and adds the
+regularized analytic secondary Kerr-Schild perturbation in that coframe.  Adding the
+secondary is essential: the global single-BH run contains the primary background only,
+whereas replacing the analytic metric by that background alone would remove the accretor
+from the inner problem.  The resulting binary stores ten symmetric four-metric
+components and six `K_ij` components.  AthenaK keeps only two time slabs on the device,
+performs trilinear spatial and linear temporal interpolation at every RK stage, then
+decomposes the interpolated four-metric into lapse, shift, and spatial metric.
+
+The metric grid covers all active and ghost cell centers.  `--metric-halo` must be at
+least `--mesh-nghost`; the production default is four.  A temporally tilted affine frame
+can map the outermost ghost nodes beyond the nominal first or last local sample time.
+The extractor rejects that case rather than extrapolating.  Extend the global ADM dump
+sequence on both sides of the worldtube window until all ghost-node events have valid
+source stencils.  Reducing both values can be useful for a code-path smoke test, but is
+not a substitute for production padding or a reconstruction-order audit.
+
+`K_ij` is derived from the ADM evolution identity using the sampled metric cadence and
+second-order volume derivatives.  A production campaign must therefore repeat the
+extraction at finer global dump cadence and finer metric-volume spacing and demonstrate
+convergence of `K_ij`, not merely convergence of the fluid boundary data.  Each numerical
+pilot writes AthenaK ADM dumps at the initial and final endpoints and compares all 17
+reconstructed ADM fields against the offline target; the default relative `L_inf` gate
+is `1e-5`, appropriate to single-precision binary output but still subject to a
+production tolerance study.
+
+Force and accretion history is intentionally disabled in numerical-volume mode.  The
+current off-grid shell diagnostic evaluates the analytic problem metric and would mix a
+numerical evolution with an inconsistent force geometry.  Consequently this mode also
+sets `science_ready=false` until the force sampler is connected to the same four-metric
+volume.  This does not prevent validation of metric replay, `divB`, fluid positivity, or
+the characteristic boundary.
+
+On the four-cell tilted-ADM fixture, the default four-node halo was correctly refused:
+its outer ghost event mapped to global time `0.0801854`, beyond the available endpoint
+`0.08`.  A three-ghost implementation smoke completed 666 CPU cycles in about two
+seconds.  Its initial/final ADM replay error was at most `5.76e-8`, final `divB` was
+`4.26e-14`, and the normalized boundary-flux residual was `3.92e-21`.  The overall
+runtime gate still failed because the deliberately poor fixture produced a `4.54e-2`
+characteristic fallback fraction.  The earlier analytic mode's smooth self-consistent
+outer-to-inner regression produced two fallbacks in 6144 attempts and a `1.20e-17`
+boundary-flux residual.  Neither fixture is a physical convergence result.
 
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed

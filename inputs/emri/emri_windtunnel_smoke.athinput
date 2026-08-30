@@ -197,6 +197,12 @@ flux_tolerance = 1.0e-10
 fluid_boundary = off
 fluid_state_frame = unverified
 
+<emri_adm_replay>
+# Optional numerical-background plus analytic-secondary volume metric.  The inner
+# worldtube constructor replaces the analytic prescribed-ADM callback when enabled.
+enabled = false
+file = emri_adm_volume.bin
+
 <output1>
 file_type = bin
 variable  = mhd_w
@@ -215,3 +221,9 @@ dt        = 0.05
 file_type      = hst
 dt             = 0.025
 user_hist_only = true
+
+<output5>
+# Disabled unless the numerical-ADM replay pilot requests an endpoint audit.
+file_type = bin
+variable  = adm
+dt        = 0.0

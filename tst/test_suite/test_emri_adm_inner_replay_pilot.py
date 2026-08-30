@@ -98,3 +98,44 @@ def test_structural_assessment_requires_resolution_and_separation() -> None:
     unresolved = pilot.structural_assessment(arguments, case, 16, 0.5)
     assert not unresolved["passed"]
     assert not unresolved["conditions"]["secondary_horizon_resolution"]["passed"]
+
+
+def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -> None:
+    cells = 2
+    halo = 1
+    nodes = cells + 2 * halo
+    times = np.asarray((5.0, 7.0))
+    fields = np.zeros((2, len(pilot.adm_volume.FIELD_NAMES), nodes, nodes, nodes))
+    metric_left = np.asarray(
+        (
+            (-1.8, 0.2, -0.1, 0.05),
+            (0.2, 1.5, 0.1, 0.0),
+            (-0.1, 0.1, 1.2, 0.02),
+            (0.05, 0.0, 0.02, 0.9),
+        )
+    )
+    metric_right = metric_left.copy()
+    metric_right[0, 0] -= 0.4
+    metric_right[0, 1] += 0.1
+    metric_right[1, 0] += 0.1
+    metric_right[2, 2] += 0.2
+    for time_index, metric in enumerate((metric_left, metric_right)):
+        for field, (left, right) in enumerate(pilot.adm_volume.METRIC_COMPONENTS):
+            fields[time_index, field] = metric[left, right]
+        for offset in range(len(pilot.adm_volume.CURVATURE_COMPONENTS)):
+            fields[time_index, 10 + offset] = time_index + 0.1 * offset
+    volume = pilot.adm_volume.ADMVolume(
+        times,
+        np.full(3, -1.5),
+        np.ones(3),
+        fields,
+        {},
+    )
+    expected = pilot._expected_adm_fields(volume, 6.0, cells, halo)
+    midpoint = 0.5 * (metric_left + metric_right)
+    decomposed, _ = pilot.adm_volume.decompose_four_metric(midpoint)
+    np.testing.assert_allclose(expected["adm_alpha"], decomposed["alpha"])
+    np.testing.assert_allclose(expected["adm_betax"], decomposed["beta"][0])
+    np.testing.assert_allclose(expected["adm_gzz"], midpoint[3, 3])
+    np.testing.assert_allclose(expected["adm_Kyz"], 0.9)
+    assert all(expected[name].shape == (cells, cells, cells) for name in expected)

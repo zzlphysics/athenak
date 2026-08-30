@@ -108,7 +108,7 @@ void ParameterInput::CheckBlockNames() {
     "time", "problem", "output", "units",
     "hydro", "mhd", "ion-neutral", "radiation", "z4c", "z4c_amr", "cce",
     "rad_srcterms", "hydro_srcterms", "mhd_srcterms", "particles", "turb_driving",
-    "emri_worldtube"
+    "emri_worldtube", "emri_adm_replay"
     };
 
   for (auto it1 = block.begin(); it1 != block.end(); ++it1) {
