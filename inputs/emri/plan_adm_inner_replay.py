@@ -251,6 +251,7 @@ def resource_estimate(
     cfl: float,
     half_width: float,
     fluid_bytes_per_allocated_cell: float,
+    hybrid_primary_adm: bool = False,
 ) -> dict[str, object]:
     for name, value in (
         ("fluid_cells", fluid_cells),
@@ -281,11 +282,14 @@ def resource_estimate(
     metric_nodes = metric_cells + 2 * metric_halo
     metric_node_count = metric_nodes**3
     gib = 1024.0**3
-    binary_bytes = metric_samples * 16 * metric_node_count * 8
-    device_two_slab_bytes = 2 * 16 * metric_node_count * 8
-    # build_volume simultaneously retains g_mu_nu, K_ij, and the packed 16-field
-    # output.  This is a strict array floor and excludes sampler/cache temporaries.
-    builder_floor_bytes = metric_samples * (16 + 9 + 16) * metric_node_count * 8
+    replay_fields = 40 if hybrid_primary_adm else 16
+    builder_arrays = (16 + 48 + 40) if hybrid_primary_adm else (16 + 9 + 16)
+    binary_bytes = metric_samples * replay_fields * metric_node_count * 8
+    device_two_slab_bytes = 2 * replay_fields * metric_node_count * 8
+    # The hybrid builder retains primary g_mu_nu, three full spatial-derivative
+    # tensors, and 40 packed fields.  The legacy builder retains g_mu_nu, K_ij,
+    # and 16 packed fields.  Both values exclude sampler/cache temporaries.
+    builder_floor_bytes = metric_samples * builder_arrays * metric_node_count * 8
     return {
         "fluid": {
             "active_cells": active_fluid_cells,
@@ -303,6 +307,12 @@ def resource_estimate(
             ),
         },
         "adm_volume": {
+            "representation": (
+                "hybrid-primary-online-secondary"
+                if hybrid_primary_adm
+                else "composed-metric-K"
+            ),
+            "field_count": replay_fields,
             "active_cells_per_axis": metric_cells,
             "halo_nodes_per_side": metric_halo,
             "nodes_per_axis": metric_nodes,
@@ -328,6 +338,7 @@ def convergence_cost_matrix(
     cfl: float,
     half_width: float,
     fluid_bytes_per_allocated_cell: float,
+    hybrid_primary_adm: bool = False,
 ) -> dict[str, object]:
     """Estimate uniform ADM-volume cost without allocating any volume arrays."""
 
@@ -346,6 +357,7 @@ def convergence_cost_matrix(
             cfl=cfl,
             half_width=half_width,
             fluid_bytes_per_allocated_cell=fluid_bytes_per_allocated_cell,
+            hybrid_primary_adm=hybrid_primary_adm,
         )
         result[f"{factor:.8g}"] = {
             "metric_resolution_factor": factor,
@@ -492,6 +504,7 @@ def build_plan(arguments: argparse.Namespace) -> dict[str, object]:
         cfl=arguments.cfl,
         half_width=half_width,
         fluid_bytes_per_allocated_cell=arguments.fluid_bytes_per_allocated_cell,
+        hybrid_primary_adm=arguments.hybrid_primary_adm,
     )
     required_halo = pilot.minimum_metric_halo(
         metric_cells, cells, arguments.mesh_nghost
@@ -617,6 +630,7 @@ def build_plan(arguments: argparse.Namespace) -> dict[str, object]:
             fluid_bytes_per_allocated_cell=(
                 arguments.fluid_bytes_per_allocated_cell
             ),
+            hybrid_primary_adm=arguments.hybrid_primary_adm,
         )
         return {
             "face_cells_per_axis": design_cells,
@@ -644,6 +658,7 @@ def build_plan(arguments: argparse.Namespace) -> dict[str, object]:
                 fluid_bytes_per_allocated_cell=(
                     arguments.fluid_bytes_per_allocated_cell
                 ),
+                hybrid_primary_adm=arguments.hybrid_primary_adm,
             )["fluid"],
         }
     return {
@@ -855,6 +870,7 @@ def parse_arguments() -> argparse.Namespace:
         "--maximum-boundary-magnetization-proxy", type=float, default=1.0e3
     )
     parser.add_argument("--metric-cells-per-axis", type=int)
+    parser.add_argument("--hybrid-primary-adm", action="store_true")
     parser.add_argument("--metric-cadence-stride", type=int, default=1)
     parser.add_argument("--metric-halo", type=int, default=4)
     parser.add_argument("--mesh-nghost", type=int, default=4)

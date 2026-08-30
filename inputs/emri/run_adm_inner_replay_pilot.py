@@ -185,7 +185,9 @@ def structural_assessment(
     horizon_radius = arguments.secondary_mass * (
         1.0 + math.sqrt(max(0.0, 1.0 - spin * spin))
     )
-    spacing = 2.0 * half_width / cells
+    root_spacing = 2.0 * half_width / cells
+    amr_levels = getattr(arguments, "amr_levels", 1)
+    spacing = root_spacing / 2.0 ** (amr_levels - 1)
     boundary_state = case.get("boundary_state")
     if not isinstance(boundary_state, dict):
         raise ValueError("campaign case predates the required boundary-state audit")
@@ -221,7 +223,9 @@ def structural_assessment(
         "passed": all(entry["passed"] for entry in conditions.values()),
         "conditions": conditions,
         "secondary_horizon_radius": horizon_radius,
+        "root_cell_spacing": root_spacing,
         "cell_spacing": spacing,
+        "amr_levels": amr_levels,
         "metric_model": "isolated analytic secondary Kerr",
         "science_ready": False,
         "science_blocker": (
@@ -275,10 +279,16 @@ def apply_numerical_coframe_assessment(
     )
 
 
-def _mesh_arguments(cells: int, half_width: float) -> list[str]:
-    meshblock = next(
-        value for value in range(min(cells, 16), 0, -1) if cells % value == 0
+def _mesh_arguments(
+    cells: int, half_width: float, meshblock_cells: int | None = None
+) -> list[str]:
+    meshblock = (
+        next(value for value in range(min(cells, 16), 0, -1) if cells % value == 0)
+        if meshblock_cells is None
+        else meshblock_cells
     )
+    if meshblock < 1 or cells % meshblock != 0:
+        raise ValueError("meshblock cells must be a positive divisor of fluid cells")
     result = []
     for axis in (1, 2, 3):
         result.extend(
@@ -366,6 +376,25 @@ def _run(command: list[str], log_path: Path) -> float:
     return elapsed
 
 
+def _amr_pilot_input(source: Path, output: Path) -> Path:
+    """Remove optional static regions so the user AMR shell owns refinement."""
+
+    lines = source.read_text(encoding="utf-8").splitlines()
+    retained = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("<refined_region"):
+            skipping = True
+            continue
+        if skipping and stripped.startswith("<"):
+            skipping = False
+        if not skipping:
+            retained.append(line)
+    output.write_text("\n".join(retained) + "\n", encoding="utf-8")
+    return output
+
+
 def _log_diagnostics(path: Path) -> dict[str, object]:
     content = path.read_text(encoding="utf-8", errors="replace")
     count = re.search(
@@ -381,11 +410,18 @@ def _log_diagnostics(path: Path) -> dict[str, object]:
     projections = 0 if count is None else int(count.group(1))
     fallbacks = 0 if count is None else int(count.group(2))
     total = projections + fallbacks
+    topology_rebuilds = [
+        int(value)
+        for value in re.findall(r"rebuilt boundary topology after AMR, count=(\d+)", content)
+    ]
     return {
         "projection_count": projections,
         "fallback_count": fallbacks,
         "fallback_fraction": fallbacks / total if total else None,
         "maximum_boundary_flux_residual": max(residuals) if residuals else None,
+        "amr_boundary_topology_rebuild_count": (
+            max(topology_rebuilds) if topology_rebuilds else 0
+        ),
     }
 
 
@@ -404,32 +440,14 @@ def _field_summary(path: Path) -> dict[str, object]:
     return result
 
 
-def _expected_adm_fields(
+def _sample_adm_volume_fields(
+    fields: np.ndarray,
     volume: adm_volume.ADMVolume,
-    table_time: float,
     cells: int,
     half_width: float,
-) -> dict[str, np.ndarray]:
-    """Reproduce the C++ time interpolation and ADM decomposition on active cells."""
+) -> np.ndarray:
+    """Trilinearly sample one ADM replay slab on the active fluid centers."""
 
-    tolerance = 128.0 * np.finfo(float).eps * max(
-        abs(table_time), abs(float(volume.times[0])), abs(float(volume.times[-1])), 1.0
-    )
-    if (
-        table_time < volume.times[0] - tolerance
-        or table_time > volume.times[-1] + tolerance
-    ):
-        raise ValueError("Athena output time lies outside the ADM replay table")
-    interval = int(np.searchsorted(volume.times, table_time, side="right") - 1)
-    interval = min(max(interval, 0), volume.times.size - 2)
-    fraction = (table_time - volume.times[interval]) / (
-        volume.times[interval + 1] - volume.times[interval]
-    )
-    fraction = min(max(float(fraction), 0.0), 1.0)
-    fields = (
-        (1.0 - fraction) * volume.fields[interval]
-        + fraction * volume.fields[interval + 1]
-    )
     fluid_spacing = 2.0 * half_width / cells
     coordinates = -half_width + (np.arange(cells) + 0.5) * fluid_spacing
     indices = []
@@ -442,9 +460,7 @@ def _expected_adm_fields(
             raise ValueError("ADM volume does not cover the active-cell centers")
         indices.append(left)
         fractions.append(logical - left)
-    active = np.zeros(
-        (len(adm_volume.FIELD_NAMES), cells, cells, cells), dtype=np.float64
-    )
+    active = np.zeros((fields.shape[0], cells, cells, cells), dtype=np.float64)
     for z_offset in (0, 1):
         z_weight = fractions[2] if z_offset else 1.0 - fractions[2]
         for y_offset in (0, 1):
@@ -462,15 +478,283 @@ def _expected_adm_fields(
                     * y_weight[None, :, None]
                     * x_weight[None, None, :]
                 )
-    if active.shape != (len(adm_volume.FIELD_NAMES), cells, cells, cells):
+    if active.shape != (fields.shape[0], cells, cells, cells):
         raise ValueError("ADM volume does not contain the requested active-cell cube")
-    metric = np.zeros((cells, cells, cells, 4, 4), dtype=np.float64)
+    return active
+
+
+def _metric_from_fields(fields: np.ndarray) -> np.ndarray:
+    metric = np.zeros(fields.shape[1:] + (4, 4), dtype=np.float64)
     for field, (left, right) in enumerate(adm_volume.METRIC_COMPONENTS):
-        metric[..., left, right] = active[field]
-        metric[..., right, left] = active[field]
-    adm, _ = adm_volume.decompose_four_metric(metric)
+        metric[..., left, right] = fields[field]
+        metric[..., right, left] = fields[field]
+    return metric
+
+
+def _sample_adm_volume_points(
+    fields: np.ndarray, volume: adm_volume.ADMVolume, positions: np.ndarray
+) -> np.ndarray:
+    """Trilinearly sample a replay slab at arbitrary local Cartesian points."""
+
+    points = np.asarray(positions, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise ValueError("ADM sample points must have finite shape (N,3)")
+    logical = (points - volume.lower[None, :]) / volume.spacing[None, :]
+    lower = np.floor(logical).astype(int)
+    shape_xyz = np.asarray(fields.shape[:0:-1])
+    if np.any(lower < 0) or np.any(lower >= shape_xyz[None, :] - 1):
+        raise ValueError("ADM volume does not cover all requested sample points")
+    fraction = logical - lower
+    result = np.zeros((fields.shape[0], points.shape[0]), dtype=np.float64)
+    for z_offset in (0, 1):
+        z_weight = fraction[:, 2] if z_offset else 1.0 - fraction[:, 2]
+        for y_offset in (0, 1):
+            y_weight = fraction[:, 1] if y_offset else 1.0 - fraction[:, 1]
+            for x_offset in (0, 1):
+                x_weight = fraction[:, 0] if x_offset else 1.0 - fraction[:, 0]
+                result += fields[
+                    :,
+                    lower[:, 2] + z_offset,
+                    lower[:, 1] + y_offset,
+                    lower[:, 0] + x_offset,
+                ] * (z_weight * y_weight * x_weight)[None, :]
+    return result
+
+
+def _expected_adm_points(
+    volume: adm_volume.ADMVolume, table_time: float, positions: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Evaluate the replay contract at arbitrary fluid/AMR cell centers."""
+
+    tolerance = 128.0 * np.finfo(float).eps * max(
+        abs(table_time), abs(float(volume.times[0])), abs(float(volume.times[-1])), 1.0
+    )
+    if (
+        table_time < volume.times[0] - tolerance
+        or table_time > volume.times[-1] + tolerance
+    ):
+        raise ValueError("Athena output time lies outside the ADM replay table")
+    interval = int(np.searchsorted(volume.times, table_time, side="right") - 1)
+    interval = min(max(interval, 0), volume.times.size - 2)
+    time_width = volume.times[interval + 1] - volume.times[interval]
+    fraction = min(
+        max(float((table_time - volume.times[interval]) / time_width), 0.0), 1.0
+    )
+    left_fields = _sample_adm_volume_points(
+        volume.fields[interval], volume, positions
+    )
+    right_fields = _sample_adm_volume_points(
+        volume.fields[interval + 1], volume, positions
+    )
+    if volume.hybrid_parameters is None:
+        active = (1.0 - fraction) * left_fields + fraction * right_fields
+        metric = _metric_from_fields(active)
+        adm, _ = adm_volume.decompose_four_metric(metric)
+        curvature = active[len(adm_volume.METRIC_COMPONENTS) :]
+    else:
+        if volume.secondary_coframes is None:
+            raise ValueError("hybrid ADM volume has no secondary coframes")
+        parameters = np.asarray(volume.hybrid_parameters, dtype=np.float64)
+        secondary = []
+        for endpoint in (interval, interval + 1):
+            secondary.append(
+                adm_volume.secondary_kerr_perturbation(
+                    positions,
+                    parameters[0],
+                    parameters[1],
+                    volume.secondary_coframes[endpoint],
+                    parameters[2],
+                    parameters[3],
+                )
+            )
+        metric_left = _metric_from_fields(left_fields) + secondary[0]
+        metric_right = _metric_from_fields(right_fields) + secondary[1]
+        metric = (1.0 - fraction) * metric_left + fraction * metric_right
+        derivatives_left = np.zeros(metric.shape[:-2] + (4, 4, 4))
+        derivatives_right = np.zeros_like(derivatives_left)
+        derivatives_left[..., 0, :, :] = (metric_right - metric_left) / time_width
+        derivatives_right[..., 0, :, :] = derivatives_left[..., 0, :, :]
+        fd_step = parameters[4]
+        for direction in range(3):
+            lower = positions.copy()
+            upper = positions.copy()
+            lower[:, direction] -= fd_step
+            upper[:, direction] += fd_step
+            for endpoint, derivatives, endpoint_fields in (
+                (interval, derivatives_left, left_fields),
+                (interval + 1, derivatives_right, right_fields),
+            ):
+                secondary_lower = adm_volume.secondary_kerr_perturbation(
+                    lower,
+                    parameters[0],
+                    parameters[1],
+                    volume.secondary_coframes[endpoint],
+                    parameters[2],
+                    parameters[3],
+                )
+                secondary_upper = adm_volume.secondary_kerr_perturbation(
+                    upper,
+                    parameters[0],
+                    parameters[1],
+                    volume.secondary_coframes[endpoint],
+                    parameters[2],
+                    parameters[3],
+                )
+                secondary_derivative = (
+                    secondary_upper - secondary_lower
+                ) / (2.0 * fd_step)
+                offset = len(adm_volume.METRIC_COMPONENTS) * (direction + 1)
+                primary_derivative = _metric_from_fields(
+                    endpoint_fields[offset : offset + len(adm_volume.METRIC_COMPONENTS)]
+                )
+                derivatives[..., direction + 1, :, :] = (
+                    primary_derivative + secondary_derivative
+                )
+        derivatives = (
+            (1.0 - fraction) * derivatives_left + fraction * derivatives_right
+        )
+        adm, curvature_tensor = adm_volume.decompose_metric_derivatives(
+            metric, derivatives
+        )
+        curvature = np.stack(
+            [
+                curvature_tensor[..., left, right]
+                for left, right in adm_volume.CURVATURE_COMPONENTS
+            ]
+        )
     gamma = adm["gamma"]
-    curvature = active[len(adm_volume.METRIC_COMPONENTS) :]
+    return {
+        "adm_gxx": gamma[..., 0, 0],
+        "adm_gxy": gamma[..., 0, 1],
+        "adm_gxz": gamma[..., 0, 2],
+        "adm_gyy": gamma[..., 1, 1],
+        "adm_gyz": gamma[..., 1, 2],
+        "adm_gzz": gamma[..., 2, 2],
+        "adm_Kxx": curvature[0],
+        "adm_Kxy": curvature[1],
+        "adm_Kxz": curvature[2],
+        "adm_Kyy": curvature[3],
+        "adm_Kyz": curvature[4],
+        "adm_Kzz": curvature[5],
+        "adm_psi4": np.cbrt(np.linalg.det(gamma)),
+        "adm_alpha": adm["alpha"],
+        "adm_betax": adm["beta"][..., 0],
+        "adm_betay": adm["beta"][..., 1],
+        "adm_betaz": adm["beta"][..., 2],
+    }
+
+
+def _expected_adm_fields(
+    volume: adm_volume.ADMVolume,
+    table_time: float,
+    cells: int,
+    half_width: float,
+) -> dict[str, np.ndarray]:
+    """Reproduce C++ interpolation, hybrid composition, and ADM decomposition."""
+
+    tolerance = 128.0 * np.finfo(float).eps * max(
+        abs(table_time), abs(float(volume.times[0])), abs(float(volume.times[-1])), 1.0
+    )
+    if (
+        table_time < volume.times[0] - tolerance
+        or table_time > volume.times[-1] + tolerance
+    ):
+        raise ValueError("Athena output time lies outside the ADM replay table")
+    interval = int(np.searchsorted(volume.times, table_time, side="right") - 1)
+    interval = min(max(interval, 0), volume.times.size - 2)
+    time_width = volume.times[interval + 1] - volume.times[interval]
+    fraction = (table_time - volume.times[interval]) / time_width
+    fraction = min(max(float(fraction), 0.0), 1.0)
+
+    left_fields = _sample_adm_volume_fields(
+        volume.fields[interval], volume, cells, half_width
+    )
+    right_fields = _sample_adm_volume_fields(
+        volume.fields[interval + 1], volume, cells, half_width
+    )
+    if volume.hybrid_parameters is None:
+        active = (1.0 - fraction) * left_fields + fraction * right_fields
+        metric = _metric_from_fields(active)
+        adm, _ = adm_volume.decompose_four_metric(metric)
+        curvature = active[len(adm_volume.METRIC_COMPONENTS) :]
+    else:
+        if volume.secondary_coframes is None:
+            raise ValueError("hybrid ADM volume has no secondary coframes")
+        parameters = np.asarray(volume.hybrid_parameters, dtype=np.float64)
+        if parameters.shape != (len(adm_volume.HYBRID_PARAMETER_NAMES),):
+            raise ValueError("hybrid ADM parameter block has the wrong shape")
+        coordinates = -half_width + (
+            np.arange(cells) + 0.5
+        ) * (2.0 * half_width / cells)
+        z, y, x = np.meshgrid(coordinates, coordinates, coordinates, indexing="ij")
+        positions = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+        secondary = []
+        for endpoint in (interval, interval + 1):
+            perturbation = adm_volume.secondary_kerr_perturbation(
+                positions,
+                parameters[0],
+                parameters[1],
+                volume.secondary_coframes[endpoint],
+                parameters[2],
+                parameters[3],
+            )
+            secondary.append(perturbation.reshape((cells, cells, cells, 4, 4)))
+        metric_left = _metric_from_fields(left_fields) + secondary[0]
+        metric_right = _metric_from_fields(right_fields) + secondary[1]
+        metric = (1.0 - fraction) * metric_left + fraction * metric_right
+        derivatives_left = np.zeros(metric.shape[:-2] + (4, 4, 4))
+        derivatives_right = np.zeros_like(derivatives_left)
+        derivatives_left[..., 0, :, :] = (metric_right - metric_left) / time_width
+        derivatives_right[..., 0, :, :] = derivatives_left[..., 0, :, :]
+        fd_step = parameters[4]
+        for direction in range(3):
+            lower = positions.copy()
+            upper = positions.copy()
+            lower[:, direction] -= fd_step
+            upper[:, direction] += fd_step
+            for side, endpoint, derivatives, endpoint_fields in (
+                (0, interval, derivatives_left, left_fields),
+                (1, interval + 1, derivatives_right, right_fields),
+            ):
+                secondary_lower = adm_volume.secondary_kerr_perturbation(
+                    lower,
+                    parameters[0],
+                    parameters[1],
+                    volume.secondary_coframes[endpoint],
+                    parameters[2],
+                    parameters[3],
+                )
+                secondary_upper = adm_volume.secondary_kerr_perturbation(
+                    upper,
+                    parameters[0],
+                    parameters[1],
+                    volume.secondary_coframes[endpoint],
+                    parameters[2],
+                    parameters[3],
+                )
+                secondary_derivative = (
+                    (secondary_upper - secondary_lower) / (2.0 * fd_step)
+                ).reshape((cells, cells, cells, 4, 4))
+                offset = len(adm_volume.METRIC_COMPONENTS) * (direction + 1)
+                primary_derivative = _metric_from_fields(
+                    endpoint_fields[offset : offset + len(adm_volume.METRIC_COMPONENTS)]
+                )
+                derivatives[..., direction + 1, :, :] = (
+                    primary_derivative + secondary_derivative
+                )
+        derivatives = (
+            (1.0 - fraction) * derivatives_left + fraction * derivatives_right
+        )
+        adm, curvature_tensor = adm_volume.decompose_metric_derivatives(
+            metric, derivatives
+        )
+        curvature = np.stack(
+            [
+                curvature_tensor[..., left, right]
+                for left, right in adm_volume.CURVATURE_COMPONENTS
+            ]
+        )
+    gamma = adm["gamma"]
     expected = {
         "adm_gxx": gamma[..., 0, 0],
         "adm_gxy": gamma[..., 0, 1],
@@ -508,13 +792,45 @@ def _adm_replay_comparison(
         data = extract.bin_convert.read_binary(str(path))
         athena_time = float(data["time"])
         table_time = float(volume.times[0]) + athena_time
-        expected = _expected_adm_fields(volume, table_time, cells, half_width)
+        geometries = np.asarray(data["mb_geometry"], dtype=np.float64)
+        field_maximum = {
+            name: {"absolute": 0.0, "scale": np.finfo(float).tiny}
+            for name in ATHENA_ADM_FIELDS
+        }
+        levels = []
+        if len(geometries) != len(data["mb_data"][ATHENA_ADM_FIELDS[0]]):
+            raise ValueError("ADM output MeshBlock geometry count is inconsistent")
+        for block_index, geometry in enumerate(geometries):
+            template = np.asarray(
+                data["mb_data"][ATHENA_ADM_FIELDS[0]][block_index]
+            )
+            nz, ny, nx = template.shape
+            axes = []
+            for axis, count in enumerate((nx, ny, nz)):
+                lower = float(geometry[2 * axis])
+                upper = float(geometry[2 * axis + 1])
+                axes.append(lower + (np.arange(count) + 0.5) * (upper - lower) / count)
+            z, y, x = np.meshgrid(axes[2], axes[1], axes[0], indexing="ij")
+            positions = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+            expected = _expected_adm_points(volume, table_time, positions)
+            root_spacing = 2.0 * half_width / cells
+            block_spacing = (float(geometry[1]) - float(geometry[0])) / nx
+            levels.append(int(round(math.log2(root_spacing / block_spacing))))
+            for name in ATHENA_ADM_FIELDS:
+                observed = np.asarray(data["mb_data"][name][block_index]).ravel()
+                difference = observed - expected[name]
+                field_maximum[name]["absolute"] = max(
+                    field_maximum[name]["absolute"],
+                    float(np.max(np.abs(difference))),
+                )
+                field_maximum[name]["scale"] = max(
+                    field_maximum[name]["scale"],
+                    float(np.max(np.abs(expected[name]))),
+                )
         field_errors = {}
         for name in ATHENA_ADM_FIELDS:
-            observed = extract.closure.assemble_uniform_grid(data, name)
-            difference = observed - expected[name]
-            absolute = float(np.max(np.abs(difference)))
-            scale = max(float(np.max(np.abs(expected[name]))), np.finfo(float).tiny)
+            absolute = field_maximum[name]["absolute"]
+            scale = field_maximum[name]["scale"]
             relative = absolute / scale
             field_errors[name] = {
                 "maximum_absolute": absolute,
@@ -527,6 +843,9 @@ def _adm_replay_comparison(
                 "path": str(path),
                 "athena_time": athena_time,
                 "replay_table_time": table_time,
+                "meshblock_count": len(geometries),
+                "minimum_physical_level": min(levels),
+                "maximum_physical_level": max(levels),
                 "fields": field_errors,
             }
         )
@@ -569,7 +888,14 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         raise ValueError(
             "isolated-secondary pilot requires a cube centered at the origin"
         )
-    cells = faces[worldtube.FACE_NAMES[0]].cell_state.shape[-1]
+    source_cells = faces[worldtube.FACE_NAMES[0]].cell_state.shape[-1]
+    cells = (
+        source_cells
+        if arguments.fluid_cells_per_axis is None
+        else arguments.fluid_cells_per_axis
+    )
+    if cells != source_cells:
+        faces = worldtube.resample_worldtube(times, faces, cells)
     half_width = float(metadata["half_width"])
     profile = fit_initial_affine_profile(faces, metadata)
     assessment = structural_assessment(arguments, case, cells, half_width)
@@ -606,6 +932,8 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "replay_binary": str(replay_path),
         "sample_times": times.tolist(),
         "cells_per_axis": cells,
+        "source_cells_per_axis": source_cells,
+        "spatially_resampled_worldtube": cells != source_cells,
         "half_width": half_width,
         "secondary_mass": arguments.secondary_mass,
         "secondary_chi": arguments.secondary_chi,
@@ -676,6 +1004,8 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 arguments.metric_halo,
                 arguments.secondary_mass,
                 arguments.secondary_chi,
+                hybrid_primary=arguments.hybrid_primary_adm,
+                secondary_metric_fd_step=arguments.secondary_metric_fd_step,
             )
             metric_validation = adm_volume.write_binary(metric_path, metric_volume)
             apply_numerical_coframe_assessment(
@@ -704,6 +1034,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 "metric_time_indices": metric_time_indices,
                 "metric_sample_times": metric_times.tolist(),
                 "mesh_nghost": arguments.mesh_nghost,
+                "adm_representation": metric_volume.metadata.get("representation"),
             }
         )
         if not assessment["passed"] and not arguments.allow_unsafe_structural_smoke:
@@ -728,16 +1059,19 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     output = workdir / "run"
     output.mkdir()
     log_path = workdir / "athena.log"
+    run_input = arguments.input.expanduser().resolve(strict=True)
+    if arguments.amr_levels > 1:
+        run_input = _amr_pilot_input(run_input, workdir / "amr-pilot.athinput")
     history_dt = tlim / arguments.history_samples
     adm_audit_dt = tlim / arguments.adm_audit_samples
     command = [
         str(arguments.athena.expanduser().resolve(strict=True)),
         "-i",
-        str(arguments.input.expanduser().resolve(strict=True)),
+        str(run_input),
         "-d",
         str(output),
         "job/basename=inner",
-        *_mesh_arguments(cells, half_width),
+        *_mesh_arguments(cells, half_width, arguments.meshblock_cells_per_axis),
         f"mesh/nghost={arguments.mesh_nghost}",
         *_profile_arguments(profile),
         "time/integrator=rk3",
@@ -787,6 +1121,41 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 f"emri_adm_replay/file={metric_path}",
             )
         )
+        if metric_volume.hybrid_parameters is not None:
+            hybrid = metric_volume.hybrid_parameters
+            command.extend(
+                (
+                    f"problem/spin_buffer_secondary={hybrid[2]:.17g}",
+                    f"problem/singularity_floor={hybrid[3]:.17g}",
+                    f"problem/metric_fd_step={hybrid[4]:.17g}",
+                )
+            )
+    if arguments.amr_levels > 1:
+        refinement_radius = (
+            6.0 * arguments.secondary_mass
+            if arguments.refinement_radius is None
+            else arguments.refinement_radius
+        )
+        maximum_blocks = (
+            (cells // arguments.meshblock_cells_per_axis) ** 3
+            * 8 ** (arguments.amr_levels - 1)
+        )
+        command.extend(
+            (
+                "mesh_refinement/refinement=adaptive",
+                f"mesh_refinement/num_levels={arguments.amr_levels}",
+                f"mesh_refinement/max_nmb_per_rank={maximum_blocks}",
+                "mesh_refinement/ncycle_check=1",
+                "mesh_refinement/refinement_interval=1",
+                "mesh_refinement/prolong_primitives=false",
+                "amr_criterion0/method=user",
+            )
+        )
+        for level in range(1, arguments.amr_levels):
+            command.append(
+                f"problem/refinement_radius_level_{level}="
+                f"{refinement_radius / 2.0 ** (level - 1):.17g}"
+            )
     wall_seconds = _run(command, log_path)
     states = sorted((output / "bin").glob("inner.mhd_w_bcc.*.bin"))
     divergences = sorted((output / "bin").glob("inner.mhd_divb.*.bin"))
@@ -832,6 +1201,14 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "threshold": True,
         "passed": finite_state and positive_state,
     }
+    if arguments.amr_levels > 1:
+        rebuild_count = log_diagnostics["amr_boundary_topology_rebuild_count"]
+        runtime_conditions["amr_boundary_topology_refresh"] = {
+            "relation": "minimum",
+            "observed": rebuild_count,
+            "threshold": 1,
+            "passed": rebuild_count >= 1,
+        }
     histories = sorted(output.rglob("*.hst"))
     history_summary = _history_summary(histories)
     runtime_conditions["force_accretion_history"] = {
@@ -858,6 +1235,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     report.update(
         {
             "run_status": "completed",
+            "run_input": str(run_input),
             "command": command,
             "wall_seconds": wall_seconds,
             "log": str(log_path),
@@ -892,6 +1270,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--history-samples", type=int, default=16)
     parser.add_argument("--adm-audit-samples", type=int, default=1)
     parser.add_argument("--numerical-adm-volume", action="store_true")
+    parser.add_argument("--hybrid-primary-adm", action="store_true")
+    parser.add_argument("--secondary-metric-fd-step", type=float)
+    parser.add_argument("--fluid-cells-per-axis", type=int)
+    parser.add_argument("--meshblock-cells-per-axis", type=int)
+    parser.add_argument("--amr-levels", type=int, default=1)
+    parser.add_argument("--refinement-radius", type=float)
     parser.add_argument("--metric-cells-per-axis", type=int)
     parser.add_argument("--metric-cadence-stride", type=int, default=1)
     parser.add_argument("--metric-halo", type=int, default=4)
@@ -948,6 +1332,32 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--metric-cells-per-axis must be at least two")
     if arguments.metric_cadence_stride < 1:
         parser.error("--metric-cadence-stride must be positive")
+    if arguments.hybrid_primary_adm and not arguments.numerical_adm_volume:
+        parser.error("--hybrid-primary-adm requires --numerical-adm-volume")
+    if arguments.secondary_metric_fd_step is not None and (
+        not math.isfinite(arguments.secondary_metric_fd_step)
+        or arguments.secondary_metric_fd_step <= 0.0
+    ):
+        parser.error("--secondary-metric-fd-step must be finite and positive")
+    if arguments.fluid_cells_per_axis is not None and (
+        arguments.fluid_cells_per_axis < 1
+    ):
+        parser.error("--fluid-cells-per-axis must be positive")
+    if arguments.meshblock_cells_per_axis is not None and (
+        arguments.meshblock_cells_per_axis < 1
+    ):
+        parser.error("--meshblock-cells-per-axis must be positive")
+    if arguments.amr_levels < 1:
+        parser.error("--amr-levels must be positive")
+    if arguments.amr_levels > 1 and not arguments.hybrid_primary_adm:
+        parser.error("AMR requires --hybrid-primary-adm")
+    if arguments.amr_levels > 1 and arguments.meshblock_cells_per_axis is None:
+        parser.error("AMR requires --meshblock-cells-per-axis")
+    if arguments.refinement_radius is not None and (
+        not math.isfinite(arguments.refinement_radius)
+        or arguments.refinement_radius <= 0.0
+    ):
+        parser.error("--refinement-radius must be finite and positive")
     if (
         not math.isfinite(arguments.maximum_fallback_fraction)
         or not 0.0 <= arguments.maximum_fallback_fraction <= 1.0

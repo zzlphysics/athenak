@@ -25,6 +25,7 @@
 #include "athena.hpp"
 #include "coordinates/adm.hpp"
 #include "coordinates/cell_locations.hpp"
+#include "coordinates/emri_comoving.hpp"
 #include "driver/driver.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "globals.hpp"
@@ -50,7 +51,10 @@ constexpr std::uint32_t kLegacyBinaryVersion = 1;
 constexpr std::uint32_t kBinaryVersion = 2;
 constexpr std::uint32_t kLegacyADMBinaryVersion = 1;
 constexpr std::uint32_t kADMBinaryVersion = 2;
+constexpr std::uint32_t kHybridADMBinaryVersion = 3;
 constexpr int kADMFields = 16;
+constexpr int kHybridADMFields = 40;
+constexpr int kHybridADMParameters = 5;
 constexpr int kFaceColumns = 7;
 constexpr int kEdgeColumns = 7;
 constexpr int kVolumeFaceColumns = 6;
@@ -287,6 +291,67 @@ Real SampleADMField(const DvceArray1D<Real> &slab, int field, int nx, int ny,
   return result;
 }
 
+KOKKOS_INLINE_FUNCTION
+void DecomposeMetricDerivatives(const Real metric[4][4], const Real derivative[4][4][4],
+                                Real &alpha, Real beta[3], Real gamma[6],
+                                Real curvature[6], Real &psi4) {
+  gamma[0] = metric[1][1];
+  gamma[1] = metric[1][2];
+  gamma[2] = metric[1][3];
+  gamma[3] = metric[2][2];
+  gamma[4] = metric[2][3];
+  gamma[5] = metric[3][3];
+  const Real determinant = adm::SpatialDet(
+      gamma[0], gamma[1], gamma[2], gamma[3], gamma[4], gamma[5]);
+  const Real minor2 = gamma[0]*gamma[3] - gamma[1]*gamma[1];
+  if (!(isfinite(determinant) && gamma[0] > 0.0 && minor2 > 0.0 &&
+        determinant > 0.0)) {
+    Kokkos::abort("interpolated numerical ADM spatial metric is not positive");
+  }
+  Real inverse[3][3];
+  adm::SpatialInv(1.0/determinant,
+      gamma[0], gamma[1], gamma[2], gamma[3], gamma[4], gamma[5],
+      &inverse[0][0], &inverse[0][1], &inverse[0][2],
+      &inverse[1][1], &inverse[1][2], &inverse[2][2]);
+  inverse[1][0] = inverse[0][1];
+  inverse[2][0] = inverse[0][2];
+  inverse[2][1] = inverse[1][2];
+  const Real beta_lower[3] = {metric[0][1], metric[0][2], metric[0][3]};
+  Real beta_squared = 0.0;
+  for (int i = 0; i < 3; ++i) {
+    beta[i] = 0.0;
+    for (int j = 0; j < 3; ++j) beta[i] += inverse[i][j]*beta_lower[j];
+    beta_squared += beta[i]*beta_lower[i];
+  }
+  const Real lapse_squared = beta_squared - metric[0][0];
+  if (!(isfinite(lapse_squared) && lapse_squared > 0.0)) {
+    Kokkos::abort("interpolated numerical ADM lapse is not positive");
+  }
+  alpha = sqrt(lapse_squared);
+  psi4 = cbrt(determinant);
+  const int row[6] = {0, 0, 0, 1, 1, 2};
+  const int column[6] = {0, 1, 2, 1, 2, 2};
+  for (int component = 0; component < 6; ++component) {
+    const int i = row[component];
+    const int j = column[component];
+    Real covariant_i_beta_j = derivative[i + 1][0][j + 1];
+    Real covariant_j_beta_i = derivative[j + 1][0][i + 1];
+    for (int k = 0; k < 3; ++k) {
+      Real christoffel = 0.0;
+      for (int l = 0; l < 3; ++l) {
+        christoffel += 0.5*inverse[k][l]*(
+            derivative[i + 1][l + 1][j + 1]
+            + derivative[j + 1][l + 1][i + 1]
+            - derivative[l + 1][i + 1][j + 1]);
+      }
+      covariant_i_beta_j -= christoffel*beta_lower[k];
+      covariant_j_beta_i -= christoffel*beta_lower[k];
+    }
+    curvature[component] = (covariant_i_beta_j + covariant_j_beta_i
+        - derivative[0][i + 1][j + 1])/(2.0*alpha);
+  }
+}
+
 }  // namespace
 
 EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm,
@@ -295,9 +360,7 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
   if (pm->pmb_pack == nullptr || pm->pmb_pack->pmhd == nullptr) {
     InnerFatal("inner worldtube replay requires the MHD module");
   }
-  if (!pm->three_d || pm->adaptive || pm->multilevel) {
-    InnerFatal("inner worldtube replay currently requires a fixed single-level 3D mesh");
-  }
+  if (!pm->three_d) InnerFatal("inner worldtube replay requires a 3D mesh");
   path_ = pin->GetString("emri_worldtube", "file");
   flux_tolerance_ = pin->GetOrAddReal("emri_worldtube", "flux_tolerance", 1.0e-10);
   if (!(std::isfinite(flux_tolerance_) && flux_tolerance_ > 0.0)) {
@@ -332,6 +395,10 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
     ReadADMVolume(pin, pm);
     pm->pmb_pack->padm->SetADMVariables = &EmriInnerWorldtubeSetADMVariables;
   }
+  if (pm->multilevel && (!pm->adaptive || !adm_hybrid_primary_)) {
+    InnerFatal(
+        "inner replay refinement requires adaptive AMR and hybrid ADM version three");
+  }
   if (fluid_boundary_enabled_) {
     mhd::MHD *pmhd = pm->pmb_pack->pmhd;
     if (!has_cell_centered_magnetic_state_) {
@@ -363,7 +430,7 @@ EmriInnerWorldtubeReplay::EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm
       ValidateGRFaceFrameReference();
     }
   }
-  BuildBoundaryTopology(pm);
+  BuildBoundaryTopology(pm, true);
   LoadInterval(interval_);
   if (adm_volume_enabled_) {
     SetADMVariables(pm->pmb_pack);
@@ -564,18 +631,23 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
         static_cast<Real>(ReadLEDouble(header.data() + 64 + 8*axis));
   }
   const std::uint64_t stored_crc = ReadLE64(header.data() + 88);
-  if ((version != kLegacyADMBinaryVersion && version != kADMBinaryVersion) ||
-      adm_nt_ < 2 || adm_nvar_ != kADMFields ||
+  const bool supported_version =
+      version == kLegacyADMBinaryVersion || version == kADMBinaryVersion ||
+      version == kHybridADMBinaryVersion;
+  const int expected_fields =
+      version == kHybridADMBinaryVersion ? kHybridADMFields : kADMFields;
+  if (!supported_version || adm_nt_ < 2 || adm_nvar_ != expected_fields ||
       adm_nx_ < 2 || adm_ny_ < 2 || adm_nz_ < 2 ||
       stored_crc > std::numeric_limits<std::uint32_t>::max()) {
     InnerFatal("ADM volume replay dimensions or version are unsupported");
   }
   adm_binary_version_ = static_cast<int>(version);
+  adm_hybrid_primary_ = (version == kHybridADMBinaryVersion);
   const bool has_force_coframes = (version >= kADMBinaryVersion);
   if (pin->GetOrAddBoolean("problem", "user_hist", false)) {
     if (!has_force_coframes) {
       InnerFatal(
-          "ADM volume replay force history requires a version-two binary with "
+          "ADM volume replay force history requires a version-two-or-newer binary with "
           "secondary embedding coframes");
     }
     if (pin->GetOrAddString("problem", "force_frame", "source_tetrad") !=
@@ -604,14 +676,18 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
       ? CheckedProduct(
           {static_cast<std::uint64_t>(adm_nt_), 16}, "ADM force coframes")
       : 0;
+  const std::uint64_t hybrid_parameter_values = adm_hybrid_primary_
+      ? kHybridADMParameters : 0;
   const std::uint64_t nt_values = static_cast<std::uint64_t>(adm_nt_);
   const std::uint64_t maximum_size = std::numeric_limits<std::uint64_t>::max();
   if (coframe_values > maximum_size - nt_values ||
-      field_payload_values > maximum_size - nt_values - coframe_values) {
+      hybrid_parameter_values > maximum_size - nt_values - coframe_values ||
+      field_payload_values > maximum_size - nt_values - coframe_values
+          - hybrid_parameter_values) {
     InnerFatal("ADM volume payload size overflows a 64-bit value count");
   }
   const std::uint64_t total_payload_values =
-      nt_values + coframe_values + field_payload_values;
+      nt_values + coframe_values + hybrid_parameter_values + field_payload_values;
   const std::uint64_t payload_bytes = CheckedProduct(
       {8, total_payload_values},
       "ADM volume payload bytes");
@@ -649,7 +725,46 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
         adm_path_, kADMHeaderBytes + 8*static_cast<std::uint64_t>(adm_nt_),
         coframe_values);
   }
-  adm_data_offset_ = kADMHeaderBytes + 8*(nt_values + coframe_values);
+  if (adm_hybrid_primary_) {
+    const std::uint64_t parameter_offset =
+        kADMHeaderBytes + 8*(nt_values + coframe_values);
+    const std::vector<Real> parameters = ReadDoublesAt(
+        adm_path_, parameter_offset, hybrid_parameter_values);
+    for (int index = 0; index < kHybridADMParameters; ++index) {
+      adm_hybrid_parameters_[index] = parameters[index];
+    }
+    const Real mass = adm_hybrid_parameters_[0];
+    const Real chi = adm_hybrid_parameters_[1];
+    const Real spin_buffer = adm_hybrid_parameters_[2];
+    const Real singularity_floor = adm_hybrid_parameters_[3];
+    const Real fd_step = adm_hybrid_parameters_[4];
+    if (!(mass > 0.0) || std::abs(chi) > 1.0 || !(spin_buffer >= 0.0) ||
+        !(singularity_floor > 0.0) || !(fd_step > 0.0)) {
+      InnerFatal("hybrid ADM replay parameters are invalid");
+    }
+    const Real expected_mass = pin->GetOrAddReal("problem", "secondary_mass", 1.0);
+    const Real expected_chi = pin->GetOrAddReal("problem", "secondary_chi", 0.0);
+    const Real expected_spin_buffer =
+        pin->GetOrAddReal("problem", "spin_buffer_secondary", 0.05);
+    const Real expected_floor =
+        pin->GetOrAddReal("problem", "singularity_floor", 1.0e-3);
+#if SINGLE_PRECISION_ENABLED
+    const Real default_fd_step = 5.0e-4*expected_mass;
+#else
+    const Real default_fd_step = 5.0e-5*expected_mass;
+#endif
+    const Real expected_fd_step =
+        pin->GetOrAddReal("problem", "metric_fd_step", default_fd_step);
+    if (!NearlyEqual(mass, expected_mass) || !NearlyEqual(chi, expected_chi) ||
+        !NearlyEqual(spin_buffer, expected_spin_buffer) ||
+        !NearlyEqual(singularity_floor, expected_floor) ||
+        !NearlyEqual(fd_step, expected_fd_step)) {
+      InnerFatal(
+          "hybrid ADM replay secondary parameters differ from the problem contract");
+    }
+  }
+  adm_data_offset_ = kADMHeaderBytes +
+      8*(nt_values + coframe_values + hybrid_parameter_values);
   adm_left_ = DvceArray1D<Real>("emri_adm_left", adm_slab_values_);
   adm_right_ = DvceArray1D<Real>("emri_adm_right", adm_slab_values_);
   const Real start_time = pm->time + time_offset_;
@@ -694,15 +809,23 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
   if (global_variable::my_rank == 0) {
     std::cout << "EMRI numerical ADM volume replay: grid="
               << adm_nx_ << "x" << adm_ny_ << "x" << adm_nz_
-              << ", samples=" << adm_nt_ << std::endl;
+              << ", samples=" << adm_nt_
+              << ", representation="
+              << (adm_hybrid_primary_ ? "hybrid-primary-online-secondary"
+                                      : "composed-metric-K")
+              << std::endl;
   }
 }
 
-void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
+void EmriInnerWorldtubeReplay::BuildBoundaryTopology(
+    Mesh *pm, bool initialize_storage) {
   const RegionIndcs &indcs = pm->mb_indcs;
   MeshBlockPack *pack = pm->pmb_pack;
   auto &sizes = pack->pmb->mb_size;
   const int cells = cells_per_edge_;
+  host_faces_.clear();
+  host_edges_.clear();
+  host_volume_faces_.clear();
   std::vector<int> coverage(static_cast<std::size_t>(6)*cells*cells, 0);
   for (int m = 0; m < pack->nmb_thispack; ++m) {
     const RegionSize &size = sizes.h_view(m);
@@ -722,6 +845,12 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
       const Real block_boundary = (normal_sign < 0) ? minimum[normal_axis]
                                                      : maximum[normal_axis];
       if (!NearlyEqual(boundary, block_boundary, dx_)) continue;
+      if (!NearlyEqual(size.dx1, dx_, dx_) || !NearlyEqual(size.dx2, dx_, dx_) ||
+          !NearlyEqual(size.dx3, dx_, dx_)) {
+        InnerFatal(
+            "adaptive refinement reached the replay boundary; keep a root-level "
+            "buffer between the refinement shell and every cube face");
+      }
       const int normal_offset = (normal_sign < 0) ? 0 : axis_cells[normal_axis] - 1;
       const int u_axis = kUAxis[face];
       const int v_axis = kVAxis[face];
@@ -758,7 +887,7 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
     if (count != 1) InnerFatal("inner boundary face topology lacks a unique owner");
   }
 
-  if (has_initial_volume_flux_) {
+  if (has_initial_volume_flux_ && initialize_storage && !is_restart_) {
     const Real domain_minimum[3] = {pm->mesh_size.x1min, pm->mesh_size.x2min,
                                     pm->mesh_size.x3min};
     const std::size_t component_size =
@@ -904,33 +1033,83 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
   }
   Kokkos::deep_copy(volume_face_records_, host_volume_face_view);
 
-  const std::size_t face_cells = static_cast<std::size_t>(6)*cells*cells;
-  const std::size_t face_edges = static_cast<std::size_t>(12)*cells*(cells + 1);
-  state_left_ = DvceArray1D<Real>("emri_inner_state_left", face_cells*nvar_);
-  state_right_ = DvceArray1D<Real>("emri_inner_state_right", face_cells*nvar_);
-  flux_left_ = DvceArray1D<Real>("emri_inner_flux_left", face_cells);
-  flux_right_ = DvceArray1D<Real>("emri_inner_flux_right", face_cells);
-  interval_emf_ = DvceArray1D<Real>("emri_inner_interval_emf", face_edges);
-  const std::size_t volume_faces = static_cast<std::size_t>(3)*(cells + 1)*cells*cells;
-  initial_volume_flux_ = DvceArray1D<Real>(
-      "emri_inner_initial_volume_flux", std::max<std::size_t>(volume_faces, 1));
-  if (has_initial_volume_flux_) {
-    auto host_volume_flux = Kokkos::create_mirror_view(initial_volume_flux_);
-    const std::uint64_t component_count =
-        static_cast<std::uint64_t>(cells + 1)*cells*cells;
-    for (int component = 0; component < 3; ++component) {
-      const std::vector<Real> values = ReadDoublesAt(
-          path_, initial_volume_flux_offsets_[component], component_count);
-      const std::size_t base = static_cast<std::size_t>(component)*component_count;
-      for (std::size_t index = 0; index < values.size(); ++index) {
-        host_volume_flux(base + index) = values[index];
+  if (initialize_storage) {
+    const std::size_t face_cells = static_cast<std::size_t>(6)*cells*cells;
+    const std::size_t face_edges = static_cast<std::size_t>(12)*cells*(cells + 1);
+    state_left_ = DvceArray1D<Real>("emri_inner_state_left", face_cells*nvar_);
+    state_right_ = DvceArray1D<Real>("emri_inner_state_right", face_cells*nvar_);
+    flux_left_ = DvceArray1D<Real>("emri_inner_flux_left", face_cells);
+    flux_right_ = DvceArray1D<Real>("emri_inner_flux_right", face_cells);
+    interval_emf_ = DvceArray1D<Real>("emri_inner_interval_emf", face_edges);
+    const std::size_t volume_faces =
+        static_cast<std::size_t>(3)*(cells + 1)*cells*cells;
+    initial_volume_flux_ = DvceArray1D<Real>(
+        "emri_inner_initial_volume_flux", std::max<std::size_t>(volume_faces, 1));
+    if (has_initial_volume_flux_ && !is_restart_) {
+      auto host_volume_flux = Kokkos::create_mirror_view(initial_volume_flux_);
+      const std::uint64_t component_count =
+          static_cast<std::uint64_t>(cells + 1)*cells*cells;
+      for (int component = 0; component < 3; ++component) {
+        const std::vector<Real> values = ReadDoublesAt(
+            path_, initial_volume_flux_offsets_[component], component_count);
+        const std::size_t base = static_cast<std::size_t>(component)*component_count;
+        for (std::size_t index = 0; index < values.size(); ++index) {
+          host_volume_flux(base + index) = values[index];
+        }
       }
+      Kokkos::deep_copy(initial_volume_flux_, host_volume_flux);
     }
-    Kokkos::deep_copy(initial_volume_flux_, host_volume_flux);
+    characteristic_diagnostics_ = DvceArray1D<int>(
+        "emri_inner_characteristic_diagnostics", 2);
+    Kokkos::deep_copy(characteristic_diagnostics_, 0);
   }
-  characteristic_diagnostics_ = DvceArray1D<int>(
-      "emri_inner_characteristic_diagnostics", 2);
-  Kokkos::deep_copy(characteristic_diagnostics_, 0);
+  topology_gids_.resize(pack->nmb_thispack);
+  topology_geometry_.resize(static_cast<std::size_t>(pack->nmb_thispack)*7);
+  for (int m = 0; m < pack->nmb_thispack; ++m) {
+    topology_gids_[m] = pack->pmb->mb_gid.h_view(m);
+    const RegionSize &size = sizes.h_view(m);
+    const std::size_t offset = static_cast<std::size_t>(m)*7;
+    topology_geometry_[offset] = pack->pmb->mb_lev.h_view(m);
+    topology_geometry_[offset + 1] = size.x1min;
+    topology_geometry_[offset + 2] = size.x1max;
+    topology_geometry_[offset + 3] = size.x2min;
+    topology_geometry_[offset + 4] = size.x2max;
+    topology_geometry_[offset + 5] = size.x3min;
+    topology_geometry_[offset + 6] = size.x3max;
+  }
+}
+
+bool EmriInnerWorldtubeReplay::BoundaryTopologyCurrent(Mesh *pm) const {
+  if (pm == nullptr || pm->pmb_pack == nullptr || pm->pmb_pack->pmb == nullptr ||
+      topology_gids_.size() !=
+          static_cast<std::size_t>(pm->pmb_pack->nmb_thispack) ||
+      topology_geometry_.size() !=
+          static_cast<std::size_t>(pm->pmb_pack->nmb_thispack)*7) {
+    return false;
+  }
+  for (int m = 0; m < pm->pmb_pack->nmb_thispack; ++m) {
+    if (topology_gids_[m] != pm->pmb_pack->pmb->mb_gid.h_view(m)) return false;
+    const RegionSize &size = pm->pmb_pack->pmb->mb_size.h_view(m);
+    const std::size_t offset = static_cast<std::size_t>(m)*7;
+    const Real current[7] = {
+        static_cast<Real>(pm->pmb_pack->pmb->mb_lev.h_view(m)),
+        size.x1min, size.x1max, size.x2min, size.x2max, size.x3min, size.x3max};
+    for (int component = 0; component < 7; ++component) {
+      if (topology_geometry_[offset + component] != current[component]) return false;
+    }
+  }
+  return true;
+}
+
+void EmriInnerWorldtubeReplay::EnsureBoundaryTopologyCurrent(Mesh *pm) {
+  if (!BoundaryTopologyCurrent(pm)) {
+    BuildBoundaryTopology(pm, false);
+    ++topology_rebuild_count_;
+    if (global_variable::my_rank == 0) {
+      std::cout << "EMRI inner worldtube: rebuilt boundary topology after AMR, count="
+                << topology_rebuild_count_ << std::endl;
+    }
+  }
 }
 
 void EmriInnerWorldtubeReplay::LoadInterval(int interval) {
@@ -1024,6 +1203,33 @@ void EmriInnerWorldtubeReplay::SetADMVariables(MeshBlockPack *pack) {
 
   auto left = adm_left_;
   auto right = adm_right_;
+  const bool hybrid_primary = adm_hybrid_primary_;
+  const Real hybrid_fd_step = adm_hybrid_parameters_[4];
+  emri_comoving::MetricParameters secondary_left{};
+  emri_comoving::MetricParameters secondary_right{};
+  if (hybrid_primary) {
+    secondary_left.secondary_mass = adm_hybrid_parameters_[0];
+    secondary_right.secondary_mass = adm_hybrid_parameters_[0];
+    secondary_left.secondary_spin =
+        adm_hybrid_parameters_[0]*adm_hybrid_parameters_[1];
+    secondary_right.secondary_spin = secondary_left.secondary_spin;
+    secondary_left.spin_buffer_secondary = adm_hybrid_parameters_[2];
+    secondary_right.spin_buffer_secondary = adm_hybrid_parameters_[2];
+    secondary_left.singularity_floor = adm_hybrid_parameters_[3];
+    secondary_right.singularity_floor = adm_hybrid_parameters_[3];
+    secondary_left.embed_secondary_in_tetrad = true;
+    secondary_right.embed_secondary_in_tetrad = true;
+    const std::size_t left_coframe = static_cast<std::size_t>(adm_interval_)*16;
+    const std::size_t right_coframe = left_coframe + 16;
+    for (int a = 0; a < 4; ++a) {
+      for (int b = 0; b < 4; ++b) {
+        secondary_left.secondary_tetrad_covector[a][b] =
+            adm_secondary_coframes_[left_coframe + 4*a + b];
+        secondary_right.secondary_tetrad_covector[a][b] =
+            adm_secondary_coframes_[right_coframe + 4*a + b];
+      }
+    }
+  }
   auto &adm_vars = pack->padm->adm;
   auto &sizes = pack->pmb->mb_size;
   const RegionIndcs &indcs = pack->pmesh->mb_indcs;
@@ -1055,54 +1261,132 @@ void EmriInnerWorldtubeReplay::SetADMVariables(MeshBlockPack *pack) {
     const Real qx = (x - lower_x)*inverse_dx;
     const Real qy = (y - lower_y)*inverse_dy;
     const Real qz = (z - lower_z)*inverse_dz;
-    Real values[kADMFields];
-    for (int field = 0; field < kADMFields; ++field) {
-      const Real value_left = SampleADMField(left, field, nx, ny, nz, qx, qy, qz);
-      const Real value_right = SampleADMField(
-          right, field, nx, ny, nz, qx, qy, qz);
-      values[field] = (1.0 - fraction)*value_left + fraction*value_right;
-    }
-    const Real gxx = values[4];
-    const Real gxy = values[5];
-    const Real gxz = values[6];
-    const Real gyy = values[7];
-    const Real gyz = values[8];
-    const Real gzz = values[9];
-    const Real determinant = adm::SpatialDet(gxx, gxy, gxz, gyy, gyz, gzz);
-    const Real minor2 = gxx*gyy - gxy*gxy;
-    if (!(gxx > 0.0 && minor2 > 0.0 && determinant > 0.0)) {
-      Kokkos::abort("interpolated numerical ADM spatial metric is not positive");
-    }
-    Real inverse[3][3];
-    adm::SpatialInv(1.0/determinant, gxx, gxy, gxz, gyy, gyz, gzz,
-        &inverse[0][0], &inverse[0][1], &inverse[0][2],
-        &inverse[1][1], &inverse[1][2], &inverse[2][2]);
-    inverse[1][0] = inverse[0][1];
-    inverse[2][0] = inverse[0][2];
-    inverse[2][1] = inverse[1][2];
-    const Real beta_lower[3] = {values[1], values[2], values[3]};
-    Real beta[3] = {0.0, 0.0, 0.0};
-    Real beta_squared = 0.0;
-    for (int a = 0; a < 3; ++a) {
-      for (int b = 0; b < 3; ++b) beta[a] += inverse[a][b]*beta_lower[b];
-      beta_squared += beta[a]*beta_lower[a];
-    }
-    const Real lapse_squared = beta_squared - values[0];
-    if (!(lapse_squared > 0.0)) {
-      Kokkos::abort("interpolated numerical ADM lapse is not positive");
-    }
-    const Real gamma[6] = {gxx, gxy, gxz, gyy, gyz, gzz};
     const int row[6] = {0, 0, 0, 1, 1, 2};
     const int column[6] = {0, 1, 2, 1, 2, 2};
+    Real alpha = 0.0;
+    Real beta[3] = {0.0, 0.0, 0.0};
+    Real gamma[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    Real curvature[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    Real psi4 = 0.0;
+    if (hybrid_primary) {
+      const int metric_row[10] = {0, 0, 0, 0, 1, 1, 1, 2, 2, 3};
+      const int metric_column[10] = {0, 1, 2, 3, 1, 2, 3, 2, 3, 3};
+      Real metric_left[4][4] = {{0.0}};
+      Real metric_right[4][4] = {{0.0}};
+      for (int component = 0; component < 10; ++component) {
+        const int a = metric_row[component];
+        const int b = metric_column[component];
+        const Real value_left = SampleADMField(
+            left, component, nx, ny, nz, qx, qy, qz);
+        const Real value_right = SampleADMField(
+            right, component, nx, ny, nz, qx, qy, qz);
+        metric_left[a][b] = value_left;
+        metric_left[b][a] = value_left;
+        metric_right[a][b] = value_right;
+        metric_right[b][a] = value_right;
+      }
+      Real perturbation_left[4][4];
+      Real perturbation_right[4][4];
+      emri_comoving::ComputeSecondaryMetricPerturbation(
+          x, y, z, secondary_left, perturbation_left);
+      emri_comoving::ComputeSecondaryMetricPerturbation(
+          x, y, z, secondary_right, perturbation_right);
+      Real metric[4][4];
+      Real derivative[4][4][4] = {{{0.0}}};
+      for (int a = 0; a < 4; ++a) {
+        for (int b = 0; b < 4; ++b) {
+          metric_left[a][b] += perturbation_left[a][b];
+          metric_right[a][b] += perturbation_right[a][b];
+          metric[a][b] = (1.0 - fraction)*metric_left[a][b]
+              + fraction*metric_right[a][b];
+          derivative[0][a][b] =
+              (metric_right[a][b] - metric_left[a][b])/(right_time - left_time);
+        }
+      }
+      const Real coordinate[3] = {x, y, z};
+      for (int direction = 0; direction < 3; ++direction) {
+        Real lower_coordinate[3] = {coordinate[0], coordinate[1], coordinate[2]};
+        Real upper_coordinate[3] = {coordinate[0], coordinate[1], coordinate[2]};
+        lower_coordinate[direction] -= hybrid_fd_step;
+        upper_coordinate[direction] += hybrid_fd_step;
+        if (!(upper_coordinate[direction] > lower_coordinate[direction])) {
+          Kokkos::abort("hybrid ADM finite-difference step is too small");
+        }
+        Real secondary_left_lower[4][4];
+        Real secondary_left_upper[4][4];
+        Real secondary_right_lower[4][4];
+        Real secondary_right_upper[4][4];
+        emri_comoving::ComputeSecondaryMetricPerturbation(
+            lower_coordinate[0], lower_coordinate[1], lower_coordinate[2],
+            secondary_left, secondary_left_lower);
+        emri_comoving::ComputeSecondaryMetricPerturbation(
+            upper_coordinate[0], upper_coordinate[1], upper_coordinate[2],
+            secondary_left, secondary_left_upper);
+        emri_comoving::ComputeSecondaryMetricPerturbation(
+            lower_coordinate[0], lower_coordinate[1], lower_coordinate[2],
+            secondary_right, secondary_right_lower);
+        emri_comoving::ComputeSecondaryMetricPerturbation(
+            upper_coordinate[0], upper_coordinate[1], upper_coordinate[2],
+            secondary_right, secondary_right_upper);
+        const Real inverse_width =
+            1.0/(upper_coordinate[direction] - lower_coordinate[direction]);
+        for (int component = 0; component < 10; ++component) {
+          const int a = metric_row[component];
+          const int b = metric_column[component];
+          const int field = 10 + 10*direction + component;
+          const Real primary_left = SampleADMField(
+              left, field, nx, ny, nz, qx, qy, qz);
+          const Real primary_right = SampleADMField(
+              right, field, nx, ny, nz, qx, qy, qz);
+          const Real secondary_derivative_left =
+              (secondary_left_upper[a][b] - secondary_left_lower[a][b])
+              * inverse_width;
+          const Real secondary_derivative_right =
+              (secondary_right_upper[a][b] - secondary_right_lower[a][b])
+              * inverse_width;
+          const Real value = (1.0 - fraction)
+              *(primary_left + secondary_derivative_left)
+              + fraction*(primary_right + secondary_derivative_right);
+          derivative[direction + 1][a][b] = value;
+          derivative[direction + 1][b][a] = value;
+        }
+      }
+      DecomposeMetricDerivatives(
+          metric, derivative, alpha, beta, gamma, curvature, psi4);
+    } else {
+      Real values[kADMFields];
+      for (int field = 0; field < kADMFields; ++field) {
+        const Real value_left = SampleADMField(
+            left, field, nx, ny, nz, qx, qy, qz);
+        const Real value_right = SampleADMField(
+            right, field, nx, ny, nz, qx, qy, qz);
+        values[field] = (1.0 - fraction)*value_left + fraction*value_right;
+      }
+      Real metric[4][4] = {{0.0}};
+      const int metric_row[10] = {0, 0, 0, 0, 1, 1, 1, 2, 2, 3};
+      const int metric_column[10] = {0, 1, 2, 3, 1, 2, 3, 2, 3, 3};
+      for (int component = 0; component < 10; ++component) {
+        const int a = metric_row[component];
+        const int b = metric_column[component];
+        metric[a][b] = values[component];
+        metric[b][a] = values[component];
+      }
+      Real unused_derivative[4][4][4] = {{{0.0}}};
+      DecomposeMetricDerivatives(
+          metric, unused_derivative, alpha, beta, gamma, curvature, psi4);
+      for (int component = 0; component < 6; ++component) {
+        curvature[component] = values[10 + component];
+      }
+    }
     for (int a = 0; a < 3; ++a) adm_vars.beta_u(m, a, k, j, i) = beta[a];
     for (int component = 0; component < 6; ++component) {
       adm_vars.g_dd(m, row[component], column[component], k, j, i) =
           gamma[component];
       adm_vars.vK_dd(m, row[component], column[component], k, j, i) =
-          values[10 + component];
+          curvature[component];
     }
-    adm_vars.alpha(m, k, j, i) = sqrt(lapse_squared);
-    adm_vars.psi4(m, k, j, i) = cbrt(determinant);
+    adm_vars.alpha(m, k, j, i) = alpha;
+    adm_vars.psi4(m, k, j, i) = psi4;
   });
 }
 
@@ -1250,6 +1534,7 @@ Real EmriInnerWorldtubeReplay::BoundaryFluxResidual(
 void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
                                                        int stage) {
   if (!fluid_boundary_enabled_ || exhausted_) return;
+  EnsureBoundaryTopologyCurrent(pm);
   const Real data_time = StageStateTime(pm, pdrive, stage) + time_offset_;
   const Real left_time = times_[interval_];
   const Real right_time = times_[interval_ + 1];
@@ -1465,6 +1750,7 @@ void EmriInnerWorldtubeReplay::ApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive,
 
 void EmriInnerWorldtubeReplay::InjectEField(Mesh *pm, Driver *pdrive, int stage) {
   if (exhausted_) InnerFatal("inner evolution advanced beyond the replay table");
+  EnsureBoundaryTopologyCurrent(pm);
   if (pdrive->LevelSubcyclingRequested() || pdrive->nimp_stages != 0 ||
       (pdrive->integrator != "rk1" && pdrive->integrator != "rk2" &&
        pdrive->integrator != "rk3")) {
@@ -1522,6 +1808,7 @@ void EmriInnerWorldtubeReplay::CompleteStep(Mesh *pm, Driver *pdrive) {
     InnerFatal("inner timestep crossed a replay interval endpoint");
   }
   if (!NearlyEqual(data_time, next_time, next_time)) return;
+  EnsureBoundaryTopologyCurrent(pm);
   const Real residual = BoundaryFluxResidual(pm, flux_right_);
   if (global_variable::my_rank == 0) {
     std::cout << "EMRI inner worldtube: data_time=" << next_time

@@ -4,8 +4,9 @@
 The source numerical-ADM metric is pulled back through the same affine frame used
 by the fluid worldtube.  An analytic secondary Kerr-Schild perturbation is then
 embedded in the orthonormal tangent frame of that numerical background.  The
-resulting effective four-metric is decomposed into ADM variables on a regular
-local volume, including a ghost-zone halo.
+resulting effective four-metric can be stored directly, or the smooth primary
+four-metric and its spatial derivatives can be stored separately for hybrid
+runtime composition with an analytic secondary on the fluid/AMR grid.
 """
 
 from __future__ import annotations
@@ -29,9 +30,11 @@ import worldtube_flux_emf as worldtube
 CLASSIFICATION = "athenak-emri-adm-volume-replay-v1"
 LEGACY_BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v1"
 BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v2"
+HYBRID_BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v3"
 BINARY_MAGIC = b"AEMRIADMVOL001\x00\x00"
 LEGACY_BINARY_VERSION = 1
 BINARY_VERSION = 2
+HYBRID_BINARY_VERSION = 3
 BINARY_HEADER = struct.Struct("<16sIIIIII6dQ")
 FIELD_NAMES = (
     "g00",
@@ -71,6 +74,21 @@ CURVATURE_COMPONENTS = (
     (1, 2),
     (2, 2),
 )
+HYBRID_FIELD_NAMES = tuple(
+    list(FIELD_NAMES[: len(METRIC_COMPONENTS)])
+    + [
+        f"d{direction}_{FIELD_NAMES[field]}"
+        for direction in ("x1", "x2", "x3")
+        for field in range(len(METRIC_COMPONENTS))
+    ]
+)
+HYBRID_PARAMETER_NAMES = (
+    "secondary_mass",
+    "secondary_chi",
+    "secondary_spin_buffer",
+    "secondary_singularity_floor",
+    "secondary_metric_fd_step",
+)
 
 
 @dataclass(frozen=True)
@@ -81,6 +99,7 @@ class ADMVolume:
     fields: np.ndarray
     metadata: dict[str, object]
     secondary_coframes: np.ndarray | None = None
+    hybrid_parameters: np.ndarray | None = None
 
 
 def _finite_positive(value: object, name: str) -> float:
@@ -351,6 +370,69 @@ def extrinsic_curvature(
     }
 
 
+def spatial_metric_derivatives(metric: object, spacing: object) -> np.ndarray:
+    """Differentiate a metric volume along local x1, x2, and x3."""
+
+    values = np.asarray(metric, dtype=np.float64)
+    delta = np.asarray(spacing, dtype=np.float64)
+    if values.ndim != 6 or values.shape[-2:] != (4, 4):
+        raise ValueError("metric series must have shape (nt,nz,ny,nx,4,4)")
+    if min(values.shape[1:4]) < 3:
+        raise ValueError("metric volume needs at least three nodes on every axis")
+    if delta.shape != (3,) or not np.isfinite(delta).all() or np.min(delta) <= 0.0:
+        raise ValueError("metric volume spacing must contain three positive values")
+    result = np.empty(values.shape[:-2] + (3, 4, 4), dtype=np.float64)
+    # The stored volume is indexed (z,y,x), while derivative directions are
+    # ordered (x1,x2,x3).
+    for direction, array_axis in enumerate((3, 2, 1)):
+        result[..., direction, :, :] = np.gradient(
+            values, delta[direction], axis=array_axis, edge_order=2
+        )
+    return result
+
+
+def decompose_metric_derivatives(
+    metric: object, metric_derivatives: object
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Return ADM variables and K_ij from g_ab and partial_c g_ab.
+
+    ``metric_derivatives[..., c, a, b]`` uses c=0 for time and c=1,2,3
+    for x1,x2,x3.  Reconstructing K from the composed metric avoids assuming
+    that primary and secondary extrinsic curvatures add independently.
+    """
+
+    values = np.asarray(metric, dtype=np.float64)
+    derivatives = np.asarray(metric_derivatives, dtype=np.float64)
+    if derivatives.shape != values.shape[:-2] + (4, 4, 4):
+        raise ValueError("metric derivatives have incompatible dimensions")
+    if not np.isfinite(derivatives).all():
+        raise ValueError("metric derivatives must be finite")
+    adm, _ = decompose_four_metric(values)
+    beta = adm["beta"]
+    curvature = np.empty(values.shape[:-2] + (3, 3), dtype=np.float64)
+    for i in range(3):
+        for j in range(i, 3):
+            covariant_sum = (
+                derivatives[..., i + 1, 0, j + 1]
+                + derivatives[..., j + 1, 0, i + 1]
+            )
+            connection_contraction = np.zeros(values.shape[:-2], dtype=np.float64)
+            for lower in range(3):
+                connection_contraction += beta[..., lower] * (
+                    derivatives[..., i + 1, lower + 1, j + 1]
+                    + derivatives[..., j + 1, lower + 1, i + 1]
+                    - derivatives[..., lower + 1, i + 1, j + 1]
+                )
+            value = (
+                covariant_sum
+                - connection_contraction
+                - derivatives[..., 0, i + 1, j + 1]
+            ) / (2.0 * adm["alpha"])
+            curvature[..., i, j] = value
+            curvature[..., j, i] = value
+    return adm, curvature
+
+
 def _source_series(
     manifest_path: Path,
 ) -> tuple[extract.SourceSeries, dict[str, object], Path]:
@@ -378,10 +460,17 @@ def build_volume(
     chunk_size: int = 65536,
     spin_buffer: float = 0.05,
     singularity_floor: float = 1.0e-3,
+    hybrid_primary: bool = False,
+    secondary_metric_fd_step: float | None = None,
 ) -> ADMVolume:
     sample_times = worldtube.validate_times(times)
     half_width = _finite_positive(half_width, "volume half width")
     secondary_mass = _finite_positive(secondary_mass, "secondary mass")
+    if secondary_metric_fd_step is None:
+        secondary_metric_fd_step = 5.0e-5 * secondary_mass
+    secondary_metric_fd_step = _finite_positive(
+        secondary_metric_fd_step, "secondary metric finite-difference step"
+    )
     if not isinstance(cells, int) or isinstance(cells, bool) or cells < 2:
         raise ValueError("volume cells must be an integer of at least two")
     if not isinstance(halo, int) or isinstance(halo, bool) or halo < 1:
@@ -407,6 +496,8 @@ def build_volume(
     metric = np.empty((sample_times.size, nodes, nodes, nodes, 4, 4))
     secondary_coframes = np.empty((sample_times.size, 4, 4))
     coframe_diagnostics = []
+    minimum_composed_lapse = math.inf
+    minimum_composed_spatial_eigenvalue = math.inf
     for time_index, local_time in enumerate(sample_times):
         background_origin = sampler.sample(
             float(local_time), np.zeros((1, 3))
@@ -430,26 +521,90 @@ def build_volume(
         for start in range(0, positions.shape[0], chunk_size):
             stop = min(start + chunk_size, positions.shape[0])
             background = sampler.sample(float(local_time), positions[start:stop])
-            secondary = secondary_kerr_perturbation(
-                positions[start:stop],
+            if hybrid_primary:
+                flattened[start:stop] = background
+                secondary = secondary_kerr_perturbation(
+                    positions[start:stop],
+                    secondary_mass,
+                    secondary_chi,
+                    coframe,
+                    spin_buffer,
+                    singularity_floor,
+                )
+                _, composed_audit = decompose_four_metric(background + secondary)
+                minimum_composed_lapse = min(
+                    minimum_composed_lapse,
+                    float(np.min(composed_audit["lapse"])),
+                )
+                minimum_composed_spatial_eigenvalue = min(
+                    minimum_composed_spatial_eigenvalue,
+                    float(np.min(composed_audit["minimum_spatial_eigenvalue"])),
+                )
+            else:
+                secondary = secondary_kerr_perturbation(
+                    positions[start:stop],
+                    secondary_mass,
+                    secondary_chi,
+                    coframe,
+                    spin_buffer,
+                    singularity_floor,
+                )
+                flattened[start:stop] = background + secondary
+    hybrid_parameters = None
+    if hybrid_primary:
+        derivatives = spatial_metric_derivatives(metric, np.full(3, spacing))
+        fields = np.empty(
+            (sample_times.size, len(HYBRID_FIELD_NAMES), nodes, nodes, nodes),
+            dtype=np.float64,
+        )
+        for field, (left, right) in enumerate(METRIC_COMPONENTS):
+            fields[:, field] = metric[..., left, right]
+            for direction in range(3):
+                offset = len(METRIC_COMPONENTS) * (direction + 1) + field
+                fields[:, offset] = derivatives[..., direction, left, right]
+        _, background_audit = decompose_four_metric(metric)
+        adm_diagnostics = {
+            "minimum_lapse": minimum_composed_lapse,
+            "minimum_spatial_metric_eigenvalue": (
+                minimum_composed_spatial_eigenvalue
+            ),
+            "minimum_primary_lapse": float(np.min(background_audit["lapse"])),
+            "minimum_primary_spatial_metric_eigenvalue": float(
+                np.min(background_audit["minimum_spatial_eigenvalue"])
+            ),
+            "temporal_derivative": (
+                "exact derivative of piecewise-linear endpoint composition at runtime"
+            ),
+            "spatial_derivative": (
+                "stored second-order primary derivative plus online analytic secondary"
+            ),
+        }
+        hybrid_parameters = np.asarray(
+            (
                 secondary_mass,
                 secondary_chi,
-                coframe,
                 spin_buffer,
                 singularity_floor,
-            )
-            flattened[start:stop] = background + secondary
-    curvature, adm_diagnostics = extrinsic_curvature(
-        metric, sample_times, np.full(3, spacing)
-    )
-    fields = np.empty(
-        (sample_times.size, len(FIELD_NAMES), nodes, nodes, nodes),
-        dtype=np.float64,
-    )
-    for field, (left, right) in enumerate(METRIC_COMPONENTS):
-        fields[:, field] = metric[..., left, right]
-    for offset, (left, right) in enumerate(CURVATURE_COMPONENTS):
-        fields[:, len(METRIC_COMPONENTS) + offset] = curvature[..., left, right]
+                secondary_metric_fd_step,
+            ),
+            dtype=np.float64,
+        )
+        field_names = HYBRID_FIELD_NAMES
+        representation = "primary_metric_derivatives_plus_online_secondary"
+    else:
+        curvature, adm_diagnostics = extrinsic_curvature(
+            metric, sample_times, np.full(3, spacing)
+        )
+        fields = np.empty(
+            (sample_times.size, len(FIELD_NAMES), nodes, nodes, nodes),
+            dtype=np.float64,
+        )
+        for field, (left, right) in enumerate(METRIC_COMPONENTS):
+            fields[:, field] = metric[..., left, right]
+        for offset, (left, right) in enumerate(CURVATURE_COMPONENTS):
+            fields[:, len(METRIC_COMPONENTS) + offset] = curvature[..., left, right]
+        field_names = FIELD_NAMES
+        representation = "composed_metric_and_extrinsic_curvature"
     metadata = {
         "classification": CLASSIFICATION,
         "source_manifest": str(resolved_manifest),
@@ -463,7 +618,8 @@ def build_volume(
         "secondary_embedding": "numerical-background tangent tetrad",
         "secondary_spin_buffer": spin_buffer,
         "secondary_singularity_floor": singularity_floor,
-        "field_names": list(FIELD_NAMES),
+        "field_names": list(field_names),
+        "representation": representation,
         "sampling": sampler.diagnostics(),
         "coframe_diagnostics": coframe_diagnostics,
         "adm_diagnostics": adm_diagnostics,
@@ -475,6 +631,7 @@ def build_volume(
         fields,
         metadata,
         secondary_coframes,
+        hybrid_parameters,
     )
 
 
@@ -486,16 +643,17 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
     coframes = None
     if volume.secondary_coframes is not None:
         coframes = np.asarray(volume.secondary_coframes, dtype=np.float64)
+    hybrid_parameters = None
+    if volume.hybrid_parameters is not None:
+        hybrid_parameters = np.asarray(volume.hybrid_parameters, dtype=np.float64)
     if lower.shape != (3,) or spacing.shape != (3,):
         raise ValueError("ADM volume lower and spacing must contain three values")
     if not np.isfinite(lower).all() or not np.isfinite(spacing).all():
         raise ValueError("ADM volume geometry is non-finite")
     if np.min(spacing) <= 0.0:
         raise ValueError("ADM volume spacing must be positive")
-    if fields.ndim != 5 or fields.shape[:2] != (
-        times.size,
-        len(FIELD_NAMES),
-    ):
+    field_names = HYBRID_FIELD_NAMES if hybrid_parameters is not None else FIELD_NAMES
+    if fields.ndim != 5 or fields.shape[:2] != (times.size, len(field_names)):
         raise ValueError("ADM volume fields have incompatible dimensions")
     if min(fields.shape[2:]) < 2 or not np.isfinite(fields).all():
         raise ValueError("ADM volume fields are invalid")
@@ -503,23 +661,43 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
         coframes.shape != (times.size, 4, 4) or not np.isfinite(coframes).all()
     ):
         raise ValueError("secondary coframes must have finite shape (nt,4,4)")
-    version = BINARY_VERSION if coframes is not None else LEGACY_BINARY_VERSION
-    classification = (
-        BINARY_CLASSIFICATION
-        if version >= BINARY_VERSION
-        else LEGACY_BINARY_CLASSIFICATION
-    )
+    if hybrid_parameters is not None:
+        if coframes is None:
+            raise ValueError("hybrid ADM volume requires secondary coframes")
+        if (
+            hybrid_parameters.shape != (len(HYBRID_PARAMETER_NAMES),)
+            or not np.isfinite(hybrid_parameters).all()
+        ):
+            raise ValueError("hybrid ADM parameters have incompatible dimensions")
+        if (
+            hybrid_parameters[0] <= 0.0
+            or abs(hybrid_parameters[1]) > 1.0
+            or hybrid_parameters[2] < 0.0
+            or hybrid_parameters[3] <= 0.0
+            or hybrid_parameters[4] <= 0.0
+        ):
+            raise ValueError("hybrid ADM parameters are outside their physical ranges")
+        version = HYBRID_BINARY_VERSION
+        classification = HYBRID_BINARY_CLASSIFICATION
+    elif coframes is not None:
+        version = BINARY_VERSION
+        classification = BINARY_CLASSIFICATION
+    else:
+        version = LEGACY_BINARY_VERSION
+        classification = LEGACY_BINARY_CLASSIFICATION
     nz, ny, nx = fields.shape[2:]
     payload = times.astype("<f8", copy=False).tobytes(order="C")
     if coframes is not None:
         payload += coframes.astype("<f8", copy=False).tobytes(order="C")
+    if hybrid_parameters is not None:
+        payload += hybrid_parameters.astype("<f8", copy=False).tobytes(order="C")
     payload += fields.astype("<f8", copy=False).tobytes(order="C")
     checksum = zlib.crc32(payload) & 0xFFFFFFFF
     header = BINARY_HEADER.pack(
         BINARY_MAGIC,
         version,
         times.size,
-        len(FIELD_NAMES),
+        len(field_names),
         nx,
         ny,
         nz,
@@ -536,13 +714,16 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
             "binary_file": path.name,
             "binary_version": version,
             "payload_crc32": f"{checksum:08x}",
-            "field_names": list(FIELD_NAMES),
+            "field_names": list(field_names),
             "times": times.tolist(),
             "grid_lower_node": lower.tolist(),
             "grid_spacing": spacing.tolist(),
             "grid_shape_xyz": [nx, ny, nz],
         }
     )
+    if hybrid_parameters is not None:
+        sidecar["hybrid_parameter_names"] = list(HYBRID_PARAMETER_NAMES)
+        sidecar["hybrid_parameters"] = hybrid_parameters.tolist()
     sidecar_path = path.with_suffix(path.suffix + ".json")
     sidecar_path.write_text(
         json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -562,16 +743,23 @@ def read_binary(path: Path) -> ADMVolume:
     if magic != BINARY_MAGIC or version not in (
         LEGACY_BINARY_VERSION,
         BINARY_VERSION,
+        HYBRID_BINARY_VERSION,
     ):
         raise ValueError("ADM volume binary magic or version is unsupported")
-    if nt < 2 or nvar != len(FIELD_NAMES) or min(nx, ny, nz) < 2:
+    field_names = HYBRID_FIELD_NAMES if version == HYBRID_BINARY_VERSION else FIELD_NAMES
+    if nt < 2 or nvar != len(field_names) or min(nx, ny, nz) < 2:
         raise ValueError("ADM volume binary dimensions are invalid")
     binary_payload = payload[BINARY_HEADER.size :]
     checksum = zlib.crc32(binary_payload) & 0xFFFFFFFF
     if checksum != expected_checksum:
         raise ValueError("ADM volume binary checksum mismatch")
     coframe_values = nt * 16 if version >= BINARY_VERSION else 0
-    expected_values = nt + coframe_values + nt * nvar * nx * ny * nz
+    parameter_values = (
+        len(HYBRID_PARAMETER_NAMES) if version == HYBRID_BINARY_VERSION else 0
+    )
+    expected_values = (
+        nt + coframe_values + parameter_values + nt * nvar * nx * ny * nz
+    )
     values = np.frombuffer(binary_payload, dtype="<f8")
     if values.size != expected_values or not np.isfinite(values).all():
         raise ValueError("ADM volume binary payload dimensions are invalid")
@@ -581,28 +769,58 @@ def read_binary(path: Path) -> ADMVolume:
     if version >= BINARY_VERSION:
         coframes = np.asarray(values[cursor : cursor + coframe_values].reshape(nt, 4, 4))
         cursor += coframe_values
+    hybrid_parameters = None
+    if version == HYBRID_BINARY_VERSION:
+        hybrid_parameters = np.asarray(values[cursor : cursor + parameter_values])
+        cursor += parameter_values
+        if (
+            hybrid_parameters[0] <= 0.0
+            or abs(hybrid_parameters[1]) > 1.0
+            or hybrid_parameters[2] < 0.0
+            or hybrid_parameters[3] <= 0.0
+            or hybrid_parameters[4] <= 0.0
+        ):
+            raise ValueError("hybrid ADM binary parameters are invalid")
     fields = np.asarray(values[cursor:].reshape(nt, nvar, nz, ny, nx))
     metadata: dict[str, object] = {
         "classification": (
-            BINARY_CLASSIFICATION
-            if version >= BINARY_VERSION
-            else LEGACY_BINARY_CLASSIFICATION
+            HYBRID_BINARY_CLASSIFICATION
+            if version == HYBRID_BINARY_VERSION
+            else (
+                BINARY_CLASSIFICATION
+                if version >= BINARY_VERSION
+                else LEGACY_BINARY_CLASSIFICATION
+            )
         ),
         "binary_version": version,
         "payload_crc32": f"{checksum:08x}",
-        "field_names": list(FIELD_NAMES),
+        "field_names": list(field_names),
     }
+    if hybrid_parameters is not None:
+        metadata["hybrid_parameter_names"] = list(HYBRID_PARAMETER_NAMES)
+        metadata["hybrid_parameters"] = hybrid_parameters.tolist()
     sidecar_path = path.with_suffix(path.suffix + ".json")
     if sidecar_path.exists():
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
         if (
             sidecar.get("classification") != metadata["classification"]
             or sidecar.get("payload_crc32") != f"{checksum:08x}"
-            or sidecar.get("field_names") != list(FIELD_NAMES)
+            or sidecar.get("field_names") != list(field_names)
+            or (
+                hybrid_parameters is not None
+                and (
+                    sidecar.get("hybrid_parameter_names")
+                    != list(HYBRID_PARAMETER_NAMES)
+                    or sidecar.get("hybrid_parameters")
+                    != hybrid_parameters.tolist()
+                )
+            )
         ):
             raise ValueError("ADM volume sidecar does not match its binary")
         metadata.update(sidecar)
-    return ADMVolume(times, lower, spacing, fields, metadata, coframes)
+    return ADMVolume(
+        times, lower, spacing, fields, metadata, coframes, hybrid_parameters
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -616,6 +834,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--secondary-mass", type=float, required=True)
     parser.add_argument("--secondary-chi", type=float, default=0.0)
     parser.add_argument("--chunk-size", type=int, default=65536)
+    parser.add_argument("--hybrid-primary", action="store_true")
+    parser.add_argument("--secondary-metric-fd-step", type=float)
     return parser.parse_args()
 
 
@@ -630,6 +850,8 @@ def main() -> None:
         arguments.secondary_mass,
         arguments.secondary_chi,
         arguments.chunk_size,
+        hybrid_primary=arguments.hybrid_primary,
+        secondary_metric_fd_step=arguments.secondary_metric_fd_step,
     )
     report = write_binary(arguments.output, volume)
     print(arguments.output)

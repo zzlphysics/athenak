@@ -863,15 +863,47 @@ four-metric, constructs an orthonormal tangent coframe at the local origin, and 
 regularized analytic secondary Kerr-Schild perturbation in that coframe.  Adding the
 secondary is essential: the global single-BH run contains the primary background only,
 whereas replacing the analytic metric by that background alone would remove the accretor
-from the inner problem.  The resulting binary stores ten symmetric four-metric
+from the inner problem.  The legacy version-two binary stores ten symmetric four-metric
 components, six `K_ij` components, and one 4-by-4 secondary embedding coframe per time
 sample.  The coframes are negligible compared with the volume data.  AthenaK keeps only
 two field time slabs on the device, performs trilinear spatial and linear temporal
 interpolation at every RK stage, then decomposes the interpolated four-metric into lapse,
 shift, and spatial metric.
 
-The metric grid covers all active and ghost cell centers.  `--metric-halo` must be at
-least `--mesh-nghost`; the production default is four.  A temporally tilted affine frame
+For an EMRI, prefer the hybrid version-three representation:
+
+```bash
+python3 inputs/emri/run_adm_inner_replay_pilot.py \
+  --campaign runs/emri/adm_worldtube_campaign/summary.json \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/adm_hybrid_inner_pilot \
+  --secondary-mass 1e-5 \
+  --numerical-adm-volume --hybrid-primary-adm \
+  --metric-cells-per-axis 16 --metric-halo 4 --mesh-nghost 4 \
+  --fail-on-gate
+```
+
+Version three stores the ten smooth primary four-metric components and their three
+spatial derivatives, for 40 fields per node.  The secondary Kerr term and its spatial
+derivatives are evaluated analytically on every fluid or AMR cell.  The time derivative
+is the exact slope between the two endpoint *total* metrics, including the changing
+secondary coframe.  AthenaK then reconstructs `K_ij` from the composed metric and all
+four derivatives.  It never adds separately decomposed primary and secondary extrinsic
+curvatures, because lapse, shift, inverse spatial metric, and the connection are
+nonlinear functions of the total metric.
+
+This separation removes the requirement that the global-primary ADM volume resolve the
+secondary horizon.  On the four-cell fixture the v2 and v3 four-metrics agreed to
+machine precision, but their coarse-grid `K_ij` differed by relative L2 `0.77`: v2 was
+differentiating the secondary on a grid with spacing about `25m`.  The v3 C++ result,
+including all six `K_ij`, agreed with an independent endpoint composition and
+decomposition to about `5.8e-8`.  The primary metric resolution must still be converged
+against its own curvature/gradient scale; v3 is not permission to underresolve the
+global primary data.
+
+The metric grid covers all active and ghost cell centers.  The required halo is computed
+from the metric-to-root-fluid resolution ratio, so it need not equal `mesh/nghost`; the
+production defaults are both four.  A temporally tilted affine frame
 can map the outermost ghost nodes beyond the nominal first or last local sample time.
 The extractor rejects that case rather than extrapolating.  Extend the global ADM dump
 sequence on both sides of the worldtube window until all ghost-node events have valid
@@ -904,6 +936,24 @@ replay but are rejected when force history is requested.  The summary still sets
 `science_ready=false` until `K_ij`, metric-volume resolution, and force histories pass a
 production cadence/resolution convergence campaign.
 
+Hybrid v3 also supports central dynamic AMR.  The six replay boundaries must remain at
+the root level; a refinement shell touching a cube face is rejected.  After every AMR
+topology change the replay rebuilds its root-boundary face and edge ownership maps,
+while the metric callback evaluates both coarse and fine cell centers directly.  For a
+structural AMR test, `--fluid-cells-per-axis` may mimetically resample the supplied
+worldtube cochains and `--meshblock-cells-per-axis`, `--amr-levels`, and
+`--refinement-radius` define the hierarchy.  Resampling is explicitly reported and does
+not create physical source resolution.  A `16^3` root-grid/two-level test refined from
+64 to 120 MeshBlocks, rebuilt the boundary topology once, obtained ADM relative error
+`5.4e-8` on levels zero and one, and ended with maximum `|divB|=2.74e-12`.
+
+At the same coarse primary grid v3 uses 40/16 = 2.5 times the binary/device storage of
+v2, and the current Python builder array floor grows by 104/41.  The gain is that metric
+resolution is decoupled from the far finer secondary/fluid hierarchy.  Pass
+`--hybrid-primary-adm` to `plan_adm_inner_replay.py` to obtain the correct v3 memory
+estimate; do not set the primary metric resolution factor equal to the finest AMR fluid
+resolution by default.
+
 The geometric floor/flux excision masks conservatively take the union of the secondary
 regions defined by the two coframes bracketing the current replay time.  Their
 cell-diagonal padding and the pilot's horizon-resolution/worldtube-separation gates are
@@ -928,8 +978,8 @@ convergence result.
 ### Numerical-ADM force convergence matrix
 
 `run_adm_inner_replay_convergence.py` turns the remaining metric-representation blocker
-into an executable matrix.  It holds the fluid/worldtube mesh fixed while independently
-varying:
+into an executable matrix.  It holds one fluid/worldtube mesh or AMR hierarchy shared
+by all cases while independently varying:
 
 - `--metric-resolution-factors`, the number of ADM volume cells per fluid cell; and
 - `--metric-cadence-strides`, the subsampling stride of the ADM time table.

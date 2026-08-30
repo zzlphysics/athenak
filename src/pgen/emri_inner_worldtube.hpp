@@ -76,7 +76,9 @@ class EmriInnerWorldtubeReplay {
 
   void ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm);
   void ReadADMVolume(ParameterInput *pin, Mesh *pm);
-  void BuildBoundaryTopology(Mesh *pm);
+  void BuildBoundaryTopology(Mesh *pm, bool initialize_storage);
+  void EnsureBoundaryTopologyCurrent(Mesh *pm);
+  bool BoundaryTopologyCurrent(Mesh *pm) const;
   void LoadInterval(int interval);
   void LoadADMInterval(int interval);
   void AdvanceADMInterval(Real data_time);
@@ -87,6 +89,7 @@ class EmriInnerWorldtubeReplay {
   bool characteristic_sr_boundary_ = false;
   bool characteristic_gr_boundary_ = false;
   bool adm_volume_enabled_ = false;
+  bool adm_hybrid_primary_ = false;
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   bool has_cell_centered_magnetic_state_ = false;
@@ -101,6 +104,7 @@ class EmriInnerWorldtubeReplay {
   int adm_nt_ = 0;
   int adm_interval_ = 0;
   int adm_binary_version_ = 0;
+  int topology_rebuild_count_ = 0;
   Real data_center_[3] = {0.0, 0.0, 0.0};
   Real half_width_ = 0.0;
   Real dx_ = 0.0;
@@ -113,9 +117,12 @@ class EmriInnerWorldtubeReplay {
   std::uint64_t adm_slab_values_ = 0;
   Real adm_lower_[3] = {0.0, 0.0, 0.0};
   Real adm_spacing_[3] = {0.0, 0.0, 0.0};
+  Real adm_hybrid_parameters_[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
   std::vector<Real> times_;
   std::vector<Real> adm_times_;
   std::vector<Real> adm_secondary_coframes_;
+  std::vector<int> topology_gids_;
+  std::vector<Real> topology_geometry_;
   std::array<std::uint64_t, 6> state_offsets_{};
   std::array<std::uint64_t, 6> flux_offsets_{};
   std::array<std::uint64_t, 6> emf_u_offsets_{};

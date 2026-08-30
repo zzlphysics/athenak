@@ -3,6 +3,7 @@
 from argparse import Namespace
 from pathlib import Path
 import sys
+import tempfile
 
 import numpy as np
 
@@ -98,6 +99,13 @@ def test_structural_assessment_requires_resolution_and_separation() -> None:
     unresolved = pilot.structural_assessment(arguments, case, 16, 0.5)
     assert not unresolved["passed"]
     assert not unresolved["conditions"]["secondary_horizon_resolution"]["passed"]
+    arguments.amr_levels = 2
+    refined = pilot.structural_assessment(arguments, case, 16, 0.5)
+    assert np.isclose(
+        refined["conditions"]["secondary_horizon_resolution"]["observed"],
+        2.0
+        * unresolved["conditions"]["secondary_horizon_resolution"]["observed"],
+    )
     coframes = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
     coframes[:, 1, 1] = 0.5
     volume = pilot.adm_volume.ADMVolume(
@@ -122,6 +130,21 @@ def test_structural_assessment_requires_resolution_and_separation() -> None:
         assert "fewer than three" in str(error)
     else:
         raise AssertionError("two-sample K_ij table was accepted")
+
+
+def test_amr_pilot_input_removes_static_region_only() -> None:
+    source = """<mesh>\nnx1=8\n<refined_region1>\nlevel=1\nx1min=-1\n<time>\nnlim=2\n"""
+    with tempfile.TemporaryDirectory() as directory:
+        source_path = Path(directory) / "source.athinput"
+        output_path = Path(directory) / "amr.athinput"
+        source_path.write_text(source, encoding="utf-8")
+        pilot._amr_pilot_input(source_path, output_path)
+        result = output_path.read_text(encoding="utf-8")
+    assert "<refined_region1>" not in result
+    assert "x1min=-1" not in result
+    assert "<mesh>" in result
+    assert "<time>" in result
+    assert "nlim=2" in result
 
 
 def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -> None:
@@ -163,3 +186,44 @@ def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -
     np.testing.assert_allclose(expected["adm_gzz"], midpoint[3, 3])
     np.testing.assert_allclose(expected["adm_Kyz"], 0.9)
     assert all(expected[name].shape == (cells, cells, cells) for name in expected)
+    coordinates = np.asarray((-0.5, 0.5))
+    z, y, x = np.meshgrid(coordinates, coordinates, coordinates, indexing="ij")
+    points = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    point_expected = pilot._expected_adm_points(volume, 6.0, points)
+    for name in expected:
+        np.testing.assert_allclose(point_expected[name], expected[name].ravel())
+
+
+def test_expected_hybrid_adm_fields_composes_online_secondary() -> None:
+    cells = 2
+    nodes = 4
+    times = np.asarray((5.0, 7.0))
+    fields = np.zeros(
+        (2, len(pilot.adm_volume.HYBRID_FIELD_NAMES), nodes, nodes, nodes)
+    )
+    fields[:, 0] = -1.0
+    for field in (4, 7, 9):
+        fields[:, field] = 1.0
+    coframes = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
+    parameters = np.asarray((0.1, 0.0, 0.05, 1.0e-3, 1.0e-5))
+    volume = pilot.adm_volume.ADMVolume(
+        times,
+        np.full(3, -1.5),
+        np.ones(3),
+        fields,
+        {},
+        coframes,
+        parameters,
+    )
+    expected = pilot._expected_adm_fields(volume, 6.0, cells, 1.0)
+    coordinates = np.asarray((-0.5, 0.5))
+    z, y, x = np.meshgrid(coordinates, coordinates, coordinates, indexing="ij")
+    positions = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    metric = np.broadcast_to(np.diag((-1.0, 1.0, 1.0, 1.0)), (8, 4, 4)).copy()
+    metric += pilot.adm_volume.secondary_kerr_perturbation(
+        positions, *parameters[:2], np.eye(4), *parameters[2:4]
+    )
+    adm, _ = pilot.adm_volume.decompose_four_metric(metric.reshape(2, 2, 2, 4, 4))
+    np.testing.assert_allclose(expected["adm_alpha"], adm["alpha"])
+    np.testing.assert_allclose(expected["adm_gxx"], adm["gamma"][..., 0, 0])
+    assert all(np.isfinite(expected[name]).all() for name in expected)

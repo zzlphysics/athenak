@@ -438,6 +438,12 @@ def _run_case(
         "mesh_nghost": arguments.mesh_nghost,
         "secondary_mass": arguments.secondary_mass,
         "secondary_chi": arguments.secondary_chi,
+        "hybrid_primary_adm": arguments.hybrid_primary_adm,
+        "secondary_metric_fd_step": arguments.secondary_metric_fd_step,
+        "fluid_cells_per_axis": arguments.fluid_cells_per_axis,
+        "meshblock_cells_per_axis": arguments.meshblock_cells_per_axis,
+        "amr_levels": arguments.amr_levels,
+        "refinement_radius": arguments.refinement_radius,
         "history_samples": arguments.history_samples,
         "adm_audit_samples": arguments.adm_audit_samples,
         "tlim": arguments.tlim,
@@ -475,6 +481,12 @@ def _run_case(
         history_samples=arguments.history_samples,
         adm_audit_samples=arguments.adm_audit_samples,
         numerical_adm_volume=True,
+        hybrid_primary_adm=arguments.hybrid_primary_adm,
+        secondary_metric_fd_step=arguments.secondary_metric_fd_step,
+        fluid_cells_per_axis=arguments.fluid_cells_per_axis,
+        meshblock_cells_per_axis=arguments.meshblock_cells_per_axis,
+        amr_levels=arguments.amr_levels,
+        refinement_radius=arguments.refinement_radius,
         metric_cells_per_axis=metric_cells,
         metric_cadence_stride=case.cadence_stride,
         metric_halo=metric_halo,
@@ -507,7 +519,12 @@ def run_convergence(arguments: argparse.Namespace) -> dict[str, object]:
     case_name, source_case = pilot._case_document(source, arguments.case)
     worldtube_path = Path(source_case["worldtube"]).expanduser().resolve(strict=True)
     _, faces, _ = worldtube.read_worldtube(worldtube_path)
-    fluid_cells = faces[worldtube.FACE_NAMES[0]].cell_state.shape[-1]
+    source_fluid_cells = faces[worldtube.FACE_NAMES[0]].cell_state.shape[-1]
+    fluid_cells = (
+        source_fluid_cells
+        if arguments.fluid_cells_per_axis is None
+        else arguments.fluid_cells_per_axis
+    )
     cases = convergence_cases(
         arguments.metric_resolution_factors, arguments.metric_cadence_strides
     )
@@ -621,6 +638,7 @@ def run_convergence(arguments: argparse.Namespace) -> dict[str, object]:
         "case": case_name,
         "source_worldtube": str(worldtube_path),
         "fluid_cells_per_axis": fluid_cells,
+        "source_fluid_cells_per_axis": source_fluid_cells,
         "secondary_mass": arguments.secondary_mass,
         "secondary_chi": arguments.secondary_chi,
         "metric_resolution_factors": arguments.metric_resolution_factors,
@@ -632,7 +650,11 @@ def run_convergence(arguments: argparse.Namespace) -> dict[str, object]:
         "cadence_sensitivity_at_fixed_resolution": cadence_sensitivity,
         "assessment": assessment,
         "limitations": [
-            "the fluid mesh is fixed so this isolates metric representation error",
+            (
+                "the fluid AMR hierarchy is shared by all cases"
+                if arguments.amr_levels > 1
+                else "the fluid mesh is fixed so this isolates metric representation error"
+            ),
             "one-way coupling remains in force",
             "threshold passage is not a substitute for a long-duration physical run",
         ],
@@ -656,6 +678,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--secondary-mass", type=float, required=True)
     parser.add_argument("--secondary-chi", type=float, default=0.0)
+    parser.add_argument("--hybrid-primary-adm", action="store_true")
+    parser.add_argument("--secondary-metric-fd-step", type=float)
+    parser.add_argument("--fluid-cells-per-axis", type=int)
+    parser.add_argument("--meshblock-cells-per-axis", type=int)
+    parser.add_argument("--amr-levels", type=int, default=1)
+    parser.add_argument("--refinement-radius", type=float)
     parser.add_argument(
         "--metric-resolution-factors", type=int, nargs="+", default=(1, 2, 4)
     )
@@ -740,6 +768,30 @@ def parse_arguments() -> argparse.Namespace:
         not math.isfinite(arguments.tlim) or arguments.tlim <= 0.0
     ):
         parser.error("--tlim must be finite and positive")
+    if arguments.secondary_metric_fd_step is not None and (
+        not math.isfinite(arguments.secondary_metric_fd_step)
+        or arguments.secondary_metric_fd_step <= 0.0
+    ):
+        parser.error("--secondary-metric-fd-step must be finite and positive")
+    if arguments.fluid_cells_per_axis is not None and (
+        arguments.fluid_cells_per_axis < 1
+    ):
+        parser.error("--fluid-cells-per-axis must be positive")
+    if arguments.meshblock_cells_per_axis is not None and (
+        arguments.meshblock_cells_per_axis < 1
+    ):
+        parser.error("--meshblock-cells-per-axis must be positive")
+    if arguments.amr_levels < 1:
+        parser.error("--amr-levels must be positive")
+    if arguments.amr_levels > 1 and not arguments.hybrid_primary_adm:
+        parser.error("AMR requires --hybrid-primary-adm")
+    if arguments.amr_levels > 1 and arguments.meshblock_cells_per_axis is None:
+        parser.error("AMR requires --meshblock-cells-per-axis")
+    if arguments.refinement_radius is not None and (
+        not math.isfinite(arguments.refinement_radius)
+        or arguments.refinement_radius <= 0.0
+    ):
+        parser.error("--refinement-radius must be finite and positive")
     if (
         not math.isfinite(arguments.maximum_fallback_fraction)
         or not 0.0 <= arguments.maximum_fallback_fraction <= 1.0

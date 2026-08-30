@@ -106,6 +106,13 @@ primary_mass     = 1000.0
 secondary_mass   = 1.0
 primary_chi      = 0.5
 secondary_chi    = 0.0
+# Explicit central-refinement shells are inactive when refinement=none.  Keeping
+# them in the smoke input lets replay pilots override their physical radii from
+# the command line without relying on parameters that do not yet exist.
+refinement_radius_level_1 = 6.0
+refinement_radius_level_2 = 3.0
+refinement_radius_level_3 = 1.5
+refinement_radius_level_4 = 0.75
 orbital_radius   = 10000.0
 orbit_direction  = 1
 omega_mode       = kerr_geodesic

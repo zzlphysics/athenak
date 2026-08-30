@@ -123,6 +123,29 @@ def test_resource_estimate_separates_fluid_and_adm_costs() -> None:
     assert matrix["0.5"]["metric_cells_per_axis"] == 20
     assert matrix["2"]["minimum_metric_halo"] == 8
     assert matrix["2"]["binary_gib"] > matrix["1"]["binary_gib"]
+    hybrid = planner.resource_estimate(
+        fluid_cells=40,
+        metric_cells=20,
+        mesh_nghost=4,
+        metric_halo=4,
+        metric_samples=4,
+        duration=0.08,
+        cfl=0.02,
+        half_width=4.0,
+        fluid_bytes_per_allocated_cell=512.0,
+        hybrid_primary_adm=True,
+    )
+    assert hybrid["adm_volume"]["field_count"] == 40
+    assert np.isclose(
+        hybrid["adm_volume"]["binary_gib"]
+        / estimate["adm_volume"]["binary_gib"],
+        2.5,
+    )
+    assert np.isclose(
+        hybrid["adm_volume"]["python_builder_array_floor_gib"]
+        / estimate["adm_volume"]["python_builder_array_floor_gib"],
+        104.0 / 41.0,
+    )
 
 
 def test_primary_only_provenance_is_mandatory() -> None:
