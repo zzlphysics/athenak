@@ -23,6 +23,9 @@ CALIBRATION_CLASSIFICATION = "athenak-emri-frozen-direct-cloud-calibration-v1"
 QUALIFICATION_CLASSIFICATION = (
     "athenak-emri-frozen-production-io-qualification-v1"
 )
+RESTART_QUALIFICATION_CLASSIFICATION = (
+    "athenak-emri-frozen-production-restart-read-qualification-v1"
+)
 REAL_BYTES = 8
 MHD_CONSERVED_VARIABLES = 5
 PRESCRIBED_ADM_VARIABLES = 17
@@ -137,11 +140,37 @@ def _validate_qualification(
         raise ValueError("calibration and qualification disagree on final MeshBlocks")
 
 
+def _validate_restart_qualification(
+    restart_qualification: dict[str, object],
+    pilot: dict[str, object],
+    calibration: dict[str, object],
+) -> None:
+    if restart_qualification.get("classification") != \
+            RESTART_QUALIFICATION_CLASSIFICATION:
+        raise ValueError("input restart qualification has the wrong classification")
+    result = restart_qualification.get("result")
+    analysis = restart_qualification.get("qualification_analysis")
+    if not isinstance(result, dict) or result.get("passed") is not True:
+        raise ValueError("production restart qualification did not pass")
+    if not isinstance(analysis, dict):
+        raise ValueError("production restart qualification lacks timing analysis")
+    if restart_qualification.get("case_id") != pilot.get("case_id"):
+        raise ValueError("pilot and restart qualification disagree on case id")
+    source_checkpoint = result.get("source_checkpoint")
+    if not isinstance(source_checkpoint, dict) or source_checkpoint.get(
+        "meshblocks"
+    ) != calibration["result"].get("final_meshblocks"):
+        raise ValueError(
+            "calibration and restart qualification disagree on final MeshBlocks"
+        )
+
+
 def build_production_campaign(
     pilot: dict[str, object],
     calibration: dict[str, object],
     *,
     qualification: dict[str, object] | None = None,
+    restart_qualification: dict[str, object] | None = None,
     target_segment_wall_hours: float = 3.0,
     checkpoint_wall_hours: float = 1.5,
     history_root_steps: int = 1,
@@ -152,6 +181,14 @@ def build_production_campaign(
     _validate_identity(pilot, calibration)
     if qualification is not None:
         _validate_qualification(qualification, pilot, calibration)
+    if restart_qualification is not None:
+        if qualification is None:
+            raise ValueError(
+                "restart qualification requires its production I/O qualification"
+            )
+        _validate_restart_qualification(
+            restart_qualification, pilot, calibration
+        )
     target_segment_wall_hours = _positive(
         target_segment_wall_hours, "target segment wall hours"
     )
@@ -190,6 +227,7 @@ def build_production_campaign(
     )
     budget_root_cycle_seconds = root_cycle_seconds
     force_diagnostic_overhead_fraction = None
+    force_qualified_root_cycle_seconds = None
     if qualification is not None:
         force_analysis = qualification["qualification_analysis"].get(
             "paired_full_topology_force_diagnostic"
@@ -210,6 +248,22 @@ def build_production_campaign(
             raise ValueError("qualified force-history timing has negative overhead")
         force_diagnostic_overhead_fraction = (
             budget_root_cycle_seconds / no_force_seconds - 1.0
+        )
+        force_qualified_root_cycle_seconds = budget_root_cycle_seconds
+    if restart_qualification is not None:
+        restart_budget = restart_qualification["qualification_analysis"].get(
+            "production_budget"
+        )
+        if not isinstance(restart_budget, dict):
+            raise ValueError(
+                "production restart qualification lacks production budget analysis"
+            )
+        budget_root_cycle_seconds = max(
+            budget_root_cycle_seconds,
+            _positive(
+                restart_budget["conservative_root_cycle_seconds"],
+                "restart-qualified conservative root cycle",
+            ),
         )
     measured_rate = _positive(
         result["zone_cycles_per_second_reported"], "measured zone-cycle rate"
@@ -258,6 +312,35 @@ def build_production_campaign(
     segment_duration_proxy = segment_root_steps * measured_root_dt
     segment_wall_hours_proxy = (
         segment_root_steps * budget_root_cycle_seconds / 3600.0
+    )
+    projected_segments = math.ceil(projected_root_cycles / segment_root_steps)
+    projected_restart_reads = max(0, projected_segments - 1)
+    restart_read_seconds = 0.0
+    durable_sync_seconds = 0.0
+    operational_reserve_hours = None
+    if restart_qualification is not None:
+        qualified_result = restart_qualification["result"]
+        cold_restart = qualified_result["cold_restart"]
+        sync_values = qualified_result["durable_sync_seconds"].values()
+        cold_seconds = _positive(
+            cold_restart["restart_load_tree_allocate_and_cache_rebuild_seconds"],
+            "cold restart load and rebuild seconds",
+        )
+        maximum_sync_seconds = max(
+            _positive(value, "durable sync seconds") for value in sync_values
+        )
+        restart_read_seconds = projected_restart_reads * cold_seconds
+        durable_sync_seconds = projected_segments * maximum_sync_seconds
+        operational_reserve_hours = _positive(
+            restart_qualification["qualification_analysis"]["production_budget"][
+                "recommended_operational_reserve_hours"
+            ],
+            "recommended operational reserve hours",
+        )
+    qualified_nominal_seconds = (
+        production_diagnostic_seconds
+        + restart_read_seconds
+        + durable_sync_seconds
     )
 
     force_radii = [capture_radius * value for value in force_outer_capture_fractions]
@@ -353,6 +436,8 @@ def build_production_campaign(
             "measured_root_dt_in_secondary_masses": measured_root_dt,
             "baseline_steady_root_cycle_seconds": root_cycle_seconds,
             "budget_root_cycle_seconds": budget_root_cycle_seconds,
+            "force_qualified_root_cycle_seconds":
+                force_qualified_root_cycle_seconds,
             "projected_root_cycles": projected_root_cycles,
             "planner_root_cycle_proxy": planner_root_cycle_proxy,
             "measured_to_planner_step_count_correction": step_count_correction,
@@ -367,6 +452,10 @@ def build_production_campaign(
                 production_diagnostic_seconds / 3600.0,
             "force_diagnostic_overhead_fraction":
                 force_diagnostic_overhead_fraction,
+            "projected_restart_read_hours": restart_read_seconds / 3600.0,
+            "projected_durable_sync_hours": durable_sync_seconds / 3600.0,
+            "qualified_nominal_hours": qualified_nominal_seconds / 3600.0,
+            "recommended_operational_reserve_hours": operational_reserve_hours,
             "budget_rule": (
                 "use empirical_with_production_diagnostics_hours; then add checkpoint, "
                 "field-output, restart-read, startup, system-variance, and "
@@ -379,7 +468,8 @@ def build_production_campaign(
             "duration_per_segment_proxy": segment_duration_proxy,
             "wall_hours_per_segment_proxy": segment_wall_hours_proxy,
             "segments_if_root_dt_is_stationary":
-                math.ceil(projected_root_cycles / segment_root_steps),
+                projected_segments,
+            "projected_cold_restart_reads": projected_restart_reads,
             "checkpoint_root_steps": checkpoint_root_steps,
             "checkpoint_dt_in_secondary_masses": checkpoint_dt,
             "checkpoint_wall_hours_proxy":
@@ -493,6 +583,31 @@ def build_production_campaign(
             "measured_post_process_finalize_seconds_proxy":
                 qualified_result["post_process_finalize_seconds_proxy"],
         })
+    if restart_qualification is not None:
+        restart_result = restart_qualification["result"]
+        campaign["source_restart_qualification"] = {
+            "classification": restart_qualification["classification"],
+            "date": restart_qualification.get("date"),
+            "source_commit": restart_qualification["source"]["commit"],
+            "athena_sha256": restart_qualification["build"]["athena_sha256"],
+            "evidence_summary_sha256": restart_qualification[
+                "downloaded_evidence"
+            ]["summary_sha256"],
+        }
+        campaign["resource_envelope"].update({
+            "restart_read_qualification_passed": True,
+            "qualified_cold_restart_seconds": restart_result["cold_restart"][
+                "restart_load_tree_allocate_and_cache_rebuild_seconds"
+            ],
+            "qualified_exact_endpoint_resume": restart_result[
+                "endpoint_comparison"
+            ]["all_stored_fields_match"],
+            "warning": (
+                "production restart write and cold-read paths are qualified on the "
+                "recorded A100 host storage; requalify materially different GPU or "
+                "storage backends, and retain the runtime stationarity gate"
+            ),
+        })
     return campaign
 
 
@@ -501,6 +616,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--pilot", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--qualification", type=Path)
+    parser.add_argument("--restart-qualification", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-segment-wall-hours", type=float, default=3.0)
     parser.add_argument("--checkpoint-wall-hours", type=float, default=1.5)
@@ -525,10 +641,18 @@ def main() -> int:
         qualification = json.loads(
             arguments.qualification.expanduser().resolve(strict=True).read_text()
         )
+    restart_qualification = None
+    if arguments.restart_qualification is not None:
+        restart_qualification = json.loads(
+            arguments.restart_qualification.expanduser().resolve(
+                strict=True
+            ).read_text()
+        )
     campaign = build_production_campaign(
         pilot,
         calibration,
         qualification=qualification,
+        restart_qualification=restart_qualification,
         target_segment_wall_hours=arguments.target_segment_wall_hours,
         checkpoint_wall_hours=arguments.checkpoint_wall_hours,
         history_root_steps=arguments.history_root_steps,

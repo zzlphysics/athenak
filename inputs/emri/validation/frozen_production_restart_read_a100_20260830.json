@@ -1,0 +1,136 @@
+{
+  "classification": "athenak-emri-frozen-production-restart-read-qualification-v1",
+  "date": "2026-08-30",
+  "case_id": "r56_p000_t5000",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "cd98f35eb70698573e87a9b0893a97575088e0e2",
+    "campaign_plan_sha256": "c86a6d533e4315d1d5ff31ae0412779e345ea43ca572604f74112f9eadfb8e49",
+    "production_io_qualification": "inputs/emri/validation/frozen_production_io_a100_20260830.json"
+  },
+  "cloud_resource": {
+    "provider": "Zhixing Cloud",
+    "instance_id": 652281,
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_count": 1,
+    "cpu_count": 8,
+    "host_memory_GB": 24,
+    "root_disk_GB": 196,
+    "image": "ubuntu22_cuda12.4",
+    "quoted_cost_CNY_for_one_hour": 8.0625,
+    "released_after_evidence_download": true,
+    "release_disk": true,
+    "post_release_status": 0,
+    "post_release_additional_disk_GB": 0,
+    "post_release_status_checked_at": "2026-08-30 20:19:11 Asia/Shanghai"
+  },
+  "build": {
+    "build_type": "Release",
+    "problem": "emri_windtunnel",
+    "mpi": false,
+    "single_precision": false,
+    "kokkos_cuda": true,
+    "kokkos_arch": "AMPERE80",
+    "cuda_toolkit": "12.4.99",
+    "kokkos_commit": "08ceff92bcf3a828844480bc1e6137eb74028517",
+    "athena_sha256": "1270e98d571576424349c61e80d9e90217d76f3dc40d2dad8247baa265277963",
+    "cmake_cache_sha256": "c598993fb527ff28cc86bf970b3cca528b8308f110cfe2645781a2914f5b92da"
+  },
+  "experiment": {
+    "split_fresh_endpoint_cycle": 10,
+    "resumed_endpoint_cycle": 11,
+    "continuous_endpoint_cycle": 11,
+    "root_dt_in_secondary_masses": 5.03425,
+    "physical_refinement_levels": 9,
+    "meshblocks_at_checkpoint": 2779,
+    "restart_cache_contract_version": 1,
+    "source_checkpoint_synced_before_read": true,
+    "host_page_cache_dropped_before_read": true,
+    "comparison_rtol": 0.0,
+    "comparison_atol": 0.0,
+    "comparison_streaming_unit": "one MeshBlock pair"
+  },
+  "result": {
+    "passed": true,
+    "source_checkpoint": {
+      "cycle": 10,
+      "time_in_secondary_masses": 50.34249803109447,
+      "meshblocks": 2779,
+      "size_bytes": 7721877183,
+      "sha256": "52a84a2541eb70f6f1d1795893b9b934af7bcf341db7b643221554414a2f524e",
+      "all_stored_reals_finite": true,
+      "complete_leaf_coverage": true,
+      "audit_wall_seconds": 22.54957604408264
+    },
+    "cold_restart": {
+      "restart_load_tree_allocate_and_cache_rebuild_seconds": 23.90582,
+      "resumed_root_cycle_seconds": 119.94548,
+      "post_cycle_finalize_seconds_proxy": 0.7225415718078523,
+      "maximum_raw_component_relative_proposed_change": 2.2204402163886858e-16,
+      "maximum_absolute_proposed_change": 1.3877787807814457e-17,
+      "maximum_mixed_scale_proposed_change": 2.2204402163886858e-16,
+      "mixed_scale_acceptance_tolerance": 9.094947017729282e-13
+    },
+    "durable_sync_seconds": {
+      "fresh_cycle10_outputs": 0.994044303894043,
+      "resumed_cycle11_outputs": 0.7929956912994385,
+      "continuous_cycle11_outputs": 0.8776090145111084
+    },
+    "endpoint_comparison": {
+      "same_endpoint": true,
+      "same_topology": true,
+      "meshblocks": 2779,
+      "authoritative_match": true,
+      "all_stored_fields_match": true,
+      "mhd_active_max_abs": 0.0,
+      "mhd_ghost_max_abs": 0.0,
+      "face_active_max_abs": 0.0,
+      "face_ghost_max_abs": 0.0,
+      "adm_active_max_abs": 0.0,
+      "adm_ghost_max_abs": 0.0,
+      "comparison_wall_seconds": 60.35704851150513,
+      "continuous_final_sha256": "08793fc1faa727ef0c13e030ac5b97cb73c822a0c2c72128cfb8b405317f0b0c",
+      "resumed_final_sha256": "91dfb7b8e16ecce2df1a42a283c5d09ea2c7778a057f060b2f6e838f946ec5d6"
+    },
+    "history_comparison": {
+      "exact_after_time_deduplication": true,
+      "distinct_times": 11,
+      "columns_including_derived": 40,
+      "maximum_absolute_difference": 0.0,
+      "continuous_sha256": "dba7170cc9d403d399bae4bcfcb2d035660d1c82b194f51fe068309ddcf2d7d3",
+      "resumed_sha256": "63653b80919bfc11c24e1ce56d0c828258c7c693fb1a9cbe092c6deff1ae3c25"
+    },
+    "constraint": {
+      "continuous_maximum_divB": 1.015576511775862e-13,
+      "resumed_maximum_divB": 1.015576511775862e-13
+    },
+    "peak_gpu_memory_MiB": 47675.0
+  },
+  "qualification_analysis": {
+    "production_budget": {
+      "projected_root_cycles_for_two_crossings": 1677,
+      "conservative_root_cycle_seconds": 120.1823,
+      "root_steps_per_three_hour_segment": 89,
+      "projected_segments": 19,
+      "projected_cold_restart_reads": 18,
+      "evolution_hours": 55.98492141666667,
+      "cold_restart_read_hours": 0.1195291,
+      "durable_sync_upper_proxy_hours": 0.00524634493721856,
+      "qualified_nominal_hours": 56.109696861603894,
+      "recommended_operational_reserve_hours": 60.0,
+      "quarter_crossing_extension_hours": 6.998115177083334,
+      "recommended_reserve_with_one_quarter_crossing_extension_hours": 67.0
+    },
+    "conclusion": "Cold production restart adds only 23.9 seconds per resumed segment and exact endpoint equivalence holds. Use 89 rather than 90 root steps to keep a segment below three hours at the slowest measured full-topology cycle."
+  },
+  "downloaded_evidence": {
+    "summary_sha256": "1f442b54f837e44c8384d35c9cbb6a06e868e011562230efedc4a439866b9516",
+    "field_comparison_sha256": "64d5adae5eef17ed296a252bf5cb9172b0effc2c29f65b893b10f929c31dccd7",
+    "split_fresh_log_sha256": "09e467245939d463853bc99c577aeb7af14629217b6a98b0157d7149adf241bf",
+    "resume_log_sha256": "ebcb7ea342d22ba482219eb84762703e055bed2dbb117b4c6b03be2d1cead998",
+    "continuous_log_sha256": "31ac8f7a6d972d3072b14063ac7ed4f4f207284bf71600e9fa295f47e10ff637",
+    "private_instance_state_sha256": "cd7eb06de4f750b107ccc4f108776c2d0a852386c3a143cac3e4705e16b60879",
+    "private_release_state_sha256": "9b2732afde1846219f394938f302714859bcb2d9381f97f95f2e3b599b5329ba"
+  },
+  "scope": "Cold production-grid restart read/rebuild latency, durable output flush, exact one-root-cycle resume equivalence, force-history continuity, and CT. This is not a settled-flow result or a physical-resolution convergence claim."
+}

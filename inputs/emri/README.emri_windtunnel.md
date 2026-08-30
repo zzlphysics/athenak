@@ -558,14 +558,16 @@ python3 inputs/emri/prepare_frozen_production_campaign.py \
   --pilot profiles/r56-direct-calibration.json \
   --calibration inputs/emri/validation/frozen_r56_direct_a100_20260830.json \
   --qualification inputs/emri/validation/frozen_production_io_a100_20260830.json \
+  --restart-qualification \
+    inputs/emri/validation/frozen_production_restart_read_a100_20260830.json \
   --output profiles/r56-direct-production.json
 ```
 
-With the production qualification, the default policy uses 90 measured root steps per
-segment (about 2.99 A100 hours), a 45-root-step restart cadence (about 1.49 hours), a
+With both production qualifications, the default policy uses 89 measured root steps per
+segment (about 2.97 A100 hours), a 45-root-step restart cadence (about 1.50 hours), a
 nominal force-history interval of one measured root timestep, and four primitive/`divB`
 field dumps per capture crossing.  Later segments must inspect the newest completed
-restart, set `nlim=current_cycle+90`, and retain the global physical
+restart, set `nlim=current_cycle+89`, and retain the global physical
 `tlim`; a script must never guess the next checkpoint number after a failed segment.
 AthenaK appends history files and the force-history reader removes duplicate times, so
 the forced endpoint sample of one segment and the initial sample after restart do not
@@ -587,16 +589,27 @@ estimate was accurate to 0.0011 per cent), and produced a 7.61608 GiB terminal
 restart/primitive/`divB` bundle.  Peak A100 memory was 47675 MiB, only 54 MiB above the
 earlier no-restart calibration peak, all ten history records and 22 columns were finite,
 and `max|divB|=7.80e-14`.  The A100 and its disk were released after the evidence hashes
-were downloaded.  This closes the production write-path memory and size risk; a full-
-grid restart-read latency benchmark remains outstanding.
+were downloaded.  This closes the production write-path memory and size risk.
+
+The cold-read and exact-resume qualification is recorded in
+`validation/frozen_production_restart_read_a100_20260830.json`.  After the 7.19 GiB
+cycle-10 checkpoint was synchronously flushed, the host page cache was dropped.  Reading
+the checkpoint, rebuilding the 2779-block tree, allocating the A100 state, and rebuilding
+the primitive/metric caches then took 23.91 seconds.  The maximum proposed mixed-scale
+cache change was `2.22e-16`, versus a `9.09e-13` acceptance tolerance.  After one more
+root cycle, the restarted and independent continuous endpoints agreed bit for bit in all
+active and ghost MHD values, all active and ghost CT face fields, and all 17 active and
+ghost ADM fields.  Their 11 de-duplicated history times and 40 base/derived columns also
+agreed exactly, and both had `max|divB|=1.02e-13`.
 
 The qualification also resolves a previously hidden runtime cost.  At identical 2779-
 block topology, a root cycle without a due force-history record took 108.965 seconds and
 the next cycle with the four-shell force integral took 119.516 seconds, a conservative
-9.68 per cent overhead.  The two-crossing estimate is therefore 55.7 A100 hours with
-production diagnostics, not 50.8 hours.  Reserve 60 A100 hours for the nominal baseline
-to cover output, restart reads, startup, and system variance.  If the stationarity gate
-requires one quarter-crossing extension, add about 7.0 hours and reserve 67 hours.  These
+9.68 per cent overhead.  Including the slower 120.182-second full-topology sample, 18
+cold restart reads, and conservative durable-sync proxies gives 56.1 A100 hours for two
+crossings, not 50.8 hours.  Reserve 60 A100 hours for the nominal baseline.  If the
+stationarity gate requires one quarter-crossing extension, add about 7.0 hours and
+reserve 67 hours.  These
 are operational budgets, not a guarantee that the physical stationarity gate will pass.
 
 Two capture crossings are a target, not an automatic claim of relaxation.  Discard at
@@ -613,8 +626,8 @@ through a cycle-two checkpoint.  At the common endpoint all active and ghost MHD
 conserved values, all active and ghost face fields, and all prescribed ADM values agreed
 bit for bit.  Both paths had `max|divB|=8.67e-17`; after duplicate-time removal, all 40
 derived force-history columns at five times also agreed exactly.  This establishes the
-restart/force/CT continuity contract, but not the memory or I/O cost of a 2779-block
-production checkpoint.
+restart/force/CT continuity contract on a small CPU case; the two A100 qualifications
+above close its production-grid memory, write, cold-read, and one-step exact-resume gates.
 
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is

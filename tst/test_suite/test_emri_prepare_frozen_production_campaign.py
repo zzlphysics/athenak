@@ -137,6 +137,36 @@ def _qualification() -> dict[str, object]:
     }
 
 
+def _restart_qualification() -> dict[str, object]:
+    return {
+        "classification": production.RESTART_QUALIFICATION_CLASSIFICATION,
+        "date": "2026-08-30",
+        "case_id": "r56_p000_t5000",
+        "source": {"commit": "2" * 40},
+        "build": {"athena_sha256": "d" * 64},
+        "result": {
+            "passed": True,
+            "source_checkpoint": {"meshblocks": 2779},
+            "cold_restart": {
+                "restart_load_tree_allocate_and_cache_rebuild_seconds": 23.90582,
+            },
+            "durable_sync_seconds": {
+                "fresh_cycle10_outputs": 0.994044303894043,
+                "resumed_cycle11_outputs": 0.7929956912994385,
+                "continuous_cycle11_outputs": 0.8776090145111084,
+            },
+            "endpoint_comparison": {"all_stored_fields_match": True},
+        },
+        "qualification_analysis": {
+            "production_budget": {
+                "conservative_root_cycle_seconds": 120.1823,
+                "recommended_operational_reserve_hours": 60.0,
+            },
+        },
+        "downloaded_evidence": {"summary_sha256": "e" * 64},
+    }
+
+
 def test_real_calibration_produces_conservative_segment_and_output_policy() -> None:
     campaign = production.build_production_campaign(_pilot(), _calibration())
 
@@ -218,6 +248,41 @@ def test_passed_production_qualification_controls_runtime_and_resources() -> Non
     assert campaign["source_qualification"]["evidence_summary_sha256"] == "c" * 64
 
 
+def test_restart_qualification_closes_read_budget_and_shortens_segment() -> None:
+    campaign = production.build_production_campaign(
+        _pilot(),
+        _calibration(),
+        qualification=_qualification(),
+        restart_qualification=_restart_qualification(),
+    )
+
+    runtime = campaign["runtime_projection"]
+    assert runtime["budget_root_cycle_seconds"] == pytest.approx(120.1823)
+    assert runtime["empirical_with_production_diagnostics_hours"] \
+        == pytest.approx(55.9849214167)
+    assert runtime["projected_restart_read_hours"] == pytest.approx(0.1195291)
+    assert runtime["projected_durable_sync_hours"] \
+        == pytest.approx(0.00524634494)
+    assert runtime["qualified_nominal_hours"] == pytest.approx(56.1096968616)
+    assert runtime["recommended_operational_reserve_hours"] == 60.0
+
+    segmentation = campaign["segmentation"]
+    assert segmentation["root_steps_per_segment"] == 89
+    assert segmentation["checkpoint_root_steps"] == 45
+    assert segmentation["segments_if_root_dt_is_stationary"] == 19
+    assert segmentation["projected_cold_restart_reads"] == 18
+    assert segmentation["wall_hours_per_segment_proxy"] \
+        == pytest.approx(2.97117352778)
+
+    resources = campaign["resource_envelope"]
+    assert resources["restart_read_qualification_passed"] is True
+    assert resources["qualified_cold_restart_seconds"] == pytest.approx(23.90582)
+    assert resources["qualified_exact_endpoint_resume"] is True
+    assert campaign["source_restart_qualification"][
+        "evidence_summary_sha256"
+    ] == "e" * 64
+
+
 def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
     calibration = _calibration()
     calibration["source"]["source_state_sha256"] = "1" * 64
@@ -235,6 +300,13 @@ def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
     with pytest.raises(ValueError, match="qualification disagree on case id"):
         production.build_production_campaign(
             _pilot(), _calibration(), qualification=qualification
+        )
+
+    with pytest.raises(ValueError, match="requires its production I/O qualification"):
+        production.build_production_campaign(
+            _pilot(),
+            _calibration(),
+            restart_qualification=_restart_qualification(),
         )
 
 
