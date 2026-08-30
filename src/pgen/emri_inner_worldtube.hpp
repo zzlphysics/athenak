@@ -79,6 +79,7 @@ class EmriInnerWorldtubeReplay {
   void BuildBoundaryTopology(Mesh *pm);
   void LoadInterval(int interval);
   void LoadADMInterval(int interval);
+  void AdvanceADMInterval(Real data_time);
   Mesh *pmesh_ = nullptr;
   bool is_restart_ = false;
   bool exhausted_ = false;
@@ -97,6 +98,7 @@ class EmriInnerWorldtubeReplay {
   int adm_ny_ = 0;
   int adm_nz_ = 0;
   int adm_nvar_ = 0;
+  int adm_nt_ = 0;
   int adm_interval_ = 0;
   int adm_binary_version_ = 0;
   Real data_center_[3] = {0.0, 0.0, 0.0};
@@ -112,6 +114,7 @@ class EmriInnerWorldtubeReplay {
   Real adm_lower_[3] = {0.0, 0.0, 0.0};
   Real adm_spacing_[3] = {0.0, 0.0, 0.0};
   std::vector<Real> times_;
+  std::vector<Real> adm_times_;
   std::vector<Real> adm_secondary_coframes_;
   std::array<std::uint64_t, 6> state_offsets_{};
   std::array<std::uint64_t, 6> flux_offsets_{};

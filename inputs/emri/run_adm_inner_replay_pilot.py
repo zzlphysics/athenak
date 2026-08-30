@@ -140,13 +140,39 @@ def fit_initial_affine_profile(
 def _condition(
     relation: str, observed: float, threshold: float
 ) -> dict[str, object]:
-    passed = observed >= threshold if relation == "minimum" else observed <= threshold
+    finite = math.isfinite(observed)
+    passed = finite and (
+        observed >= threshold if relation == "minimum" else observed <= threshold
+    )
     return {
         "relation": relation,
-        "observed": observed,
+        "observed": observed if finite else None,
         "threshold": threshold,
         "passed": passed,
     }
+
+
+def selected_time_indices(sample_count: int, stride: int) -> list[int]:
+    if sample_count < 3 or stride < 1:
+        raise ValueError("ADM replay requires at least three times and positive stride")
+    indices = list(range(0, sample_count, stride))
+    if indices[-1] != sample_count - 1:
+        indices.append(sample_count - 1)
+    if len(indices) < 3:
+        raise ValueError(
+            "metric cadence leaves fewer than three times for second-order K_ij"
+        )
+    return indices
+
+
+def minimum_metric_halo(
+    metric_cells: int, fluid_cells: int, mesh_nghost: int
+) -> int:
+    if min(metric_cells, fluid_cells, mesh_nghost) < 1:
+        raise ValueError("metric/fluid cells and ghost count must be positive")
+    ratio = metric_cells / fluid_cells
+    required = 0.5 + ratio * (mesh_nghost - 0.5)
+    return max(1, math.ceil(required - 64.0 * np.finfo(float).eps * required))
 
 
 def structural_assessment(
@@ -368,9 +394,11 @@ def _field_summary(path: Path) -> dict[str, object]:
     result = {}
     for name, blocks in data.items():
         values = np.concatenate([np.asarray(block).ravel() for block in blocks])
+        minimum = float(np.min(values))
+        maximum = float(np.max(values))
         result[name] = {
-            "minimum": float(np.min(values)),
-            "maximum": float(np.max(values)),
+            "minimum": minimum if math.isfinite(minimum) else None,
+            "maximum": maximum if math.isfinite(maximum) else None,
             "finite": bool(np.isfinite(values).all()),
         }
     return result
@@ -380,7 +408,7 @@ def _expected_adm_fields(
     volume: adm_volume.ADMVolume,
     table_time: float,
     cells: int,
-    halo: int,
+    half_width: float,
 ) -> dict[str, np.ndarray]:
     """Reproduce the C++ time interpolation and ADM decomposition on active cells."""
 
@@ -402,12 +430,38 @@ def _expected_adm_fields(
         (1.0 - fraction) * volume.fields[interval]
         + fraction * volume.fields[interval + 1]
     )
-    active = fields[
-        :,
-        halo : halo + cells,
-        halo : halo + cells,
-        halo : halo + cells,
-    ]
+    fluid_spacing = 2.0 * half_width / cells
+    coordinates = -half_width + (np.arange(cells) + 0.5) * fluid_spacing
+    indices = []
+    fractions = []
+    grid_shape_xyz = fields.shape[:0:-1]
+    for axis, size in enumerate(grid_shape_xyz):
+        logical = (coordinates - volume.lower[axis]) / volume.spacing[axis]
+        left = np.floor(logical).astype(int)
+        if np.any(left < 0) or np.any(left >= size - 1):
+            raise ValueError("ADM volume does not cover the active-cell centers")
+        indices.append(left)
+        fractions.append(logical - left)
+    active = np.zeros(
+        (len(adm_volume.FIELD_NAMES), cells, cells, cells), dtype=np.float64
+    )
+    for z_offset in (0, 1):
+        z_weight = fractions[2] if z_offset else 1.0 - fractions[2]
+        for y_offset in (0, 1):
+            y_weight = fractions[1] if y_offset else 1.0 - fractions[1]
+            for x_offset in (0, 1):
+                x_weight = fractions[0] if x_offset else 1.0 - fractions[0]
+                values = fields[
+                    :,
+                    indices[2][:, None, None] + z_offset,
+                    indices[1][None, :, None] + y_offset,
+                    indices[0][None, None, :] + x_offset,
+                ]
+                active += values * (
+                    z_weight[:, None, None]
+                    * y_weight[None, :, None]
+                    * x_weight[None, None, :]
+                )
     if active.shape != (len(adm_volume.FIELD_NAMES), cells, cells, cells):
         raise ValueError("ADM volume does not contain the requested active-cell cube")
     metric = np.zeros((cells, cells, cells, 4, 4), dtype=np.float64)
@@ -443,7 +497,7 @@ def _adm_replay_comparison(
     paths: list[Path],
     volume: adm_volume.ADMVolume,
     cells: int,
-    halo: int,
+    half_width: float,
 ) -> dict[str, object]:
     if not paths:
         raise ValueError("numerical ADM pilot produced no ADM output")
@@ -454,7 +508,7 @@ def _adm_replay_comparison(
         data = extract.bin_convert.read_binary(str(path))
         athena_time = float(data["time"])
         table_time = float(volume.times[0]) + athena_time
-        expected = _expected_adm_fields(volume, table_time, cells, halo)
+        expected = _expected_adm_fields(volume, table_time, cells, half_width)
         field_errors = {}
         for name in ATHENA_ADM_FIELDS:
             observed = extract.closure.assemble_uniform_grid(data, name)
@@ -578,13 +632,47 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     metric_volume = None
     metric_path = workdir / "adm.bin"
     if arguments.numerical_adm_volume:
+        metric_cells = (
+            cells
+            if arguments.metric_cells_per_axis is None
+            else arguments.metric_cells_per_axis
+        )
+        required_halo = minimum_metric_halo(
+            metric_cells, cells, arguments.mesh_nghost
+        )
+        if arguments.metric_halo < required_halo:
+            report.update(
+                {
+                    "adm_volume_status": "failed",
+                    "metric_active_cells_per_axis": metric_cells,
+                    "minimum_metric_halo": required_halo,
+                    "refusal_reason": (
+                        "metric halo does not cover every fluid ghost-cell center"
+                    ),
+                }
+            )
+            return report
+        try:
+            metric_time_indices = selected_time_indices(
+                times.size, arguments.metric_cadence_stride
+            )
+        except ValueError as error:
+            report.update(
+                {
+                    "adm_volume_status": "failed",
+                    "adm_volume_error": str(error),
+                    "refusal_reason": "metric cadence cannot define second-order K_ij",
+                }
+            )
+            return report
+        metric_times = times[metric_time_indices]
         try:
             manifest_path = Path(case["manifest"]).expanduser().resolve(strict=True)
             metric_volume = adm_volume.build_volume(
                 manifest_path,
-                times,
+                metric_times,
                 half_width,
-                cells,
+                metric_cells,
                 arguments.metric_halo,
                 arguments.secondary_mass,
                 arguments.secondary_chi,
@@ -609,7 +697,12 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 "adm_volume_status": "validated",
                 "adm_volume": str(metric_path),
                 "adm_volume_validation": metric_validation,
+                "metric_active_cells_per_axis": metric_cells,
                 "metric_halo": arguments.metric_halo,
+                "minimum_metric_halo": required_halo,
+                "metric_cadence_stride": arguments.metric_cadence_stride,
+                "metric_time_indices": metric_time_indices,
+                "metric_sample_times": metric_times.tolist(),
                 "mesh_nghost": arguments.mesh_nghost,
             }
         )
@@ -636,6 +729,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
     output.mkdir()
     log_path = workdir / "athena.log"
     history_dt = tlim / arguments.history_samples
+    adm_audit_dt = tlim / arguments.adm_audit_samples
     command = [
         str(arguments.athena.expanduser().resolve(strict=True)),
         "-i",
@@ -679,7 +773,11 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         f"output4/dt={history_dt:.17g}",
         "output4/user_hist_only=true",
         "output5/variable=adm",
-        f"output5/dt={tlim:.17g}" if metric_volume is not None else "output5/dt=0",
+        (
+            f"output5/dt={adm_audit_dt:.17g}"
+            if metric_volume is not None
+            else "output5/dt=0"
+        ),
     ]
     if metric_volume is not None:
         command.extend(
@@ -712,15 +810,19 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         ),
         "maximum_divb": _condition(
             "maximum",
-            max(
-                abs(float(divergence_summary["minimum"])),
-                abs(float(divergence_summary["maximum"])),
+            (
+                max(
+                    abs(float(divergence_summary["minimum"])),
+                    abs(float(divergence_summary["maximum"])),
+                )
+                if divergence_summary["finite"]
+                else math.inf
             ),
             arguments.maximum_divb,
         ),
     }
     finite_state = all(entry["finite"] for entry in state_summary.values())
-    positive_state = (
+    positive_state = finite_state and (
         float(state_summary["dens"]["minimum"]) > 0.0
         and float(state_summary["press"]["minimum"]) > 0.0
     )
@@ -746,7 +848,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
             adm_outputs,
             metric_volume,
             cells,
-            arguments.metric_halo,
+            half_width,
         )
         runtime_conditions["adm_endpoint_replay"] = _condition(
             "maximum",
@@ -788,7 +890,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--tlim", type=float)
     parser.add_argument("--cfl", type=float, default=0.02)
     parser.add_argument("--history-samples", type=int, default=16)
+    parser.add_argument("--adm-audit-samples", type=int, default=1)
     parser.add_argument("--numerical-adm-volume", action="store_true")
+    parser.add_argument("--metric-cells-per-axis", type=int)
+    parser.add_argument("--metric-cadence-stride", type=int, default=1)
     parser.add_argument("--metric-halo", type=int, default=4)
     parser.add_argument("--mesh-nghost", type=int, default=4)
     parser.add_argument("--minimum-horizon-cells", type=float, default=4.0)
@@ -833,12 +938,16 @@ def parse_arguments() -> argparse.Namespace:
         not math.isfinite(arguments.tlim) or arguments.tlim <= 0.0
     ):
         parser.error("--tlim must be finite and positive")
-    if arguments.history_samples < 1:
-        parser.error("--history-samples must be positive")
+    if arguments.history_samples < 1 or arguments.adm_audit_samples < 1:
+        parser.error("--history-samples and --adm-audit-samples must be positive")
     if arguments.metric_halo < 1 or arguments.mesh_nghost < 1:
         parser.error("--metric-halo and --mesh-nghost must be positive")
-    if arguments.metric_halo < arguments.mesh_nghost:
-        parser.error("--metric-halo must be at least --mesh-nghost")
+    if arguments.metric_cells_per_axis is not None and (
+        arguments.metric_cells_per_axis < 2
+    ):
+        parser.error("--metric-cells-per-axis must be at least two")
+    if arguments.metric_cadence_stride < 1:
+        parser.error("--metric-cadence-stride must be positive")
     if (
         not math.isfinite(arguments.maximum_fallback_fraction)
         or not 0.0 <= arguments.maximum_fallback_fraction <= 1.0
@@ -852,7 +961,8 @@ def main() -> int:
     report = run_pilot(arguments)
     output = arguments.workdir.expanduser().resolve() / "summary.json"
     output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     print(f"run_status={report['run_status']}")
     print(

@@ -925,6 +925,66 @@ mode's smooth self-consistent outer-to-inner regression produced two fallbacks i
 attempts and a `1.20e-17` boundary-flux residual.  Neither fixture is a physical
 convergence result.
 
+### Numerical-ADM force convergence matrix
+
+`run_adm_inner_replay_convergence.py` turns the remaining metric-representation blocker
+into an executable matrix.  It holds the fluid/worldtube mesh fixed while independently
+varying:
+
+- `--metric-resolution-factors`, the number of ADM volume cells per fluid cell; and
+- `--metric-cadence-strides`, the subsampling stride of the ADM time table.
+
+The fluid boundary and ADM volume now have independent time tables and interval cursors.
+The timestep is capped at the next endpoint of either table.  A refined metric grid is
+also independent of the fluid grid.  Its halo is chosen from the actual coordinate
+coverage condition
+
+```text
+N_halo,metric >= ceil[1/2 + (N_metric/N_fluid)(N_ghost-1/2)],
+```
+
+not merely by copying `mesh/nghost`.  The pilot's `--metric-cells-per-axis`,
+`--metric-cadence-stride`, and `--adm-audit-samples` controls are useful for debugging a
+single matrix point.
+
+For every case the convergence driver checks the ordinary structural/runtime gates,
+parses the coordinate force history, and compares piecewise-linearly in time over the
+common interval.  Vector components are normalized together, avoiding meaningless
+componentwise relative errors when a symmetry makes one component nearly zero.  The
+reported groups are `mdot`, momentum flux, Newtonian volume force, all three
+relativistic-force radii, the ten ADM metric fields, and all six `K_ij` fields.  Reports
+contain comparisons to the global finest reference as well as spatial slices at fixed
+cadence and cadence slices at fixed resolution.  With three or more metric resolutions,
+the driver also estimates the observed spatial order from successive errors relative to
+the finest case.
+
+For example, the intentionally unresolved four-cell fixture can be exercised with:
+
+```bash
+python3 inputs/emri/run_adm_inner_replay_convergence.py \
+  --campaign /path/to/adm-campaign/summary.json --case CASE \
+  --athena build_emri/src/athena --workdir /path/to/convergence \
+  --secondary-mass 1e-4 --mesh-nghost 3 \
+  --metric-resolution-factors 1 2 4 --metric-cadence-strides 1 2 \
+  --allow-unsafe-structural-smoke
+```
+
+The two finite spatial levels of that fixture changed the ADM metric by `2.09e-3` in
+relative space-time `L2`, but changed `K_ij` by `3.02e-1`, `mdot` by `1.16e-1`, momentum
+flux by `2.90e-2`, the Newtonian volume force by `1.96e-1`, and the relativistic forces
+by `1.19e-2`, `1.19e-2`, and `7.00e-3`.  Cadence-two changes at fixed resolution were
+much smaller (`2.92e-3` for `mdot` and at most `6.49e-5` for the outer relativistic
+force in this short sample).  Refining the metric to the third level while leaving the
+fluid horizon resolution at only `0.08` cells made the finest-cadence fluid pressure
+non-finite.  This is a useful fail-closed result: resolving a stronger prescribed metric
+on a fluid grid that cannot resolve the secondary is not a valid route to convergence.
+
+The driver sets `science_ready=true` only when at least three metric resolutions and two
+cadences are present, every pilot structural and runtime gate passes, all observable
+thresholds pass, and the requested minimum spatial order is achieved.  `--resume`
+reuses completed case summaries and preserves an interrupted case directory under an
+`.incompleteN` suffix before retrying it.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is

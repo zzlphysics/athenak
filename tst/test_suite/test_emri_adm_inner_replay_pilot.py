@@ -113,6 +113,15 @@ def test_structural_assessment_requires_resolution_and_separation() -> None:
     )
     assert np.isclose(assessment["maximum_secondary_coordinate_stretch"], 2.0)
     assert not assessment["conditions"]["worldtube_separation"]["passed"]
+    assert pilot.minimum_metric_halo(4, 4, 3) == 3
+    assert pilot.minimum_metric_halo(8, 4, 3) == 6
+    assert pilot.selected_time_indices(4, 2) == [0, 2, 3]
+    try:
+        pilot.selected_time_indices(4, 3)
+    except ValueError as error:
+        assert "fewer than three" in str(error)
+    else:
+        raise AssertionError("two-sample K_ij table was accepted")
 
 
 def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -> None:
@@ -146,7 +155,7 @@ def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -
         fields,
         {},
     )
-    expected = pilot._expected_adm_fields(volume, 6.0, cells, halo)
+    expected = pilot._expected_adm_fields(volume, 6.0, cells, 1.0)
     midpoint = 0.5 * (metric_left + metric_right)
     decomposed, _ = pilot.adm_volume.decompose_four_metric(midpoint)
     np.testing.assert_allclose(expected["adm_alpha"], decomposed["alpha"])
