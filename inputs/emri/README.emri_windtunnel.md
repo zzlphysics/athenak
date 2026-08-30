@@ -557,17 +557,20 @@ policy with
 python3 inputs/emri/prepare_frozen_production_campaign.py \
   --pilot profiles/r56-direct-calibration.json \
   --calibration inputs/emri/validation/frozen_r56_direct_a100_20260830.json \
+  --qualification inputs/emri/validation/frozen_production_io_a100_20260830.json \
   --output profiles/r56-direct-production.json
 ```
 
-The default policy uses 98 measured root steps per segment (about 2.97 A100 hours), a
-49-root-step restart cadence (about 1.49 hours), one force-history sample per root step,
-and four primitive/`divB` field dumps per capture crossing.  Later segments must inspect
-the newest completed restart, set `nlim=current_cycle+98`, and retain the global physical
+With the production qualification, the default policy uses 90 measured root steps per
+segment (about 2.99 A100 hours), a 45-root-step restart cadence (about 1.49 hours), a
+nominal force-history interval of one measured root timestep, and four primitive/`divB`
+field dumps per capture crossing.  Later segments must inspect the newest completed
+restart, set `nlim=current_cycle+90`, and retain the global physical
 `tlim`; a script must never guess the next checkpoint number after a failed segment.
 AthenaK appends history files and the force-history reader removes duplicate times, so
 the forced endpoint sample of one segment and the initial sample after restart do not
-bias an average.
+bias an average.  History uses physical-time cadence: analyze the timestamps actually
+written rather than assuming a row for every integer root cycle.
 
 For this direct box, the production force shells are `0.5 r_a`, `1 r_a`, and `2 r_a`
 instead of the smoke-test radii `4m`, `6m`, and `7.5m`.  The latter see only the near-hole
@@ -575,9 +578,26 @@ flow and cannot establish closure of the BHL wake force.  With 2779 blocks a dou
 precision restart is estimated at 7.19 GiB because it contains ghosted MHD conserved
 variables, face fields, and the prescribed ADM arrays; at the configured 3500-block
 capacity it is 9.06 GiB.  Retain at least two audited generations and budget at least
-42 GiB of working disk for the default output policy.  Restart creation also allocates
-device-side output copies, so its actual peak memory and write latency require a short
-A100 qualification before the first long segment.
+42 GiB of working disk for the default output policy.
+
+The real-grid output qualification is recorded in
+`validation/frozen_production_io_a100_20260830.json`.  It reached the calibrated 2779-
+block topology with the production force shells, wrote a 7.19156 GiB restart (the payload
+estimate was accurate to 0.0011 per cent), and produced a 7.61608 GiB terminal
+restart/primitive/`divB` bundle.  Peak A100 memory was 47675 MiB, only 54 MiB above the
+earlier no-restart calibration peak, all ten history records and 22 columns were finite,
+and `max|divB|=7.80e-14`.  The A100 and its disk were released after the evidence hashes
+were downloaded.  This closes the production write-path memory and size risk; a full-
+grid restart-read latency benchmark remains outstanding.
+
+The qualification also resolves a previously hidden runtime cost.  At identical 2779-
+block topology, a root cycle without a due force-history record took 108.965 seconds and
+the next cycle with the four-shell force integral took 119.516 seconds, a conservative
+9.68 per cent overhead.  The two-crossing estimate is therefore 55.7 A100 hours with
+production diagnostics, not 50.8 hours.  Reserve 60 A100 hours for the nominal baseline
+to cover output, restart reads, startup, and system variance.  If the stationarity gate
+requires one quarter-crossing extension, add about 7.0 hours and reserve 67 hours.  These
+are operational budgets, not a guarantee that the physical stationarity gate will pass.
 
 Two capture crossings are a target, not an automatic claim of relaxation.  Discard at
 least the first crossing, compare adjacent quarter-crossing windows of `mdot_hat` and all

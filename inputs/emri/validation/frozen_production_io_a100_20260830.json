@@ -1,0 +1,128 @@
+{
+  "classification": "athenak-emri-frozen-production-io-qualification-v1",
+  "date": "2026-08-30",
+  "case_id": "r56_p000_t5000",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "17e94e173828e315fbf584b8778dba2427b8a87b",
+    "pilot_case": "r56_p000_t5000",
+    "campaign_plan_sha256": "217cc3440c91c8393b882f991e2e2e5a85969f586603c8f2163ba7a790279314"
+  },
+  "cloud_resource": {
+    "provider": "Zhixing Cloud",
+    "instance_id": 652250,
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_count": 1,
+    "cpu_count": 8,
+    "host_memory_GB": 24,
+    "root_disk_GB": 196,
+    "image": "ubuntu22_cuda12.4",
+    "quoted_cost_CNY_for_one_hour": 8.0625,
+    "released_after_evidence_download": true,
+    "release_disk": true,
+    "post_release_status": 0,
+    "post_release_additional_disk_GB": 0,
+    "post_release_status_checked_at": "2026-08-30 19:16:13 Asia/Shanghai"
+  },
+  "build": {
+    "build_type": "Release",
+    "problem": "emri_windtunnel",
+    "mpi": false,
+    "single_precision": false,
+    "kokkos_cuda": true,
+    "kokkos_arch": "AMPERE80",
+    "cuda_toolkit": "12.4.99",
+    "athena_sha256": "a747d3e359445665b59894e7711d50d5d1a5385ddae65af3110993aaa7315446",
+    "cmake_cache_sha256": "ce4e286b1462054865fee6321e3959047d4f5a5f6a0088af2018744ec2f28fbe"
+  },
+  "experiment": {
+    "qualification_cycles": 10,
+    "root_dt_in_secondary_masses": 5.03425,
+    "level_subcycling": true,
+    "dynamic_adm": true,
+    "force_history_enabled": true,
+    "force_frame": "source_tetrad",
+    "force_shell_radii_in_secondary_masses": [
+      3.0,
+      164.5206154716463,
+      329.0412309432926,
+      658.0824618865852
+    ],
+    "initial_and_final_primitive_output": "mhd_w_bcc",
+    "initial_and_final_constraint_output": "mhd_divb",
+    "initial_and_final_restart": true,
+    "restart_cache_contract_version": 1
+  },
+  "result": {
+    "passed": true,
+    "returncode": 0,
+    "final_cycle": 10,
+    "final_time_in_secondary_masses": 50.3425,
+    "final_meshblocks": 2779,
+    "created_meshblocks": 2492,
+    "meshblock_cycles": 868330,
+    "zone_cycles_per_second_reported": 10730650.0,
+    "process_wall_seconds": 333.4627776145935,
+    "peak_gpu_memory_MiB": 47675.0,
+    "mean_sampled_gpu_utilization_percent": 95.1642910727682,
+    "maximum_divB": 7.80486786311485e-14,
+    "history_samples": 10,
+    "history_distinct_times": 10,
+    "history_all_columns_finite": true,
+    "history_columns": 22,
+    "final_restart_size_bytes": 7721877209,
+    "final_primitive_size_bytes": 410039066,
+    "final_divB_size_bytes": 45789922,
+    "terminal_output_bundle_size_bytes": 8177706197,
+    "post_process_finalize_seconds_proxy": 0.7362776145935186
+  },
+  "qualification_analysis": {
+    "restart_layout": {
+      "estimated_final_restart_size_bytes": 7721796096,
+      "measured_final_restart_size_bytes": 7721877209,
+      "measured_final_restart_GiB": 7.1915585631504655,
+      "relative_estimate_error": -1.0504311025780761e-05,
+      "conclusion": "The analytic payload estimate agrees to 0.0011%; the 81113-byte difference is file metadata."
+    },
+    "paired_full_topology_force_diagnostic": {
+      "without_force_history_cycle": 9,
+      "without_force_history_seconds": 108.965,
+      "with_force_history_cycle": 10,
+      "with_force_history_seconds": 119.5162,
+      "conservative_overhead_seconds_per_sample": 10.5512,
+      "conservative_overhead_fraction": 0.09683109255265447,
+      "interpretation": "Both cycles use 2779 MeshBlocks. The physical-time history scheduler missed its nominal cycle-9 timestamp and wrote cycle 10, isolating a conservative force-integration timing pair before forced final field and restart output."
+    },
+    "history_cadence_audit": {
+      "mode": "physical time",
+      "nominal_dt_in_secondary_masses": 5.03425,
+      "observed_samples_including_initial_and_forced_final": 10,
+      "nominal_cycle_9_time_not_written": 45.30825,
+      "conclusion": "Use recorded timestamps for physical-time windows; do not assume one history row per integer root cycle. A quarter capture crossing still contains about 210 nominal samples."
+    },
+    "two_crossing_budget": {
+      "projected_root_cycles": 1677,
+      "without_force_diagnostic_hours": 50.83336375,
+      "with_force_diagnostic_hours": 55.674629833333334,
+      "recommended_operational_reserve_hours_before_stationarity_extension": 60.0,
+      "quarter_crossing_extension_hours_at_qualified_rate": 6.959328729166667,
+      "recommended_reserve_with_one_quarter_crossing_extension_hours": 67.0,
+      "caveat": "Restart write memory and size are qualified. Production-grid restart read latency, durable-storage flush latency, host contention, and physical stationarity remain unmeasured."
+    },
+    "resource_conclusion": "The real 2779-block topology, force shells, CT output, and a 7.72-GB restart fit one A100-80GB with 32.4 GiB of GPU headroom and ample disk headroom."
+  },
+  "downloaded_evidence": {
+    "summary_sha256": "94d7c47128efb205809f7a6ec7ba1f9a14b8cd77469ef15779f409fc4657272e",
+    "command_sha256": "e0abbab467f2ca5def6c08f321bbd1a8c483e3d8ae1550ea5fb9823698addcf5",
+    "athena_log_sha256": "d6f159aee23b8e166fffd34b4965da3800c7b5586f34d70af95d862880c067d6",
+    "gpu_log_sha256": "b888cfc1b98f0f5e9c811bd27ec8d642e61188989a0b2fd88b2784279d2380d7",
+    "history_sha256": "a91a9cc0eb1c110f6818abd87480b7a01f731b6e917f03db0bd5979e5dfafbbe",
+    "initial_restart_sha256": "f045ee378645c8909275d82f5c509c6266b2b2976eeb3933feab92f12d29cbc4",
+    "final_restart_sha256": "1bfead68f3cc55629e7d52b4093118472e2ba7f8b59e4521a68201f525c47634",
+    "final_primitive_sha256": "6ef24a6310d4a8ff3f9e3ea0ff5dd817252d29e6c9ba4b8cfb72aae5ae0a3ea2",
+    "final_divB_sha256": "ebb72adb209c092b417e22e3f64c047bb91888ba699ac77f8700498120339564",
+    "private_instance_state_sha256": "e245fbd8d67170e0de5c869c088e0a06b43f80bdbf866d1893b5cc797f2660b9",
+    "private_release_state_sha256": "1085b79f31b21ae3c16c66468cdcb0ce1a8b8c57391fec93ee61c01c6a1f43d8"
+  },
+  "scope": "Production-grid force-history, output memory, restart size/write path, AMR topology, source-tetrad force finiteness, and CT qualification. This is not a restart-read benchmark, a settled-flow result, or a physical-resolution convergence claim."
+}

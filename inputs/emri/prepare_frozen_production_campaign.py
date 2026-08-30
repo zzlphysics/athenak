@@ -20,6 +20,9 @@ import prepare_frozen_direct_pilot as direct_pilot
 
 CLASSIFICATION = "athenak-emri-frozen-direct-production-campaign-v1"
 CALIBRATION_CLASSIFICATION = "athenak-emri-frozen-direct-cloud-calibration-v1"
+QUALIFICATION_CLASSIFICATION = (
+    "athenak-emri-frozen-production-io-qualification-v1"
+)
 REAL_BYTES = 8
 MHD_CONSERVED_VARIABLES = 5
 PRESCRIBED_ADM_VARIABLES = 17
@@ -114,10 +117,31 @@ def _validate_identity(
             raise ValueError(f"pilot and calibration disagree on {label}")
 
 
+def _validate_qualification(
+    qualification: dict[str, object],
+    pilot: dict[str, object],
+    calibration: dict[str, object],
+) -> None:
+    if qualification.get("classification") != QUALIFICATION_CLASSIFICATION:
+        raise ValueError("input qualification is not a frozen production qualification")
+    result = qualification.get("result")
+    analysis = qualification.get("qualification_analysis")
+    if not isinstance(result, dict) or result.get("passed") is not True:
+        raise ValueError("production qualification did not pass")
+    if not isinstance(analysis, dict):
+        raise ValueError("production qualification lacks derived timing analysis")
+    if qualification.get("case_id") != pilot.get("case_id"):
+        raise ValueError("pilot and qualification disagree on case id")
+    calibration_result = calibration["result"]
+    if result.get("final_meshblocks") != calibration_result.get("final_meshblocks"):
+        raise ValueError("calibration and qualification disagree on final MeshBlocks")
+
+
 def build_production_campaign(
     pilot: dict[str, object],
     calibration: dict[str, object],
     *,
+    qualification: dict[str, object] | None = None,
     target_segment_wall_hours: float = 3.0,
     checkpoint_wall_hours: float = 1.5,
     history_root_steps: int = 1,
@@ -126,6 +150,8 @@ def build_production_campaign(
     retained_restart_generations: int = 2,
 ) -> dict[str, object]:
     _validate_identity(pilot, calibration)
+    if qualification is not None:
+        _validate_qualification(qualification, pilot, calibration)
     target_segment_wall_hours = _positive(
         target_segment_wall_hours, "target segment wall hours"
     )
@@ -162,6 +188,29 @@ def build_production_campaign(
         result["steady_nine_level_root_cycle_seconds"],
         "steady root-cycle seconds",
     )
+    budget_root_cycle_seconds = root_cycle_seconds
+    force_diagnostic_overhead_fraction = None
+    if qualification is not None:
+        force_analysis = qualification["qualification_analysis"].get(
+            "paired_full_topology_force_diagnostic"
+        )
+        if not isinstance(force_analysis, dict):
+            raise ValueError(
+                "production qualification lacks paired full-topology force timing"
+            )
+        no_force_seconds = _positive(
+            force_analysis["without_force_history_seconds"],
+            "full-topology cycle without force history",
+        )
+        budget_root_cycle_seconds = _positive(
+            force_analysis["with_force_history_seconds"],
+            "full-topology cycle with force history",
+        )
+        if budget_root_cycle_seconds < no_force_seconds:
+            raise ValueError("qualified force-history timing has negative overhead")
+        force_diagnostic_overhead_fraction = (
+            budget_root_cycle_seconds / no_force_seconds - 1.0
+        )
     measured_rate = _positive(
         result["zone_cycles_per_second_reported"], "measured zone-cycle rate"
     )
@@ -185,12 +234,19 @@ def build_production_campaign(
     topology_correction = measured_zone_cycles_per_root / ideal_zone_cycles_per_root
     corrected_lower_seconds = ideal_updates * step_count_correction / measured_rate
     empirical_seconds = projected_root_cycles * root_cycle_seconds
+    production_diagnostic_seconds = (
+        projected_root_cycles * budget_root_cycle_seconds
+    )
 
     segment_root_steps = max(
-        1, math.floor(target_segment_wall_hours * 3600.0 / root_cycle_seconds)
+        1,
+        math.floor(
+            target_segment_wall_hours * 3600.0 / budget_root_cycle_seconds
+        ),
     )
     checkpoint_root_steps = max(
-        1, round(checkpoint_wall_hours * 3600.0 / root_cycle_seconds)
+        1,
+        round(checkpoint_wall_hours * 3600.0 / budget_root_cycle_seconds),
     )
     checkpoint_root_steps = min(checkpoint_root_steps, segment_root_steps)
     field_root_steps = max(
@@ -200,7 +256,9 @@ def build_production_campaign(
     checkpoint_dt = checkpoint_root_steps * measured_root_dt
     field_dt = field_root_steps * measured_root_dt
     segment_duration_proxy = segment_root_steps * measured_root_dt
-    segment_wall_hours_proxy = segment_root_steps * root_cycle_seconds / 3600.0
+    segment_wall_hours_proxy = (
+        segment_root_steps * budget_root_cycle_seconds / 3600.0
+    )
 
     force_radii = [capture_radius * value for value in force_outer_capture_fractions]
     conservative_half_width = min(
@@ -266,7 +324,7 @@ def build_production_campaign(
         raise ValueError("production overrides contain duplicates: " + ", ".join(duplicates))
 
     earliest_stationarity_time = 1.5 * crossing_time
-    return {
+    campaign = {
         "classification": CLASSIFICATION,
         "case_id": pilot["case_id"],
         "source_state_sha256": pilot["source_state_sha256"],
@@ -293,6 +351,8 @@ def build_production_campaign(
         },
         "runtime_projection": {
             "measured_root_dt_in_secondary_masses": measured_root_dt,
+            "baseline_steady_root_cycle_seconds": root_cycle_seconds,
+            "budget_root_cycle_seconds": budget_root_cycle_seconds,
             "projected_root_cycles": projected_root_cycles,
             "planner_root_cycle_proxy": planner_root_cycle_proxy,
             "measured_to_planner_step_count_correction": step_count_correction,
@@ -303,9 +363,14 @@ def build_production_campaign(
             "uncorrected_ideal_hours": ideal_updates / measured_rate / 3600.0,
             "cfl_corrected_lower_bound_hours": corrected_lower_seconds / 3600.0,
             "empirical_steady_topology_hours": empirical_seconds / 3600.0,
+            "empirical_with_production_diagnostics_hours":
+                production_diagnostic_seconds / 3600.0,
+            "force_diagnostic_overhead_fraction":
+                force_diagnostic_overhead_fraction,
             "budget_rule": (
-                "use empirical_steady_topology_hours before diagnostic, checkpoint, "
-                "field-output, startup, and stationarity-extension overhead"
+                "use empirical_with_production_diagnostics_hours; then add checkpoint, "
+                "field-output, restart-read, startup, system-variance, and "
+                "stationarity-extension reserve"
             ),
         },
         "segmentation": {
@@ -318,7 +383,7 @@ def build_production_campaign(
             "checkpoint_root_steps": checkpoint_root_steps,
             "checkpoint_dt_in_secondary_masses": checkpoint_dt,
             "checkpoint_wall_hours_proxy":
-                checkpoint_root_steps * root_cycle_seconds / 3600.0,
+                checkpoint_root_steps * budget_root_cycle_seconds / 3600.0,
             "resume_rule": (
                 "read the newest audited restart, set nlim=current_cycle+"
                 f"{segment_root_steps}, retain the global tlim, and never infer the "
@@ -326,8 +391,13 @@ def build_production_campaign(
             ),
         },
         "outputs": {
-            "history_root_steps": history_root_steps,
+            "history_root_steps_proxy": history_root_steps,
             "history_dt_in_secondary_masses": history_dt,
+            "history_cadence_mode": "physical_time_from_calibrated_root_dt",
+            "history_cadence_note": (
+                "analyze actual timestamps; floating time scheduling and forced segment "
+                "endpoints do not guarantee one record at every nominal root cycle"
+            ),
             "field_root_steps": field_root_steps,
             "field_dt_in_secondary_masses": field_dt,
             "field_outputs_per_crossing_proxy": crossing_time / field_dt,
@@ -356,8 +426,9 @@ def build_production_campaign(
             "estimated_retained_field_GiB": retained_field_bytes / 2**30,
             "minimum_working_disk_GiB": math.ceil(working_disk_bytes / 2**30),
             "warning": (
-                "restart output duplicates U/B and prescribed ADM arrays on the device; "
-                "measure peak memory, file size, and write latency before a long run"
+                "without source_qualification, restart output memory, size, and write "
+                "latency remain estimates; even with write qualification, production-"
+                "grid restart read latency is not yet measured"
             ),
         },
         "stationarity_gate": {
@@ -394,12 +465,42 @@ def build_production_campaign(
         ],
         "fresh_overrides": fresh_overrides,
     }
+    if qualification is not None:
+        qualified_result = qualification["result"]
+        measured_restart_bytes = _positive_integer(
+            qualified_result["final_restart_size_bytes"],
+            "qualified final restart size",
+        )
+        campaign["source_qualification"] = {
+            "classification": qualification["classification"],
+            "date": qualification.get("date"),
+            "source_commit": qualification["source"]["commit"],
+            "athena_sha256": qualification["build"]["athena_sha256"],
+            "evidence_summary_sha256": qualification["downloaded_evidence"][
+                "summary_sha256"
+            ],
+        }
+        campaign["resource_envelope"].update({
+            "qualification_passed": True,
+            "qualified_peak_gpu_memory_MiB":
+                qualified_result["peak_gpu_memory_MiB"],
+            "measured_restart_GiB_at_calibrated_topology":
+                measured_restart_bytes / 2**30,
+            "restart_size_estimate_relative_error":
+                restart_final_bytes / measured_restart_bytes - 1.0,
+            "measured_terminal_output_bundle_GiB":
+                qualified_result["terminal_output_bundle_size_bytes"] / 2**30,
+            "measured_post_process_finalize_seconds_proxy":
+                qualified_result["post_process_finalize_seconds_proxy"],
+        })
+    return campaign
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pilot", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--qualification", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-segment-wall-hours", type=float, default=3.0)
     parser.add_argument("--checkpoint-wall-hours", type=float, default=1.5)
@@ -419,9 +520,15 @@ def main() -> int:
     calibration = json.loads(
         arguments.calibration.expanduser().resolve(strict=True).read_text()
     )
+    qualification = None
+    if arguments.qualification is not None:
+        qualification = json.loads(
+            arguments.qualification.expanduser().resolve(strict=True).read_text()
+        )
     campaign = build_production_campaign(
         pilot,
         calibration,
+        qualification=qualification,
         target_segment_wall_hours=arguments.target_segment_wall_hours,
         checkpoint_wall_hours=arguments.checkpoint_wall_hours,
         history_root_steps=arguments.history_root_steps,
@@ -441,7 +548,8 @@ def main() -> int:
     runtime = campaign["runtime_projection"]
     segmentation = campaign["segmentation"]
     print(
-        f"empirical_hours={runtime['empirical_steady_topology_hours']:.3f} "
+        "production_diagnostic_hours="
+        f"{runtime['empirical_with_production_diagnostics_hours']:.3f} "
         f"segments={segmentation['segments_if_root_dt_is_stationary']} "
         f"steps_per_segment={segmentation['root_steps_per_segment']}"
     )

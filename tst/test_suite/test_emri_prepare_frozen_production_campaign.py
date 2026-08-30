@@ -112,6 +112,31 @@ def _calibration() -> dict[str, object]:
     }
 
 
+def _qualification() -> dict[str, object]:
+    return {
+        "classification": production.QUALIFICATION_CLASSIFICATION,
+        "date": "2026-08-30",
+        "case_id": "r56_p000_t5000",
+        "source": {"commit": "1" * 40},
+        "build": {"athena_sha256": "b" * 64},
+        "result": {
+            "passed": True,
+            "final_meshblocks": 2779,
+            "peak_gpu_memory_MiB": 47675.0,
+            "final_restart_size_bytes": 7721877209,
+            "terminal_output_bundle_size_bytes": 8177706197,
+            "post_process_finalize_seconds_proxy": 0.7362776145935186,
+        },
+        "qualification_analysis": {
+            "paired_full_topology_force_diagnostic": {
+                "without_force_history_seconds": 108.965,
+                "with_force_history_seconds": 119.5162,
+            },
+        },
+        "downloaded_evidence": {"summary_sha256": "c" * 64},
+    }
+
+
 def test_real_calibration_produces_conservative_segment_and_output_policy() -> None:
     campaign = production.build_production_campaign(_pilot(), _calibration())
 
@@ -126,6 +151,9 @@ def test_real_calibration_produces_conservative_segment_and_output_policy() -> N
     assert runtime["empirical_steady_topology_hours"] == pytest.approx(
         50.83336375
     )
+    assert runtime["empirical_with_production_diagnostics_hours"] \
+        == pytest.approx(50.83336375)
+    assert runtime["force_diagnostic_overhead_fraction"] is None
     assert runtime["empirical_steady_topology_hours"] \
         > runtime["cfl_corrected_lower_bound_hours"] \
         > runtime["uncorrected_ideal_hours"]
@@ -161,6 +189,35 @@ def test_real_calibration_produces_conservative_segment_and_output_policy() -> N
     assert campaign["stationarity_gate"]["status"] == "runtime_evidence_required"
 
 
+def test_passed_production_qualification_controls_runtime_and_resources() -> None:
+    campaign = production.build_production_campaign(
+        _pilot(), _calibration(), qualification=_qualification()
+    )
+
+    runtime = campaign["runtime_projection"]
+    assert runtime["budget_root_cycle_seconds"] == pytest.approx(119.5162)
+    assert runtime["force_diagnostic_overhead_fraction"] == pytest.approx(
+        0.09683109255
+    )
+    assert runtime["empirical_with_production_diagnostics_hours"] \
+        == pytest.approx(55.6746298333)
+
+    segmentation = campaign["segmentation"]
+    assert segmentation["root_steps_per_segment"] == 90
+    assert segmentation["checkpoint_root_steps"] == 45
+    assert segmentation["segments_if_root_dt_is_stationary"] == 19
+    assert segmentation["wall_hours_per_segment_proxy"] == pytest.approx(2.987905)
+
+    resources = campaign["resource_envelope"]
+    assert resources["qualification_passed"] is True
+    assert resources["qualified_peak_gpu_memory_MiB"] == 47675.0
+    assert resources["measured_restart_GiB_at_calibrated_topology"] \
+        == pytest.approx(7.19155856315)
+    assert resources["restart_size_estimate_relative_error"] \
+        == pytest.approx(-1.05043110258e-5)
+    assert campaign["source_qualification"]["evidence_summary_sha256"] == "c" * 64
+
+
 def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
     calibration = _calibration()
     calibration["source"]["source_state_sha256"] = "1" * 64
@@ -172,6 +229,13 @@ def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
     pilot["mesh"]["upper"] = [500.0, 500.0, 500.0]
     with pytest.raises(ValueError, match="outer force shell"):
         production.build_production_campaign(pilot, _calibration())
+
+    qualification = _qualification()
+    qualification["case_id"] = "another-case"
+    with pytest.raises(ValueError, match="qualification disagree on case id"):
+        production.build_production_campaign(
+            _pilot(), _calibration(), qualification=qualification
+        )
 
 
 def test_restart_layout_estimate_includes_faces_and_prescribed_adm() -> None:
