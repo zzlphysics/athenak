@@ -1,0 +1,200 @@
+{
+  "classification": "athenak-emri-frozen-production-retained-data-disk-lifecycle-qualification-v1",
+  "date": "2026-08-30",
+  "case_id": "r56_p000_t5000",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "f6c0c796ca9b15d67e4c863f65dcd42e53ddd7da",
+    "campaign_plan_sha256": "cddf90950646598ac520cfc02a612ac0b8d2d5a2214483037d327ccc9bf81b7f",
+    "task_uuid": "cdf809bc-4ea9-45ab-9e64-1793c5839281"
+  },
+  "cloud_resource": {
+    "provider": "Zhixing Cloud",
+    "first_instance_id": 652320,
+    "restored_instance_id": 652329,
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_count_per_instance": 1,
+    "cpu_count_per_instance": 8,
+    "host_memory_GB_per_instance": 24,
+    "root_disk_GB_per_instance": 196,
+    "added_data_disk_GiB": 100,
+    "image": "ubuntu22_cuda12.4",
+    "quoted_cost_CNY_per_one_hour_instance": 8.1225,
+    "quoted_cost_CNY_for_two_one_hour_instances": 16.245,
+    "second_create_inventory_retry": {
+      "initial_create_rejected_for_no_available_GPU": true,
+      "read_only_ext_uid_reconciliation_before_retry": true,
+      "source_retention_rechecked_before_retry": true,
+      "quote_unchanged_before_retry": true
+    },
+    "final_audit": {
+      "first_instance_status": 0,
+      "first_instance_is_latest_copy": false,
+      "restored_instance_status": 0,
+      "final_stop_release_disk": 1,
+      "dedicated_release_endpoint_after_final_stop_accepted": false,
+      "dedicated_release_endpoint_rejection": "instance is no longer in an operable retained-disk state",
+      "kept_disk_price_quote_is_not_a_retention_validity_check": true,
+      "running_instances_from_this_qualification": 0
+    }
+  },
+  "build": {
+    "build_type": "Release",
+    "problem": "emri_windtunnel",
+    "mpi": false,
+    "single_precision": false,
+    "kokkos_cuda": true,
+    "kokkos_arch": "AMPERE80",
+    "cuda_toolkit": "12.4.99",
+    "kokkos_commit": "08ceff92bcf3a828844480bc1e6137eb74028517",
+    "athena_sha256": "5a18ec37c321d0502dcba093779314a7d776aaf9e5195c9dae444431d497964d",
+    "cmake_cache_sha256": "06f5b63985589f2cb2d00ff9a0e671923d1b95bfd6889e77200bbd7197df2989"
+  },
+  "provider_contract": {
+    "provider": "Zhixing Cloud OpenAPI v2",
+    "documentation": {
+      "create_instance": "https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-242713438",
+      "stop_with_refund": "https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-298742527",
+      "create_from_kept_disk": "https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-242551569",
+      "release_kept_disk": "https://s.apifox.cn/b0fc397f-c455-4c9a-9d82-875fc48ae106/api-242528020"
+    },
+    "initial_create": {
+      "due_mode": 1,
+      "added_data_disk_GiB": 100,
+      "filesystem": "ext4",
+      "filesystem_label": "EMRI_R56_L3",
+      "filesystem_layout": "raw whole-disk filesystem without a partition table",
+      "mount_source": "/dev/vdb",
+      "mount_target": "/mnt/emri-lifecycle",
+      "mount_options": "rw,noatime"
+    },
+    "between_segments": {
+      "stop_endpoint": "/instance/stop_instance_with_refund",
+      "release_disk": 0,
+      "expected_stopped_status": 8,
+      "require_is_latest_copy": true,
+      "observed_stopped_status": 8,
+      "observed_is_latest_copy": true,
+      "restore_endpoint": "/instance/create_kvm_instance_from_keepped_disk",
+      "restore_due_mode": 1,
+      "restore_add_disk_size_GiB": 0,
+      "restored_instance_received_data_disk_GiB": 100
+    },
+    "final_cleanup": {
+      "stop_endpoint": "/instance/stop_instance_with_refund",
+      "release_disk": 1,
+      "expected_post_release_status": 0,
+      "observed_post_release_status": 0,
+      "running_instances_after_audit": 0
+    },
+    "negative_controls": [
+      {
+        "instance_id": 652299,
+        "due_mode": -1,
+        "added_data_disk_GiB": 0,
+        "stop_release_disk": 0,
+        "observed_status": 0,
+        "create_from_kept_disk_rejected": true,
+        "conclusion": "a root-disk-only instance did not produce a resumable retained copy"
+      },
+      {
+        "instance_id": 652308,
+        "due_mode": -1,
+        "added_data_disk_GiB": 100,
+        "stop_release_disk": 0,
+        "observed_status": 0,
+        "create_from_kept_disk_rejected": true,
+        "conclusion": "release_disk=0 alone did not override due_mode=-1, even with a populated added data disk"
+      }
+    ]
+  },
+  "result": {
+    "passed": true,
+    "restored_filesystem": {
+      "filesystem_uuid": "6f93020a-a9ab-46d2-a940-967eed38d503",
+      "filesystem_uuid_before_stop": "6f93020a-a9ab-46d2-a940-967eed38d503",
+      "filesystem_uuid_after_restore": "6f93020a-a9ab-46d2-a940-967eed38d503",
+      "filesystem_uuid_match": true,
+      "partition_uuid_present": false,
+      "mount_source_before_stop": "/dev/vdb",
+      "mount_source_after_restore": "/dev/vdb",
+      "mount_options_before_stop": "rw,noatime",
+      "mount_options_after_restore": "rw,noatime"
+    },
+    "source_checkpoint": {
+      "cycle": 10,
+      "time_in_secondary_masses": 50.34249803109447,
+      "meshblocks": 2779,
+      "size_bytes": 7721877183,
+      "sha256": "9c4fa446371105c3da7232ca5cb57683f6c83d5294207edc9ad63794be02cc3b",
+      "all_stored_reals_finite": true,
+      "complete_leaf_coverage": true,
+      "fresh_process_wall_seconds": 335.2987277507782,
+      "audit_wall_seconds_before_stop": 15.193674564361572,
+      "audit_wall_seconds_after_restore": 22.632907390594482
+    },
+    "preflight": {
+      "athena_hash_match": true,
+      "checkpoint_all_stored_reals_finite": true,
+      "checkpoint_complete_leaf_coverage": true,
+      "checkpoint_cycle_match": true,
+      "checkpoint_hash_match": true,
+      "checkpoint_meshblocks_match": true,
+      "checkpoint_size_match": true,
+      "commit_match": true,
+      "filesystem_uuid_match": true,
+      "partition_uuid_match": false,
+      "plan_hash_match": true
+    },
+    "resume": {
+      "advanced_one_root_cycle": true,
+      "source_cycle": 10,
+      "final_cycle": 11,
+      "source_time_in_secondary_masses": 50.34249803109447,
+      "final_time_in_secondary_masses": 55.37674783420392,
+      "root_dt_in_secondary_masses": 5.03425,
+      "process_wall_seconds": 151.48047304153442,
+      "restart_reconstruction_record_present": true,
+      "maximum_mixed_scale_proposed_change": 2.2204402163886858e-16,
+      "mixed_scale_acceptance_tolerance": 9.094947017729282e-13,
+      "log_sha256": "3837e75047d1873443fa4b4827c0fa25408e8b5a3ee257d44ec0467fc5ea273e"
+    },
+    "final_checkpoint": {
+      "cycle": 11,
+      "time_in_secondary_masses": 55.37674783420392,
+      "meshblocks": 2779,
+      "size_bytes": 7721877513,
+      "sha256": "6b36a7c3dea31cf3702e768dbeedaf72d1cf0fe560f739e178fb1a346e30a25a",
+      "all_stored_reals_finite": true,
+      "complete_leaf_coverage": true,
+      "audit_wall_seconds": 17.766196966171265
+    },
+    "history": {
+      "all_finite": true,
+      "distinct_times": 11,
+      "columns_including_derived": 40,
+      "sha256": "63653b80919bfc11c24e1ce56d0c828258c7c693fb1a9cbe092c6deff1ae3c25"
+    },
+    "durable_sync_seconds": {
+      "before_first_stop": 0.03809499740600586,
+      "after_resumed_checkpoint": 0.03199148178100586
+    }
+  },
+  "qualification_analysis": {
+    "positive_conclusion": "A due_mode=1 instance with a dedicated 100-GiB ext4 data disk survived stop with release_disk=0, reappeared byte-identically on a new A100 instance, and resumed the production 2779-block checkpoint by one root cycle.",
+    "negative_conclusion": "Both due_mode=-1 controls ended in Status=0 and could not create a new instance from kept disk; release_disk=0 is necessary but not sufficient.",
+    "production_rule": "Put source, build, campaign manifest, run directory, restarts, and ready records on the added data disk; mount by filesystem UUID; require Status=8 plus IsLatestCopy=true before destroying the first instance context; verify every identity and payload hash before resuming.",
+    "final_release_rule": "After off-disk evidence export, stop with release_disk=1 and require Status=0. Treat the dedicated release endpoint's current-state rejection as confirmation that no operable retained copy remains; do not use the price-query endpoint as a validity probe.",
+    "remaining_storage_risk": "The provider-local data disk is a restart-continuity mechanism rather than a redundant backup. Export milestone checkpoints and final science products independently."
+  },
+  "downloaded_evidence": {
+    "fresh_log_sha256": "4adadf2e0f1076c211f325f39b3c1292cc0fc3c8cc73dff2676dc0bf8abd7e88",
+    "source_manifest_sha256": "6a15c8ddea0c17f3bbe63454150fa76a74c9dcd65731f86f89497a00f365b22e",
+    "source_ready_sha256": "943fba221db7f57daab78046a5662d5a4445b3f4609427fe55f4f0be2db6fb89",
+    "stage1_summary_sha256": "daa16fb8b184cb88eaafa397e183d2b375fe2a9fe21002bcd27590433a23b292",
+    "resume_command_sha256": "98a9e110d682bc7f04a3144a6b0fa394834d58ef4a6ab4f15b71216853e8a10c",
+    "resume_log_sha256": "3837e75047d1873443fa4b4827c0fa25408e8b5a3ee257d44ec0467fc5ea273e",
+    "stage2_summary_sha256": "a55d6e15e1e732bf0bf2d62a94443ff455e0040b20bd088f6a6741ef6d2123b1"
+  },
+  "scope": "Provider stop-retain and kept-disk restore semantics, dedicated-filesystem identity, byte-identical 7.72-GB production checkpoint persistence, cross-instance one-root-cycle A100 resume, history continuity, and final resource release. This is not a redundant-storage durability test, a settled-flow result, or a physical-resolution convergence claim."
+}

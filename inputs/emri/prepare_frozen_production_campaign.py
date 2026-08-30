@@ -26,6 +26,9 @@ QUALIFICATION_CLASSIFICATION = (
 RESTART_QUALIFICATION_CLASSIFICATION = (
     "athenak-emri-frozen-production-restart-read-qualification-v1"
 )
+LIFECYCLE_QUALIFICATION_CLASSIFICATION = (
+    "athenak-emri-frozen-production-retained-data-disk-lifecycle-qualification-v1"
+)
 REAL_BYTES = 8
 MHD_CONSERVED_VARIABLES = 5
 PRESCRIBED_ADM_VARIABLES = 17
@@ -165,18 +168,96 @@ def _validate_restart_qualification(
         )
 
 
+def _validate_lifecycle_qualification(
+    lifecycle_qualification: dict[str, object],
+    pilot: dict[str, object],
+    calibration: dict[str, object],
+) -> None:
+    if lifecycle_qualification.get("classification") != \
+            LIFECYCLE_QUALIFICATION_CLASSIFICATION:
+        raise ValueError("input lifecycle qualification has the wrong classification")
+    result = lifecycle_qualification.get("result")
+    contract = lifecycle_qualification.get("provider_contract")
+    if not isinstance(result, dict) or result.get("passed") is not True:
+        raise ValueError("production data-disk lifecycle qualification did not pass")
+    if not isinstance(contract, dict):
+        raise ValueError("production lifecycle qualification lacks provider contract")
+    if lifecycle_qualification.get("case_id") != pilot.get("case_id"):
+        raise ValueError("pilot and lifecycle qualification disagree on case id")
+
+    source_checkpoint = result.get("source_checkpoint")
+    restored = result.get("restored_filesystem")
+    preflight = result.get("preflight")
+    final_checkpoint = result.get("final_checkpoint")
+    resume = result.get("resume")
+    if not isinstance(source_checkpoint, dict) or source_checkpoint.get(
+        "meshblocks"
+    ) != calibration["result"].get("final_meshblocks"):
+        raise ValueError(
+            "calibration and lifecycle qualification disagree on final MeshBlocks"
+        )
+    if not isinstance(restored, dict) or restored.get(
+        "filesystem_uuid_match"
+    ) is not True:
+        raise ValueError("lifecycle qualification did not restore the same filesystem")
+    required_preflight = (
+        "athena_hash_match",
+        "checkpoint_all_stored_reals_finite",
+        "checkpoint_complete_leaf_coverage",
+        "checkpoint_cycle_match",
+        "checkpoint_hash_match",
+        "checkpoint_meshblocks_match",
+        "checkpoint_size_match",
+        "commit_match",
+        "filesystem_uuid_match",
+        "plan_hash_match",
+    )
+    if not isinstance(preflight, dict) or not all(
+        preflight.get(key) is True for key in required_preflight
+    ):
+        raise ValueError("production lifecycle preflight did not pass exactly")
+    if not isinstance(final_checkpoint, dict) or any(
+        final_checkpoint.get(key) is not True
+        for key in ("all_stored_reals_finite", "complete_leaf_coverage")
+    ):
+        raise ValueError("production lifecycle final checkpoint audit did not pass")
+    if not isinstance(resume, dict) or resume.get(
+        "advanced_one_root_cycle"
+    ) is not True:
+        raise ValueError(
+            "production lifecycle qualification did not advance a root cycle"
+        )
+
+    initial = contract.get("initial_create")
+    between = contract.get("between_segments")
+    final = contract.get("final_cleanup")
+    if not isinstance(initial, dict) or initial.get("due_mode") != 1 \
+            or int(initial.get("added_data_disk_GiB", 0)) < 1:
+        raise ValueError("lifecycle qualification lacks a retained initial data disk")
+    if not isinstance(between, dict) or between.get("release_disk") != 0 \
+            or between.get("expected_stopped_status") != 8 \
+            or between.get("require_is_latest_copy") is not True \
+            or between.get("restore_due_mode") != 1:
+        raise ValueError("lifecycle qualification has an unsafe segment-stop contract")
+    if not isinstance(final, dict) or final.get("release_disk") != 1 \
+            or final.get("expected_post_release_status") != 0:
+        raise ValueError("lifecycle qualification lacks an explicit final disk release")
+
+
 def build_production_campaign(
     pilot: dict[str, object],
     calibration: dict[str, object],
     *,
     qualification: dict[str, object] | None = None,
     restart_qualification: dict[str, object] | None = None,
+    lifecycle_qualification: dict[str, object] | None = None,
     target_segment_wall_hours: float = 3.0,
     checkpoint_wall_hours: float = 1.5,
     history_root_steps: int = 1,
     field_outputs_per_crossing: int = 4,
     force_outer_capture_fractions: tuple[float, float, float] = (0.5, 1.0, 2.0),
     retained_restart_generations: int = 2,
+    provisioned_data_disk_GiB: int = 100,
 ) -> dict[str, object]:
     _validate_identity(pilot, calibration)
     if qualification is not None:
@@ -188,6 +269,14 @@ def build_production_campaign(
             )
         _validate_restart_qualification(
             restart_qualification, pilot, calibration
+        )
+    if lifecycle_qualification is not None:
+        if restart_qualification is None:
+            raise ValueError(
+                "data-disk lifecycle qualification requires restart qualification"
+            )
+        _validate_lifecycle_qualification(
+            lifecycle_qualification, pilot, calibration
         )
     target_segment_wall_hours = _positive(
         target_segment_wall_hours, "target segment wall hours"
@@ -202,6 +291,18 @@ def build_production_campaign(
     retained_restart_generations = _positive_integer(
         retained_restart_generations, "retained restart generations"
     )
+    provisioned_data_disk_GiB = _positive_integer(
+        provisioned_data_disk_GiB, "provisioned data disk GiB"
+    )
+    if lifecycle_qualification is not None:
+        qualified_data_disk_GiB = lifecycle_qualification[
+            "provider_contract"
+        ]["initial_create"]["added_data_disk_GiB"]
+        if provisioned_data_disk_GiB != qualified_data_disk_GiB:
+            raise ValueError(
+                "provisioned data disk differs from the provider-qualified size: "
+                f"{provisioned_data_disk_GiB} != {qualified_data_disk_GiB} GiB"
+            )
     if len(force_outer_capture_fractions) != 3 or not all(
         math.isfinite(value) and value > 0.0
         for value in force_outer_capture_fractions
@@ -373,6 +474,12 @@ def build_production_campaign(
     retained_field_bytes = field_count * (primitive_final_bytes + divb_final_bytes)
     rolling_restart_bytes = retained_restart_generations * restart_capacity_bytes
     working_disk_bytes = rolling_restart_bytes + retained_field_bytes + 20 * 2**30
+    minimum_working_disk_GiB = math.ceil(working_disk_bytes / 2**30)
+    if provisioned_data_disk_GiB < minimum_working_disk_GiB:
+        raise ValueError(
+            "provisioned data disk is smaller than the production working set: "
+            f"{provisioned_data_disk_GiB} < {minimum_working_disk_GiB} GiB"
+        )
 
     basename = _safe_basename(str(pilot["case_id"]))
     replacements = {
@@ -480,6 +587,82 @@ def build_production_campaign(
                 "next restart filename from a failed segment"
             ),
         },
+        "storage_lifecycle": {
+            "status": (
+                "provider_qualified" if lifecycle_qualification is not None
+                else "provider_qualification_required"
+            ),
+            "provider": "Zhixing Cloud OpenAPI v2",
+            "persistent_volume": "dedicated added data disk; never the root disk",
+            "filesystem": "ext4",
+            "mount_identity": (
+                "filesystem UUID (raw whole-disk filesystems have no PARTUUID)"
+            ),
+            "provisioned_data_disk_GiB": provisioned_data_disk_GiB,
+            "required_persistent_artifacts": [
+                "source checkout at the recorded commit",
+                "A100 build and its SHA-256 manifest",
+                "campaign JSON and its SHA-256 manifest",
+                "run directory, rolling restarts, history, and field outputs",
+                "durably synced restart ready/manifest records",
+            ],
+            "initial_create": {
+                "due_mode": 1,
+                "add_disk_size_GiB": provisioned_data_disk_GiB,
+                "record_before_evolution": [
+                    "instance identity", "filesystem UUID", "mount source/options",
+                    "source commit", "Athena SHA-256", "campaign SHA-256",
+                ],
+            },
+            "between_segments": {
+                "before_stop": (
+                    "audit the newest complete restart, write manifest plus ready "
+                    "record, fsync files and directories, sync the mounted "
+                    "filesystem, and record the filesystem UUID"
+                ),
+                "stop_endpoint": "/instance/stop_instance_with_refund",
+                "release_disk": 0,
+                "required_stopped_status": 8,
+                "require_is_latest_copy": True,
+                "restore_endpoint":
+                    "/instance/create_kvm_instance_from_keepped_disk",
+                "restore_due_mode": 1,
+                "restore_add_disk_size_GiB": 0,
+                "preflight_before_resume": (
+                    "mount the existing filesystem by UUID without mkfs; require "
+                    "exact filesystem UUID, source commit, Athena/campaign/checkpoint "
+                    "hashes, checkpoint size/cycle/topology, finite payload, and leaf "
+                    "coverage"
+                ),
+            },
+            "final_cleanup": {
+                "prerequisite": (
+                    "copy science products, manifests, logs, and required restart "
+                    "backups off the provider-local disk and verify their hashes"
+                ),
+                "stop_endpoint": "/instance/stop_instance_with_refund",
+                "release_disk": 1,
+                "required_post_release_status": 0,
+            },
+            "fail_closed": [
+                "due_mode=-1 is forbidden for retained-disk segment boundaries",
+                (
+                    "Status=0 after a retain request is a failed retention, not a "
+                    "resumable state"
+                ),
+                "a root-disk-only run is not an accepted production layout",
+                "never format a disk that already has a filesystem signature",
+                (
+                    "never retry a non-idempotent create/stop request before read-only "
+                    "reconciliation"
+                ),
+            ],
+            "backup_note": (
+                "provider-local retained disks provide restart continuity, not "
+                "redundant backup; export milestone checkpoints and final products "
+                "independently"
+            ),
+        },
         "outputs": {
             "history_root_steps_proxy": history_root_steps,
             "history_dt_in_secondary_masses": history_dt,
@@ -514,7 +697,10 @@ def build_production_campaign(
             "estimated_restart_GiB_at_capacity": restart_capacity_bytes / 2**30,
             "retained_restart_generations": retained_restart_generations,
             "estimated_retained_field_GiB": retained_field_bytes / 2**30,
-            "minimum_working_disk_GiB": math.ceil(working_disk_bytes / 2**30),
+            "minimum_working_disk_GiB": minimum_working_disk_GiB,
+            "provisioned_data_disk_GiB": provisioned_data_disk_GiB,
+            "provisioned_data_disk_headroom_GiB":
+                provisioned_data_disk_GiB - minimum_working_disk_GiB,
             "warning": (
                 "without source_qualification, restart output memory, size, and write "
                 "latency remain estimates; even with write qualification, production-"
@@ -608,6 +794,32 @@ def build_production_campaign(
                 "storage backends, and retain the runtime stationarity gate"
             ),
         })
+    if lifecycle_qualification is not None:
+        lifecycle_result = lifecycle_qualification["result"]
+        campaign["source_storage_lifecycle_qualification"] = {
+            "classification": lifecycle_qualification["classification"],
+            "date": lifecycle_qualification.get("date"),
+            "source_commit": lifecycle_qualification["source"]["commit"],
+            "athena_sha256": lifecycle_qualification["build"]["athena_sha256"],
+            "evidence_summary_sha256": lifecycle_qualification[
+                "downloaded_evidence"
+            ]["stage2_summary_sha256"],
+            "source_checkpoint_sha256": lifecycle_result[
+                "source_checkpoint"
+            ]["sha256"],
+            "filesystem_uuid": lifecycle_result[
+                "restored_filesystem"
+            ]["filesystem_uuid"],
+        }
+        campaign["resource_envelope"].update({
+            "retained_data_disk_lifecycle_qualification_passed": True,
+            "qualified_data_disk_GiB": lifecycle_qualification[
+                "provider_contract"
+            ]["initial_create"]["added_data_disk_GiB"],
+            "qualified_cross_instance_checkpoint_bytes": lifecycle_result[
+                "source_checkpoint"
+            ]["size_bytes"],
+        })
     return campaign
 
 
@@ -617,6 +829,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--qualification", type=Path)
     parser.add_argument("--restart-qualification", type=Path)
+    parser.add_argument("--lifecycle-qualification", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-segment-wall-hours", type=float, default=3.0)
     parser.add_argument("--checkpoint-wall-hours", type=float, default=1.5)
@@ -627,6 +840,7 @@ def parse_arguments() -> argparse.Namespace:
         default=(0.5, 1.0, 2.0), metavar=("R1", "R2", "R3"),
     )
     parser.add_argument("--retained-restart-generations", type=int, default=2)
+    parser.add_argument("--provisioned-data-disk-GiB", type=int, default=100)
     return parser.parse_args()
 
 
@@ -648,17 +862,26 @@ def main() -> int:
                 strict=True
             ).read_text()
         )
+    lifecycle_qualification = None
+    if arguments.lifecycle_qualification is not None:
+        lifecycle_qualification = json.loads(
+            arguments.lifecycle_qualification.expanduser().resolve(
+                strict=True
+            ).read_text()
+        )
     campaign = build_production_campaign(
         pilot,
         calibration,
         qualification=qualification,
         restart_qualification=restart_qualification,
+        lifecycle_qualification=lifecycle_qualification,
         target_segment_wall_hours=arguments.target_segment_wall_hours,
         checkpoint_wall_hours=arguments.checkpoint_wall_hours,
         history_root_steps=arguments.history_root_steps,
         field_outputs_per_crossing=arguments.field_outputs_per_crossing,
         force_outer_capture_fractions=tuple(arguments.force_outer_capture_fractions),
         retained_restart_generations=arguments.retained_restart_generations,
+        provisioned_data_disk_GiB=arguments.provisioned_data_disk_GiB,
     )
     output = arguments.output.expanduser().resolve()
     if output.exists():

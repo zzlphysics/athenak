@@ -560,11 +560,13 @@ python3 inputs/emri/prepare_frozen_production_campaign.py \
   --qualification inputs/emri/validation/frozen_production_io_a100_20260830.json \
   --restart-qualification \
     inputs/emri/validation/frozen_production_restart_read_a100_20260830.json \
+  --lifecycle-qualification \
+    inputs/emri/validation/frozen_production_retained_data_disk_a100_20260830.json \
   --output profiles/r56-direct-production.json
 ```
 
-With both production qualifications, the default policy uses 89 measured root steps per
-segment (about 2.97 A100 hours), a 45-root-step restart cadence (about 1.50 hours), a
+With all three production qualifications, the default policy uses 89 measured root steps
+per segment (about 2.97 A100 hours), a 45-root-step restart cadence (about 1.50 hours), a
 nominal force-history interval of one measured root timestep, and four primitive/`divB`
 field dumps per capture crossing.  Later segments must inspect the newest completed
 restart, set `nlim=current_cycle+89`, and retain the global physical
@@ -580,7 +582,11 @@ flow and cannot establish closure of the BHL wake force.  With 2779 blocks a dou
 precision restart is estimated at 7.19 GiB because it contains ghosted MHD conserved
 variables, face fields, and the prescribed ADM arrays; at the configured 3500-block
 capacity it is 9.06 GiB.  Retain at least two audited generations and budget at least
-42 GiB of working disk for the default output policy.
+42 GiB of working disk for the default output policy.  The qualified cloud layout
+provisions a 100 GiB dedicated data disk, leaving 58 GiB above that estimated working
+set.  The source checkout, A100 build, campaign manifest, run directory, restarts,
+history, and field outputs must all live on this disk rather than the disposable root
+filesystem.
 
 The real-grid output qualification is recorded in
 `validation/frozen_production_io_a100_20260830.json`.  It reached the calibrated 2779-
@@ -601,6 +607,35 @@ root cycle, the restarted and independent continuous endpoints agreed bit for bi
 active and ghost MHD values, all active and ghost CT face fields, and all 17 active and
 ghost ADM fields.  Their 11 de-duplicated history times and 40 base/derived columns also
 agreed exactly, and both had `max|divB|=1.02e-13`.
+
+The provider-level retained-disk qualification is recorded in
+`validation/frozen_production_retained_data_disk_a100_20260830.json`.  A first A100 wrote
+and synchronously flushed the 7,721,877,183-byte cycle-10 checkpoint on a raw ext4
+100-GiB added disk.  Stopping with `due_mode=1` and `release_disk=0` produced provider
+`Status=8` with `IsLatestCopy=true`; creating a second A100 from the kept disk recovered
+the same filesystem UUID and the exact checkpoint SHA-256.  The second instance then
+advanced the real 2779-block grid to cycle 11, with complete leaf coverage, finite stored
+values, and finite 40-column history.  Thus the qualification crosses an actual provider
+stop and a new instance identity; it is not merely a restart within one VM.
+
+Both negative controls with `due_mode=-1` ended in `Status=0` and rejected creation from
+kept disk, including one control that had a populated 100-GiB added disk and requested
+`release_disk=0`.  Therefore `release_disk=0` alone is insufficient.  Every production
+segment must use `due_mode=1`, durably audit its newest restart and ready manifest, stop
+with `release_disk=0`, and require `Status=8` plus `IsLatestCopy=true`.  Restore with
+`create_kvm_instance_from_keepped_disk`, mount the existing filesystem by filesystem UUID
+without running `mkfs`, then compare the filesystem UUID, source commit, executable,
+campaign, checkpoint hash/size/cycle/topology, finite payload, and leaf coverage before
+AthenaK is allowed to resume.  A raw whole-disk filesystem has no `PARTUUID`, so an exact
+filesystem-UUID match is the authoritative storage identity here.
+
+After final products and required milestone checkpoints have been copied off the local
+provider disk and their hashes verified, stop with `release_disk=1` and require
+`Status=0`.  The provider's kept-disk price-query endpoint can still quote an ineligible
+instance, so it is not a validity test; the dedicated release endpoint rejected the
+final instance as no longer being in an operable retained state.  Provider-local retained
+storage supplies segment continuity, not redundant backup, and must not be the only copy
+of irreplaceable science products.
 
 The qualification also resolves a previously hidden runtime cost.  At identical 2779-
 block topology, a root cycle without a due force-history record took 108.965 seconds and

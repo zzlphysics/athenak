@@ -167,6 +167,59 @@ def _restart_qualification() -> dict[str, object]:
     }
 
 
+def _lifecycle_qualification() -> dict[str, object]:
+    return {
+        "classification": production.LIFECYCLE_QUALIFICATION_CLASSIFICATION,
+        "date": "2026-08-30",
+        "case_id": "r56_p000_t5000",
+        "source": {"commit": "3" * 40},
+        "build": {"athena_sha256": "f" * 64},
+        "provider_contract": {
+            "initial_create": {"due_mode": 1, "added_data_disk_GiB": 100},
+            "between_segments": {
+                "release_disk": 0,
+                "expected_stopped_status": 8,
+                "require_is_latest_copy": True,
+                "restore_due_mode": 1,
+            },
+            "final_cleanup": {
+                "release_disk": 1,
+                "expected_post_release_status": 0,
+            },
+        },
+        "result": {
+            "passed": True,
+            "restored_filesystem": {
+                "filesystem_uuid": "6f93020a-a9ab-46d2-a940-967eed38d503",
+                "filesystem_uuid_match": True,
+            },
+            "source_checkpoint": {
+                "meshblocks": 2779,
+                "size_bytes": 7721877183,
+                "sha256": "9" * 64,
+            },
+            "preflight": {
+                "athena_hash_match": True,
+                "checkpoint_all_stored_reals_finite": True,
+                "checkpoint_complete_leaf_coverage": True,
+                "checkpoint_cycle_match": True,
+                "checkpoint_hash_match": True,
+                "checkpoint_meshblocks_match": True,
+                "checkpoint_size_match": True,
+                "commit_match": True,
+                "filesystem_uuid_match": True,
+                "plan_hash_match": True,
+            },
+            "resume": {"advanced_one_root_cycle": True},
+            "final_checkpoint": {
+                "all_stored_reals_finite": True,
+                "complete_leaf_coverage": True,
+            },
+        },
+        "downloaded_evidence": {"stage2_summary_sha256": "8" * 64},
+    }
+
+
 def test_real_calibration_produces_conservative_segment_and_output_policy() -> None:
     campaign = production.build_production_campaign(_pilot(), _calibration())
 
@@ -206,6 +259,16 @@ def test_real_calibration_produces_conservative_segment_and_output_policy() -> N
     assert resources["estimated_restart_GiB_at_calibrated_topology"] \
         == pytest.approx(7.19148302078)
     assert resources["minimum_working_disk_GiB"] >= 40
+    assert resources["provisioned_data_disk_GiB"] == 100
+    assert resources["provisioned_data_disk_headroom_GiB"] >= 50
+
+    lifecycle = campaign["storage_lifecycle"]
+    assert lifecycle["status"] == "provider_qualification_required"
+    assert lifecycle["persistent_volume"].endswith("never the root disk")
+    assert lifecycle["initial_create"]["due_mode"] == 1
+    assert lifecycle["between_segments"]["release_disk"] == 0
+    assert lifecycle["between_segments"]["required_stopped_status"] == 8
+    assert lifecycle["final_cleanup"]["release_disk"] == 1
 
     overrides = campaign["fresh_overrides"]
     keys = [item.split("=", 1)[0] for item in overrides]
@@ -283,6 +346,32 @@ def test_restart_qualification_closes_read_budget_and_shortens_segment() -> None
     ] == "e" * 64
 
 
+def test_retained_data_disk_lifecycle_is_machine_checkable() -> None:
+    campaign = production.build_production_campaign(
+        _pilot(),
+        _calibration(),
+        qualification=_qualification(),
+        restart_qualification=_restart_qualification(),
+        lifecycle_qualification=_lifecycle_qualification(),
+    )
+
+    lifecycle = campaign["storage_lifecycle"]
+    assert lifecycle["status"] == "provider_qualified"
+    assert lifecycle["provisioned_data_disk_GiB"] == 100
+    assert lifecycle["mount_identity"].startswith("filesystem UUID")
+    assert lifecycle["between_segments"]["restore_due_mode"] == 1
+    assert lifecycle["between_segments"]["restore_add_disk_size_GiB"] == 0
+    assert "due_mode=-1 is forbidden" in lifecycle["fail_closed"][0]
+
+    resources = campaign["resource_envelope"]
+    assert resources["retained_data_disk_lifecycle_qualification_passed"] is True
+    assert resources["qualified_data_disk_GiB"] == 100
+    assert resources["qualified_cross_instance_checkpoint_bytes"] == 7721877183
+    source = campaign["source_storage_lifecycle_qualification"]
+    assert source["evidence_summary_sha256"] == "8" * 64
+    assert source["source_checkpoint_sha256"] == "9" * 64
+
+
 def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
     calibration = _calibration()
     calibration["source"]["source_state_sha256"] = "1" * 64
@@ -307,6 +396,39 @@ def test_identity_mismatch_and_unsafe_force_shell_fail_closed() -> None:
             _pilot(),
             _calibration(),
             restart_qualification=_restart_qualification(),
+        )
+
+    with pytest.raises(ValueError, match="requires restart qualification"):
+        production.build_production_campaign(
+            _pilot(),
+            _calibration(),
+            lifecycle_qualification=_lifecycle_qualification(),
+        )
+
+    bad_lifecycle = _lifecycle_qualification()
+    bad_lifecycle["provider_contract"]["initial_create"]["due_mode"] = -1
+    with pytest.raises(ValueError, match="retained initial data disk"):
+        production.build_production_campaign(
+            _pilot(),
+            _calibration(),
+            qualification=_qualification(),
+            restart_qualification=_restart_qualification(),
+            lifecycle_qualification=bad_lifecycle,
+        )
+
+    with pytest.raises(ValueError, match="smaller than the production working set"):
+        production.build_production_campaign(
+            _pilot(), _calibration(), provisioned_data_disk_GiB=41
+        )
+
+    with pytest.raises(ValueError, match="differs from the provider-qualified size"):
+        production.build_production_campaign(
+            _pilot(),
+            _calibration(),
+            qualification=_qualification(),
+            restart_qualification=_restart_qualification(),
+            lifecycle_qualification=_lifecycle_qualification(),
+            provisioned_data_disk_GiB=50,
         )
 
 
