@@ -98,6 +98,21 @@ def test_structural_assessment_requires_resolution_and_separation() -> None:
     unresolved = pilot.structural_assessment(arguments, case, 16, 0.5)
     assert not unresolved["passed"]
     assert not unresolved["conditions"]["secondary_horizon_resolution"]["passed"]
+    coframes = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
+    coframes[:, 1, 1] = 0.5
+    volume = pilot.adm_volume.ADMVolume(
+        np.asarray((0.0, 1.0)),
+        np.zeros(3),
+        np.ones(3),
+        np.zeros((2, len(pilot.adm_volume.FIELD_NAMES), 2, 2, 2)),
+        {},
+        coframes,
+    )
+    pilot.apply_numerical_coframe_assessment(
+        assessment, volume, arguments, 0.5
+    )
+    assert np.isclose(assessment["maximum_secondary_coordinate_stretch"], 2.0)
+    assert not assessment["conditions"]["worldtube_separation"]["passed"]
 
 
 def test_expected_adm_fields_reproduces_time_interpolation_and_decomposition() -> None:

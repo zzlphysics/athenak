@@ -80,6 +80,7 @@ def test_adm_volume_binary_round_trip_and_checksum() -> None:
         np.ones(3),
         fields,
         {"classification": replay.CLASSIFICATION},
+        np.broadcast_to(np.eye(4), (times.size, 4, 4)).copy(),
     )
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "adm.bin"
@@ -87,6 +88,10 @@ def test_adm_volume_binary_round_trip_and_checksum() -> None:
         loaded = replay.read_binary(path)
         np.testing.assert_array_equal(loaded.times, times)
         np.testing.assert_array_equal(loaded.fields, fields)
+        np.testing.assert_array_equal(
+            loaded.secondary_coframes, volume.secondary_coframes
+        )
+        assert loaded.metadata["binary_version"] == replay.BINARY_VERSION
         corrupted = bytearray(path.read_bytes())
         corrupted[-1] ^= 1
         bad = Path(directory) / "bad.bin"
@@ -97,3 +102,16 @@ def test_adm_volume_binary_round_trip_and_checksum() -> None:
             assert "checksum" in str(error)
         else:
             raise AssertionError("corrupt ADM volume binary was accepted")
+
+        legacy_path = Path(directory) / "legacy.bin"
+        legacy = replay.ADMVolume(
+            times,
+            volume.lower,
+            volume.spacing,
+            fields,
+            volume.metadata,
+        )
+        replay.write_binary(legacy_path, legacy)
+        loaded_legacy = replay.read_binary(legacy_path)
+        assert loaded_legacy.secondary_coframes is None
+        assert loaded_legacy.metadata["binary_version"] == replay.LEGACY_BINARY_VERSION

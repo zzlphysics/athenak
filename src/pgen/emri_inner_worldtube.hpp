@@ -21,6 +21,12 @@ class Mesh;
 class MeshBlockPack;
 class ParameterInput;
 
+struct EmriADMReplayGeometry {
+  Real coframe_left[4][4];
+  Real coframe_right[4][4];
+  Real time_fraction;
+};
+
 class EmriInnerWorldtubeReplay {
  public:
   EmriInnerWorldtubeReplay(ParameterInput *pin, Mesh *pm, bool is_restart);
@@ -31,6 +37,7 @@ class EmriInnerWorldtubeReplay {
   void CompleteStep(Mesh *pm, Driver *pdrive);
   void CapTimestep(Mesh *pm);
   void SetADMVariables(MeshBlockPack *pack);
+  bool GetADMReplayGeometry(EmriADMReplayGeometry &geometry) const;
   bool FluidBoundaryEnabled() const { return fluid_boundary_enabled_; }
   bool ADMVolumeEnabled() const { return adm_volume_enabled_; }
   // CUDA extended lambdas require their enclosing member to be publicly accessible.
@@ -91,6 +98,7 @@ class EmriInnerWorldtubeReplay {
   int adm_nz_ = 0;
   int adm_nvar_ = 0;
   int adm_interval_ = 0;
+  int adm_binary_version_ = 0;
   Real data_center_[3] = {0.0, 0.0, 0.0};
   Real half_width_ = 0.0;
   Real dx_ = 0.0;
@@ -104,6 +112,7 @@ class EmriInnerWorldtubeReplay {
   Real adm_lower_[3] = {0.0, 0.0, 0.0};
   Real adm_spacing_[3] = {0.0, 0.0, 0.0};
   std::vector<Real> times_;
+  std::vector<Real> adm_secondary_coframes_;
   std::array<std::uint64_t, 6> state_offsets_{};
   std::array<std::uint64_t, 6> flux_offsets_{};
   std::array<std::uint64_t, 6> emf_u_offsets_{};
@@ -131,5 +140,7 @@ void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stag
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeCapTimestep(Mesh *pm);
 void EmriInnerWorldtubeSetADMVariables(MeshBlockPack *pack);
+bool EmriInnerWorldtubeADMReplayGeometry(
+    Mesh *pm, EmriADMReplayGeometry &geometry);
 
 #endif  // PGEN_EMRI_INNER_WORLDTUBE_HPP_

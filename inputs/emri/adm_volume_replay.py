@@ -27,9 +27,11 @@ import worldtube_flux_emf as worldtube
 
 
 CLASSIFICATION = "athenak-emri-adm-volume-replay-v1"
-BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v1"
+LEGACY_BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v1"
+BINARY_CLASSIFICATION = "athenak-emri-adm-volume-binary-v2"
 BINARY_MAGIC = b"AEMRIADMVOL001\x00\x00"
-BINARY_VERSION = 1
+LEGACY_BINARY_VERSION = 1
+BINARY_VERSION = 2
 BINARY_HEADER = struct.Struct("<16sIIIIII6dQ")
 FIELD_NAMES = (
     "g00",
@@ -78,6 +80,7 @@ class ADMVolume:
     spacing: np.ndarray
     fields: np.ndarray
     metadata: dict[str, object]
+    secondary_coframes: np.ndarray | None = None
 
 
 def _finite_positive(value: object, name: str) -> float:
@@ -178,11 +181,10 @@ def decompose_four_metric(
     }
 
 
-def _source_coframe(background_metric: np.ndarray) -> np.ndarray:
-    _, coframe = static.build_source_tetrad(
+def _source_tetrad(background_metric: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return static.build_source_tetrad(
         background_metric, np.zeros(3), np.eye(3)
     )
-    return coframe
 
 
 def secondary_kerr_perturbation(
@@ -403,19 +405,25 @@ def build_volume(
     z, y, x = np.meshgrid(coordinates, coordinates, coordinates, indexing="ij")
     positions = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
     metric = np.empty((sample_times.size, nodes, nodes, nodes, 4, 4))
+    secondary_coframes = np.empty((sample_times.size, 4, 4))
     coframe_diagnostics = []
     for time_index, local_time in enumerate(sample_times):
         background_origin = sampler.sample(
             float(local_time), np.zeros((1, 3))
         )[0]
-        coframe = _source_coframe(background_origin)
-        spatial_deviation = float(
-            np.max(np.abs(coframe[1:, 1:] - np.eye(3)))
-        )
+        tetrad, coframe = _source_tetrad(background_origin)
+        secondary_coframes[time_index] = coframe
+        gram = tetrad @ background_origin @ tetrad.T
+        dual = coframe @ tetrad.T
         coframe_diagnostics.append(
             {
                 "time": float(local_time),
-                "maximum_spatial_identity_deviation": spatial_deviation,
+                "maximum_orthonormal_gram_error": float(
+                    np.max(np.abs(gram - np.diag((-1.0, 1.0, 1.0, 1.0))))
+                ),
+                "maximum_dual_identity_error": float(
+                    np.max(np.abs(dual - np.eye(4)))
+                ),
             }
         )
         flattened = metric[time_index].reshape(-1, 4, 4)
@@ -466,6 +474,7 @@ def build_volume(
         np.full(3, spacing),
         fields,
         metadata,
+        secondary_coframes,
     )
 
 
@@ -474,6 +483,9 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
     lower = np.asarray(volume.lower, dtype=np.float64)
     spacing = np.asarray(volume.spacing, dtype=np.float64)
     fields = np.asarray(volume.fields, dtype=np.float64)
+    coframes = None
+    if volume.secondary_coframes is not None:
+        coframes = np.asarray(volume.secondary_coframes, dtype=np.float64)
     if lower.shape != (3,) or spacing.shape != (3,):
         raise ValueError("ADM volume lower and spacing must contain three values")
     if not np.isfinite(lower).all() or not np.isfinite(spacing).all():
@@ -487,13 +499,25 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
         raise ValueError("ADM volume fields have incompatible dimensions")
     if min(fields.shape[2:]) < 2 or not np.isfinite(fields).all():
         raise ValueError("ADM volume fields are invalid")
+    if coframes is not None and (
+        coframes.shape != (times.size, 4, 4) or not np.isfinite(coframes).all()
+    ):
+        raise ValueError("secondary coframes must have finite shape (nt,4,4)")
+    version = BINARY_VERSION if coframes is not None else LEGACY_BINARY_VERSION
+    classification = (
+        BINARY_CLASSIFICATION
+        if version >= BINARY_VERSION
+        else LEGACY_BINARY_CLASSIFICATION
+    )
     nz, ny, nx = fields.shape[2:]
     payload = times.astype("<f8", copy=False).tobytes(order="C")
+    if coframes is not None:
+        payload += coframes.astype("<f8", copy=False).tobytes(order="C")
     payload += fields.astype("<f8", copy=False).tobytes(order="C")
     checksum = zlib.crc32(payload) & 0xFFFFFFFF
     header = BINARY_HEADER.pack(
         BINARY_MAGIC,
-        BINARY_VERSION,
+        version,
         times.size,
         len(FIELD_NAMES),
         nx,
@@ -508,9 +532,9 @@ def write_binary(path: Path, volume: ADMVolume) -> dict[str, object]:
     sidecar = dict(volume.metadata)
     sidecar.update(
         {
-            "classification": BINARY_CLASSIFICATION,
+            "classification": classification,
             "binary_file": path.name,
-            "binary_version": BINARY_VERSION,
+            "binary_version": version,
             "payload_crc32": f"{checksum:08x}",
             "field_names": list(FIELD_NAMES),
             "times": times.tolist(),
@@ -535,7 +559,10 @@ def read_binary(path: Path) -> ADMVolume:
     lower = np.asarray(remaining[:3])
     spacing = np.asarray(remaining[3:6])
     expected_checksum = remaining[6]
-    if magic != BINARY_MAGIC or version != BINARY_VERSION:
+    if magic != BINARY_MAGIC or version not in (
+        LEGACY_BINARY_VERSION,
+        BINARY_VERSION,
+    ):
         raise ValueError("ADM volume binary magic or version is unsupported")
     if nt < 2 or nvar != len(FIELD_NAMES) or min(nx, ny, nz) < 2:
         raise ValueError("ADM volume binary dimensions are invalid")
@@ -543,14 +570,24 @@ def read_binary(path: Path) -> ADMVolume:
     checksum = zlib.crc32(binary_payload) & 0xFFFFFFFF
     if checksum != expected_checksum:
         raise ValueError("ADM volume binary checksum mismatch")
-    expected_values = nt + nt * nvar * nx * ny * nz
+    coframe_values = nt * 16 if version >= BINARY_VERSION else 0
+    expected_values = nt + coframe_values + nt * nvar * nx * ny * nz
     values = np.frombuffer(binary_payload, dtype="<f8")
     if values.size != expected_values or not np.isfinite(values).all():
         raise ValueError("ADM volume binary payload dimensions are invalid")
     times = worldtube.validate_times(values[:nt])
-    fields = np.asarray(values[nt:].reshape(nt, nvar, nz, ny, nx))
+    cursor = nt
+    coframes = None
+    if version >= BINARY_VERSION:
+        coframes = np.asarray(values[cursor : cursor + coframe_values].reshape(nt, 4, 4))
+        cursor += coframe_values
+    fields = np.asarray(values[cursor:].reshape(nt, nvar, nz, ny, nx))
     metadata: dict[str, object] = {
-        "classification": BINARY_CLASSIFICATION,
+        "classification": (
+            BINARY_CLASSIFICATION
+            if version >= BINARY_VERSION
+            else LEGACY_BINARY_CLASSIFICATION
+        ),
         "binary_version": version,
         "payload_crc32": f"{checksum:08x}",
         "field_names": list(FIELD_NAMES),
@@ -559,13 +596,13 @@ def read_binary(path: Path) -> ADMVolume:
     if sidecar_path.exists():
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
         if (
-            sidecar.get("classification") != BINARY_CLASSIFICATION
+            sidecar.get("classification") != metadata["classification"]
             or sidecar.get("payload_crc32") != f"{checksum:08x}"
             or sidecar.get("field_names") != list(FIELD_NAMES)
         ):
             raise ValueError("ADM volume sidecar does not match its binary")
         metadata.update(sidecar)
-    return ADMVolume(times, lower, spacing, fields, metadata)
+    return ADMVolume(times, lower, spacing, fields, metadata, coframes)
 
 
 def parse_arguments() -> argparse.Namespace:

@@ -4,8 +4,8 @@
 The default structural mode retains the isolated analytic secondary metric.  With
 ``--numerical-adm-volume``, the pilot instead pulls back the numerical primary ADM
 background and adds the analytic secondary Kerr perturbation in its tangent frame.
-Force history remains disabled in that mode until its off-grid metric sampler uses
-the same replayed metric.
+Its coordinate-frame force and accretion history uses that same replayed metric and
+the time-interpolated secondary embedding geometry.
 """
 
 from __future__ import annotations
@@ -202,6 +202,51 @@ def structural_assessment(
             "the volume does not yet replay the transformed numerical ADM metric"
         ),
     }
+
+
+def apply_numerical_coframe_assessment(
+    assessment: dict[str, object],
+    volume: adm_volume.ADMVolume,
+    arguments: argparse.Namespace,
+    half_width: float,
+) -> None:
+    coframes = volume.secondary_coframes
+    if coframes is None:
+        raise ValueError("numerical force assessment requires secondary coframes")
+    spatial = np.asarray(coframes[:, 1:, 1:], dtype=np.float64)
+    try:
+        coordinate_stretches = np.asarray(
+            [np.linalg.norm(np.linalg.inv(matrix), ord=2) for matrix in spatial]
+        )
+    except np.linalg.LinAlgError as error:
+        raise ValueError("secondary coframe has a singular spatial block") from error
+    maximum_stretch = float(np.max(coordinate_stretches))
+    spin = arguments.secondary_chi * arguments.secondary_mass
+    regularization_radius = arguments.secondary_mass + math.sqrt(
+        max(arguments.secondary_mass**2 - spin**2, 0.0)
+    )
+    rest_enclosing = math.sqrt(spin**2 + regularization_radius**2)
+    coordinate_enclosing = maximum_stretch * rest_enclosing
+    spacing = float(assessment["cell_spacing"])
+    conditions = assessment["conditions"]
+    conditions["secondary_horizon_resolution"] = _condition(
+        "minimum",
+        coordinate_enclosing / spacing,
+        arguments.minimum_horizon_cells,
+    )
+    conditions["worldtube_separation"] = _condition(
+        "minimum",
+        half_width / coordinate_enclosing,
+        arguments.minimum_boundary_horizon_radii,
+    )
+    assessment.update(
+        {
+            "passed": all(entry["passed"] for entry in conditions.values()),
+            "maximum_secondary_coordinate_stretch": maximum_stretch,
+            "secondary_coordinate_enclosing_radius": coordinate_enclosing,
+            "coframe_adjusted_geometry_gates": True,
+        }
+    )
 
 
 def _mesh_arguments(cells: int, half_width: float) -> list[str]:
@@ -482,8 +527,8 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 ),
                 "science_ready": False,
                 "science_blocker": (
-                    "the off-grid force/accretion diagnostic is not yet connected "
-                    "to the replayed numerical metric"
+                    "production convergence of K_ij and force histories across metric "
+                    "cadence and volume resolution has not yet been demonstrated"
                 ),
             }
         )
@@ -545,6 +590,9 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 arguments.secondary_chi,
             )
             metric_validation = adm_volume.write_binary(metric_path, metric_volume)
+            apply_numerical_coframe_assessment(
+                assessment, metric_volume, arguments, half_width
+            )
         except (KeyError, OSError, RuntimeError, ValueError) as error:
             report.update(
                 {
@@ -565,9 +613,19 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
                 "mesh_nghost": arguments.mesh_nghost,
             }
         )
-    horizon = float(assessment["secondary_horizon_radius"])
+        if not assessment["passed"] and not arguments.allow_unsafe_structural_smoke:
+            report["refusal_reason"] = (
+                "coframe-adjusted numerical metric geometry gates failed"
+            )
+            return report
+    secondary_extent = float(
+        assessment.get(
+            "secondary_coordinate_enclosing_radius",
+            assessment["secondary_horizon_radius"],
+        )
+    )
     force_radii = (
-        max(1.5 * horizon, 0.25 * half_width),
+        max(1.5 * secondary_extent, 0.25 * half_width),
         0.55 * half_width,
         0.70 * half_width,
         0.875 * half_width,
@@ -602,7 +660,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         f"problem/secondary_chi={arguments.secondary_chi:.17g}",
         "problem/orbital_radius=10",
         "problem/require_stable_orbit=false",
-        f"problem/user_hist={'false' if metric_volume is not None else 'true'}",
+        "problem/user_hist=true",
         "problem/force_frame=coordinate",
         f"problem/force_surface_radius={force_radii[0]:.17g}",
         f"problem/force_outer_radius_1={force_radii[1]:.17g}",
@@ -618,7 +676,7 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "output2/variable=mhd_divb",
         f"output2/dt={tlim:.17g}",
         "output3/dt=0",
-        f"output4/dt={history_dt:.17g}" if metric_volume is None else "output4/dt=0",
+        f"output4/dt={history_dt:.17g}",
         "output4/user_hist_only=true",
         "output5/variable=adm",
         f"output5/dt={tlim:.17g}" if metric_volume is not None else "output5/dt=0",
@@ -673,22 +731,16 @@ def run_pilot(arguments: argparse.Namespace) -> dict[str, object]:
         "passed": finite_state and positive_state,
     }
     histories = sorted(output.rglob("*.hst"))
+    history_summary = _history_summary(histories)
+    runtime_conditions["force_accretion_history"] = {
+        "relation": "required",
+        "observed": history_summary["valid"],
+        "threshold": True,
+        "passed": history_summary["valid"],
+    }
     if metric_volume is None:
-        history_summary = _history_summary(histories)
-        runtime_conditions["force_accretion_history"] = {
-            "relation": "required",
-            "observed": history_summary["valid"],
-            "threshold": True,
-            "passed": history_summary["valid"],
-        }
         adm_comparison = None
     else:
-        history_summary = {
-            "valid": False,
-            "disabled_reason": (
-                "force/accretion diagnostic still samples the analytic off-grid metric"
-            ),
-        }
         adm_outputs = sorted((output / "bin").glob("inner.adm.*.bin"))
         adm_comparison = _adm_replay_comparison(
             adm_outputs,

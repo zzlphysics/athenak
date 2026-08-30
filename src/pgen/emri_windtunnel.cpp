@@ -31,6 +31,7 @@
 #include "mhd/mhd.hpp"
 #include "outputs/outputs.hpp"
 #include "parameter_input.hpp"
+#include "pgen/emri_inner_worldtube.hpp"
 
 namespace {
 
@@ -474,19 +475,20 @@ void DifferentiateMetric(const Real x, const Real y, const Real z,
 KOKKOS_INLINE_FUNCTION
 void DifferentiateSecondaryDisplacement(
     const Real x, const Real y, const Real z,
-    const WindTunnelParameters &parameters, Real derivative[3][4][4]) {
+    const emri_comoving::MetricParameters &metric_parameters,
+    const Real fd_step, Real derivative[3][4][4]) {
   const Real coordinate[3] = {x, y, z};
   for (int direction=0; direction<3; ++direction) {
     Real lower[3] = {coordinate[0], coordinate[1], coordinate[2]};
     Real upper[3] = {coordinate[0], coordinate[1], coordinate[2]};
-    lower[direction] -= parameters.metric_fd_step;
-    upper[direction] += parameters.metric_fd_step;
+    lower[direction] -= fd_step;
+    upper[direction] += fd_step;
     Real metric_lower[4][4];
     Real metric_upper[4][4];
     emri_comoving::ComputeSecondaryMetricPerturbationAtDisplacement(
-        lower[0], lower[1], lower[2], x, y, parameters.metric, metric_lower);
+        lower[0], lower[1], lower[2], x, y, metric_parameters, metric_lower);
     emri_comoving::ComputeSecondaryMetricPerturbationAtDisplacement(
-        upper[0], upper[1], upper[2], x, y, parameters.metric, metric_upper);
+        upper[0], upper[1], upper[2], x, y, metric_parameters, metric_upper);
     const Real inverse_width = 1.0/(upper[direction]-lower[direction]);
     for (int a=0; a<4; ++a) {
       for (int b=0; b<4; ++b) {
@@ -497,17 +499,33 @@ void DifferentiateSecondaryDisplacement(
   }
 }
 
-//! Reconstruct T^{mu nu} from dynamical-GRMHD primitives.  The velocity primitive is
-//! W v^i measured by the Eulerian observer, while the CT magnetic field is densitized
-//! by sqrt(gamma).
+//! Reconstruct the covariant four-metric from its ADM decomposition.
 KOKKOS_INLINE_FUNCTION
-void ComputeStressEnergy(
-    const Real x, const Real y, const Real z,
+void ADMToFourMetric(const Real gamma[3][3], const Real alpha,
+                     const Real beta[3], Real metric[4][4]) {
+  Real beta_lower[3] = {0.0, 0.0, 0.0};
+  for (int i=0; i<3; ++i) {
+    for (int j=0; j<3; ++j) {
+      metric[i+1][j+1] = gamma[i][j];
+      beta_lower[i] += gamma[i][j]*beta[j];
+    }
+    metric[0][i+1] = beta_lower[i];
+    metric[i+1][0] = beta_lower[i];
+  }
+  metric[0][0] = -SQR(alpha);
+  for (int i=0; i<3; ++i) metric[0][0] += beta_lower[i]*beta[i];
+}
+
+//! Reconstruct T^{mu nu} from dynamical-GRMHD primitives and a supplied metric.  The
+//! velocity primitive is W v^i measured by the Eulerian observer, while the CT magnetic
+//! field is densitized by sqrt(gamma).
+KOKKOS_INLINE_FUNCTION
+void ComputeStressEnergyFromMetric(
+    const Real metric[4][4],
     const WindTunnelParameters &parameters, const Real density, const Real pressure,
-    const Real velocity[3], const Real densitized_field[3], Real metric[4][4],
+    const Real velocity[3], const Real densitized_field[3],
     Real four_velocity[4], Real stress[4][4], Real &sqrt_gamma,
     Real &sqrt_minus_g) {
-  EvaluateMetric(x, y, z, parameters, metric);
   const Real determinant = adm::SpatialDet(
       metric[1][1], metric[1][2], metric[1][3], metric[2][2], metric[2][3],
       metric[3][3]);
@@ -596,6 +614,19 @@ void ComputeStressEnergy(
           - magnetic_four[a]*magnetic_four[b];
     }
   }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ComputeStressEnergy(
+    const Real x, const Real y, const Real z,
+    const WindTunnelParameters &parameters, const Real density, const Real pressure,
+    const Real velocity[3], const Real densitized_field[3], Real metric[4][4],
+    Real four_velocity[4], Real stress[4][4], Real &sqrt_gamma,
+    Real &sqrt_minus_g) {
+  EvaluateMetric(x, y, z, parameters, metric);
+  ComputeStressEnergyFromMetric(
+      metric, parameters, density, pressure, velocity, densitized_field,
+      four_velocity, stress, sqrt_gamma, sqrt_minus_g);
 }
 
 // dt(gamma_ij) = -2 alpha K_ij + D_i beta_j + D_j beta_i.
@@ -709,6 +740,35 @@ Real MatrixSpectralNorm(const Real matrix[3][3]) {
     }
   }
   return std::sqrt(eigenvalue);
+}
+
+void CoframeSpatialStretches(const Real coframe[4][4],
+                             Real &coordinate_stretch, Real &rest_stretch) {
+  const Real a = coframe[1][1];
+  const Real b = coframe[1][2];
+  const Real c = coframe[1][3];
+  const Real d = coframe[2][1];
+  const Real e = coframe[2][2];
+  const Real f = coframe[2][3];
+  const Real g = coframe[3][1];
+  const Real h = coframe[3][2];
+  const Real i = coframe[3][3];
+  const Real determinant = a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+  if (!(std::abs(determinant) > std::numeric_limits<Real>::epsilon()) ||
+      !std::isfinite(determinant)) {
+    Fatal("secondary replay coframe has a singular spatial block");
+  }
+  const Real inverse[3][3] = {
+    {(e*i-f*h)/determinant, (c*h-b*i)/determinant,
+     (b*f-c*e)/determinant},
+    {(f*g-d*i)/determinant, (a*i-c*g)/determinant,
+     (c*d-a*f)/determinant},
+    {(d*h-e*g)/determinant, (b*g-a*h)/determinant,
+     (a*e-b*d)/determinant}
+  };
+  const Real spatial[3][3] = {{a, b, c}, {d, e, f}, {g, h, i}};
+  coordinate_stretch = MatrixSpectralNorm(inverse);
+  rest_stretch = MatrixSpectralNorm(spatial);
 }
 
 void ConfigureSourceFrame() {
@@ -1392,7 +1452,8 @@ void ValidateMetricKernel() {
 #endif
   Real displacement_derivative[3][4][4];
   DifferentiateSecondaryDisplacement(
-      100.0, 0.0, 0.0, weak_field, displacement_derivative);
+      100.0, 0.0, 0.0, weak_field.metric, weak_field.metric_fd_step,
+      displacement_derivative);
   const Real newtonian_kernel = 1.0e-4;
   const Real relativistic_kernel = -0.5*displacement_derivative[0][0][0];
   if (std::abs(relativistic_kernel/newtonian_kernel-1.0)
@@ -1471,6 +1532,18 @@ void ValidateMetricKernel() {
   DecomposeMetric(differentiated, decomposed);
   if (!std::isfinite(decomposed.alpha) || !std::isfinite(decomposed.psi4)) {
     Fatal("local EMRI ADM decomposition is not finite");
+  }
+  Real reconstructed_metric[4][4];
+  ADMToFourMetric(
+      decomposed.gamma, decomposed.alpha, decomposed.beta,
+      reconstructed_metric);
+  for (int a=0; a<4; ++a) {
+    for (int b=0; b<4; ++b) {
+      if (std::abs(reconstructed_metric[a][b]-differentiated.g[a][b])
+          > 10.0*tolerance) {
+        Fatal("local EMRI ADM-to-four-metric reconstruction failed");
+      }
+    }
   }
 
   // In the primary-only spacetime, the local origin must be a geodesic when Omega is
@@ -2546,6 +2619,32 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp) {
   const int active_offset = pmbp->active_offset;
   const int nmb_active = pmbp->nmb_active;
   const WindTunnelParameters parameters = wind_tunnel;
+  EmriADMReplayGeometry replay_geometry{};
+  const bool numerical_adm = EmriInnerWorldtubeADMReplayGeometry(
+      pmbp->pmesh, replay_geometry);
+  emri_comoving::MetricParameters metric_left = parameters.metric;
+  emri_comoving::MetricParameters metric_right = parameters.metric;
+  Real rest_stretch_left = parameters.secondary_rest_stretch;
+  Real rest_stretch_right = parameters.secondary_rest_stretch;
+  if (numerical_adm) {
+    for (int a=0; a<4; ++a) {
+      for (int b=0; b<4; ++b) {
+        metric_left.secondary_tetrad_covector[a][b] =
+            replay_geometry.coframe_left[a][b];
+        metric_right.secondary_tetrad_covector[a][b] =
+            replay_geometry.coframe_right[a][b];
+      }
+    }
+    metric_left.embed_secondary_in_tetrad = true;
+    metric_right.embed_secondary_in_tetrad = true;
+    Real unused_coordinate_stretch;
+    CoframeSpatialStretches(
+        replay_geometry.coframe_left, unused_coordinate_stretch,
+        rest_stretch_left);
+    CoframeSpatialStretches(
+        replay_geometry.coframe_right, unused_coordinate_stretch,
+        rest_stretch_right);
+  }
 
   par_for_active("emri_geometric_excision", DevExeSpace(), active_lids, active_offset,
   nmb_active, 0, n3-1, 0, n2-1, 0, n1-1,
@@ -2556,26 +2655,42 @@ void AugmentEMRIExcisionMasks(MeshBlockPack *pmbp) {
                                size.d_view(m).x2max);
     const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                size.d_view(m).x3max);
-    const Real radius2 = emri_comoving::SecondaryKerrRadiusSquared(
-        x, y, z, parameters.metric);
+    const Real radius2_left = emri_comoving::SecondaryKerrRadiusSquared(
+        x, y, z, metric_left);
+    const Real radius2_right = numerical_adm
+        ? emri_comoving::SecondaryKerrRadiusSquared(x, y, z, metric_right)
+        : radius2_left;
     const Real regularization_radius =
-        emri_comoving::SecondaryRegularizationRadius(parameters.metric);
+        emri_comoving::SecondaryRegularizationRadius(metric_left);
     const Real dx2 = (indcs.nx2 > 1) ? SQR(size.d_view(m).dx2) : 0.0;
     const Real dx3 = (indcs.nx3 > 1) ? SQR(size.d_view(m).dx3) : 0.0;
     const Real padding = 0.5*sqrt(SQR(size.d_view(m).dx1)+dx2+dx3)
                        + parameters.metric_fd_step;
     const Real spin2 = SQR(parameters.metric.secondary_spin);
     const Real enclosing_radius = sqrt(spin2+SQR(regularization_radius));
-    Real rest_position[3];
+    Real rest_position_left[3];
     emri_comoving::SecondaryRestFramePosition(
-        x, y, z, parameters.metric, rest_position);
-    const Real rest_distance = sqrt(SQR(rest_position[0])+SQR(rest_position[1])
-                                  +SQR(rest_position[2]));
+        x, y, z, metric_left, rest_position_left);
+    const Real rest_distance_left = sqrt(
+        SQR(rest_position_left[0])+SQR(rest_position_left[1])
+        +SQR(rest_position_left[2]));
+    Real rest_distance_right = rest_distance_left;
+    if (numerical_adm) {
+      Real rest_position_right[3];
+      emri_comoving::SecondaryRestFramePosition(
+          x, y, z, metric_right, rest_position_right);
+      rest_distance_right = sqrt(
+          SQR(rest_position_right[0])+SQR(rest_position_right[1])
+          +SQR(rest_position_right[2]));
+    }
     floor(m, k, j, i) = floor(m, k, j, i)
-                     || radius2 <= SQR(regularization_radius);
+                     || radius2_left <= SQR(regularization_radius)
+                     || radius2_right <= SQR(regularization_radius);
     flux(m, k, j, i) = flux(m, k, j, i)
-                    || rest_distance <= enclosing_radius
-                                      +parameters.secondary_rest_stretch*padding;
+                    || rest_distance_left <= enclosing_radius
+                                             +rest_stretch_left*padding
+                    || rest_distance_right <= enclosing_radius
+                                              +rest_stretch_right*padding;
   });
 }
 
@@ -2603,6 +2718,13 @@ void RefineSecondary(MeshBlockPack *pmbp) {
 }
 
 void EMRIHistory(HistoryData *pdata, Mesh *pm) {
+  MeshBlockPack *pmbp = pm->pmb_pack;
+  EmriADMReplayGeometry replay_geometry{};
+  const bool numerical_adm_force =
+      EmriInnerWorldtubeADMReplayGeometry(pm, replay_geometry);
+  if (numerical_adm_force && wind_tunnel.force_is_source_tetrad) {
+    Fatal("numerical ADM force history currently requires coordinate force frame");
+  }
   pdata->nhist = 20;
   const char *coordinate_labels[20] = {
     "mass_ratio", "orbit_r_M", "omega_M", "mdot",
@@ -2625,7 +2747,6 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
         ? source_labels[n] : coordinate_labels[n];
     pdata->hdata[n] = 0.0;
   }
-
   const auto &metric_parameters = wind_tunnel.metric;
   if (global_variable::my_rank == 0) {
     pdata->hdata[0] = metric_parameters.secondary_mass
@@ -2636,20 +2757,59 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     pdata->hdata[19] = primary_geodesic_residual;
   }
 
-  MeshBlockPack *pmbp = pm->pmb_pack;
   if (pm->pgen->spherical_grids.size() != 1) {
     Fatal("EMRI force history requires exactly one momentum-flux sphere");
   }
   auto &grid = *pm->pgen->spherical_grids[0];
   DualArray2D<Real> interpolated_field;
+  DualArray2D<Real> interpolated_adm;
   grid.InterpolateToSphere(3, pmbp->pmhd->bcc0);
   Kokkos::realloc(interpolated_field, grid.nangles, 3);
   Kokkos::deep_copy(interpolated_field, grid.interp_vals);
   interpolated_field.template modify<DevExeSpace>();
   interpolated_field.template sync<HostMemSpace>();
+  if (numerical_adm_force) {
+    grid.InterpolateToSphere(adm::ADM::nadm, pmbp->padm->u_adm);
+    Kokkos::realloc(interpolated_adm, grid.nangles, adm::ADM::nadm);
+    Kokkos::deep_copy(interpolated_adm, grid.interp_vals);
+    interpolated_adm.template modify<DevExeSpace>();
+    interpolated_adm.template sync<HostMemSpace>();
+  }
   grid.InterpolateToSphere(0, IPR, pmbp->pmhd->w0);
 
   const WindTunnelParameters parameters = wind_tunnel;
+  emri_comoving::MetricParameters secondary_metric_left = parameters.metric;
+  emri_comoving::MetricParameters secondary_metric_right = parameters.metric;
+  if (numerical_adm_force) {
+    for (int a=0; a<4; ++a) {
+      for (int b=0; b<4; ++b) {
+        secondary_metric_left.secondary_tetrad_covector[a][b] =
+            replay_geometry.coframe_left[a][b];
+        secondary_metric_right.secondary_tetrad_covector[a][b] =
+            replay_geometry.coframe_right[a][b];
+      }
+    }
+    secondary_metric_left.embed_secondary_in_tetrad = true;
+    secondary_metric_right.embed_secondary_in_tetrad = true;
+    Real coordinate_stretch_left;
+    Real coordinate_stretch_right;
+    Real unused_rest_stretch;
+    CoframeSpatialStretches(
+        replay_geometry.coframe_left, coordinate_stretch_left,
+        unused_rest_stretch);
+    CoframeSpatialStretches(
+        replay_geometry.coframe_right, coordinate_stretch_right,
+        unused_rest_stretch);
+    const Real regularization_radius =
+        emri_comoving::SecondaryRegularizationRadius(secondary_metric_left);
+    const Real rest_enclosing_radius = sqrt(
+        SQR(secondary_metric_left.secondary_spin)+SQR(regularization_radius));
+    const Real coordinate_enclosing_radius = rest_enclosing_radius*std::max(
+        coordinate_stretch_left, coordinate_stretch_right);
+    if (!(parameters.force_surface_radius > coordinate_enclosing_radius)) {
+      Fatal("numerical ADM force surface does not enclose the replayed secondary");
+    }
+  }
   const Real surface_radius2 = SQR(parameters.force_surface_radius);
   for (int n=0; n<grid.nangles; ++n) {
     const Real x = grid.interp_coord.h_view(n, 0);
@@ -2692,14 +2852,40 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     };
     const Real density = grid.interp_vals.h_view(n, IDN);
     const Real pressure = grid.interp_vals.h_view(n, IPR);
+    if (density == 0.0 && pressure == 0.0) continue;
     Real metric[4][4];
     Real four_velocity[4];
     Real stress[4][4];
     Real sqrt_gamma;
     Real sqrt_minus_g;
-    ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
-                        densitized_field, metric, four_velocity, stress,
-                        sqrt_gamma, sqrt_minus_g);
+    if (numerical_adm_force) {
+      Real gamma[3][3];
+      const int gamma_index[3][3] = {
+        {adm::ADM::I_ADM_GXX, adm::ADM::I_ADM_GXY, adm::ADM::I_ADM_GXZ},
+        {adm::ADM::I_ADM_GXY, adm::ADM::I_ADM_GYY, adm::ADM::I_ADM_GYZ},
+        {adm::ADM::I_ADM_GXZ, adm::ADM::I_ADM_GYZ, adm::ADM::I_ADM_GZZ}
+      };
+      for (int i=0; i<3; ++i) {
+        for (int j=0; j<3; ++j) {
+          gamma[i][j] = interpolated_adm.h_view(n, gamma_index[i][j]);
+        }
+      }
+      const Real beta[3] = {
+        interpolated_adm.h_view(n, adm::ADM::I_ADM_BETAX),
+        interpolated_adm.h_view(n, adm::ADM::I_ADM_BETAY),
+        interpolated_adm.h_view(n, adm::ADM::I_ADM_BETAZ)
+      };
+      ADMToFourMetric(
+          gamma, interpolated_adm.h_view(n, adm::ADM::I_ADM_ALPHA),
+          beta, metric);
+      ComputeStressEnergyFromMetric(
+          metric, parameters, density, pressure, velocity, densitized_field,
+          four_velocity, stress, sqrt_gamma, sqrt_minus_g);
+    } else {
+      ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
+                          densitized_field, metric, four_velocity, stress,
+                          sqrt_gamma, sqrt_minus_g);
+    }
     const Real area_weight = surface_radius2
         *grid.solid_angles.h_view(n)*sqrt_minus_g;
     Real radial_velocity = 0.0;
@@ -2740,6 +2926,7 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
 
   auto &w0 = pmbp->pmhd->w0;
   auto &bcc = pmbp->pmhd->bcc0;
+  auto adm_variables = pmbp->padm->adm;
   auto &excision_floor = pmbp->pcoord->excision_floor;
   auto &size = pmbp->pmb->mb_size;
   auto &indcs = pm->mb_indcs;
@@ -2806,12 +2993,51 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
       Real stress[4][4];
       Real sqrt_gamma;
       Real sqrt_minus_g;
-      ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
-                          densitized_field, local_metric, four_velocity, stress,
-                          sqrt_gamma, sqrt_minus_g);
+      if (numerical_adm_force) {
+        Real gamma[3][3];
+        Real beta[3];
+        for (int a=0; a<3; ++a) {
+          beta[a] = adm_variables.beta_u(m, a, k, j, i);
+          for (int b=0; b<3; ++b) {
+            gamma[a][b] = adm_variables.g_dd(m, a, b, k, j, i);
+          }
+        }
+        ADMToFourMetric(
+            gamma, adm_variables.alpha(m, k, j, i), beta, local_metric);
+        ComputeStressEnergyFromMetric(
+            local_metric, parameters, density, pressure, velocity,
+            densitized_field, four_velocity, stress, sqrt_gamma, sqrt_minus_g);
+      } else {
+        ComputeStressEnergy(x, y, z, parameters, density, pressure, velocity,
+                            densitized_field, local_metric, four_velocity, stress,
+                            sqrt_gamma, sqrt_minus_g);
+      }
       Real metric_derivative[3][4][4];
-      DifferentiateSecondaryDisplacement(
-          x, y, z, parameters, metric_derivative);
+      if (numerical_adm_force) {
+        Real derivative_left[3][4][4];
+        Real derivative_right[3][4][4];
+        DifferentiateSecondaryDisplacement(
+            x, y, z, secondary_metric_left, parameters.metric_fd_step,
+            derivative_left);
+        DifferentiateSecondaryDisplacement(
+            x, y, z, secondary_metric_right, parameters.metric_fd_step,
+            derivative_right);
+        for (int direction=0; direction<3; ++direction) {
+          for (int a=0; a<4; ++a) {
+            for (int b=0; b<4; ++b) {
+              metric_derivative[direction][a][b] =
+                  (1.0-replay_geometry.time_fraction)
+                      *derivative_left[direction][a][b]
+                  +replay_geometry.time_fraction
+                      *derivative_right[direction][a][b];
+            }
+          }
+        }
+      } else {
+        DifferentiateSecondaryDisplacement(
+            x, y, z, parameters.metric, parameters.metric_fd_step,
+            metric_derivative);
+      }
       const Real coordinate_volume = size.d_view(m).dx1*size.d_view(m).dx2
                                    *size.d_view(m).dx3;
       const Real radius = sqrt(radius2);

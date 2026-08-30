@@ -200,6 +200,8 @@ fluid_state_frame = unverified
 <emri_adm_replay>
 # Optional numerical-background plus analytic-secondary volume metric.  The inner
 # worldtube constructor replaces the analytic prescribed-ADM callback when enabled.
+# Coordinate-frame force history additionally requires a version-two volume containing
+# the time-dependent secondary embedding coframes.
 enabled = false
 file = emri_adm_volume.bin
 

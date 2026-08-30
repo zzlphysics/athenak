@@ -864,9 +864,11 @@ regularized analytic secondary Kerr-Schild perturbation in that coframe.  Adding
 secondary is essential: the global single-BH run contains the primary background only,
 whereas replacing the analytic metric by that background alone would remove the accretor
 from the inner problem.  The resulting binary stores ten symmetric four-metric
-components and six `K_ij` components.  AthenaK keeps only two time slabs on the device,
-performs trilinear spatial and linear temporal interpolation at every RK stage, then
-decomposes the interpolated four-metric into lapse, shift, and spatial metric.
+components, six `K_ij` components, and one 4-by-4 secondary embedding coframe per time
+sample.  The coframes are negligible compared with the volume data.  AthenaK keeps only
+two field time slabs on the device, performs trilinear spatial and linear temporal
+interpolation at every RK stage, then decomposes the interpolated four-metric into lapse,
+shift, and spatial metric.
 
 The metric grid covers all active and ghost cell centers.  `--metric-halo` must be at
 least `--mesh-nghost`; the production default is four.  A temporally tilted affine frame
@@ -885,22 +887,43 @@ reconstructed ADM fields against the offline target; the default relative `L_inf
 is `1e-5`, appropriate to single-precision binary output but still subject to a
 production tolerance study.
 
-Force and accretion history is intentionally disabled in numerical-volume mode.  The
-current off-grid shell diagnostic evaluates the analytic problem metric and would mix a
-numerical evolution with an inconsistent force geometry.  Consequently this mode also
-sets `science_ready=false` until the force sampler is connected to the same four-metric
-volume.  This does not prevent validation of metric replay, `divB`, fluid positivity, or
-the characteristic boundary.
+Numerical-volume mode supports the coordinate-frame force and accretion history.  The
+momentum-flux sphere interpolates AthenaK's current ADM arrays and reconstructs the same
+four-metric used by the evolution.  The volume force uses those arrays directly at cell
+centers.  Its generalized-force kernel differentiates only the analytic secondary term
+with respect to the secondary position: it evaluates that derivative using the stored
+left and right embedding coframes, then applies the same temporal interpolation as the
+metric.  The numerical primary background is held fixed in this derivative, as required
+for the force on the secondary.  This avoids storing 30 additional derivative fields at
+every volume node.
+
+`force_frame=source_tetrad` remains fail-closed in numerical-volume mode because its
+projection basis would itself be time dependent; the pilot requests `coordinate`.
+Version-one ADM binaries without embedding coframes also remain readable for metric-only
+replay but are rejected when force history is requested.  The summary still sets
+`science_ready=false` until `K_ij`, metric-volume resolution, and force histories pass a
+production cadence/resolution convergence campaign.
+
+The geometric floor/flux excision masks conservatively take the union of the secondary
+regions defined by the two coframes bracketing the current replay time.  Their
+cell-diagonal padding and the pilot's horizon-resolution/worldtube-separation gates are
+also enlarged by the corresponding spatial coframe stretches.  This prevents a moving
+or tilted numerical embedding from slipping outside a mask built from the original
+analytic coframe.  The history column `geo_resid` is only the analytic orbit
+setup check; it is deliberately not presented as a geodesic residual of the numerical
+primary metric.
 
 On the four-cell tilted-ADM fixture, the default four-node halo was correctly refused:
 its outer ghost event mapped to global time `0.0801854`, beyond the available endpoint
 `0.08`.  A three-ghost implementation smoke completed 666 CPU cycles in about two
 seconds.  Its initial/final ADM replay error was at most `5.76e-8`, final `divB` was
-`4.26e-14`, and the normalized boundary-flux residual was `3.92e-21`.  The overall
-runtime gate still failed because the deliberately poor fixture produced a `4.54e-2`
-characteristic fallback fraction.  The earlier analytic mode's smooth self-consistent
-outer-to-inner regression produced two fallbacks in 6144 attempts and a `1.20e-17`
-boundary-flux residual.  Neither fixture is a physical convergence result.
+`4.26e-14`, and the normalized boundary-flux residual was `3.92e-21`.  All 17 requested
+coordinate-frame force/accretion history samples were finite and passed the runtime
+history check.  The overall runtime gate still failed because the deliberately poor
+fixture produced a `4.54e-2` characteristic fallback fraction.  The earlier analytic
+mode's smooth self-consistent outer-to-inner regression produced two fallbacks in 6144
+attempts and a `1.20e-17` boundary-flux residual.  Neither fixture is a physical
+convergence result.
 
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed

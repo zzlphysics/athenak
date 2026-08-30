@@ -48,7 +48,8 @@ constexpr std::uint64_t kHeaderBytes = 72;
 constexpr std::uint64_t kADMHeaderBytes = 96;
 constexpr std::uint32_t kLegacyBinaryVersion = 1;
 constexpr std::uint32_t kBinaryVersion = 2;
-constexpr std::uint32_t kADMBinaryVersion = 1;
+constexpr std::uint32_t kLegacyADMBinaryVersion = 1;
+constexpr std::uint32_t kADMBinaryVersion = 2;
 constexpr int kADMFields = 16;
 constexpr int kFaceColumns = 7;
 constexpr int kEdgeColumns = 7;
@@ -536,11 +537,6 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
   if (!pm->pmb_pack->padm->is_dynamic) {
     InnerFatal("ADM volume replay requires <adm> dynamic=true for RK-stage updates");
   }
-  if (pin->GetOrAddBoolean("problem", "user_hist", false)) {
-    InnerFatal(
-        "ADM volume replay does not yet support EMRI force history because that "
-        "diagnostic still evaluates the analytic metric off-grid");
-  }
   adm_path_ = pin->GetString("emri_adm_replay", "file");
   std::ifstream stream(adm_path_, std::ios::binary | std::ios::ate);
   if (!stream.is_open()) InnerFatal("could not open ADM volume replay " + adm_path_);
@@ -568,10 +564,26 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
         static_cast<Real>(ReadLEDouble(header.data() + 64 + 8*axis));
   }
   const std::uint64_t stored_crc = ReadLE64(header.data() + 88);
-  if (version != kADMBinaryVersion || nt != nt_ || adm_nvar_ != kADMFields ||
+  if ((version != kLegacyADMBinaryVersion && version != kADMBinaryVersion) ||
+      nt != nt_ || adm_nvar_ != kADMFields ||
       adm_nx_ < 2 || adm_ny_ < 2 || adm_nz_ < 2 ||
       stored_crc > std::numeric_limits<std::uint32_t>::max()) {
     InnerFatal("ADM volume replay dimensions or version are unsupported");
+  }
+  adm_binary_version_ = static_cast<int>(version);
+  const bool has_force_coframes = (version >= kADMBinaryVersion);
+  if (pin->GetOrAddBoolean("problem", "user_hist", false)) {
+    if (!has_force_coframes) {
+      InnerFatal(
+          "ADM volume replay force history requires a version-two binary with "
+          "secondary embedding coframes");
+    }
+    if (pin->GetOrAddString("problem", "force_frame", "source_tetrad") !=
+        "coordinate") {
+      InnerFatal(
+          "ADM volume replay currently supports force_frame=coordinate only; "
+          "the source-tetrad projection is time dependent");
+    }
   }
   for (int axis = 0; axis < 3; ++axis) {
     if (!(std::isfinite(adm_lower_[axis]) &&
@@ -585,11 +597,22 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
        static_cast<std::uint64_t>(adm_ny_),
        static_cast<std::uint64_t>(adm_nz_)},
       "ADM volume slab");
-  const std::uint64_t payload_values = CheckedProduct(
+  const std::uint64_t field_payload_values = CheckedProduct(
       {static_cast<std::uint64_t>(nt), adm_slab_values_},
       "ADM volume payload");
+  const std::uint64_t coframe_values = has_force_coframes
+      ? CheckedProduct({static_cast<std::uint64_t>(nt), 16}, "ADM force coframes")
+      : 0;
+  const std::uint64_t nt_values = static_cast<std::uint64_t>(nt);
+  const std::uint64_t maximum_size = std::numeric_limits<std::uint64_t>::max();
+  if (coframe_values > maximum_size - nt_values ||
+      field_payload_values > maximum_size - nt_values - coframe_values) {
+    InnerFatal("ADM volume payload size overflows a 64-bit value count");
+  }
+  const std::uint64_t total_payload_values =
+      nt_values + coframe_values + field_payload_values;
   const std::uint64_t payload_bytes = CheckedProduct(
-      {8, static_cast<std::uint64_t>(nt) + payload_values},
+      {8, total_payload_values},
       "ADM volume payload bytes");
   if (payload_bytes > std::numeric_limits<std::uint64_t>::max() - kADMHeaderBytes ||
       kADMHeaderBytes + payload_bytes != file_size) {
@@ -614,7 +637,12 @@ void EmriInnerWorldtubeReplay::ReadADMVolume(ParameterInput *pin, Mesh *pm) {
       InnerFatal("ADM volume and fluid worldtube time tables differ");
     }
   }
-  adm_data_offset_ = kADMHeaderBytes + 8*static_cast<std::uint64_t>(nt);
+  if (has_force_coframes) {
+    adm_secondary_coframes_ = ReadDoublesAt(
+        adm_path_, kADMHeaderBytes + 8*static_cast<std::uint64_t>(nt),
+        coframe_values);
+  }
+  adm_data_offset_ = kADMHeaderBytes + 8*(nt_values + coframe_values);
   adm_left_ = DvceArray1D<Real>("emri_adm_left", adm_slab_values_);
   adm_right_ = DvceArray1D<Real>("emri_adm_right", adm_slab_values_);
   adm_interval_ = interval_;
@@ -1063,6 +1091,40 @@ void EmriInnerWorldtubeReplay::SetADMVariables(MeshBlockPack *pack) {
     adm_vars.alpha(m, k, j, i) = sqrt(lapse_squared);
     adm_vars.psi4(m, k, j, i) = cbrt(determinant);
   });
+}
+
+bool EmriInnerWorldtubeReplay::GetADMReplayGeometry(
+    EmriADMReplayGeometry &geometry) const {
+  if (!adm_volume_enabled_) return false;
+  // Version-one files remain valid for metric-only replay.  They predate the
+  // embedding coframes, so callers retain the analytic excision geometry.
+  if (adm_binary_version_ < static_cast<int>(kADMBinaryVersion)) return false;
+  if (adm_secondary_coframes_.size() != static_cast<std::size_t>(nt_)*16) {
+    InnerFatal("numerical ADM force geometry is unavailable in this replay binary");
+  }
+  const Real table_time = pmesh_->time + time_offset_;
+  const Real left_time = times_[adm_interval_];
+  const Real right_time = times_[adm_interval_ + 1];
+  Real fraction = (table_time - left_time)/(right_time - left_time);
+  const Real tolerance = 512.0*std::numeric_limits<Real>::epsilon()
+      *std::max({std::abs(table_time), std::abs(left_time),
+                 std::abs(right_time), Real(1.0)});
+  if (fraction < 0.0 && table_time >= left_time - tolerance) fraction = 0.0;
+  if (fraction > 1.0 && table_time <= right_time + tolerance) fraction = 1.0;
+  if (!(fraction >= 0.0 && fraction <= 1.0)) {
+    InnerFatal("ADM force-history time lies outside the loaded replay interval");
+  }
+  geometry.time_fraction = fraction;
+  for (int a = 0; a < 4; ++a) {
+    for (int b = 0; b < 4; ++b) {
+      const std::size_t component = static_cast<std::size_t>(4*a + b);
+      geometry.coframe_left[a][b] = adm_secondary_coframes_[
+          static_cast<std::size_t>(adm_interval_)*16 + component];
+      geometry.coframe_right[a][b] = adm_secondary_coframes_[
+          static_cast<std::size_t>(adm_interval_ + 1)*16 + component];
+    }
+  }
+  return true;
 }
 
 void EmriInnerWorldtubeReplay::SetInitialNormalFlux(Mesh *pm) {
@@ -1520,4 +1582,13 @@ void EmriInnerWorldtubeSetADMVariables(MeshBlockPack *pack) {
     InnerFatal("invalid inner-worldtube numerical ADM callback state");
   }
   pack->pmesh->pgen->emri_inner_worldtube_->SetADMVariables(pack);
+}
+
+bool EmriInnerWorldtubeADMReplayGeometry(
+    Mesh *pm, EmriADMReplayGeometry &geometry) {
+  if (pm == nullptr || pm->pgen == nullptr ||
+      pm->pgen->emri_inner_worldtube_ == nullptr) {
+    return false;
+  }
+  return pm->pgen->emri_inner_worldtube_->GetADMReplayGeometry(geometry);
 }

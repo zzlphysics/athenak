@@ -18,6 +18,7 @@
 
 class Driver;
 class EmriInnerWorldtubeReplay;
+struct EmriADMReplayGeometry;
 class EmriOuterWorldtubeWriter;
 
 void EmriOuterWorldtubeObserveEField(Mesh *pm, Driver *pdrive, int stage);
@@ -28,6 +29,7 @@ void EmriInnerWorldtubeApplyPrimitiveBoundary(Mesh *pm, Driver *pdrive, int stag
 void EmriInnerWorldtubeCompleteStep(Mesh *pm, Driver *pdrive);
 void EmriInnerWorldtubeCapTimestep(Mesh *pm);
 void EmriInnerWorldtubeSetADMVariables(MeshBlockPack *pmbp);
+bool EmriInnerWorldtubeADMReplayGeometry(Mesh *pm, EmriADMReplayGeometry &geometry);
 
 using ProblemFinalizeFnPtr = void (*)(ParameterInput *pin, Mesh *pm);
 using UserBoundaryFnPtr = void (*)(Mesh* pm);
@@ -127,6 +129,7 @@ class ProblemGenerator {
   friend void EmriInnerWorldtubeCompleteStep(Mesh*, Driver*);
   friend void EmriInnerWorldtubeCapTimestep(Mesh*);
   friend void EmriInnerWorldtubeSetADMVariables(MeshBlockPack*);
+  friend bool EmriInnerWorldtubeADMReplayGeometry(Mesh*, EmriADMReplayGeometry&);
 
   void ConfigureEmriOuterWorldtube(ParameterInput *pin, bool is_restart);
 
