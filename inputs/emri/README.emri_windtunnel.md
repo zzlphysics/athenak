@@ -985,6 +985,88 @@ thresholds pass, and the requested minimum spatial order is achieved.  `--resume
 reuses completed case summaries and preserves an interrupted case directory under an
 `.incompleteN` suffix before retrying it.
 
+### Resolvability and resource preflight
+
+Run the scale/resource audit before launching either a pilot or a convergence matrix:
+
+```bash
+python3 inputs/emri/plan_adm_inner_replay.py \
+  --campaign runs/emri/adm_worldtube_campaign/summary.json \
+  --output-prefix runs/emri/adm_worldtube_campaign/replay_plan
+```
+
+The planner does not accept target-grid interpolation as new physical information.  It
+compares the local cell spacing with the least-resolved direction of
+`diag(1/dx_source) e^i_a` over the complete frame table.  A target cell smaller than one
+mapped source cell fails by default, even if the extractor can return a smooth
+trilinearly interpolated value.  A production source manifest must also declare
+
+```json
+"source_provenance": {
+  "metric_content": "primary_only",
+  "fluid_content": "global_grmhd",
+  "secondary_backreaction": "absent"
+}
+```
+
+This is not decorative metadata.  `adm_volume_replay.py` adds the analytic secondary;
+feeding it a global metric that already contains the secondary double-counts the small
+hole.  The ADM campaign propagates this provenance object into every case manifest and
+its summary.  Missing or different provenance remains fail-closed for science use.
+
+For a Kerr secondary with horizon scale `r_H/m`, a uniform cube with `N_H` cells per
+horizon radius and a boundary at `N_B r_H` can exist only if
+
+```text
+N_face >= 2 N_H N_B.
+```
+
+Thus the current gates `N_H=4` and `N_B=5` require at least 40 cells per edge,
+independently of mass or box size.  This is only a horizon--near-zone geometry floor.
+For a direct uniform BHL cube whose boundary lies `N_cap` capture radii away,
+
+```text
+N_face >= 2 N_H N_cap (r_cap/r_H).
+```
+
+Use command-line upstream overrides to design a new source rather than inheriting an
+unphysical smoke-fixture state:
+
+```bash
+python3 inputs/emri/plan_adm_inner_replay.py \
+  --campaign /path/to/current/summary.json \
+  --output-prefix /tmp/low_sigma_design \
+  --upstream-rho 1 --upstream-pgas 0.01 \
+  --upstream-four-velocity 0.5 0 0 \
+  --upstream-magnetic-field 0 0 0.01
+```
+
+For this low-magnetization reference wind, the conservative proxy gives
+`r_cap/m=9.394`.  Four horizon cells plus a symmetric boundary eight capture radii away
+then require a mathematical minimum of 301 uniform cells per edge.  The planner rounds
+this to the mesh-friendly 304-cell design, about `6.32e12` RK3 active-zone updates over
+the short existing replay interval.  With four ADM times, the current uniform volume
+builder has array-memory floors of 37.1, 297, and 2364 GiB at metric-resolution factors
+one, two, and four.  A direct uniform convergence campaign is therefore the wrong
+production architecture for this state.
+
+By contrast, the 40-cell geometry-only near-zone design costs about `1.89e9` RK3
+active-zone updates, and its factor-one ADM builder floor is 0.135 GiB (8.38 GiB at
+factor four).  It can validate a resolved horizon and one-way matching machinery, but
+its half-width is only about one capture radius and it cannot claim a settled full BHL
+wake.  Production should use spatial refinement or an outer--inner hierarchy, and the
+numerical primary metric should ultimately be stored coarsely while the analytic
+secondary is evaluated at the fluid resolution.  That split avoids forcing the smooth
+primary ADM field onto the finest horizon grid.
+
+The existing four-cell ADM fixture fails all of the intended physical checks: no mass
+can satisfy both geometry gates; it contains only `7.1e-3` source cells across the
+worldtube diameter (`1.78e-3` per requested boundary cell); its coordinate
+`B^2/rho` proxy is `1.51e4`; and its primary-only provenance is unverified.  It remains
+useful strictly as an implementation regression.  The planner writes strict JSON plus a
+compact Markdown report and separately reports fluid ghost-zone cost, causal CFL steps,
+ADM binary size, two-slab device memory, and the current Python builder's array floor.
+
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed
 those raw integrals through this pullback/projection layer.  The fixed-grid observer is

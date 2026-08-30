@@ -228,6 +228,8 @@ def _manifest_document(
     }
     if scan.source_level is not None:
         document["source_level"] = scan.source_level
+    if "source_provenance" in scan.document:
+        document["source_provenance"] = scan.document["source_provenance"]
     return document
 
 
@@ -726,6 +728,7 @@ def run_campaign(arguments: argparse.Namespace) -> dict[str, object]:
         "source_snapshot_count": len(scan.descriptors),
         "source_level": scan.descriptors[0].source_level,
         "source_storage": scan.descriptors[0].source_storage,
+        "source_provenance": scan.document.get("source_provenance"),
         "source_time_range_global_units": [
             scan.descriptors[0].time,
             scan.descriptors[-1].time,

@@ -109,3 +109,30 @@ def test_subsample_scan_thins_the_actual_source_snapshot_series() -> None:
         5.0,
     ]
     assert [entry["index"] for entry in thinned.entries] == [0, 2, 4, 5]
+
+    provenance = {
+        "metric_content": "primary_only",
+        "fluid_content": "global_grmhd",
+        "secondary_backreaction": "absent",
+    }
+    thinned = extract.SnapshotManifestScan(
+        path=thinned.path,
+        document={"source_provenance": provenance},
+        entries=thinned.entries,
+        source_level=thinned.source_level,
+        snapshot_cache_size=thinned.snapshot_cache_size,
+        hash_source_files=thinned.hash_source_files,
+        descriptors=thinned.descriptors,
+    )
+    document = campaign._manifest_document(
+        thinned,
+        Path("frame.json"),
+        np.asarray((0.0, 1.0)),
+        np.zeros(3),
+        1.0,
+        8,
+        2,
+        1.0,
+        1.0,
+    )
+    assert document["source_provenance"] == provenance

@@ -1,5 +1,10 @@
 {
   "classification": "athenak-emri-global-worldtube-series-v1",
+  "source_provenance": {
+    "metric_content": "primary_only",
+    "fluid_content": "global_grmhd",
+    "secondary_backreaction": "absent"
+  },
   "snapshots": [
     {
       "state": "dumps/global.mhd_w_bcc.00100.bin",
