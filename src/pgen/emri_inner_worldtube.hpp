@@ -55,6 +55,15 @@ class EmriInnerWorldtubeReplay {
     int sign;
   };
 
+  struct VolumeFaceRecord {
+    int input;
+    int m;
+    int k;
+    int j;
+    int i;
+    int component;
+  };
+
   void ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm);
   void BuildBoundaryTopology(Mesh *pm);
   void LoadInterval(int interval);
@@ -67,6 +76,7 @@ class EmriInnerWorldtubeReplay {
   int cells_per_edge_ = 0;
   int nvar_ = 0;
   bool has_cell_centered_magnetic_state_ = false;
+  bool has_initial_volume_flux_ = false;
   int nt_ = 0;
   int interval_ = 0;
   int last_stage_ = 0;
@@ -82,15 +92,19 @@ class EmriInnerWorldtubeReplay {
   std::array<std::uint64_t, 6> flux_offsets_{};
   std::array<std::uint64_t, 6> emf_u_offsets_{};
   std::array<std::uint64_t, 6> emf_v_offsets_{};
+  std::array<std::uint64_t, 3> initial_volume_flux_offsets_{};
   std::vector<FaceRecord> host_faces_;
   std::vector<EdgeRecord> host_edges_;
+  std::vector<VolumeFaceRecord> host_volume_faces_;
   DvceArray2D<int> face_records_;
   DvceArray2D<int> edge_records_;
+  DvceArray2D<int> volume_face_records_;
   DvceArray1D<Real> state_left_;
   DvceArray1D<Real> state_right_;
   DvceArray1D<Real> flux_left_;
   DvceArray1D<Real> flux_right_;
   DvceArray1D<Real> interval_emf_;
+  DvceArray1D<Real> initial_volume_flux_;
   DvceArray1D<int> characteristic_diagnostics_;
 };
 

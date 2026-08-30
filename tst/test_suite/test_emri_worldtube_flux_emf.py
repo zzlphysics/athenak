@@ -217,7 +217,54 @@ def test_inner_device_binary_round_trip_and_checksum() -> None:
             raise AssertionError("corrupted inner replay binary was accepted")
     np.testing.assert_array_equal(loaded_times, times)
     assert metadata["center"] == [8.0, 0.0, 0.0]
+    assert metadata["binary_version"] == 2
+    assert metadata["initial_volume_flux"][
+        "maximum_relative_cell_flux_divergence"
+    ] < 1.0e-14
     assert metadata["state_variables"] == ["a", "b"]
     assert metadata["source_metadata"]["half_width"] == 2.0
     diagnostics = worldtube.validate_worldtube(loaded_times, loaded_faces)
     assert diagnostics["maximum_closed_surface_flux"] < 1.0e-15
+
+
+def test_initial_volume_flux_matches_nonuniform_closed_boundary() -> None:
+    times = np.asarray((0.0, 0.1))
+    faces = _constant_cube(4, times)
+    generator = np.random.default_rng(731)
+    net_flux = 0.0
+    for name in worldtube.FACE_NAMES[:-1]:
+        values = generator.normal(size=(4, 4))
+        faces[name].normal_flux[0] = values
+        net_flux += float(np.sum(values))
+    faces[worldtube.FACE_NAMES[-1]].normal_flux[0].fill(-net_flux / 16.0)
+    volume, diagnostics = worldtube.construct_initial_volume_flux(faces)
+    divergence = (
+        np.diff(volume["x1"], axis=2)
+        + np.diff(volume["x2"], axis=1)
+        + np.diff(volume["x3"], axis=0)
+    )
+    assert float(np.max(np.abs(divergence))) < 1.0e-11
+    assert diagnostics["maximum_relative_cell_flux_divergence"] < 1.0e-11
+    for name in worldtube.FACE_NAMES:
+        orientation = worldtube.ORIENTATIONS[name]
+        boundary = 0 if orientation.normal_sign < 0 else 4
+        reconstructed = np.empty((4, 4))
+        for v in range(4):
+            for u in range(4):
+                indices = [0, 0, 0]
+                indices[orientation.u_axis] = (
+                    u if orientation.u_sign > 0 else 3 - u
+                )
+                indices[orientation.v_axis] = (
+                    v if orientation.v_sign > 0 else 3 - v
+                )
+                if orientation.normal_axis == 0:
+                    value = volume["x1"][indices[2], indices[1], boundary]
+                elif orientation.normal_axis == 1:
+                    value = volume["x2"][indices[2], boundary, indices[0]]
+                else:
+                    value = volume["x3"][boundary, indices[1], indices[0]]
+                reconstructed[v, u] = orientation.normal_sign * value
+        np.testing.assert_array_equal(
+            reconstructed, faces[name].normal_flux[0]
+        )

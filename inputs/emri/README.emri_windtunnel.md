@@ -529,6 +529,18 @@ ADM-face GRMHD seven-wave incoming-mode boundaries.  The offline global-snapshot
 below now performs the upstream state/two-form transformation.  An online moving
 cut-surface writer remains preferable when exact source RK EMFs are available.
 
+Inner binary version two also stores an initial flux on every coordinate-oriented face
+of the volume, not only on the six outer surfaces.  `prepare-inner` obtains the unique
+minimum-norm internal flow from a Neumann graph-Laplacian solve while holding all outer
+flux cochains fixed.  The closed-surface identity is its compatibility condition.  This
+gives every finite-volume cell zero integrated magnetic divergence to solver roundoff;
+the C++ reader loads the full face field, rebuilds cell-centered `B`, and reconstructs
+the conserved state before evolution.  Version-one binaries remain readable, but they
+cannot provide this divergence-free volume initialization and should be regenerated for
+new runs.  Boundary flux does not physically determine a unique interior field: this
+minimum-norm extension is an initialization convention, whose influence must be tested
+by relaxation or replaced by an extracted global-volume field for production science.
+
 ### First AthenaK outer writer
 
 The pgen-independent outer writer is enabled by an optional input block, so it can be
@@ -802,11 +814,40 @@ the expensive local AthenaK replay automatically.
 
 An eight-case smoke campaign on the six-snapshot numerical-ADM fixture exercised both
 metric-difference multipliers, both source-cadence strides, and quadrature orders two
-and three.  Exact preflight removed the two temporally tilted endpoint samples, all 44
+and three.  Exact preflight removed the two temporally tilted endpoint samples, all 52
 structural conditions passed, and the largest relative L2 changes from the finest
 reference were `3.12e-5` in state, `6.44e-6` in normal magnetic flux, and `3.16e-5` in
-edge EMF.  These values validate the driver path; they are not physical convergence
-tolerances for a production disk.
+edge EMF.  Version two adds an initial-volume-divergence gate to every case.  These
+values validate the driver path; they are not physical convergence tolerances for a
+production disk.
+
+The isolated-secondary structural replay pilot is deliberately separate:
+
+```bash
+python3 inputs/emri/run_adm_inner_replay_pilot.py \
+  --campaign runs/emri/adm_worldtube_campaign/summary.json \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/adm_inner_pilot \
+  --secondary-mass 1 \
+  --fail-on-gate
+```
+
+It fits the first worldtube endpoint to the existing affine density, pressure, and
+velocity-profile controls, rebuilds a version-two binary, and checks that the secondary
+horizon is resolved while the matching surface remains several horizon radii away.  It
+also rejects excessive boundary `B^2/rho` and initial volume divergence before launching
+AthenaK.  A completed run records characteristic fallback fraction, boundary-flux
+residual, final `divB`, finite/positive state checks, and the force/accretion history
+path.  `--allow-unsafe-structural-smoke` exists only for implementation debugging.
+
+This pilot uses an isolated analytic secondary Kerr metric in the volume.  Its summary
+therefore always sets `science_ready=false`: the transformed numerical ADM metric is not
+yet replayed through the volume, so force and accretion histories from this mode must not
+be interpreted as the final numerical-ADM result.  On the smooth self-consistent
+outer-to-inner regression, binary version two produced two characteristic fallbacks in
+6144 attempts, a `1.20e-17` boundary-flux residual, and retained all closure gates.  The
+small tilted-ADM fixture was correctly refused because the horizon had only `0.08` cell
+and its coordinate magnetization proxy was `1.51e4`.
 
 For a future exact online path, the remaining gap is narrow and explicit: sample `F` and
 fluid four-vectors on the moving cut surface during the global RK recurrence, then feed

@@ -44,9 +44,11 @@
 namespace {
 
 constexpr std::uint64_t kHeaderBytes = 72;
-constexpr std::uint32_t kBinaryVersion = 1;
+constexpr std::uint32_t kLegacyBinaryVersion = 1;
+constexpr std::uint32_t kBinaryVersion = 2;
 constexpr int kFaceColumns = 7;
 constexpr int kEdgeColumns = 7;
+constexpr int kVolumeFaceColumns = 6;
 constexpr std::array<unsigned char, 16> kMagic = {
     'A', 'E', 'M', 'R', 'I', 'W', 'T', 'B', 'I', 'N', '0', '0', '0', '1', 0, 0};
 constexpr std::array<int, 6> kNormalAxis = {0, 0, 1, 1, 2, 2};
@@ -360,7 +362,8 @@ void EmriInnerWorldtubeReplay::ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm)
   }
   half_width_ = static_cast<Real>(ReadLEDouble(header.data() + 56));
   const std::uint64_t stored_crc = ReadLE64(header.data() + 64);
-  if (version != kBinaryVersion || cells_per_edge_ < 1 || nvar_ < 1 || nt_ < 2 ||
+  if ((version != kLegacyBinaryVersion && version != kBinaryVersion) ||
+      cells_per_edge_ < 1 || nvar_ < 1 || nt_ < 2 ||
       !(std::isfinite(half_width_) && half_width_ > 0.0) ||
       stored_crc > std::numeric_limits<std::uint32_t>::max()) {
     InnerFatal("inner replay header values are invalid or unsupported");
@@ -383,6 +386,15 @@ void EmriInnerWorldtubeReplay::ReadHeaderAndTimes(ParameterInput *pin, Mesh *pm)
     cursor += 8*emf_count;
     emf_v_offsets_[face] = cursor;
     cursor += 8*emf_count;
+  }
+  has_initial_volume_flux_ = (version >= kBinaryVersion);
+  if (has_initial_volume_flux_) {
+    const std::uint64_t volume_face_count = CheckedProduct(
+        {cells + 1, cells, cells}, "initial volume face-flux array");
+    for (int component = 0; component < 3; ++component) {
+      initial_volume_flux_offsets_[component] = cursor;
+      cursor += 8*volume_face_count;
+    }
   }
   if (cursor != file_size) {
     InnerFatal("inner replay file size does not match its declared array dimensions");
@@ -530,6 +542,75 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
     if (count != 1) InnerFatal("inner boundary face topology lacks a unique owner");
   }
 
+  if (has_initial_volume_flux_) {
+    const Real domain_minimum[3] = {pm->mesh_size.x1min, pm->mesh_size.x2min,
+                                    pm->mesh_size.x3min};
+    const std::size_t component_size =
+        static_cast<std::size_t>(cells + 1)*cells*cells;
+    if (3*component_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      InnerFatal("initial volume face-flux table exceeds 32-bit device indexing");
+    }
+    for (int m = 0; m < pack->nmb_thispack; ++m) {
+      const RegionSize &size = sizes.h_view(m);
+      const Real minimum[3] = {size.x1min, size.x2min, size.x3min};
+      const int axis_cells[3] = {indcs.nx1, indcs.nx2, indcs.nx3};
+      const int global_lower[3] = {
+          static_cast<int>(std::llround((minimum[0] - domain_minimum[0])/dx_)),
+          static_cast<int>(std::llround((minimum[1] - domain_minimum[1])/dx_)),
+          static_cast<int>(std::llround((minimum[2] - domain_minimum[2])/dx_))};
+      for (int axis = 0; axis < 3; ++axis) {
+        if (global_lower[axis] < 0 || global_lower[axis] + axis_cells[axis] > cells) {
+          InnerFatal("inner MeshBlock lies outside the initial volume-flux table");
+        }
+      }
+      for (int k = 0; k < indcs.nx3; ++k) {
+        const int global_k = global_lower[2] + k;
+        for (int j = 0; j < indcs.nx2; ++j) {
+          const int global_j = global_lower[1] + j;
+          for (int i = 0; i <= indcs.nx1; ++i) {
+            const int global_i = global_lower[0] + i;
+            const std::size_t input =
+                (static_cast<std::size_t>(global_k)*cells + global_j)
+                *(cells + 1) + global_i;
+            host_volume_faces_.push_back(VolumeFaceRecord{
+                static_cast<int>(input), m, indcs.ks + k, indcs.js + j,
+                indcs.is + i, 0});
+          }
+        }
+      }
+      for (int k = 0; k < indcs.nx3; ++k) {
+        const int global_k = global_lower[2] + k;
+        for (int j = 0; j <= indcs.nx2; ++j) {
+          const int global_j = global_lower[1] + j;
+          for (int i = 0; i < indcs.nx1; ++i) {
+            const int global_i = global_lower[0] + i;
+            const std::size_t input = component_size
+                + (static_cast<std::size_t>(global_k)*(cells + 1) + global_j)
+                *cells + global_i;
+            host_volume_faces_.push_back(VolumeFaceRecord{
+                static_cast<int>(input), m, indcs.ks + k, indcs.js + j,
+                indcs.is + i, 1});
+          }
+        }
+      }
+      for (int k = 0; k <= indcs.nx3; ++k) {
+        const int global_k = global_lower[2] + k;
+        for (int j = 0; j < indcs.nx2; ++j) {
+          const int global_j = global_lower[1] + j;
+          for (int i = 0; i < indcs.nx1; ++i) {
+            const int global_i = global_lower[0] + i;
+            const std::size_t input = 2*component_size
+                + (static_cast<std::size_t>(global_k)*cells + global_j)
+                *cells + global_i;
+            host_volume_faces_.push_back(VolumeFaceRecord{
+                static_cast<int>(input), m, indcs.ks + k, indcs.js + j,
+                indcs.is + i, 2});
+          }
+        }
+      }
+    }
+  }
+
   const std::size_t component_size = static_cast<std::size_t>(cells + 1)*cells;
   const std::size_t face_size = 2*component_size;
   using Target = std::tuple<int, int, int, int, int>;
@@ -573,6 +654,9 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
                                    std::max<int>(host_faces_.size(), 1), kFaceColumns);
   edge_records_ = DvceArray2D<int>("emri_inner_edges",
                                    std::max<int>(host_edges_.size(), 1), kEdgeColumns);
+  volume_face_records_ = DvceArray2D<int>(
+      "emri_inner_volume_faces", std::max<int>(host_volume_faces_.size(), 1),
+      kVolumeFaceColumns);
   auto host_face_view = Kokkos::create_mirror_view(face_records_);
   for (std::size_t index = 0; index < host_faces_.size(); ++index) {
     const FaceRecord &record = host_faces_[index];
@@ -593,6 +677,16 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
     }
   }
   Kokkos::deep_copy(edge_records_, host_edge_view);
+  auto host_volume_face_view = Kokkos::create_mirror_view(volume_face_records_);
+  for (std::size_t index = 0; index < host_volume_faces_.size(); ++index) {
+    const VolumeFaceRecord &record = host_volume_faces_[index];
+    const int values[kVolumeFaceColumns] = {
+        record.input, record.m, record.k, record.j, record.i, record.component};
+    for (int column = 0; column < kVolumeFaceColumns; ++column) {
+      host_volume_face_view(index, column) = values[column];
+    }
+  }
+  Kokkos::deep_copy(volume_face_records_, host_volume_face_view);
 
   const std::size_t face_cells = static_cast<std::size_t>(6)*cells*cells;
   const std::size_t face_edges = static_cast<std::size_t>(12)*cells*(cells + 1);
@@ -601,6 +695,23 @@ void EmriInnerWorldtubeReplay::BuildBoundaryTopology(Mesh *pm) {
   flux_left_ = DvceArray1D<Real>("emri_inner_flux_left", face_cells);
   flux_right_ = DvceArray1D<Real>("emri_inner_flux_right", face_cells);
   interval_emf_ = DvceArray1D<Real>("emri_inner_interval_emf", face_edges);
+  const std::size_t volume_faces = static_cast<std::size_t>(3)*(cells + 1)*cells*cells;
+  initial_volume_flux_ = DvceArray1D<Real>(
+      "emri_inner_initial_volume_flux", std::max<std::size_t>(volume_faces, 1));
+  if (has_initial_volume_flux_) {
+    auto host_volume_flux = Kokkos::create_mirror_view(initial_volume_flux_);
+    const std::uint64_t component_count =
+        static_cast<std::uint64_t>(cells + 1)*cells*cells;
+    for (int component = 0; component < 3; ++component) {
+      const std::vector<Real> values = ReadDoublesAt(
+          path_, initial_volume_flux_offsets_[component], component_count);
+      const std::size_t base = static_cast<std::size_t>(component)*component_count;
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        host_volume_flux(base + index) = values[index];
+      }
+    }
+    Kokkos::deep_copy(initial_volume_flux_, host_volume_flux);
+  }
   characteristic_diagnostics_ = DvceArray1D<int>(
       "emri_inner_characteristic_diagnostics", 2);
   Kokkos::deep_copy(characteristic_diagnostics_, 0);
@@ -657,33 +768,71 @@ void EmriInnerWorldtubeReplay::LoadInterval(int interval) {
 }
 
 void EmriInnerWorldtubeReplay::SetInitialNormalFlux(Mesh *pm) {
-  auto records = face_records_;
-  auto expected = flux_left_;
   auto b1 = pm->pmb_pack->pmhd->b0.x1f;
   auto b2 = pm->pmb_pack->pmhd->b0.x2f;
   auto b3 = pm->pmb_pack->pmhd->b0.x3f;
-  const int cells = cells_per_edge_;
   const Real inverse_area = 1.0/(dx_*dx_);
-  const int count = static_cast<int>(host_faces_.size());
-  if (count > 0) {
-    par_for("emri_inner_set_flux", DevExeSpace(), 0, count - 1,
-    KOKKOS_LAMBDA(int record_index) {
-      const int face = records(record_index, 0);
-      const int m = records(record_index, 1);
-      const int k = records(record_index, 2);
-      const int j = records(record_index, 3);
-      const int i = records(record_index, 4);
-      const int v = records(record_index, 5);
-      const int u = records(record_index, 6);
-      const int input = (face*cells + v)*cells + u;
-      const int sign = (face % 2 == 0) ? -1 : 1;
-      const Real field = sign*expected(input)*inverse_area;
-      const int axis = face/2;
-      if (axis == 0) b1(m, k, j, i + (sign > 0)) = field;
-      if (axis == 1) b2(m, k, j + (sign > 0), i) = field;
-      if (axis == 2) b3(m, k + (sign > 0), j, i) = field;
-    });
+  if (has_initial_volume_flux_) {
+    auto records = volume_face_records_;
+    auto expected = initial_volume_flux_;
+    const int count = static_cast<int>(host_volume_faces_.size());
+    if (count > 0) {
+      par_for("emri_inner_set_volume_flux", DevExeSpace(), 0, count - 1,
+      KOKKOS_LAMBDA(int record_index) {
+        const int input = records(record_index, 0);
+        const int m = records(record_index, 1);
+        const int k = records(record_index, 2);
+        const int j = records(record_index, 3);
+        const int i = records(record_index, 4);
+        const int component = records(record_index, 5);
+        const Real field = expected(input)*inverse_area;
+        if (component == 0) b1(m, k, j, i) = field;
+        if (component == 1) b2(m, k, j, i) = field;
+        if (component == 2) b3(m, k, j, i) = field;
+      });
+    }
+  } else {
+    auto records = face_records_;
+    auto expected = flux_left_;
+    const int cells = cells_per_edge_;
+    const int count = static_cast<int>(host_faces_.size());
+    if (count > 0) {
+      par_for("emri_inner_set_boundary_flux", DevExeSpace(), 0, count - 1,
+      KOKKOS_LAMBDA(int record_index) {
+        const int face = records(record_index, 0);
+        const int m = records(record_index, 1);
+        const int k = records(record_index, 2);
+        const int j = records(record_index, 3);
+        const int i = records(record_index, 4);
+        const int v = records(record_index, 5);
+        const int u = records(record_index, 6);
+        const int input = (face*cells + v)*cells + u;
+        const int sign = (face % 2 == 0) ? -1 : 1;
+        const Real field = sign*expected(input)*inverse_area;
+        const int axis = face/2;
+        if (axis == 0) b1(m, k, j, i + (sign > 0)) = field;
+        if (axis == 1) b2(m, k, j + (sign > 0), i) = field;
+        if (axis == 2) b3(m, k + (sign > 0), j, i) = field;
+      });
+    }
   }
+
+  MeshBlockPack *pack = pm->pmb_pack;
+  auto bcc = pack->pmhd->bcc0;
+  const RegionIndcs &indcs = pm->mb_indcs;
+  const int nmb = pack->nmb_thispack;
+  par_for("emri_inner_set_cell_field", DevExeSpace(), 0, nmb - 1,
+          indcs.ks, indcs.ke, indcs.js, indcs.je, indcs.is, indcs.ie,
+  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+    bcc(m, IBX, k, j, i) = 0.5*(b1(m, k, j, i) + b1(m, k, j, i + 1));
+    bcc(m, IBY, k, j, i) = 0.5*(b2(m, k, j, i) + b2(m, k, j + 1, i));
+    bcc(m, IBZ, k, j, i) = 0.5*(b3(m, k, j, i) + b3(m, k + 1, j, i));
+  });
+  if (pack->pdyngr == nullptr) {
+    InnerFatal("inner volume-flux initialization currently requires DynGRMHD");
+  }
+  pack->pdyngr->PrimToConInit(
+      indcs.is, indcs.ie, indcs.js, indcs.je, indcs.ks, indcs.ke);
 }
 
 Real EmriInnerWorldtubeReplay::BoundaryFluxResidual(

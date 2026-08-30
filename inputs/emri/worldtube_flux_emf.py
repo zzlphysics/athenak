@@ -24,9 +24,10 @@ import numpy as np
 
 CLASSIFICATION = "athenak-emri-cubical-flux-emf-worldtube-v1"
 OUTER_STREAM_CLASSIFICATION = "athenak-emri-outer-worldtube-stream-v1"
-INNER_BINARY_CLASSIFICATION = "athenak-emri-inner-worldtube-binary-v1"
+LEGACY_INNER_BINARY_CLASSIFICATION = "athenak-emri-inner-worldtube-binary-v1"
+INNER_BINARY_CLASSIFICATION = "athenak-emri-inner-worldtube-binary-v2"
 INNER_BINARY_MAGIC = b"AEMRIWTBIN0001\x00\x00"
-INNER_BINARY_VERSION = 1
+INNER_BINARY_VERSION = 2
 INNER_BINARY_HEADER = struct.Struct("<16sIIII4dQ")
 FACE_NAMES = ("x1m", "x1p", "x2m", "x2p", "x3m", "x3p")
 
@@ -313,7 +314,9 @@ def validate_worldtube(
     for name in FACE_NAMES:
         limit = absolute_tolerance + relative_tolerance * faraday_scale[name]
         if faraday_max[name] > limit:
-            failures.append(f"{name} Faraday residual {faraday_max[name]:.6g}>{limit:.6g}")
+            failures.append(
+                f"{name} Faraday residual {faraday_max[name]:.6g}>{limit:.6g}"
+            )
     edge_limit = absolute_tolerance + relative_tolerance * edge_scale
     for name, residual in edge_max.items():
         if residual > edge_limit:
@@ -366,7 +369,9 @@ def write_worldtube(
     return diagnostics
 
 
-def read_worldtube(path: Path) -> tuple[np.ndarray, dict[str, FaceData], dict[str, object]]:
+def read_worldtube(
+    path: Path,
+) -> tuple[np.ndarray, dict[str, FaceData], dict[str, object]]:
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata_json"]))
         if metadata.get("classification") != CLASSIFICATION:
@@ -527,7 +532,9 @@ def read_outer_stream(
             raise ValueError("outer stream contains an invalid binary filename")
         candidate = (directory / filename).resolve()
         if candidate.parent != directory:
-            raise ValueError("outer stream binary filenames must stay beside the manifest")
+            raise ValueError(
+                "outer stream binary filenames must stay beside the manifest"
+            )
         return candidate
 
     times = _read_exact_binary(
@@ -573,6 +580,128 @@ def _crc32_update(value: int, payload: bytes) -> int:
     return zlib.crc32(payload, value) & 0xFFFFFFFF
 
 
+def _cell_flux_divergence(volume_flux: dict[str, np.ndarray]) -> np.ndarray:
+    return (
+        np.diff(volume_flux["x1"], axis=2)
+        + np.diff(volume_flux["x2"], axis=1)
+        + np.diff(volume_flux["x3"], axis=0)
+    )
+
+
+def _graph_laplacian(values: np.ndarray) -> np.ndarray:
+    result = np.zeros_like(values)
+    for axis in range(3):
+        lower = [slice(None)] * 3
+        upper = [slice(None)] * 3
+        lower[axis] = slice(None, -1)
+        upper[axis] = slice(1, None)
+        difference = values[tuple(lower)] - values[tuple(upper)]
+        result[tuple(lower)] += difference
+        result[tuple(upper)] -= difference
+    return result
+
+
+def construct_initial_volume_flux(
+    faces: dict[str, FaceData],
+    relative_tolerance: float = 1.0e-13,
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    """Construct the minimum-norm divergence-free volume flux at the first time.
+
+    Boundary values are fixed by the six outward worldtube flux cochains.  Interior
+    coordinate-oriented face fluxes are the gradient flow obtained from the Neumann
+    graph Laplacian.  Its compatibility condition is precisely the closed-surface flux.
+    """
+
+    first = {name: np.asarray(faces[name].normal_flux[0]) for name in FACE_NAMES}
+    cells = first[FACE_NAMES[0]].shape[0]
+    if cells < 1 or any(array.shape != (cells, cells) for array in first.values()):
+        raise ValueError("initial volume flux requires one shared square face grid")
+    if not math.isfinite(relative_tolerance) or relative_tolerance <= 0.0:
+        raise ValueError("volume-flux relative tolerance must be finite and positive")
+    volume = {
+        "x1": np.zeros((cells, cells, cells + 1), dtype=np.float64),
+        "x2": np.zeros((cells, cells + 1, cells), dtype=np.float64),
+        "x3": np.zeros((cells + 1, cells, cells), dtype=np.float64),
+    }
+    for name in FACE_NAMES:
+        orientation = ORIENTATIONS[name]
+        axis = orientation.normal_axis
+        boundary = 0 if orientation.normal_sign < 0 else cells
+        for v in range(cells):
+            for u in range(cells):
+                indices = [0, 0, 0]
+                indices[orientation.u_axis] = (
+                    u if orientation.u_sign > 0 else cells - 1 - u
+                )
+                indices[orientation.v_axis] = (
+                    v if orientation.v_sign > 0 else cells - 1 - v
+                )
+                coordinate_flux = orientation.normal_sign * first[name][v, u]
+                if axis == 0:
+                    volume["x1"][indices[2], indices[1], boundary] = coordinate_flux
+                elif axis == 1:
+                    volume["x2"][indices[2], boundary, indices[0]] = coordinate_flux
+                else:
+                    volume["x3"][boundary, indices[1], indices[0]] = coordinate_flux
+
+    boundary_divergence = _cell_flux_divergence(volume)
+    right_hand_side = -boundary_divergence
+    compatibility_correction = float(np.mean(right_hand_side))
+    right_hand_side -= compatibility_correction
+    right_norm = float(np.linalg.norm(right_hand_side.ravel()))
+    potential = np.zeros_like(right_hand_side)
+    iterations = 0
+    final_residual = right_norm
+    if right_norm > 0.0:
+        residual = right_hand_side.copy()
+        direction = residual.copy()
+        residual_squared = float(np.vdot(residual, residual))
+        maximum_iterations = max(100, 20 * cells * cells)
+        target = relative_tolerance * right_norm
+        for iterations in range(1, maximum_iterations + 1):
+            action = _graph_laplacian(direction)
+            denominator = float(np.vdot(direction, action))
+            if not denominator > 0.0:
+                raise RuntimeError("volume-flux graph solve lost positive definiteness")
+            step = residual_squared / denominator
+            potential += step * direction
+            residual -= step * action
+            new_residual_squared = float(np.vdot(residual, residual))
+            final_residual = math.sqrt(new_residual_squared)
+            if final_residual <= target:
+                break
+            direction = residual + (new_residual_squared / residual_squared) * direction
+            direction -= np.mean(direction)
+            residual_squared = new_residual_squared
+        else:
+            raise RuntimeError("volume-flux graph solve did not converge")
+
+    volume["x1"][:, :, 1:cells] = (
+        potential[:, :, :-1] - potential[:, :, 1:]
+    )
+    volume["x2"][:, 1:cells, :] = (
+        potential[:, :-1, :] - potential[:, 1:, :]
+    )
+    volume["x3"][1:cells, :, :] = (
+        potential[:-1, :, :] - potential[1:, :, :]
+    )
+    divergence = _cell_flux_divergence(volume)
+    maximum_flux = max(float(np.max(np.abs(array))) for array in first.values())
+    maximum_divergence = float(np.max(np.abs(divergence)))
+    return volume, {
+        "construction": "minimum-norm Neumann graph-Laplacian extension",
+        "solver_iterations": iterations,
+        "solver_final_l2_residual": final_residual,
+        "boundary_net_outward_flux": float(
+            sum(np.sum(array) for array in first.values())
+        ),
+        "compatibility_correction_per_cell": compatibility_correction,
+        "maximum_cell_integrated_flux_divergence": maximum_divergence,
+        "maximum_relative_cell_flux_divergence": maximum_divergence
+        / max(maximum_flux, np.finfo(float).tiny),
+    }
+
+
 def write_inner_binary(
     path: Path,
     times: Iterable[float],
@@ -605,6 +734,9 @@ def write_inner_binary(
     ):
         raise ValueError("inner replay metadata requires finite center and half_width")
 
+    initial_volume_flux, initial_flux_diagnostics = construct_initial_volume_flux(
+        checked
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     checksum = 0
     with path.open("w+b") as stream:
@@ -635,6 +767,8 @@ def write_inner_binary(
             append(checked[name].normal_flux)
             append(checked[name].emf_u)
             append(checked[name].emf_v)
+        for name in ("x1", "x2", "x3"):
+            append(initial_volume_flux[name])
         stream.seek(0)
         stream.write(
             INNER_BINARY_HEADER.pack(
@@ -655,9 +789,16 @@ def write_inner_binary(
         "classification": INNER_BINARY_CLASSIFICATION,
         "binary_file": path.name,
         "format": "<16sIIII4dQ followed by little-endian float64 arrays",
+        "binary_version": INNER_BINARY_VERSION,
         "crc32_payload": f"{checksum:08x}",
         "face_order": list(FACE_NAMES),
         "array_order_per_face": ["cell_state", "normal_flux", "emf_u", "emf_v"],
+        "trailing_array_order": [
+            "initial_x1_volume_flux",
+            "initial_x2_volume_flux",
+            "initial_x3_volume_flux",
+        ],
+        "initial_volume_flux": initial_flux_diagnostics,
         "nt": int(times_array.size),
         "nvar": int(nvar),
         "cells_per_face_axis": int(cells_u),
@@ -667,9 +808,12 @@ def write_inner_binary(
         "source_metadata": document,
     }
     sidecar_path = path.with_suffix(path.suffix + ".json")
-    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8")
+    sidecar_path.write_text(
+        json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8"
+    )
     diagnostics["binary_file"] = str(path)
     diagnostics["payload_crc32"] = f"{checksum:08x}"
+    diagnostics["initial_volume_flux"] = initial_flux_diagnostics
     return diagnostics
 
 
@@ -686,7 +830,7 @@ def read_inner_binary(
     center = remaining[:3]
     half_width = remaining[3]
     expected_checksum = remaining[4]
-    if magic != INNER_BINARY_MAGIC or version != INNER_BINARY_VERSION:
+    if magic != INNER_BINARY_MAGIC or version not in (1, INNER_BINARY_VERSION):
         raise ValueError("inner replay magic or version is unsupported")
     if cells < 1 or nvar < 1 or nt < 2:
         raise ValueError("inner replay dimensions are invalid")
@@ -702,7 +846,9 @@ def read_inner_binary(
         count = math.prod(shape)
         if cursor + count > values.size:
             raise ValueError("inner replay binary ended inside an array")
-        result = np.asarray(values[cursor : cursor + count].reshape(shape), dtype=np.float64)
+        result = np.asarray(
+            values[cursor : cursor + count].reshape(shape), dtype=np.float64
+        )
         cursor += count
         if not np.isfinite(result).all():
             raise ValueError("inner replay binary contains a non-finite value")
@@ -717,16 +863,41 @@ def read_inner_binary(
             emf_u=take((nt - 1, cells + 1, cells)),
             emf_v=take((nt - 1, cells, cells + 1)),
         )
+    initial_flux_diagnostics = None
+    if version >= 2:
+        volume_flux = {
+            "x1": take((cells, cells, cells + 1)),
+            "x2": take((cells, cells + 1, cells)),
+            "x3": take((cells + 1, cells, cells)),
+        }
+        divergence = _cell_flux_divergence(volume_flux)
+        maximum_flux = max(
+            float(np.max(np.abs(array))) for array in volume_flux.values()
+        )
+        maximum_divergence = float(np.max(np.abs(divergence)))
+        initial_flux_diagnostics = {
+            "maximum_cell_integrated_flux_divergence": maximum_divergence,
+            "maximum_relative_cell_flux_divergence": maximum_divergence
+            / max(maximum_flux, np.finfo(float).tiny),
+        }
     if cursor != values.size:
         raise ValueError("inner replay binary has unclassified trailing data")
     diagnostics = validate_worldtube(times, faces)
+    binary_classification = (
+        INNER_BINARY_CLASSIFICATION
+        if version >= INNER_BINARY_VERSION
+        else LEGACY_INNER_BINARY_CLASSIFICATION
+    )
     metadata = {
-        "classification": INNER_BINARY_CLASSIFICATION,
+        "classification": binary_classification,
         "center": list(center),
         "half_width": half_width,
         "payload_crc32": f"{checksum:08x}",
+        "binary_version": version,
         "diagnostics": diagnostics,
     }
+    if initial_flux_diagnostics is not None:
+        metadata["initial_volume_flux"] = initial_flux_diagnostics
     sidecar_path = path.with_suffix(path.suffix + ".json")
     if sidecar_path.exists():
         with sidecar_path.open(encoding="utf-8") as stream:
@@ -735,7 +906,7 @@ def read_inner_binary(
             "crc32_payload", sidecar.get("payload_crc32")
         )
         if (
-            sidecar.get("classification") != INNER_BINARY_CLASSIFICATION
+            sidecar.get("classification") != binary_classification
             or sidecar_checksum != f"{checksum:08x}"
         ):
             raise ValueError("inner replay sidecar does not match its binary payload")

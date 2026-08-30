@@ -265,6 +265,55 @@ def _projection_summary(metadata: dict[str, object]) -> dict[str, float]:
     }
 
 
+def _boundary_state_summary(
+    faces: dict[str, worldtube.FaceData], metadata: dict[str, object]
+) -> dict[str, object]:
+    names = list(metadata.get("state_variables", ()))
+    required = ("rho", "pgas", "bcc1", "bcc2", "bcc3")
+    if any(name not in names for name in required):
+        raise ValueError(
+            "worldtube state lacks rho, pgas, or cell-centered magnetic data"
+        )
+    state = np.concatenate(
+        [faces[name].cell_state for name in worldtube.FACE_NAMES], axis=2
+    )
+    indices = {name: names.index(name) for name in required}
+    density = state[:, indices["rho"]]
+    pressure = state[:, indices["pgas"]]
+    magnetic_squared = sum(
+        state[:, indices[name]] ** 2 for name in ("bcc1", "bcc2", "bcc3")
+    )
+    if float(np.min(density)) <= 0.0 or float(np.min(pressure)) <= 0.0:
+        raise ValueError("worldtube boundary contains non-positive density or pressure")
+    initial = state[0]
+    initial_mean = np.mean(initial, axis=(1, 2))
+    initial_scale = np.maximum(
+        np.max(np.abs(initial), axis=(1, 2)), np.finfo(float).tiny
+    )
+    initial_spread = np.max(
+        np.abs(initial - initial_mean[:, None, None]), axis=(1, 2)
+    ) / initial_scale
+    return {
+        "minimum_density": float(np.min(density)),
+        "maximum_density": float(np.max(density)),
+        "minimum_pressure": float(np.min(pressure)),
+        "maximum_pressure": float(np.max(pressure)),
+        "maximum_b_squared_over_density_proxy": float(
+            np.max(magnetic_squared / density)
+        ),
+        "initial_face_mean_by_variable": {
+            name: float(initial_mean[index]) for index, name in enumerate(names)
+        },
+        "initial_maximum_relative_spread_by_variable": {
+            name: float(initial_spread[index]) for index, name in enumerate(names)
+        },
+        "note": (
+            "B^2/rho is a coordinate proxy because the replay file does not store "
+            "the local volume metric"
+        ),
+    }
+
+
 def _compact_preflight(report: dict[str, object]) -> dict[str, object]:
     return {
         "passed": report["passed"],
@@ -359,6 +408,12 @@ def assess_campaign(
         conditions[f"{name}_faraday_residual"] = _condition_maximum(
             projection["maximum_final_faraday_residual"],
             arguments.maximum_faraday_residual,
+        )
+        conditions[f"{name}_initial_volume_divergence"] = _condition_maximum(
+            case["inner_validation"]["initial_volume_flux"][
+                "maximum_relative_cell_flux_divergence"
+            ],
+            arguments.maximum_initial_volume_flux_divergence,
         )
     convergence = {
         field: _comparison_maximum(cases, field)
@@ -552,6 +607,7 @@ def _run_extraction_case(
         "extraction_wall_seconds": elapsed,
         "preflight": _compact_preflight(preflight_report),
         "projection": _projection_summary(metadata),
+        "boundary_state": _boundary_state_summary(faces, metadata),
         "raw_sampling": diagnostics["raw_sampling"],
         "snapshot_loading": diagnostics["snapshot_loading"],
         "worldtube_validation": validation,
@@ -769,6 +825,9 @@ def parse_arguments() -> argparse.Namespace:
         "--maximum-relative-edge-correction", type=float, default=5.0e-2
     )
     parser.add_argument("--maximum-faraday-residual", type=float, default=1.0e-10)
+    parser.add_argument(
+        "--maximum-initial-volume-flux-divergence", type=float, default=1.0e-10
+    )
     parser.add_argument("--maximum-state-relative-change", type=float)
     parser.add_argument("--maximum-flux-relative-change", type=float)
     parser.add_argument("--maximum-emf-relative-change", type=float)
@@ -815,6 +874,7 @@ def parse_arguments() -> argparse.Namespace:
         "maximum_relative_closed_flux_correction",
         "maximum_relative_edge_correction",
         "maximum_faraday_residual",
+        "maximum_initial_volume_flux_divergence",
         "maximum_state_relative_change",
         "maximum_flux_relative_change",
         "maximum_emf_relative_change",
