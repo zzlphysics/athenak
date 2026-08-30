@@ -1,0 +1,57 @@
+{
+  "classification": "athenak-emri-frozen-production-restart-validation-v1",
+  "date": "2026-08-30",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "90154b67feb17222000bcee19bf7fefeb95c27d2",
+    "binary": "build_emri/src/athena",
+    "binary_sha256": "134d3c7d39967f0369e1f4e338c83656ef5ba85afb7a227223c07e9a6ed69a28",
+    "build": "CPU serial, double precision, emri_windtunnel"
+  },
+  "experiment": {
+    "continuous_final_cycle": 4,
+    "split_cycle": 2,
+    "resumed_final_cycle": 4,
+    "root_dt": 0.05,
+    "root_meshblocks": 8,
+    "final_meshblocks": 120,
+    "physical_refinement_levels": 2,
+    "meshblock_dimensions": [8, 8, 8],
+    "level_subcycling": true,
+    "dynamic_adm": true,
+    "user_force_history": true,
+    "restart_cache_contract_version": 1,
+    "restart_reconstruction_maximum_mixed_scale_change": 2.218849628541568e-16,
+    "restart_reconstruction_acceptance_tolerance": 9.094947017729282e-13
+  },
+  "comparison": {
+    "passed": true,
+    "same_endpoint": true,
+    "same_topology": true,
+    "rtol": 0.0,
+    "atol": 0.0,
+    "all_stored_fields_match": true,
+    "authoritative_match": true,
+    "mhd_conserved_active_max_abs": 0.0,
+    "mhd_conserved_ghost_max_abs": 0.0,
+    "magnetic_active_faces_max_abs": 0.0,
+    "magnetic_ghost_faces_max_abs": 0.0,
+    "adm_active_max_abs": 0.0,
+    "adm_ghost_max_abs": 0.0,
+    "continuous_maximum_divB": 8.673617379884035e-17,
+    "resumed_maximum_divB": 8.673617379884035e-17,
+    "history_distinct_times": 5,
+    "history_derived_columns": 40,
+    "history_times_and_values_exact_after_time_deduplication": true
+  },
+  "evidence": {
+    "continuous_restart_size_bytes": 99058462,
+    "resumed_restart_size_bytes": 99058462,
+    "continuous_restart_sha256": "e70023dbdb2db48cdc1beb80fca9ac7dca2ea04a6c0276ec053bd3dcae1ad7f1",
+    "resumed_restart_sha256": "b81882491fac724df15e1f6c652a630eab40e7b8c5f140afd482c2cbfa8481e0",
+    "continuous_history_sha256": "307c961c8fe55fe1a58ae7ff13ef39115f7302e4c595592778adc701e8bd77db",
+    "resumed_history_sha256": "88ec154c420fc2a201a7b559a1e95133342ad693cf95674feb68b052046fa27d",
+    "note": "Whole-file hashes differ because restart checkpoint identities, nlim headers, and repeated history headers are intentionally invocation-specific; authoritative field comparison and time-deduplicated history values are exact."
+  },
+  "scope": "Local CPU proof that strict level-subcycled AMR restart preserves the EMRI MHD/ADM/CT state and source-frame force history. This does not qualify production-grid checkpoint memory or I/O cost."
+}

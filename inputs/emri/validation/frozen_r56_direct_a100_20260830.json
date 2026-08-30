@@ -86,6 +86,7 @@
     "returncode": 0,
     "final_cycle": 15,
     "final_time_in_secondary_masses": 75.51375,
+    "measured_root_dt_in_secondary_masses": 5.03425,
     "wall_seconds": 868.0895671844482,
     "final_meshblocks": 2779,
     "created_meshblocks": 2492,
@@ -104,7 +105,17 @@
     "measured_rate_projection_seconds": 73119.16801224412,
     "measured_rate_projection_hours": 20.310880003401145,
     "calibration_to_projected_update_ratio": 84.36242074838388,
-    "warning": "This is a throughput projection from a topology-building calibration. Production force diagnostics, checkpoints, field outputs, transient settling uncertainty, and convergence variations add cost."
+    "planner_root_cycle_proxy": 684.083984375,
+    "projected_root_cycles_at_measured_root_dt": 1677,
+    "measured_to_planner_step_count_correction": 2.451453386285835,
+    "measured_zone_cycles_per_steady_root_cycle": 1197815922.45,
+    "planner_ideal_zone_cycles_per_root_proxy": 1173258240.0,
+    "measured_to_planner_topology_correction": 1.020931182592845,
+    "cfl_corrected_lower_bound_seconds": 179248.23202601878,
+    "cfl_corrected_lower_bound_hours": 49.791175562782996,
+    "empirical_steady_topology_projection_seconds": 183000.10950000002,
+    "empirical_steady_topology_projection_hours": 50.833363750000004,
+    "warning": "The 20.31-hour zone-update projection is only an ideal-CFL lower bound. The measured root timestep requires 2.451 times more root cycles; use the 50.83-hour empirical steady-topology projection before force diagnostics, checkpoints, field outputs, startup, stationarity extensions, and convergence variations add cost."
   },
   "downloaded_evidence": {
     "summary_sha256": "a63786f045edea35bf4c5bfb19c89e1c76d5c42bf7f2443504ff3db844772dd0",

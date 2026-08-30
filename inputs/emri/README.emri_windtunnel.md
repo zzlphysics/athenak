@@ -542,9 +542,59 @@ The real `r_BL=56M`, phase-zero A100 calibration is recorded in
 98.2 per cent, and maximum `|divB|` was `2.76e-13`.  A single V100-32GB cannot contain
 the same topology plus regridding temporaries: its memory-safe 2300-block capacity was
 already below the 2499 blocks requested at cycle six.  At the measured A100 rate, the
-reduced two-capture-crossing plan projects to about 20.3 hours before force/output and
-convergence overhead; the 15-cycle run is consequently a resource calibration, not a
-relaxed BHL solution.
+ideal nested-zone model gives 20.3 hours, but this is not a usable production estimate.
+The model's topology differs from the measured steady topology by only 2.1 per cent;
+the important correction is that the measured root timestep is 2.451 times shorter than
+the planner's ideal-CFL proxy.  The corrected lower bound is 49.8 hours and direct
+steady-root-cycle extrapolation is 50.8 hours, both before force/output, checkpoint,
+startup, stationarity-extension, and convergence overhead.  The 15-cycle run is
+consequently a resource calibration, not a relaxed BHL solution.
+
+Convert a passed pilot and its matching GPU evidence into a restartable production
+policy with
+
+```bash
+python3 inputs/emri/prepare_frozen_production_campaign.py \
+  --pilot profiles/r56-direct-calibration.json \
+  --calibration inputs/emri/validation/frozen_r56_direct_a100_20260830.json \
+  --output profiles/r56-direct-production.json
+```
+
+The default policy uses 98 measured root steps per segment (about 2.97 A100 hours), a
+49-root-step restart cadence (about 1.49 hours), one force-history sample per root step,
+and four primitive/`divB` field dumps per capture crossing.  Later segments must inspect
+the newest completed restart, set `nlim=current_cycle+98`, and retain the global physical
+`tlim`; a script must never guess the next checkpoint number after a failed segment.
+AthenaK appends history files and the force-history reader removes duplicate times, so
+the forced endpoint sample of one segment and the initial sample after restart do not
+bias an average.
+
+For this direct box, the production force shells are `0.5 r_a`, `1 r_a`, and `2 r_a`
+instead of the smoke-test radii `4m`, `6m`, and `7.5m`.  The latter see only the near-hole
+flow and cannot establish closure of the BHL wake force.  With 2779 blocks a double-
+precision restart is estimated at 7.19 GiB because it contains ghosted MHD conserved
+variables, face fields, and the prescribed ADM arrays; at the configured 3500-block
+capacity it is 9.06 GiB.  Retain at least two audited generations and budget at least
+42 GiB of working disk for the default output policy.  Restart creation also allocates
+device-side output copies, so its actual peak memory and write latency require a short
+A100 qualification before the first long segment.
+
+Two capture crossings are a target, not an automatic claim of relaxation.  Discard at
+least the first crossing, compare adjacent quarter-crossing windows of `mdot_hat` and all
+three force vectors, and require closure of the outer-shell increment.  If the window
+drift exceeds ten per cent, its mean shift exceeds two combined block standard errors,
+the `1 r_a -> 2 r_a` increment exceeds fifteen per cent, or a block is shorter than the
+measured autocorrelation time, extend by a quarter crossing and reassess.
+
+The local segmented-run gate is recorded in
+`validation/frozen_production_restart_cpu_20260830.json`.  A two-level physical AMR
+hierarchy ending at 120 MeshBlocks was evolved continuously to cycle four and separately
+through a cycle-two checkpoint.  At the common endpoint all active and ghost MHD
+conserved values, all active and ghost face fields, and all prescribed ADM values agreed
+bit for bit.  Both paths had `max|divB|=8.67e-17`; after duplicate-time removal, all 40
+derived force-history columns at five times also agreed exactly.  This establishes the
+restart/force/CT continuity contract, but not the memory or I/O cost of a 2779-block
+production checkpoint.
 
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is
