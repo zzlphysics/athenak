@@ -1,0 +1,122 @@
+{
+  "classification": "athenak-emri-frozen-direct-cloud-calibration-v1",
+  "date": "2026-08-30",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "solver_commit": "56e79037c048470069370c1de258fb33422bfc9d",
+    "campaign_case": "r56_p000_t5000",
+    "source_state_sha256": "0ce2f278908b3bd0ee439611d35632f871b0cb8328bc53ed11096172687625b6",
+    "pilot_generator": "inputs/emri/prepare_frozen_direct_pilot.py"
+  },
+  "physical_case": {
+    "mass_ratio": 1e-05,
+    "primary_dimensionless_spin": 0.9375,
+    "orbital_radius_in_primary_masses": 56.0,
+    "source_adiabatic_index": 1.4444444444444444,
+    "capture_radius_in_secondary_masses": 329.0412309432926,
+    "wind_spatial_four_velocity": [
+      -0.03469185339078683,
+      -0.02655332151092482,
+      0.00006563300765654642
+    ],
+    "root_dimensions": [128, 112, 80],
+    "meshblock_dimensions": [16, 16, 16],
+    "physical_refinement_levels": 9,
+    "finest_refinement_radius_in_secondary_masses": 3.0,
+    "configured_maximum_meshblocks_per_rank": 3500,
+    "calibration_cycles": 15,
+    "level_subcycling": true
+  },
+  "resource_routing_audit": {
+    "single_v100_32GB": {
+      "suitable": false,
+      "observations": [
+        {
+          "maximum_meshblocks_per_rank": 3500,
+          "outcome": "initialization OOM allocating e2_cc",
+          "peak_gpu_memory_MiB": 32222.0
+        },
+        {
+          "maximum_meshblocks_per_rank": 2400,
+          "outcome": "cycle-5 OOM allocating a 29.16 MiB excision_flux temporary",
+          "peak_gpu_memory_MiB": 32472.0
+        },
+        {
+          "maximum_meshblocks_per_rank": 2300,
+          "outcome": "memory-safe through cycle 6, then AMR requested 2499 blocks",
+          "peak_gpu_memory_MiB": 31160.0
+        }
+      ],
+      "conclusion": "The scientific topology and safe temporary-memory margin do not overlap on one 32GB V100."
+    },
+    "dual_v100_32GB": {
+      "hardware_memory_suitable": true,
+      "execution_ready_on_stock_image": false,
+      "system_openmpi_cuda_support": false,
+      "nvlink_topology": "two bonded NVLinks (NV2)",
+      "conclusion": "AthenaK passes device buffers directly to MPI; the stock Ubuntu OpenMPI cannot be used without a validated CUDA-aware MPI stack."
+    },
+    "single_a100_80GB": {
+      "suitable": true,
+      "provider": "Zhixing Cloud",
+      "instance_id": 652212,
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "gpu_count": 1,
+      "cpu_count": 8,
+      "host_memory_GB": 24,
+      "image": "ubuntu22_cuda12.4",
+      "nvidia_driver": "550.127.05",
+      "cuda_toolkit": "12.4.99",
+      "quoted_cost_CNY_for_one_hour": 8.0625,
+      "released_after_evidence_download": true
+    }
+  },
+  "build": {
+    "build_type": "Release",
+    "problem": "emri_windtunnel",
+    "mpi": false,
+    "single_precision": false,
+    "kokkos_cuda": true,
+    "kokkos_arch": "AMPERE80",
+    "athena_sha256": "cd4f8a29c4cae6cface56f7af8912a9ceeb8cfb6344a5059ed88557c9d98c1a0",
+    "cmake_cache_sha256": "6df79e920fbd0e4d12f8be5f6cf921a8acc18f5014b6689553cba679b9e83af5"
+  },
+  "result": {
+    "passed": true,
+    "returncode": 0,
+    "final_cycle": 15,
+    "final_time_in_secondary_masses": 75.51375,
+    "wall_seconds": 868.0895671844482,
+    "final_meshblocks": 2779,
+    "created_meshblocks": 2492,
+    "meshblock_cycles": 2322705,
+    "zone_cycles": 9513799680,
+    "zone_cycles_per_second_reported": 10976700.0,
+    "steady_nine_level_root_cycle_seconds": 109.1235,
+    "peak_gpu_memory_MiB": 47621.0,
+    "mean_sampled_gpu_utilization_percent": 98.1821325648415,
+    "maximum_divB": 2.758904216193514e-13,
+    "termination": "cycle limit"
+  },
+  "reduced_direct_cost_projection": {
+    "flow_crossings": 2.0,
+    "ideal_level_subcycled_zone_updates": 802607171520,
+    "measured_rate_projection_seconds": 73119.16801224412,
+    "measured_rate_projection_hours": 20.310880003401145,
+    "calibration_to_projected_update_ratio": 84.36242074838388,
+    "warning": "This is a throughput projection from a topology-building calibration. Production force diagnostics, checkpoints, field outputs, transient settling uncertainty, and convergence variations add cost."
+  },
+  "downloaded_evidence": {
+    "summary_sha256": "a63786f045edea35bf4c5bfb19c89e1c76d5c42bf7f2443504ff3db844772dd0",
+    "plan_sha256": "d5a590fb964de7d2e2dcabc9fa591c5cabd622a12155cb59978791020eb32b8d",
+    "command_sha256": "ba48b00b662c48319e78fb3ca008d681e14d6cb66f6291b90d11e819f1e21818",
+    "athena_log_sha256": "469ec3ecaff68aa41b7cb1076dc11f0fa7ecda3753b2779a238ad82d07ae2753",
+    "gpu_log_sha256": "605ce9062047cfb82be6f5725b03584a499c2af6f2bda64d54a518c031b39e56",
+    "divB_output_sha256": {
+      "00000": "227b96b5945ec3f98ab33e91d5a4ec13af4f4d637a265fc874629c7908648608",
+      "00001": "c59d7b5e75e2149828529fe8f3ef6f37d5ff4fa2fdf6aa9dd882ccc734e38389",
+      "00002": "f00090b8aa8df4bf29ca1fe421258695bc9c32dd10b4502d62934a91d5729568"
+    }
+  },
+  "scope": "GPU memory, throughput, dynamic-AMR topology, active-level user boundaries, prescribed dynamic ADM, and CT calibration only. This is not a settled-flow force result or a physical-resolution convergence claim."
+}

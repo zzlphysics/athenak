@@ -527,6 +527,25 @@ EMRI boundary callback is active-level aware; other user-boundary problems remai
 fail-closed under level subcycling unless they explicitly implement the same contract.
 This calibration is a memory/throughput measurement, not a settled-flow result.
 
+`max_nmb_per_rank` is a resident-allocation capacity, not only an AMR safety check:
+AthenaK provisions the GRMHD and ADM views to that value on every rank.  The pilot
+therefore records both the total block-budget estimate and its per-rank allocation.
+Use `--parallel-ranks N` when preparing an MPI resource plan, or
+`--maximum-meshblocks-per-rank` for a deliberately capacity-limited calibration.  The
+latter never changes the physical mesh; AthenaK stops if the evolving topology exceeds
+the declared capacity.
+
+The real `r_BL=56M`, phase-zero A100 calibration is recorded in
+`validation/frozen_r56_direct_a100_20260830.json`.  The nine-level mesh grew from 287 to
+2779 MeshBlocks and completed 15 root cycles in 868.1 seconds at
+`1.09767e7` zone-cycles/s.  Peak A100-80GB memory was 47621 MiB, sampled utilization was
+98.2 per cent, and maximum `|divB|` was `2.76e-13`.  A single V100-32GB cannot contain
+the same topology plus regridding temporaries: its memory-safe 2300-block capacity was
+already below the 2499 blocks requested at cycle six.  At the measured A100 rate, the
+reduced two-capture-crossing plan projects to about 20.3 hours before force/output and
+convergence overhead; the 15-cycle run is consequently a resource calibration, not a
+relaxed BHL solution.
+
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is
 not merely a convenience check: the current local metric is circular and equatorial, so

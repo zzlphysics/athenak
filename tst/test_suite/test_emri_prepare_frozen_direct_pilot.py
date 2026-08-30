@@ -72,3 +72,42 @@ def test_reduced_pilot_has_runnable_mesh_and_source_eos() -> None:
     assert any(value == "mhd/gamma=1.4444444444444444"
                for value in result["athena_overrides"])
     assert math.isfinite(result["bhl_plan"]["scales"]["capture_radius_factor_two_for_cost"])
+
+    root_blocks = math.prod(value // 8 for value in mesh["root_dimensions"])
+    capacity_limited = pilot.build_pilot(
+        campaign,
+        "selected",
+        cells_per_secondary_mass=8.0,
+        outer_cells_per_capture_radius=8.0,
+        flow_crossings=2.0,
+        meshblock_cells=8,
+        calibration_cycles=15,
+        finest_refinement_radius=1.0,
+        maximum_meshblocks_per_rank=root_blocks,
+    )
+    limited_mesh = capacity_limited["mesh"]
+    assert limited_mesh["maximum_meshblocks_per_rank"] == root_blocks
+    assert limited_mesh["capacity_limited_calibration"] is True
+    assert limited_mesh["estimated_meshblocks_for_budget"] > root_blocks
+    assert (
+        f"mesh_refinement/max_nmb_per_rank={root_blocks}"
+        in capacity_limited["athena_overrides"]
+    )
+
+    two_rank = pilot.build_pilot(
+        campaign,
+        "selected",
+        cells_per_secondary_mass=8.0,
+        outer_cells_per_capture_radius=8.0,
+        flow_crossings=2.0,
+        meshblock_cells=8,
+        calibration_cycles=15,
+        finest_refinement_radius=1.0,
+        parallel_ranks=2,
+    )
+    two_rank_mesh = two_rank["mesh"]
+    assert two_rank_mesh["parallel_ranks"] == 2
+    assert two_rank_mesh["capacity_limited_calibration"] is False
+    assert two_rank_mesh["maximum_meshblocks_per_rank"] == math.ceil(
+        two_rank_mesh["estimated_meshblocks_for_budget"] / 2
+    )

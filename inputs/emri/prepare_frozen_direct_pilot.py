@@ -52,12 +52,16 @@ def build_pilot(
     meshblock_cells: int,
     calibration_cycles: int,
     finest_refinement_radius: float,
+    maximum_meshblocks_per_rank: int | None = None,
+    parallel_ranks: int = 1,
 ) -> dict[str, object]:
     case = _case(campaign, identifier)
     if meshblock_cells < 4 or meshblock_cells % 2 != 0:
         raise ValueError("meshblock cells must be an even integer of at least four")
     if calibration_cycles < 1:
         raise ValueError("calibration cycles must be positive")
+    if parallel_ranks < 1:
+        raise ValueError("parallel ranks must be positive")
     if not math.isfinite(finest_refinement_radius) or finest_refinement_radius <= 0.0:
         raise ValueError("finest refinement radius must be finite and positive")
     reference = case["profiles"][0]
@@ -115,6 +119,18 @@ def build_pilot(
     estimated_blocks = math.ceil(
         1.25 * int(direct["optimistic_nested_resident_cells"]) / block_cells
     )
+    root_blocks = math.prod(value // meshblock_cells for value in dimensions)
+    configured_blocks = (
+        math.ceil(estimated_blocks / parallel_ranks)
+        if maximum_meshblocks_per_rank is None
+        else int(maximum_meshblocks_per_rank)
+    )
+    minimum_initial_blocks_per_rank = math.ceil(root_blocks / parallel_ranks)
+    if configured_blocks < minimum_initial_blocks_per_rank:
+        raise ValueError(
+            "maximum meshblocks per rank cannot hold a balanced initial root grid: "
+            f"{configured_blocks} < {minimum_initial_blocks_per_rank}"
+        )
     boundaries = inflow_boundaries(velocity)
     root_block_widths = [
         (upper[axis] - lower[axis]) * meshblock_cells / dimensions[axis]
@@ -148,7 +164,7 @@ def build_pilot(
         "adm/dynamic=true",
         "mesh_refinement/refinement=adaptive",
         f"mesh_refinement/num_levels={levels + 1}",
-        f"mesh_refinement/max_nmb_per_rank={estimated_blocks}",
+        f"mesh_refinement/max_nmb_per_rank={configured_blocks}",
         "mesh_refinement/ncycle_check=1",
         "mesh_refinement/refinement_interval=1",
         f"mesh/nx1={dimensions[0]}",
@@ -206,7 +222,15 @@ def build_pilot(
             "meshblock_dimensions": [meshblock_cells] * 3,
             "physical_refinement_levels": levels,
             "refinement_radii": refinement_radii,
-            "maximum_meshblocks_per_rank": estimated_blocks,
+            "estimated_meshblocks_for_budget": estimated_blocks,
+            "estimated_meshblocks_per_rank_for_budget": math.ceil(
+                estimated_blocks / parallel_ranks
+            ),
+            "maximum_meshblocks_per_rank": configured_blocks,
+            "parallel_ranks": parallel_ranks,
+            "capacity_limited_calibration": (
+                configured_blocks * parallel_ranks < estimated_blocks
+            ),
             "boundary_conditions": boundaries,
             "root_meshblock_physical_widths": root_block_widths,
             "user_boundary_refinement_clearances": user_boundary_clearances,
@@ -233,6 +257,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--meshblock-cells", type=int, default=8)
     parser.add_argument("--calibration-cycles", type=int, default=15)
     parser.add_argument("--finest-refinement-radius", type=float, default=3.0)
+    parser.add_argument("--maximum-meshblocks-per-rank", type=int)
+    parser.add_argument("--parallel-ranks", type=int, default=1)
     return parser.parse_args()
 
 
@@ -249,6 +275,8 @@ def main() -> int:
         meshblock_cells=arguments.meshblock_cells,
         calibration_cycles=arguments.calibration_cycles,
         finest_refinement_radius=arguments.finest_refinement_radius,
+        maximum_meshblocks_per_rank=arguments.maximum_meshblocks_per_rank,
+        parallel_ranks=arguments.parallel_ranks,
     )
     output = arguments.output.expanduser().resolve()
     if output.exists():
