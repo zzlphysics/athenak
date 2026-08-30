@@ -901,6 +901,31 @@ decomposition to about `5.8e-8`.  The primary metric resolution must still be co
 against its own curvature/gradient scale; v3 is not permission to underresolve the
 global primary data.
 
+Before spending on a source-data convergence campaign, run the manufactured v3
+`K_ij` validation matrix:
+
+```bash
+python3 inputs/emri/run_hybrid_adm_k_validation.py \
+  --athena build_emri/src/athena \
+  --workdir runs/emri/hybrid_adm_k_validation \
+  --fd-ratios 2.5e-5 5e-5 1e-4 \
+  --fail-on-gate
+```
+
+For each finite-difference step, the first part compares a v3 replay containing an
+exact Minkowski primary against the independent analytic isolated-secondary callback.
+It compares the six `K_ij` components with a joint tensor norm, as well as every other
+ADM field.  The spread across the three `h/m` values must remain below one per cent.
+The second part uses a non-diagonal, time-dependent affine primary metric with exact
+stored spatial derivatives and a time-dependent orthonormal secondary coframe.  It
+runs two-level dynamic AMR, audits every coarse and fine output cell against the Python
+reconstruction, requires a boundary-topology rebuild, and checks `divB`.  The
+manufactured test deliberately disables fluid-state replay while retaining CT replay
+and time synchronization, so a characteristic-boundary fallback cannot hide or mimic a
+metric-reconstruction failure.  Passing this matrix establishes implementation
+consistency; it does not replace convergence of the real primary ADM source resolution
+and cadence.
+
 The metric grid covers all active and ghost cell centers.  The required halo is computed
 from the metric-to-root-fluid resolution ratio, so it need not equal `mesh/nghost`; the
 production defaults are both four.  A temporally tilted affine frame
