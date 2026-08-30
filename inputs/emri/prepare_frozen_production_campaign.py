@@ -519,16 +519,18 @@ def build_production_campaign(
     # Build the complete adaptive tree before any science segment, then retain the
     # checkpoint tree verbatim under static refinement.  One level can be added per
     # synchronized root cycle, so levels+1 provides a final verification cycle at the
-    # complete topology.  Field/history output is deferred until the tree is frozen;
-    # the active restart output produces the topology hand-off checkpoint.
+    # complete topology.  History is deferred until the tree is frozen.  Activating
+    # field and restart output at exactly the warmup duration preserves both the initial
+    # state and a full-topology hand-off snapshot even though the first science cadence
+    # has not yet elapsed.
     topology_warmup_root_steps = levels + 1
     topology_warmup_duration_proxy = topology_warmup_root_steps * measured_root_dt
     warmup_overrides = _replace_overrides(
         fresh_overrides,
         {
             "time/nlim": str(topology_warmup_root_steps),
-            "output1/dt": "0",
-            "output2/dt": "0",
+            "output1/dt": f"{topology_warmup_duration_proxy:.17g}",
+            "output2/dt": f"{topology_warmup_duration_proxy:.17g}",
             "output3/dt": f"{topology_warmup_duration_proxy:.17g}",
             "output4/dt": "0",
         },
@@ -634,6 +636,12 @@ def build_production_campaign(
             "required_warmup_meshblocks": final_meshblocks,
             "required_physical_refinement_levels": levels,
             "production_refinement_mode": "static",
+            "required_handoff_outputs": [
+                "full-topology mhd_w_bcc field",
+                "full-topology mhd_divb field",
+                "full-topology restart",
+                "SHA-256 manifest exported before provider-disk release",
+            ],
             "handoff_rule": (
                 "accept only a complete finite warmup restart whose leaf tree has the "
                 "calibrated MeshBlock count and maximum physical level; all science, "

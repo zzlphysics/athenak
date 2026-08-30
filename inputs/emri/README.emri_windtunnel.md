@@ -581,7 +581,10 @@ The generated policy now separates mesh construction from science evolution.  Ru
 the calibrated leaf count and finest level, and audit its final restart.  Every ordinary
 production restart then overrides `mesh_refinement/refinement=static`; changing leaf
 quadrature can no longer masquerade as time evolution in a force integral.  The
-`fixed_topology_background_argv_template` loads a copy of the same warmup restart,
+warmup output cadence deliberately writes `mhd_w_bcc`, `mhd_divb`, and a restart at the
+full-topology handoff even though the first quarter-crossing science cadence has not
+elapsed.  Export that field pair and its hashes before releasing the provider disk.
+The `fixed_topology_background_argv_template` loads a copy of the same warmup restart,
 switches off level subcycling, replaces its GRMHD state by the analytic upstream wind,
 and advances one `1e-6`-root-step probe to force a new history sample.  Its residual
 surface momentum flux is the topology-matched interpolation/quadrature baseline.  Never

@@ -293,8 +293,13 @@ def test_real_calibration_produces_conservative_segment_and_output_policy() -> N
     assert "problem/reinitialize_wind_on_restart=true" \
         in campaign["fixed_topology_background_argv_template"]
     assert "time/nlim=10" in campaign["adaptive_warmup_overrides"]
-    assert "output1/dt=0" in campaign["adaptive_warmup_overrides"]
+    assert "output1/dt=50.342500000000001" \
+        in campaign["adaptive_warmup_overrides"]
+    assert "output2/dt=50.342500000000001" \
+        in campaign["adaptive_warmup_overrides"]
     assert "output4/dt=0" in campaign["adaptive_warmup_overrides"]
+    assert "full-topology mhd_w_bcc field" \
+        in topology["required_handoff_outputs"]
 
 
 def test_passed_production_qualification_controls_runtime_and_resources() -> None:
