@@ -456,6 +456,15 @@ corresponds to a very long time in secondary-mass units; short local relaxation 
 should therefore use a frozen-snapshot ensemble rather than pretend to evolve across a
 global interval.
 
+The first real-data pilot is recorded in
+`validation/real_taylor_r41_20260830.json`.  Seven `a=0.9375` MAD snapshots at
+`r_BL=41M` passed the reference-fit residual, fit-radius, cadence, single-level-cell,
+trace-free-field, and one-cycle CT smoke gates.  Extending the same arc to nine snapshots
+crossed a static-AMR interface (cell-volume ratio eight), and the audit rejected it as
+intended.  This is a loader and local-model qualification, not a convergence claim: all
+three fit radii still sample one global resolution, and at `q=10^-5` the global cadence
+maps to millions of secondary-mass time units.
+
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is
 not merely a convenience check: the current local metric is circular and equatorial, so

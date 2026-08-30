@@ -1,0 +1,160 @@
+{
+  "classification": "athenak-emri-real-mad-taylor-pilot-v1",
+  "date": "2026-08-30",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "b33bfb4c5df5364266c564e92f406b86cfafd955",
+    "dataset": "output/20240929_cuda_mad_a09375_128-128-128-8",
+    "dump_pattern": "bin/torus.mhd_w_bcc.NNNNN.bin",
+    "metric": {
+      "classification": "athenak-emri-analytic-kerr-schild-primary-v1",
+      "coordinates": "aligned-spin Cartesian Kerr-Schild",
+      "primary_mass": 1.0,
+      "dimensionless_spin": 0.9375
+    },
+    "thermodynamics": {
+      "input_variable": "eint",
+      "adiabatic_index": 1.4444444444444444,
+      "conversion": "press=(gamma-1)*eint"
+    }
+  },
+  "state_dumps": [
+    {
+      "id": "00246",
+      "time_global": 4920.0,
+      "cycle": 262400,
+      "sha256": "eb4fce074d1fe726d80d6d6d3fc641827c10f1f3755a08ef54c8e98eb9babcc0"
+    },
+    {
+      "id": "00247",
+      "time_global": 4940.01,
+      "cycle": 263467,
+      "sha256": "7cbdad6c3400008613fb8f88833275d529ca017897a00fcd91b4bc714174edf7"
+    },
+    {
+      "id": "00248",
+      "time_global": 4960.01,
+      "cycle": 264534,
+      "sha256": "aede71e51775d3b4aadc7f26f93d3fbcf79bcabf05f2292cb290a53a89ea0810"
+    },
+    {
+      "id": "00249",
+      "time_global": 4980.0,
+      "cycle": 265600,
+      "sha256": "2b0d06f443e254d15bf135b018b233f16b7f071f6feb4733d850f848e39ea3b9"
+    },
+    {
+      "id": "00250",
+      "time_global": 5000.01,
+      "cycle": 266667,
+      "sha256": "0ce2f278908b3bd0ee439611d35632f871b0cb8328bc53ed11096172687625b6"
+    },
+    {
+      "id": "00251",
+      "time_global": 5020.01,
+      "cycle": 267734,
+      "sha256": "57127d5b8067ab77ae4b5b84ff553c4e62d439358fe48a21626c9acd0889d09c"
+    },
+    {
+      "id": "00252",
+      "time_global": 5040.0,
+      "cycle": 268800,
+      "sha256": "064fabc2c31ae90fa40f180e7fe9d7b327c836481a376504afa5ecc8690009da"
+    }
+  ],
+  "parameters": {
+    "orbit_boyer_lindquist_radius_over_primary_mass": 41.0,
+    "orbit_direction": "prograde",
+    "mean_coordinate_radius_over_primary_mass": 41.010716968251124,
+    "mean_coordinate_angular_frequency_times_primary_mass": 0.003795562015610983,
+    "mass_ratio": 0.00001,
+    "global_length_in_local_units": 100000.0,
+    "density_renormalization": 10000000000.0,
+    "fit_radii_in_source_units": [2.0, 3.0, 4.0],
+    "reference_fit_radius_in_source_units": 2.0,
+    "cadence_strides": [1, 2, 3]
+  },
+  "artifacts": {
+    "worldline_manifest_sha256": "c5ddd77e6bccfe256e20403a1f8425d338dd100a4dc3c3f951272e8e09497299",
+    "series_manifest_sha256": {
+      "fit_radius_2": "3ec354ce586930dd32c353c21b14635a15afe28f6b64b81e179335a7379f860c",
+      "fit_radius_3": "55d6f4152deb572f5e15b91f3426ab055cd67bb1ff1f5e7d2b0a31651cc2c137",
+      "fit_radius_4": "03abafa7da641f42c490494601f39d8d8b66f47666a4b0c7450324c6276ae682"
+    },
+    "fit_radius_2_table_sha256": "061462a4d37577dd97c2f31825e324501557d114db6bd3d8ae49f860aa76263e",
+    "convergence_report_sha256": "71603bf078d22b87729d2a771d1ed87968cd68d6cb7e46bbb3c7ff96d214a44b"
+  },
+  "assessment": {
+    "passed_for_local_pilot": true,
+    "science_ready": false,
+    "conditions": {
+      "density_log_fit_rms": {
+        "observed": 0.011291846244622039,
+        "maximum": 0.03,
+        "passed": true
+      },
+      "pressure_log_fit_rms": {
+        "observed": 0.01628104671881148,
+        "maximum": 0.03,
+        "passed": true
+      },
+      "velocity_fit_relative_rms": {
+        "observed": 0.011183548695508217,
+        "maximum": 0.03,
+        "passed": true
+      },
+      "magnetic_fit_relative_rms": {
+        "observed": 0.03274974542076449,
+        "maximum": 0.05,
+        "passed": true
+      },
+      "fitting_scale_sensitivity": {
+        "observed": 0.11495224684438195,
+        "maximum": 0.15,
+        "passed": true
+      },
+      "cadence_sensitivity": {
+        "observed": 0.04220778109761059,
+        "maximum": 0.1,
+        "passed": true
+      },
+      "magnetic_gradient_trace": {
+        "observed": 0.0,
+        "maximum": 1e-12,
+        "passed": true
+      },
+      "minimum_fit_samples": {
+        "observed": 32,
+        "minimum": 16,
+        "passed": true
+      },
+      "source_cell_volume_ratio": {
+        "observed": 1.0,
+        "maximum": 1.000001,
+        "passed": true
+      }
+    },
+    "rejected_extension": {
+      "dump_ids": ["00253", "00254"],
+      "source_cell_volume_ratio": 8.0,
+      "reason": "the nine-snapshot orbital arc crosses a static-AMR interface; it must not be treated as a single-resolution Taylor sample"
+    },
+    "science_blockers": [
+      "fit-radius variants share one global source grid and do not establish independent source-resolution convergence",
+      "one global dump interval maps to roughly two million secondary-mass time units at q=1e-5, so these samples define a frozen-snapshot ensemble rather than a continuous short-timescale replay",
+      "the pilot is one-way and does not include the secondary's feedback on the global disk"
+    ]
+  },
+  "athenak_smoke": {
+    "platform": "local CPU",
+    "athena_sha256": "4313b3d333c2eb665b9f2c35f8a169360984ed2680de158e5a68207d18b1d19a",
+    "profile": "fit-radius-2 seven-snapshot table",
+    "final_time_in_secondary_mass_units": 0.05,
+    "cycles": 1,
+    "maximum_divB": 1.3823577699190182e-18,
+    "history_sha256": "4e36ccb4586daca0e3c6ea58ea30fb34b9f8ed8a4b65fe5b25dc7f81cd437429",
+    "passed": true,
+    "scope": "loader, analytic-primary metric, CT initialization/evolution, positivity, and finite-history smoke only; no steady-state or force claim"
+  },
+  "resource_decision": "No cloud instance was rented for this stage: extraction, convergence auditing, compilation, and the one-cycle integration smoke completed locally. GPU time becomes useful for relaxed frozen-snapshot wind-tunnel ensembles, not for replacing the missing independent global-source resolution."
+}
