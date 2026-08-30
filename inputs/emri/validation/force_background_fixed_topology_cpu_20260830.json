@@ -3,7 +3,7 @@
   "date": "2026-08-30",
   "source": {
     "branch": "codex/emri-local-windtunnel",
-    "scope": "uncommitted implementation qualification before cloud requalification",
+    "scope": "local implementation qualification before production-grid cloud requalification",
     "emri_windtunnel_cpp_sha256": "905aea76ab39a136e1f5b0c8feea8b2196661e83c02866b868fa022918d4136f",
     "production_planner_sha256": "082cf274c7cb397fa94d09de1001587c81b609b54305d03d3b036db059320029"
   },
