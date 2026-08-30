@@ -2351,7 +2351,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << ", force frame=" << force_frame
               << ", analytic gradients=" << has_analytic_gradient
               << ", profile replay=" << wind_profile_enabled
-              << ", r_H/m=" << hill_radius/metric.secondary_mass
+              << ", r_Hill/m=" << hill_radius/metric.secondary_mass
               << ", box/orbit=" << largest_extent/metric.orbital_radius
               << ", metric_fd_step/m="
               << wind_tunnel.metric_fd_step/metric.secondary_mass

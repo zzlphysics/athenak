@@ -19,6 +19,7 @@ import numpy as np
 
 import extract_global_worldtube as extract
 import extract_static_taylor_worldtube as static
+import kerr_schild_background as kerr_background
 
 
 GENERATOR_CLASSIFICATION = "athenak-emri-kerr-circular-frame-generator-v1"
@@ -72,35 +73,9 @@ def kerr_schild_metric(
 ) -> np.ndarray:
     """Unregularized aligned-spin Cartesian Kerr-Schild covariant metric."""
 
-    point = np.asarray(position, dtype=np.float64)
-    if point.shape != (3,) or not np.isfinite(point).all():
-        raise ValueError("Kerr-Schild position must contain three finite values")
-    spin2 = primary_spin**2
-    radius2 = float(point @ point)
-    adotx = primary_spin * point[2]
-    radial_term = radius2 - spin2
-    kerr_r2 = 0.5 * (
-        radial_term + math.sqrt(radial_term**2 + 4.0 * adotx**2)
+    return kerr_background.covariant_metric(
+        position, primary_mass, primary_spin
     )
-    if primary_mass <= 0.0 or kerr_r2 <= 0.0:
-        raise ValueError("Kerr-Schild metric point is singular or mass is invalid")
-    kerr_r = math.sqrt(kerr_r2)
-    denominator = kerr_r2**2 + adotx**2
-    hfun = primary_mass * kerr_r2 * kerr_r / denominator
-    spatial_denominator = kerr_r2 + spin2
-    x_cross_a = np.asarray(
-        (primary_spin * point[1], -primary_spin * point[0], 0.0)
-    )
-    null = np.empty(4, dtype=np.float64)
-    null[0] = 1.0
-    null[1:] = (
-        kerr_r * point
-        + x_cross_a
-        + (adotx / kerr_r) * np.asarray((0.0, 0.0, primary_spin))
-    ) / spatial_denominator
-    metric = np.diag((-1.0, 1.0, 1.0, 1.0))
-    metric += 2.0 * hfun * np.outer(null, null)
-    return metric
 
 
 def _checked_times(values: object) -> np.ndarray:

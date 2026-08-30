@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Build a time-dependent EMRI Taylor-profile table from global GRMHD dumps.
 
-The input manifest pairs co-temporal AthenaK ``mhd_w_bcc`` and ``adm`` dumps with
-the secondary worldline position and global coordinate velocity.  Every pair is
-reduced with ``extract_static_taylor_worldtube``; the resulting source-tetrad
-profiles are written in the strict column order consumed by ``emri_windtunnel``.
+The input manifest supplies AthenaK ``mhd_w_bcc`` dumps with the secondary
+worldline position and global coordinate velocity.  The primary geometry can be
+a co-temporal numerical ``adm`` dump per sample or one exact, stationary Kerr
+metric declared at manifest level.  Every sample is reduced with
+``extract_static_taylor_worldtube``; the resulting source-tetrad profiles are
+written in the strict column order consumed by ``emri_windtunnel``.
 """
 
 from __future__ import annotations
@@ -59,20 +61,43 @@ def extract_entry(
     metric_fit_radius: float,
     global_length_in_local_units: float,
     density_renormalization: float,
+    analytic_kerr: tuple[float, float] | None = None,
 ) -> dict[str, object]:
-    required = {"state", "adm", "anchor", "source_velocity"}
+    required = {"state", "anchor", "source_velocity"}
+    if analytic_kerr is None:
+        required.add("adm")
     missing = sorted(required.difference(entry))
     if missing:
         raise ValueError(f"worldline sample is missing: {', '.join(missing)}")
     state_path = _resolve_dump(str(entry["state"]), manifest_directory)
-    adm_path = _resolve_dump(str(entry["adm"]), manifest_directory)
+    adm_path = (
+        None
+        if analytic_kerr is not None
+        else _resolve_dump(str(entry["adm"]), manifest_directory)
+    )
     anchor = _finite_vector(entry["anchor"], "anchor")
     source_velocity = _finite_vector(entry["source_velocity"], "source velocity")
-    state = static.bin_convert.read_binary(str(state_path))
-    adm = static.bin_convert.read_binary(str(adm_path))
-    static._check_dump(state, static.STATE_VARIABLES, "state")
-    static._check_dump(adm, static.ADM_VARIABLES, "ADM")
-    _cotemporal(state, adm)
+    state, state_thermodynamics = static.read_state_dump(state_path)
+    if adm_path is not None:
+        adm = static.bin_convert.read_binary(str(adm_path))
+        static._check_dump(adm, static.ADM_VARIABLES, "ADM")
+        _cotemporal(state, adm)
+        adm_order = static._aligned_adm_blocks(state, adm)
+        gamma, alpha, beta, metric_errors = static.fit_anchor_adm(
+            adm, anchor, metric_fit_radius
+        )
+        metric_source = {
+            "classification": "athenak-emri-numerical-adm-primary-v1"
+        }
+    else:
+        assert analytic_kerr is not None
+        adm = None
+        adm_order = None
+        gamma, alpha, beta = static.analytic_kerr_anchor_adm(
+            anchor, *analytic_kerr
+        )
+        metric_errors = {"analytic_primary_metric": 0.0}
+        metric_source = static.analytic_kerr_metric_source(*analytic_kerr)
     if "time" in entry:
         requested_time = float(entry["time"])
         tolerance = 64.0 * np.finfo(float).eps * max(
@@ -86,16 +111,18 @@ def extract_entry(
     spatial_basis = static.canonical_spatial_basis(
         anchor, primary_center, disk_normal
     )
-    adm_order = static._aligned_adm_blocks(state, adm)
-    gamma, alpha, beta, metric_errors = static.fit_anchor_adm(
-        adm, anchor, metric_fit_radius
-    )
     metric = static.spacetime_metric_from_adm(gamma, alpha, beta)
     tetrad, coframe = static.build_source_tetrad(
         metric, source_velocity, spatial_basis
     )
     cloud = static.collect_local_samples(
-        state, adm, adm_order, anchor, coframe, fit_radius
+        state,
+        adm,
+        adm_order,
+        anchor,
+        coframe,
+        fit_radius,
+        analytic_kerr=analytic_kerr,
     )
     parameters, diagnostics = static.fit_static_profile(
         cloud, coframe, fit_radius
@@ -107,14 +134,14 @@ def extract_entry(
         diagnostics, global_length_in_local_units, density_renormalization
     )
     global_time = float(state["time"])
-    return {
+    result: dict[str, object] = {
         "time": global_time * global_length_in_local_units,
         "time_global_units": global_time,
         "cycle": int(state["cycle"]),
         "state_file": str(state_path),
         "state_sha256": static.file_sha256(state_path),
-        "adm_file": str(adm_path),
-        "adm_sha256": static.file_sha256(adm_path),
+        "metric_source": metric_source,
+        "state_thermodynamics": state_thermodynamics,
         "anchor_global": anchor.tolist(),
         "source_coordinate_velocity": source_velocity.tolist(),
         "source_tetrad_contravariant": tetrad.tolist(),
@@ -123,6 +150,10 @@ def extract_entry(
         "fit_diagnostics": diagnostics,
         "anchor_metric_relative_fit_errors": metric_errors,
     }
+    if adm_path is not None:
+        result["adm_file"] = str(adm_path)
+        result["adm_sha256"] = static.file_sha256(adm_path)
+    return result
 
 
 def circular_orbit_diagnostics(
@@ -280,6 +311,16 @@ def main() -> int:
     entries = source_manifest.get("samples")
     if not isinstance(entries, list) or len(entries) < 2:
         raise RuntimeError("worldline manifest requires at least two samples")
+    try:
+        analytic_kerr = static.parse_analytic_kerr_metric_source(
+            source_manifest.get("metric_source")
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(str(error)) from error
+    if analytic_kerr is not None and any("adm" in entry for entry in entries):
+        raise RuntimeError(
+            "analytic-Kerr worldline samples must not also declare ADM dumps"
+        )
     if not args.fit_radius > 0.0 or not math.isfinite(args.fit_radius):
         raise SystemExit("--fit-radius must be finite and positive")
     metric_fit_radius = args.metric_fit_radius or args.fit_radius
@@ -319,6 +360,7 @@ def main() -> int:
             metric_fit_radius,
             args.global_length_in_local_units,
             density_renormalization,
+            analytic_kerr,
         )
         for entry in entries
     ]
@@ -378,6 +420,11 @@ def main() -> int:
         "metric_fit_radius_coordinate": metric_fit_radius,
         "global_length_in_local_units": args.global_length_in_local_units,
         "density_renormalization": density_renormalization,
+        "metric_source": (
+            static.analytic_kerr_metric_source(*analytic_kerr)
+            if analytic_kerr is not None
+            else {"classification": "athenak-emri-numerical-adm-primary-v1"}
+        ),
         "time_sampling": time_sampling,
         "orbit_tolerance": args.orbit_tolerance,
         "orbit_diagnostics": orbit_diagnostics,

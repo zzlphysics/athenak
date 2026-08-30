@@ -12,6 +12,7 @@ if str(EMRI_INPUTS) not in sys.path:
     sys.path.insert(0, str(EMRI_INPUTS))
 
 import extract_static_taylor_worldtube as extractor  # noqa: E402
+import kerr_schild_background as kerr_background  # noqa: E402
 
 
 def _flat_adm(count: int) -> dict[str, np.ndarray]:
@@ -139,3 +140,43 @@ def test_global_to_local_unit_rescaling() -> None:
     np.testing.assert_allclose(scaled["dlnpgas_dxh2"], 4.0)
     np.testing.assert_allclose(scaled["du2_dxh3"], 6.0)
     np.testing.assert_allclose(scaled["db1_dxh2"], 10.5)
+
+
+def test_ordinary_mhd_internal_energy_is_canonicalized_to_pressure() -> None:
+    internal_energy = np.asarray(([[[0.3, 0.6]]],))
+    state = {
+        "header": ["<mhd>", "gamma=1.5"],
+        "mb_data": {"eint": [internal_energy]},
+    }
+    diagnostics = extractor.canonicalize_state_thermodynamics(state)
+    np.testing.assert_allclose(
+        state["mb_data"]["press"][0], 0.5 * internal_energy
+    )
+    assert diagnostics["input_variable"] == "eint"
+    assert diagnostics["adiabatic_index"] == 1.5
+
+
+def test_analytic_kerr_adm_reconstructs_shared_covariant_metric() -> None:
+    point = np.asarray((8.0, -1.5, 0.7))
+    mass = 1.2
+    chi = 0.6
+    fields = extractor.analytic_kerr_adm(point[None, :], mass, chi)
+    gamma = np.asarray(
+        (
+            (fields["adm_gxx"][0], fields["adm_gxy"][0], fields["adm_gxz"][0]),
+            (fields["adm_gxy"][0], fields["adm_gyy"][0], fields["adm_gyz"][0]),
+            (fields["adm_gxz"][0], fields["adm_gyz"][0], fields["adm_gzz"][0]),
+        )
+    )
+    beta = np.asarray(
+        (
+            fields["adm_betax"][0],
+            fields["adm_betay"][0],
+            fields["adm_betaz"][0],
+        )
+    )
+    reconstructed = extractor.spacetime_metric_from_adm(
+        gamma, fields["adm_alpha"][0], beta
+    )
+    expected = kerr_background.covariant_metric(point, mass, mass * chi)
+    np.testing.assert_allclose(reconstructed, expected, rtol=2.0e-15, atol=2.0e-15)

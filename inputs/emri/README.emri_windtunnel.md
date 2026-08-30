@@ -306,8 +306,9 @@ rather than the built-in constant `inflow` boundary on every supplying face.
 ## Static global-GRMHD Taylor extraction
 
 `extract_static_taylor_worldtube.py` provides the first one-way global-to-local path.  A
-global single-SMBH run must write co-temporal three-dimensional `mhd_w_bcc` and `adm`
-binary dumps.  For example,
+global single-SMBH run can supply either co-temporal three-dimensional `mhd_w_bcc` and
+numerical `adm` binary dumps, or an `mhd_w_bcc` dump evolved in the exact stationary
+Cartesian Kerr-Schild metric.  For the numerical-ADM case, for example,
 
 ```bash
 python3 inputs/emri/extract_static_taylor_worldtube.py \
@@ -320,6 +321,27 @@ python3 inputs/emri/extract_static_taylor_worldtube.py \
   --orbital-omega 0.03162277660168379 \
   --fit-radius 0.5
 ```
+
+For a state-only static-Kerr run, avoid manufacturing a redundant ADM file and declare
+the exact primary directly:
+
+```bash
+python3 inputs/emri/extract_static_taylor_worldtube.py \
+  --state torus.mhd_w_bcc.00250.bin \
+  --analytic-kerr-primary-mass 1 \
+  --analytic-kerr-primary-chi 0.9375 \
+  --output-prefix profiles/orbit-r41-t5000 \
+  --anchor 41.0107169683 0 0 \
+  --primary-center 0 0 0 --disk-normal 0 0 1 \
+  --orbital-omega 0.00379556201561 --fit-radius 2
+```
+
+Ordinary ideal-MHD output labels primitive internal energy as `eint`; the adapter reads
+the dump's own `<mhd>/gamma` and converts `press=(gamma-1)*eint`.  DynGRMHD `press`
+output remains unchanged.  The manifest records the input convention and conversion.
+The analytic-primary path evaluates lapse, shift, and spatial metric at every selected
+fluid cell from the same aligned-spin Kerr-Schild formula used by the orbit and local
+metric, so it introduces no artificial primary-ADM spatial or cadence error.
 
 The extractor defaults to identical global/local code units.  When the global disk uses
 `M_primary=1` but the local tunnel uses `m_secondary=1`, pass
@@ -396,6 +418,43 @@ python3 inputs/emri/build_taylor_worldtube_series.py \
   --global-length-in-local-units 100000 \
   --density-renormalization 1.0e10
 ```
+
+For state-only static-Kerr dumps, generate the circular worldline manifest without
+hand-entering every position and velocity:
+
+```bash
+python3 inputs/emri/build_static_kerr_worldline.py \
+  --states dumps/torus.mhd_w_bcc.00246.bin \
+           dumps/torus.mhd_w_bcc.00247.bin \
+           dumps/torus.mhd_w_bcc.00248.bin \
+  --output profiles/r41.worldline.json \
+  --primary-mass 1 --primary-chi 0.9375 \
+  --orbital-radius 41 --orbit-direction 1
+```
+
+The builder reads only binary metadata, verifies the Kerr spin and primitive/topology
+contract across every dump, rejects orbits at or inside ISCO, and writes the analytic
+primary declaration consumed by the Taylor-series builder.  Individual samples must
+not also name an ADM dump in this mode.
+
+Before launching a local evolution, compare at least three fitting radii and thin the
+finest local table to multiple source cadences:
+
+```bash
+python3 inputs/emri/analyze_taylor_profile_convergence.py \
+  --series profiles/r41-fit2.json profiles/r41-fit3.json profiles/r41-fit4.json \
+  --cadence-strides 1 2 3 \
+  --output profiles/r41-convergence.json --fail-on-gate
+```
+
+This audit jointly normalizes vector/tensor groups, checks Taylor residuals, enforces
+the trace-free magnetic gradient, and rejects a fitting sphere that mixes different
+AMR cell volumes.  Fitting-radius variants measure local-model-scale sensitivity, not
+independent source-grid convergence.  A production claim still needs genuinely
+different global resolutions.  For an EMRI mass ratio, one global dump interval also
+corresponds to a very long time in secondary-mass units; short local relaxation runs
+should therefore use a frozen-snapshot ensemble rather than pretend to evolve across a
+global interval.
 
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is

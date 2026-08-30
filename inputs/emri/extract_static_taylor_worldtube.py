@@ -29,6 +29,7 @@ if str(VIS_PYTHON) not in sys.path:
     sys.path.insert(0, str(VIS_PYTHON))
 
 import bin_convert  # noqa: E402
+import kerr_schild_background as kerr_background  # noqa: E402
 
 
 STATE_VARIABLES = (
@@ -67,6 +68,9 @@ PROFILE_PARAMETER_ORDER = (
     *(f"du{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)),
     *(f"db{i}_dxh{j}" for i in range(1, 4) for j in range(1, 4)),
 )
+ANALYTIC_KERR_CLASSIFICATION = (
+    "athenak-emri-analytic-kerr-schild-primary-v1"
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,91 @@ class SampleCloud:
     cell_volume: np.ndarray
     primitive: dict[str, np.ndarray]
     adm: dict[str, np.ndarray]
+
+
+def _header_value(header: Iterable[str], block: str, key: str) -> str:
+    current = ""
+    expected = block if block.startswith("<") else f"<{block}>"
+    for line in header:
+        if line.startswith("<"):
+            current = line
+            continue
+        if current == expected and "=" in line:
+            name, value = line.split("=", maxsplit=1)
+            if name.strip() == key:
+                return value.strip()
+    raise KeyError(f"binary header has no {expected}/{key}")
+
+
+def canonicalize_state_thermodynamics(state: dict) -> dict[str, object]:
+    """Expose gas pressure for both DynGRMHD and ordinary ideal-MHD dumps."""
+
+    if "press" in state["mb_data"]:
+        return {
+            "input_variable": "press",
+            "adiabatic_index": None,
+            "conversion": "none",
+        }
+    if "eint" not in state["mb_data"]:
+        raise RuntimeError("state dump contains neither press nor eint")
+    try:
+        gamma = float(_header_value(state["header"], "<mhd>", "gamma"))
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(
+            "ordinary-MHD eint requires a finite <mhd>/gamma header"
+        ) from error
+    if not math.isfinite(gamma) or gamma <= 1.0:
+        raise RuntimeError("ordinary-MHD adiabatic index must exceed one")
+    state["mb_data"]["press"] = [
+        (gamma - 1.0) * np.asarray(values)
+        for values in state["mb_data"]["eint"]
+    ]
+    return {
+        "input_variable": "eint",
+        "adiabatic_index": gamma,
+        "conversion": "press=(gamma-1)*eint",
+    }
+
+
+def read_state_dump(path: Path) -> tuple[dict, dict[str, object]]:
+    state = bin_convert.read_binary(str(path))
+    thermodynamics = canonicalize_state_thermodynamics(state)
+    _check_dump(state, STATE_VARIABLES, "state")
+    return state, thermodynamics
+
+
+def analytic_kerr_metric_source(
+    primary_mass: float, dimensionless_spin: float
+) -> dict[str, object]:
+    if (
+        not math.isfinite(primary_mass)
+        or primary_mass <= 0.0
+        or not math.isfinite(dimensionless_spin)
+        or abs(dimensionless_spin) > 1.0
+    ):
+        raise ValueError("analytic primary Kerr parameters are invalid")
+    return {
+        "classification": ANALYTIC_KERR_CLASSIFICATION,
+        "primary_mass": float(primary_mass),
+        "dimensionless_spin": float(dimensionless_spin),
+        "coordinates": "aligned-spin Cartesian Kerr-Schild",
+    }
+
+
+def parse_analytic_kerr_metric_source(
+    document: object,
+) -> tuple[float, float] | None:
+    if document is None:
+        return None
+    if not isinstance(document, dict) or document.get(
+        "classification"
+    ) != ANALYTIC_KERR_CLASSIFICATION:
+        raise ValueError("analytic primary metric source is unsupported")
+    source = analytic_kerr_metric_source(
+        float(document.get("primary_mass")),
+        float(document.get("dimensionless_spin")),
+    )
+    return float(source["primary_mass"]), float(source["dimensionless_spin"])
 
 
 def _vector(values: Iterable[float], name: str) -> np.ndarray:
@@ -280,14 +369,51 @@ def fit_anchor_adm(
     return gamma, alpha, beta, errors
 
 
+def analytic_kerr_adm(
+    positions: object, primary_mass: float, dimensionless_spin: float
+) -> dict[str, np.ndarray]:
+    values = kerr_background.adm_fields(
+        positions, primary_mass, dimensionless_spin
+    )
+    return {
+        name: values[:, index]
+        for index, name in enumerate(ADM_VARIABLES)
+    }
+
+
+def analytic_kerr_anchor_adm(
+    anchor: np.ndarray, primary_mass: float, dimensionless_spin: float
+) -> tuple[np.ndarray, float, np.ndarray]:
+    fields = kerr_background.adm_fields(
+        np.asarray(anchor, dtype=np.float64)[None, :],
+        primary_mass,
+        dimensionless_spin,
+    )[0]
+    gamma = np.asarray(
+        (
+            (fields[0], fields[1], fields[2]),
+            (fields[1], fields[3], fields[4]),
+            (fields[2], fields[4], fields[5]),
+        )
+    )
+    return gamma, float(fields[6]), np.asarray(fields[7:10])
+
+
 def collect_local_samples(
     state: dict,
-    adm: dict,
-    adm_order: list[int],
+    adm: dict | None,
+    adm_order: list[int] | None,
     anchor: np.ndarray,
     coframe: np.ndarray,
     fit_radius: float,
+    analytic_kerr: tuple[float, float] | None = None,
 ) -> SampleCloud:
+    if (adm is None) == (analytic_kerr is None):
+        raise ValueError(
+            "exactly one numerical ADM dump or analytic Kerr source is required"
+        )
+    if adm is not None and adm_order is None:
+        raise ValueError("numerical ADM samples require MeshBlock alignment")
     coordinate_inverse = np.linalg.inv(coframe[1:, 1:])
     coordinate_bound = fit_radius * float(np.linalg.norm(coordinate_inverse, ord=2))
     global_positions = []
@@ -309,7 +435,6 @@ def collect_local_samples(
         global_positions.append(block_position[selected])
         local_positions.append(local[selected])
         volumes.append(np.full(np.count_nonzero(selected), volume))
-        adm_block = adm_order[state_block]
         for name in STATE_VARIABLES:
             if np.asarray(state["mb_data"][name][state_block]).shape != reference.shape:
                 raise RuntimeError(
@@ -319,23 +444,35 @@ def collect_local_samples(
             primitive[name].append(
                 np.asarray(state["mb_data"][name][state_block]).ravel()[selected]
             )
-        for name in ADM_VARIABLES:
-            if np.asarray(adm["mb_data"][name][adm_block]).shape != reference.shape:
-                raise RuntimeError(
-                    f"state/ADM cell shape differs in MeshBlock "
-                    f"{_block_key(state['mb_logical'][state_block])}"
+        if adm is not None:
+            assert adm_order is not None
+            adm_block = adm_order[state_block]
+            for name in ADM_VARIABLES:
+                if np.asarray(adm["mb_data"][name][adm_block]).shape != reference.shape:
+                    raise RuntimeError(
+                        f"state/ADM cell shape differs in MeshBlock "
+                        f"{_block_key(state['mb_logical'][state_block])}"
+                    )
+                adm_values[name].append(
+                    np.asarray(adm["mb_data"][name][adm_block]).ravel()[selected]
                 )
-            adm_values[name].append(
-                np.asarray(adm["mb_data"][name][adm_block]).ravel()[selected]
-            )
     if not global_positions:
         raise RuntimeError("local fitting sphere contains no state cells")
+    concatenated_positions = np.concatenate(global_positions)
+    if analytic_kerr is not None:
+        adm_result = analytic_kerr_adm(
+            concatenated_positions, analytic_kerr[0], analytic_kerr[1]
+        )
+    else:
+        adm_result = {
+            name: np.concatenate(values) for name, values in adm_values.items()
+        }
     return SampleCloud(
-        global_position=np.concatenate(global_positions),
+        global_position=concatenated_positions,
         local_position=np.concatenate(local_positions),
         cell_volume=np.concatenate(volumes),
         primitive={name: np.concatenate(values) for name, values in primitive.items()},
-        adm={name: np.concatenate(values) for name, values in adm_values.items()},
+        adm=adm_result,
     )
 
 
@@ -619,7 +756,7 @@ def _format_real(value: float) -> str:
 def write_outputs(
     prefix: Path,
     state_path: Path,
-    adm_path: Path,
+    adm_path: Path | None,
     state: dict,
     anchor: np.ndarray,
     primary_center: np.ndarray,
@@ -634,6 +771,8 @@ def write_outputs(
     parameters: dict[str, float],
     diagnostics: dict[str, object],
     metric_errors: dict[str, float],
+    metric_source: dict[str, object],
+    state_thermodynamics: dict[str, object],
 ) -> tuple[Path, Path]:
     prefix.parent.mkdir(parents=True, exist_ok=True)
     fragment_path = prefix.with_suffix(".athinput")
@@ -654,13 +793,13 @@ def write_outputs(
         f"problem/{name}={_format_real(parameters[name])}"
         for name in PROFILE_PARAMETER_ORDER
     ]
-    manifest = {
+    manifest: dict[str, object] = {
         "schema": 1,
         "classification": "athenak-emri-static-taylor-worldtube",
         "state_file": str(state_path),
         "state_sha256": file_sha256(state_path),
-        "adm_file": str(adm_path),
-        "adm_sha256": file_sha256(adm_path),
+        "metric_source": metric_source,
+        "state_thermodynamics": state_thermodynamics,
         "time": float(state["time"]),
         "time_global_units": float(state["time"]),
         "time_local_units": float(state["time"])
@@ -686,6 +825,9 @@ def write_outputs(
             "cell-centered magnetic data are replaced by a trace-free linear fit",
         ],
     }
+    if adm_path is not None:
+        manifest["adm_file"] = str(adm_path)
+        manifest["adm_sha256"] = file_sha256(adm_path)
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -695,7 +837,18 @@ def write_outputs(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, required=True, help="mhd_w_bcc binary dump")
-    parser.add_argument("--adm", type=Path, required=True, help="co-temporal adm binary dump")
+    metric_group = parser.add_mutually_exclusive_group(required=True)
+    metric_group.add_argument(
+        "--adm", type=Path, help="co-temporal numerical ADM binary dump"
+    )
+    metric_group.add_argument(
+        "--analytic-kerr-primary-mass",
+        type=float,
+        help="use an exact aligned-spin Kerr primary instead of an ADM dump",
+    )
+    parser.add_argument(
+        "--analytic-kerr-primary-chi", type=float, default=0.0
+    )
     parser.add_argument("--output-prefix", type=Path, required=True)
     parser.add_argument("--anchor", type=float, nargs=3, required=True)
     parser.add_argument("--primary-center", type=float, nargs=3, default=(0.0, 0.0, 0.0))
@@ -719,7 +872,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     state_path = args.state.expanduser().resolve(strict=True)
-    adm_path = args.adm.expanduser().resolve(strict=True)
+    adm_path = (
+        None if args.adm is None else args.adm.expanduser().resolve(strict=True)
+    )
     anchor = _vector(args.anchor, "anchor")
     primary_center = _vector(args.primary_center, "primary center")
     disk_normal = _normalize(_vector(args.disk_normal, "disk normal"), "disk normal")
@@ -753,27 +908,47 @@ def main() -> int:
         )
     spatial_basis = canonical_spatial_basis(anchor, primary_center, disk_normal)
 
-    state = bin_convert.read_binary(str(state_path))
-    adm = bin_convert.read_binary(str(adm_path))
-    _check_dump(state, STATE_VARIABLES, "state")
-    _check_dump(adm, ADM_VARIABLES, "ADM")
-    state_time = float(state["time"])
-    adm_time = float(adm["time"])
-    time_tolerance = 64.0 * np.finfo(float).eps * max(
-        1.0, abs(state_time), abs(adm_time)
-    )
-    if int(state["cycle"]) != int(adm["cycle"]) or not math.isclose(
-        state_time, adm_time, rel_tol=0.0, abs_tol=time_tolerance
-    ):
-        raise RuntimeError("state and ADM dumps are not co-temporal")
-    adm_order = _aligned_adm_blocks(state, adm)
-    gamma, alpha, beta, metric_errors = fit_anchor_adm(
-        adm, anchor, metric_fit_radius
-    )
+    state, state_thermodynamics = read_state_dump(state_path)
+    analytic_kerr = None
+    if adm_path is not None:
+        adm = bin_convert.read_binary(str(adm_path))
+        _check_dump(adm, ADM_VARIABLES, "ADM")
+        state_time = float(state["time"])
+        adm_time = float(adm["time"])
+        time_tolerance = 64.0 * np.finfo(float).eps * max(
+            1.0, abs(state_time), abs(adm_time)
+        )
+        if int(state["cycle"]) != int(adm["cycle"]) or not math.isclose(
+            state_time, adm_time, rel_tol=0.0, abs_tol=time_tolerance
+        ):
+            raise RuntimeError("state and ADM dumps are not co-temporal")
+        adm_order = _aligned_adm_blocks(state, adm)
+        gamma, alpha, beta, metric_errors = fit_anchor_adm(
+            adm, anchor, metric_fit_radius
+        )
+        metric_source = {
+            "classification": "athenak-emri-numerical-adm-primary-v1"
+        }
+    else:
+        analytic_kerr = (
+            float(args.analytic_kerr_primary_mass),
+            float(args.analytic_kerr_primary_chi),
+        )
+        metric_source = analytic_kerr_metric_source(*analytic_kerr)
+        gamma, alpha, beta = analytic_kerr_anchor_adm(anchor, *analytic_kerr)
+        metric_errors = {"analytic_primary_metric": 0.0}
+        adm = None
+        adm_order = None
     metric = spacetime_metric_from_adm(gamma, alpha, beta)
     tetrad, coframe = build_source_tetrad(metric, source_velocity, spatial_basis)
     cloud = collect_local_samples(
-        state, adm, adm_order, anchor, coframe, args.fit_radius
+        state,
+        adm,
+        adm_order,
+        anchor,
+        coframe,
+        args.fit_radius,
+        analytic_kerr=analytic_kerr,
     )
     parameters, diagnostics = fit_static_profile(cloud, coframe, args.fit_radius)
     parameters = rescale_profile_parameters(
@@ -804,6 +979,8 @@ def main() -> int:
         parameters,
         diagnostics,
         metric_errors,
+        metric_source,
+        state_thermodynamics,
     )
     print(fragment)
     print(manifest)
