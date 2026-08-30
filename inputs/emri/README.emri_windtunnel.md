@@ -465,6 +465,68 @@ intended.  This is a loader and local-model qualification, not a convergence cla
 three fit radii still sample one global resolution, and at `q=10^-5` the global cadence
 maps to millions of secondary-mass time units.
 
+### Frozen-snapshot campaign and direct-AMR preflight
+
+`build_frozen_taylor_campaign.py` evaluates independent radius/phase samples without
+pretending that global dumps provide a continuous local time series.  A request lists
+explicit cases and at least two fitting radii per case:
+
+```json
+{
+  "classification": "athenak-emri-frozen-taylor-request-v1",
+  "primary": {"mass": 1, "dimensionless_spin": 0.9375,
+              "orbit_direction": 1},
+  "mass_ratio": 1e-5,
+  "density_renormalization": 1e10,
+  "cases": [
+    {"id": "r56_p000_t5000", "state": "torus.mhd_w_bcc.00250.bin",
+     "orbital_radius": 56, "phase": 0, "fit_radii": [2, 3, 4]}
+  ]
+}
+```
+
+Run
+
+```bash
+python3 inputs/emri/build_frozen_taylor_campaign.py \
+  --request profiles/frozen-request.json \
+  --output-directory profiles/frozen-campaign
+```
+
+Each unique state file is read and hashed once.  Every case records the Taylor residual
+and fit-radius gates, single-source-level audit, gradient coherence lengths, relativistic
+sound/Alfven/fast proxies, capture and Hill radii, and direct versus matched-hierarchy
+cost decision.  The local AthenaK EOS override uses the source dump's own adiabatic
+index; the `eint` conversion alone is insufficient if the local input silently retains a
+different `mhd/gamma`.
+
+The BHL cost model encloses the wind-aligned upstream/wake cylinder in the fixed radial,
+prograde, and vertical source-tetrad axes.  This matters for disk winds that enter through
+several coordinate faces: assuming an x1-aligned wind can underestimate both root cells
+and runtime by about a factor of two.  Root dimensions are rounded to a configured
+MeshBlock multiple.
+
+For a deliberately reduced direct-AMR throughput trial, select only a case that passed
+the local Taylor gates:
+
+```bash
+python3 inputs/emri/prepare_frozen_direct_pilot.py \
+  --campaign profiles/frozen-campaign/campaign.json \
+  --case r56_p000_t5000 \
+  --cells-per-secondary-mass 8 \
+  --outer-cells-per-capture-radius 8 \
+  --flow-crossings 2 --meshblock-cells 16 \
+  --output profiles/r56-direct-calibration.json
+```
+
+The emitted JSON contains exact command-line overrides but does not launch AthenaK.
+The preflight disables force/output work, chooses every incoming `user` face from the
+measured velocity, sets `time/subcycling=level`, and demands that the level-one refined
+region remain at least one root MeshBlock away from every user physical boundary.  The
+EMRI boundary callback is active-level aware; other user-boundary problems remain
+fail-closed under level subcycling unless they explicitly implement the same contract.
+This calibration is a memory/throughput measurement, not a settled-flow result.
+
 The builder rejects non-increasing dump times and a worldline whose radius, height,
 angular frequency, radial speed, or vertical speed violates `--orbit-tolerance`.  This is
 not merely a convenience check: the current local metric is circular and equatorial, so

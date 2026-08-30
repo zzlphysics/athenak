@@ -58,8 +58,17 @@ class ProblemGenerator {
   // true if user BCs are specified on any face
   bool user_bcs;
 
+  // Problem-owned declaration that its user boundary callback updates only the
+  // active MeshBlocks published by the level-subcycling driver.  The default is
+  // deliberately false; individual problem generators must opt in after auditing
+  // their boundary/prolongation geometry.
+  bool user_bcs_level_subcycling_safe=false;
+
   // true if user srcterms are specified
   bool user_srcs;
+
+  // Analogous opt-in for a user source callback restricted to active MeshBlocks.
+  bool user_srcs_level_subcycling_safe=false;
 
   // true if user history outputs are specified
   bool user_hist;

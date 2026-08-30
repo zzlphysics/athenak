@@ -78,3 +78,32 @@ def test_emri_analytic_gradients_preserve_uniform_limit_and_divb(tmp_path: Path)
 
     assert _maximum_divb(zero_divb) < MAX_DIVB
     assert _maximum_divb(gradient_divb) < MAX_DIVB
+
+
+def test_emri_user_boundary_is_active_level_safe(tmp_path: Path) -> None:
+    flags = [
+        "-d",
+        str(tmp_path / "subcycle"),
+        "job/basename=emri_user_bc_subcycle",
+        "mesh/nx1=16",
+        "mesh/nx2=16",
+        "mesh/nx3=16",
+        "meshblock/nx1=8",
+        "meshblock/nx2=8",
+        "meshblock/nx3=8",
+        "mesh_refinement/refinement=adaptive",
+        "mesh_refinement/num_levels=2",
+        "mesh_refinement/max_nmb_per_rank=128",
+        "time/subcycling=level",
+        "time/nlim=2",
+        "time/tlim=0.05",
+        "adm/dynamic=true",
+        "problem/user_hist=false",
+        "problem/refinement_radius_level_1=4",
+        "output1/dt=0",
+        "output2/dt=0",
+        "output3/dt=0",
+        "output4/dt=0",
+        "output5/dt=0",
+    ]
+    assert testutils.run(INPUT_FILE, flags)

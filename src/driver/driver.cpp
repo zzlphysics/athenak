@@ -408,8 +408,15 @@ void Driver::ValidateLevelSubcyclingConfiguration(ParameterInput *pin,
        pmbp->pmhd->psbox_u != nullptr || pmbp->pmhd->psbox_b != nullptr)) {
     violations.emplace_back("shearing-box and orbital-advection modules are not supported");
   }
-  if (pmesh->pgen != nullptr && (pmesh->pgen->user_srcs || pmesh->pgen->user_bcs)) {
-    violations.emplace_back("full-mesh user source terms and user boundaries are not supported");
+  if (pmesh->pgen != nullptr && pmesh->pgen->user_srcs
+      && !pmesh->pgen->user_srcs_level_subcycling_safe) {
+    violations.emplace_back(
+        "full-mesh user source terms are not supported");
+  }
+  if (pmesh->pgen != nullptr && pmesh->pgen->user_bcs
+      && !pmesh->pgen->user_bcs_level_subcycling_safe) {
+    violations.emplace_back(
+        "user boundaries must explicitly implement the active-MeshBlock contract");
   }
   for (const auto &input_block : pin->block) {
     if (input_block.block_name.compare(0, 6, "output") != 0) continue;

@@ -1922,6 +1922,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   user_ref_func = RefineSecondary;
   user_hist_func = EMRIHistory;
   user_bcs_func = EMRIWindBoundary;
+  user_bcs_level_subcycling_safe = true;
 
   auto &metric = wind_tunnel.metric;
   metric.primary_mass = pin->GetOrAddReal("problem", "primary_mass", 1.0e5);
@@ -2473,7 +2474,9 @@ void EMRIWindBoundary(Mesh *pm) {
   const int n1 = indcs.nx1+2*ng;
   const int n2 = (indcs.nx2 > 1) ? indcs.nx2+2*ng : 1;
   const int n3 = (indcs.nx3 > 1) ? indcs.nx3+2*ng : 1;
-  const int nmb = pmbp->nmb_thispack;
+  auto active_lids = pmbp->active_lids.d_view;
+  const int active_offset = pmbp->active_offset;
+  const int nmb_active = pmbp->nmb_active;
   const int nscalars = pmbp->pmhd->nscalars;
   auto &mb_bcs = pmbp->pmb->mb_bcs;
   auto &size = pmbp->pmb->mb_size;
@@ -2482,7 +2485,8 @@ void EMRIWindBoundary(Mesh *pm) {
   auto &bcc0 = pmbp->pmhd->bcc0;
   const WindTunnelParameters parameters = wind_tunnel;
 
-  par_for("emri_user_b1", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1,
+  par_for_active("emri_user_b1", DevExeSpace(), active_lids, active_offset,
+      nmb_active, 0, n3-1, 0, n2-1, 0, n1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const bool user_ghost =
         (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
@@ -2508,7 +2512,8 @@ void EMRIWindBoundary(Mesh *pm) {
       b0.x1f(m, k, j, i) = field[0];
     }
   });
-  par_for("emri_user_b2", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2, 0, n1-1,
+  par_for_active("emri_user_b2", DevExeSpace(), active_lids, active_offset,
+      nmb_active, 0, n3-1, 0, n2, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const bool user_ghost =
         (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
@@ -2534,7 +2539,8 @@ void EMRIWindBoundary(Mesh *pm) {
       b0.x2f(m, k, j, i) = field[1];
     }
   });
-  par_for("emri_user_b3", DevExeSpace(), 0, nmb-1, 0, n3, 0, n2-1, 0, n1-1,
+  par_for_active("emri_user_b3", DevExeSpace(), active_lids, active_offset,
+      nmb_active, 0, n3, 0, n2-1, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const bool user_ghost =
         (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)
@@ -2561,7 +2567,8 @@ void EMRIWindBoundary(Mesh *pm) {
     }
   });
 
-  par_for("emri_user_wind", DevExeSpace(), 0, nmb-1, 0, n3-1, 0, n2-1, 0, n1-1,
+  par_for_active("emri_user_wind", DevExeSpace(), active_lids, active_offset,
+      nmb_active, 0, n3-1, 0, n2-1, 0, n1-1,
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     const bool user_ghost =
         (i < is && mb_bcs.d_view(m, BoundaryFace::inner_x1) == BoundaryFlag::user)

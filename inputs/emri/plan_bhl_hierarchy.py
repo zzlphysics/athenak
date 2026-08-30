@@ -66,6 +66,7 @@ class PlannerSettings:
     inner_window_crossings: float = 5.0
     inner_window_count: int = 4
     inner_boundary_cells_per_match_radius: float = 16.0
+    root_meshblock_cells_per_axis: int = 8
     max_resident_cells: int = 200_000_000
     max_finest_steps: int = 5_000_000
     max_refinement_levels: int = 14
@@ -80,6 +81,7 @@ class PlannerSettings:
                 "max_finest_steps",
                 "max_refinement_levels",
                 "max_global_timestep_zone_updates",
+                "root_meshblock_cells_per_axis",
             }:
                 if int(value) <= 0:
                     raise ValueError(f"{name} must be positive")
@@ -169,18 +171,57 @@ def characteristic_state(
     }
 
 
-def _domain_cells(
-    settings: PlannerSettings, cells_per_capture_radius: float
-) -> tuple[int, tuple[int, int, int]]:
-    dimensions = (
-        _ceil_ratio(
-            (settings.upstream_capture_radii + settings.downstream_capture_radii)
-            * cells_per_capture_radius
-        ),
-        _ceil_ratio(2.0 * settings.transverse_capture_radii * cells_per_capture_radius),
-        _ceil_ratio(2.0 * settings.transverse_capture_radii * cells_per_capture_radius),
+def axis_aligned_domain_envelope(
+    settings: PlannerSettings, spatial_four_velocity: Iterable[float]
+) -> dict[str, list[float]]:
+    """Bound the wind-aligned BHL cylinder in fixed source-tetrad axes.
+
+    The local metric uses radial, prograde and vertical axes.  An arbitrary
+    measured wind therefore cannot be made x1-aligned without also rotating the
+    metric chart.  This Cartesian envelope retains the requested asymmetric
+    upstream/downstream lengths and transverse radius in the fixed chart.
+    Bounds are expressed in capture-radius units.
+    """
+
+    velocity = _finite_vector(spatial_four_velocity, "spatial four-velocity")
+    norm = math.sqrt(_dot(velocity, velocity))
+    direction = (
+        (1.0, 0.0, 0.0)
+        if norm == 0.0
+        else tuple(component / norm for component in velocity)
     )
-    return math.prod(dimensions), dimensions
+    lower = []
+    upper = []
+    for component in direction:
+        endpoints = (
+            -settings.upstream_capture_radii * component,
+            settings.downstream_capture_radii * component,
+        )
+        transverse = settings.transverse_capture_radii * math.sqrt(
+            max(0.0, 1.0 - component * component)
+        )
+        lower.append(min(endpoints) - transverse)
+        upper.append(max(endpoints) + transverse)
+    return {
+        "wind_unit_vector": list(direction),
+        "lower_in_capture_radii": lower,
+        "upper_in_capture_radii": upper,
+        "widths_in_capture_radii": [high - low for low, high in zip(lower, upper)],
+    }
+
+
+def _domain_cells(
+    settings: PlannerSettings,
+    cells_per_capture_radius: float,
+    spatial_four_velocity: Iterable[float],
+) -> tuple[int, tuple[int, int, int], dict[str, list[float]]]:
+    envelope = axis_aligned_domain_envelope(settings, spatial_four_velocity)
+    block = settings.root_meshblock_cells_per_axis
+    dimensions = tuple(
+        block * _ceil_ratio(_ceil_ratio(width * cells_per_capture_radius) / block)
+        for width in envelope["widths_in_capture_radii"]
+    )
+    return math.prod(dimensions), dimensions, envelope
 
 
 def _cost_model(
@@ -190,6 +231,7 @@ def _cost_model(
     duration: float,
     finest_dx: float,
     settings: PlannerSettings,
+    domain_envelope: dict[str, list[float]],
 ) -> dict[str, float | int | list[int]]:
     finest_steps = _ceil_ratio(duration / (settings.cfl * finest_dx))
     resident_cells = base_cells * (levels + 1)
@@ -197,6 +239,13 @@ def _cost_model(
     return {
         "base_grid_dimensions": list(base_dimensions),
         "base_grid_cells": base_cells,
+        "wind_unit_vector": domain_envelope["wind_unit_vector"],
+        "domain_lower_in_capture_radii": (
+            domain_envelope["lower_in_capture_radii"]
+        ),
+        "domain_upper_in_capture_radii": (
+            domain_envelope["upper_in_capture_radii"]
+        ),
         "nested_refinement_levels": levels,
         "optimistic_nested_resident_cells": resident_cells,
         "optimistic_nested_memory_gib": (
@@ -266,8 +315,10 @@ def build_plan(
     base_dx = capture_radius / settings.outer_cells_per_capture_radius
     direct_levels = _refinement_levels(base_dx, requested_inner_dx)
     direct_finest_dx = base_dx / 2.0**direct_levels
-    base_cells, base_dimensions = _domain_cells(
-        settings, settings.outer_cells_per_capture_radius
+    base_cells, base_dimensions, domain_envelope = _domain_cells(
+        settings,
+        settings.outer_cells_per_capture_radius,
+        spatial_four_velocity,
     )
     direct_cost = _cost_model(
         base_cells,
@@ -276,25 +327,11 @@ def build_plan(
         direct_duration,
         direct_finest_dx,
         settings,
+        domain_envelope,
     )
-    uniform_dimensions = (
-        _ceil_ratio(
-            (settings.upstream_capture_radii + settings.downstream_capture_radii)
-            * capture_radius
-            / requested_inner_dx
-        ),
-        _ceil_ratio(
-            2.0
-            * settings.transverse_capture_radii
-            * capture_radius
-            / requested_inner_dx
-        ),
-        _ceil_ratio(
-            2.0
-            * settings.transverse_capture_radii
-            * capture_radius
-            / requested_inner_dx
-        ),
+    uniform_dimensions = tuple(
+        _ceil_ratio(width * capture_radius / requested_inner_dx)
+        for width in domain_envelope["widths_in_capture_radii"]
     )
     direct_cost["uniform_horizon_resolving_dimensions"] = list(uniform_dimensions)
     direct_cost["uniform_horizon_resolving_cells"] = math.prod(uniform_dimensions)
@@ -318,6 +355,7 @@ def build_plan(
         direct_duration,
         outer_finest_dx,
         settings,
+        domain_envelope,
     )
     inner_window_duration = (
         settings.inner_window_crossings * match_radius / crossing_speed
@@ -343,6 +381,12 @@ def build_plan(
         duration=inner_window_duration,
         finest_dx=inner_finest_dx,
         settings=settings,
+        domain_envelope={
+            "wind_unit_vector": domain_envelope["wind_unit_vector"],
+            "lower_in_capture_radii": [-1.0, -1.0, -1.0],
+            "upper_in_capture_radii": [1.0, 1.0, 1.0],
+            "widths_in_capture_radii": [2.0, 2.0, 2.0],
+        },
     )
     inner_steps_per_window = int(inner_window_cost["finest_steps"])
     continuous_inner_steps = _ceil_ratio(

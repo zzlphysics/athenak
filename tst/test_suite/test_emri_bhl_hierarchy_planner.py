@@ -78,6 +78,27 @@ def test_fast_compact_case_remains_direct() -> None:
     assert plan["validity"]["direct_within_budget"] is True
 
 
+def test_oblique_wind_expands_fixed_axis_domain() -> None:
+    settings = planner.PlannerSettings()
+    aligned = planner.axis_aligned_domain_envelope(settings, (1.0, 0.0, 0.0))
+    oblique = planner.axis_aligned_domain_envelope(settings, (1.0, 1.0, 0.0))
+    assert aligned["widths_in_capture_radii"] == [12.0, 8.0, 8.0]
+    assert oblique["widths_in_capture_radii"][0] > 12.0
+    assert oblique["widths_in_capture_radii"][1] > 8.0
+    assert oblique["widths_in_capture_radii"][2] == 8.0
+    assert math.isclose(
+        sum(value * value for value in oblique["wind_unit_vector"]), 1.0
+    )
+
+
+def test_oblique_root_grid_rounds_to_meshblock_multiple() -> None:
+    plan = planner.build_plan(
+        **_slow_wind(spatial_four_velocity=(0.05, 0.05, 0.0))
+    )
+    dimensions = plan["costs"]["direct"]["base_grid_dimensions"]
+    assert all(value % 8 == 0 for value in dimensions)
+
+
 def test_zero_field_plan_is_strict_json() -> None:
     plan = planner.build_plan(
         **_slow_wind(magnetic_field=(0.0, 0.0, 0.0))
