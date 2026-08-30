@@ -926,6 +926,14 @@ metric-reconstruction failure.  Passing this matrix establishes implementation
 consistency; it does not replace convergence of the real primary ADM source resolution
 and cadence.
 
+The CUDA/AMR reference run on a V100-SXM2-32GB is recorded in
+`validation/hybrid_adm_k_v100_20260830.json`.  It used commit `69f1bd1e`,
+double precision, CUDA 12.4, and 64 cells per axis split into eight-cell meshblocks.
+All gates passed: analytic/hybrid `K_ij` parity was exact, finite-difference-step
+sensitivity was `3.63e-8`, the maximum dynamic-AMR relative `L_inf` errors were
+`5.61e-8` over all ADM fields and `4.77e-8` over `K_ij`, and `divB` remained zero
+while the mesh grew from 512 to 904 blocks.
+
 The metric grid covers all active and ghost cell centers.  The required halo is computed
 from the metric-to-root-fluid resolution ratio, so it need not equal `mesh/nghost`; the
 production defaults are both four.  A temporally tilted affine frame

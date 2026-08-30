@@ -1,0 +1,122 @@
+{
+  "classification": "athenak-emri-hybrid-adm-k-cloud-validation-v1",
+  "date": "2026-08-30",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "commit": "69f1bd1ef9057d3be6315410a9a2c3c69b33dbbf",
+    "driver": "inputs/emri/run_hybrid_adm_k_validation.py"
+  },
+  "platform": {
+    "provider": "Zhixing Cloud",
+    "instance_id": 652143,
+    "gpu": "Tesla V100-SXM2-32GB",
+    "gpu_count": 1,
+    "cpu_count": 8,
+    "memory_GB": 24,
+    "image": "ubuntu22_cuda12.4",
+    "cuda_toolkit": "12.4.99",
+    "nvidia_driver": "550.127.05"
+  },
+  "build": {
+    "build_type": "Release",
+    "problem": "emri_windtunnel",
+    "mpi": false,
+    "single_precision": false,
+    "kokkos_cuda": true,
+    "kokkos_arch": "VOLTA70",
+    "athena_sha256": "f1871b4712fefef93ee5cb70f0df8cc2e786b80749889d49c69c710317039f03",
+    "cmake_cache_sha256": "47a4ec392783ebe0cbf2bb18e57198bc5062a4fd0aa28af53e5813c1d2006ab8"
+  },
+  "parameters": {
+    "cells_per_axis": 64,
+    "meshblock_cells_per_axis": 8,
+    "amr_cells_per_axis": 64,
+    "amr_meshblock_cells_per_axis": 8,
+    "metric_cells_per_axis": 8,
+    "metric_halo": 4,
+    "duration": 0.002,
+    "fd_ratios_to_secondary_mass": [0.000025, 0.00005, 0.0001]
+  },
+  "assessment": {
+    "passed": true,
+    "conditions": {
+      "analytic_hybrid_K_parity": {
+        "observed_relative_l2": 0.0,
+        "maximum": 0.000002,
+        "passed": true
+      },
+      "fd_step_K_sensitivity": {
+        "observed_relative_l2": 3.633856138878182e-08,
+        "maximum": 0.01,
+        "passed": true
+      },
+      "amr_ADM_replay": {
+        "observed_maximum_relative_linf": 5.6117246955233754e-08,
+        "maximum": 0.00001,
+        "passed": true
+      },
+      "amr_K_replay": {
+        "observed_maximum_relative_linf": 4.7698542943000995e-08,
+        "maximum": 0.00001,
+        "passed": true
+      },
+      "amr_divB": {
+        "observed_maximum": 0.0,
+        "maximum": 1e-10,
+        "passed": true
+      },
+      "amr_topology_rebuild": {
+        "observed_count": 1,
+        "minimum": 1,
+        "passed": true
+      }
+    }
+  },
+  "fd_step_sensitivity_relative_to_middle": [
+    {
+      "fd_ratio_to_secondary_mass": 0.000025,
+      "K_relative_l2": 1.0568069705569412e-08,
+      "K_relative_linf": 4.291460919725305e-08
+    },
+    {
+      "fd_ratio_to_secondary_mass": 0.00005,
+      "K_relative_l2": 0.0,
+      "K_relative_linf": 0.0
+    },
+    {
+      "fd_ratio_to_secondary_mass": 0.0001,
+      "K_relative_l2": 3.633856138878182e-08,
+      "K_relative_linf": 8.58292183945061e-08
+    }
+  ],
+  "dynamic_amr": {
+    "initial_meshblocks": 512,
+    "final_meshblocks": 904,
+    "created_meshblocks": 392,
+    "initial_maximum_physical_level": 0,
+    "final_maximum_physical_level": 1,
+    "cycles": 15,
+    "wall_seconds": 7.682400905999998,
+    "maximum_ADM_absolute_error": 1.9072813017828594e-06,
+    "maximum_ADM_relative_linf": 5.6117246955233754e-08,
+    "maximum_K_relative_linf": 4.7698542943000995e-08,
+    "maximum_divB": 0.0,
+    "boundary_topology_rebuild_count": 1,
+    "characteristic_fallback_count": 0,
+    "projection_count": 0,
+    "maximum_boundary_flux_residual": 0.0
+  },
+  "downloaded_evidence": {
+    "summary_sha256": "4face128dd80b46bd8dceae1f978182a8e69127bedd41cfec0f240cfa2903184",
+    "amr_log_sha256": "8560c90ce445fb31153008a2936d6a443a4878b5ac3d86050abb09fdd89cc099",
+    "parity_log_sha256": {
+      "fd_0.000025_analytic": "16a5470978931d36dd06fdb6d2d5d6e23ca6cae2d8656c8e45867856898c6822",
+      "fd_0.000025_hybrid": "c5801c9a5ca722f0b8ee13f2ac02c26c4fad60c5b16d1bd5999d37e3f99859bb",
+      "fd_0.00005_analytic": "335b90791b3b480e2f6b9f25a5d110bb18977212f9cdd46d288e88314e2df962",
+      "fd_0.00005_hybrid": "e41fdeecc204517e8d142f113da8ad99819bd0d2b56ee70ab62debeb6748e505",
+      "fd_0.0001_analytic": "38b74c4a9ee94aa59fc86cdcd37db6bb229fc39a588894f3e34468fde21f6007",
+      "fd_0.0001_hybrid": "232a2ed391d613a86bb0f5906b360e92c9aa04b68caf58fda4a67f5be10ff4a5"
+    }
+  },
+  "scope": "Manufactured implementation-consistency test; real-primary spatial-resolution and dump-cadence convergence remain required."
+}
