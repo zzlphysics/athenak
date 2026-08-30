@@ -1,0 +1,78 @@
+{
+  "classification": "athenak-emri-force-background-fixed-topology-cpu-v1",
+  "date": "2026-08-30",
+  "source": {
+    "branch": "codex/emri-local-windtunnel",
+    "scope": "uncommitted implementation qualification before cloud requalification",
+    "emri_windtunnel_cpp_sha256": "905aea76ab39a136e1f5b0c8feea8b2196661e83c02866b868fa022918d4136f",
+    "production_planner_sha256": "082cf274c7cb397fa94d09de1001587c81b609b54305d03d3b036db059320029"
+  },
+  "build": {
+    "platform": "local CPU",
+    "build_directory": "build_emri",
+    "athena_sha256": "0e806548d288bcd6dfd17e84f97b13040e6ae6acab15815acad227cb64115939"
+  },
+  "deltaT_zero_test": {
+    "initial_state": "analytic Taylor wind with nonzero density, pressure, velocity, and trace-free magnetic gradients",
+    "raw_Frel_norm": 21.729009931511644,
+    "raw_maximum_absolute_Frel_component": 17.6036,
+    "background_subtracted_Frel_norm": 4.317603206059353e-15,
+    "background_subtracted_maximum_absolute_Frel_component": 3.16183e-15,
+    "passed": true,
+    "criterion": "maximum absolute delta-T Frel component < 1e-12"
+  },
+  "fixed_topology_restart_test": {
+    "source_restart_sha256": "0c65b82127d0d4f6d8786aadd637e03682d7cf1adc6c5fd3b6f59cfde33143e8",
+    "meshblocks": 64,
+    "physical_refinement_levels": 1,
+    "ordinary_static_resume": {
+      "subcycling": "level",
+      "restart_cache_reconstruction_passed": true,
+      "maximum_mixed_scale_proposed_change": 2.2168319228379406e-16,
+      "acceptance_tolerance": 9.094947017729282e-13,
+      "advanced_root_cycles": 1
+    },
+    "analytic_background_control": {
+      "refinement": "static",
+      "subcycling": "none",
+      "reinitialize_wind_on_restart": true,
+      "probe_dt": 1e-6,
+      "maximum_absolute_Frel_component_after_probe": 3.0464e-6,
+      "surface_Fmom_after_probe": [0.521522, 0.0677581, -0.00147403],
+      "interpretation": "Frel scales away with the negligible probe; Fmom records the exact-tree surface interpolation/quadrature baseline"
+    },
+    "passed": true
+  },
+  "production_policy_test": {
+    "generated_campaign_sha256": "e475b487893a4f3f6e6aed5f03d0fff16879943dcd111c9d5e44e785bab9bc1e",
+    "adaptive_warmup_root_steps": 10,
+    "required_production_meshblocks": 2779,
+    "required_physical_refinement_levels": 9,
+    "production_restart_refinement": "static",
+    "background_control_present": true,
+    "pure_python_tests_passed": 6,
+    "cpp_force_regression_tests_passed": 1,
+    "legacy_nominal_a100_hours_lower_bound": 56.10969686160389,
+    "force_kernel_timing_status": "production_grid_requalification_required"
+  },
+  "resolution_audit": {
+    "finest_dx_in_secondary_masses": [
+      0.07225632103253202,
+      0.07830290489478323,
+      0.06441061523805622
+    ],
+    "cells_per_nonspinning_horizon_radius": [
+      27.67923928896876,
+      25.54183657282485,
+      31.050782430941982
+    ],
+    "physical_convergence_claim": false
+  },
+  "artifacts": {
+    "figure": "analysis/emri_force_background_fix_20260830/force_background_and_resolution.png",
+    "figure_sha256": "572a62279e3671222643e604c912367a13df5ba931b47611cccdc428d9bc93ef",
+    "analysis_summary": "analysis/emri_force_background_fix_20260830/validation_summary.json",
+    "analysis_summary_sha256": "44456a71c65d66727c08dc6be27388ce0a44b046a5483509d6811cca8993343e"
+  },
+  "scope": "Local CPU implementation, exact analytic force baseline, static-tree restart compatibility, control-probe mechanics, and resolution accounting. The changed force kernel and production static-tree handoff still require one production-grid A100 requalification before a long science run."
+}

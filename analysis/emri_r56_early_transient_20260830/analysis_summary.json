@@ -1,0 +1,65 @@
+{
+  "classification": "athenak-emri-r56-early-transient-analysis-v1",
+  "case_id": "r56_p000_t5000",
+  "scope": "early numerical and causal transient; not a stationary BHL result",
+  "samples": 11,
+  "time_end_in_secondary_masses": 55.3767,
+  "capture_crossing_time_in_secondary_masses": 4220.466758165481,
+  "capture_crossing_fraction": 0.013120989495500897,
+  "causal_reach_in_secondary_masses": 4.317346534793626,
+  "upstream": {
+    "rho": 0.7471925167986541,
+    "plasma_beta": 3387.9747445186563,
+    "magnetization_sigma": 1.7048697789906688e-06,
+    "three_speed": 0.04364598535941371,
+    "fast_mach_proxy": 0.6756236354817157,
+    "wind_unit_vector": [
+      -0.7940889373514481,
+      -0.60779972243747,
+      0.001502325191971657
+    ]
+  },
+  "accretion": {
+    "mdot_initial": 44.1332,
+    "mdot_final": 488.933,
+    "growth_factor": 11.078575766089926,
+    "bhl_proxy": 19814.032274686593,
+    "final_to_bhl_proxy": 0.024676097889707996,
+    "fractional_change_last_saved_interval": 0.0809640248324166
+  },
+  "force": {
+    "Ftotal3_final": [
+      125.7708,
+      95.4995,
+      -0.2154296
+    ],
+    "Ftotal3_vertical_fraction": 0.0013641755273548937,
+    "outer_increment_fraction_at_end": 0.5759878794836993,
+    "dFrel32_change_relative_to_initial": 0.018204400176391966,
+    "delta_Ftotal_final_by_shell": [
+      [
+        -24.959310000000002,
+        -5.470568999999994,
+        3.62399042
+      ],
+      [
+        -23.92801,
+        -9.188169000000002,
+        2.84540742
+      ],
+      [
+        -24.993610000000004,
+        -7.931169000000011,
+        2.6667728200000003
+      ]
+    ],
+    "Ftotal3_norm_fractional_change_last_saved_interval": -0.0122276696625494
+  },
+  "numerical_health": {
+    "endpoint_all_stored_fields_match": true,
+    "history_exact_after_time_deduplication": true,
+    "maximum_divB": 1.015576511775862e-13,
+    "cache_proposal_to_tolerance": 0.00024413998367008176,
+    "peak_gpu_memory_MiB": 47675.0
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "classification": "athenak-emri-force-background-and-resolution-audit-v1",
+  "force_zero_test": {
+    "scope": "local CPU t=0 analytic Taylor-gradient smoke test",
+    "raw_Frel_vectors": [
+      [
+        -4.34491,
+        -0.167241,
+        -0.00611921
+      ],
+      [
+        -11.9407,
+        0.535777,
+        -0.0232918
+      ],
+      [
+        -17.6036,
+        0.698039,
+        -0.0414162
+      ]
+    ],
+    "deltaT_Frel_vectors": [
+      [
+        1.16602e-15,
+        2.64083e-16,
+        -1.12984e-16
+      ],
+      [
+        2.32355e-15,
+        1.02709e-15,
+        3.11037e-16
+      ],
+      [
+        3.16183e-15,
+        6.17464e-16,
+        5.20208e-16
+      ]
+    ],
+    "raw_Frel_norm": 21.729009931511644,
+    "deltaT_Frel_norm": 4.317603206059353e-15,
+    "maximum_absolute_deltaT_Frel_component": 3.16183e-15,
+    "raw_Fmom": [
+      -40.7841,
+      -1.43161,
+      -0.0141573
+    ],
+    "analytic_subtracted_Fmom": [
+      -3.89404,
+      -0.629182,
+      -0.00143683
+    ],
+    "note": "The remaining Fmom is interpolation/quadrature bias on the extraction sphere; measure it with the fixed-topology restart control."
+  },
+  "r56_resolution": {
+    "root_dx_in_secondary_masses": [
+      36.99523636865639,
+      40.09108730612901,
+      32.978235001884784
+    ],
+    "finest_dx_in_secondary_masses": [
+      0.07225632103253202,
+      0.07830290489478323,
+      0.06441061523805622
+    ],
+    "physical_refinement_levels": 9,
+    "secondary_spin": 0.0,
+    "horizon_radius_in_secondary_masses": 2.0,
+    "cells_per_horizon_radius_by_axis": [
+      27.67923928896876,
+      25.54183657282485,
+      31.050782430941982
+    ],
+    "cells_per_horizon_diameter_by_axis": [
+      55.35847857793752,
+      51.0836731456497,
+      62.101564861883965
+    ],
+    "cell_diagonal_in_secondary_masses": 0.12450320557906416,
+    "athenak_paper_fine_dx_in_black_hole_masses": [
+      0.125,
+      0.08333333333333333,
+      0.0625
+    ],
+    "athenak_paper_spin": 0.9375,
+    "athenak_paper_cells_per_horizon_radius": [
+      10.783882181415011,
+      16.175823272122518,
+      21.567764362830022
+    ],
+    "assessment": "Current finest spacing is comparable to the paper's 96^3--128^3 near-horizon range, but magnetic flux/force convergence is not established without a one-level-finer local rerun."
+  }
+}

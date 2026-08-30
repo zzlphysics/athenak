@@ -281,6 +281,21 @@ def test_real_calibration_produces_conservative_segment_and_output_policy() -> N
                for item in overrides)
     assert campaign["stationarity_gate"]["status"] == "runtime_evidence_required"
 
+    topology = campaign["topology_freeze"]
+    assert topology["adaptive_warmup_root_steps"] == 10
+    assert topology["required_warmup_meshblocks"] == 2779
+    assert topology["production_refinement_mode"] == "static"
+    assert "mesh_refinement/refinement=static" in campaign["restart_argv_template"]
+    assert "problem/reinitialize_wind_on_restart=false" \
+        in campaign["restart_argv_template"]
+    assert "time/subcycling=none" \
+        in campaign["fixed_topology_background_argv_template"]
+    assert "problem/reinitialize_wind_on_restart=true" \
+        in campaign["fixed_topology_background_argv_template"]
+    assert "time/nlim=10" in campaign["adaptive_warmup_overrides"]
+    assert "output1/dt=0" in campaign["adaptive_warmup_overrides"]
+    assert "output4/dt=0" in campaign["adaptive_warmup_overrides"]
+
 
 def test_passed_production_qualification_controls_runtime_and_resources() -> None:
     campaign = production.build_production_campaign(

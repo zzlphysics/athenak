@@ -19,6 +19,7 @@ import prepare_frozen_direct_pilot as direct_pilot
 
 
 CLASSIFICATION = "athenak-emri-frozen-direct-production-campaign-v1"
+FORCE_DIAGNOSTIC_CONTRACT = "local-upstream-deltaT-v1"
 CALIBRATION_CLASSIFICATION = "athenak-emri-frozen-direct-cloud-calibration-v1"
 QUALIFICATION_CLASSIFICATION = (
     "athenak-emri-frozen-production-io-qualification-v1"
@@ -511,7 +512,31 @@ def build_production_campaign(
     keys = [item.split("=", 1)[0] for item in fresh_overrides]
     if len(keys) != len(set(keys)):
         duplicates = sorted({key for key in keys if keys.count(key) > 1})
-        raise ValueError("production overrides contain duplicates: " + ", ".join(duplicates))
+        raise ValueError(
+            "production overrides contain duplicates: " + ", ".join(duplicates)
+        )
+
+    # Build the complete adaptive tree before any science segment, then retain the
+    # checkpoint tree verbatim under static refinement.  One level can be added per
+    # synchronized root cycle, so levels+1 provides a final verification cycle at the
+    # complete topology.  Field/history output is deferred until the tree is frozen;
+    # the active restart output produces the topology hand-off checkpoint.
+    topology_warmup_root_steps = levels + 1
+    topology_warmup_duration_proxy = topology_warmup_root_steps * measured_root_dt
+    warmup_overrides = _replace_overrides(
+        fresh_overrides,
+        {
+            "time/nlim": str(topology_warmup_root_steps),
+            "output1/dt": "0",
+            "output2/dt": "0",
+            "output3/dt": f"{topology_warmup_duration_proxy:.17g}",
+            "output4/dt": "0",
+        },
+    )
+    # The topology-matched upstream control advances only a negligible probe step so
+    # the normal output scheduler emits a fresh history row after resetting the loaded
+    # GRMHD state.  Its force is the residual interpolation/quadrature baseline.
+    baseline_probe_dt = measured_root_dt * 1.0e-6
 
     earliest_stationarity_time = 1.5 * crossing_time
     campaign = {
@@ -529,6 +554,16 @@ def build_production_campaign(
             "full-primary, frozen-gradient direct BHL baseline; force stationarity and "
             "far-wake shell closure are runtime gates, not assumptions"
         ),
+        "force_diagnostic_contract": {
+            "version": FORCE_DIAGNOSTIC_CONTRACT,
+            "volume_force": "cellwise T-T_upstream(x,t) on identical metric/quadrature",
+            "surface_force": "pointwise T-T_upstream(x,t) plus fixed-tree control",
+            "timing_status": "production_grid_requalification_required",
+            "reason": (
+                "the existing A100 force timing predates the additional upstream "
+                "stress reconstruction and the adaptive-to-static handoff"
+            ),
+        },
         "physical_scales": {
             "capture_radius_in_secondary_masses": capture_radius,
             "capture_crossing_time_in_secondary_masses": crossing_time,
@@ -563,10 +598,13 @@ def build_production_campaign(
             "projected_durable_sync_hours": durable_sync_seconds / 3600.0,
             "qualified_nominal_hours": qualified_nominal_seconds / 3600.0,
             "recommended_operational_reserve_hours": operational_reserve_hours,
+            "force_kernel_timing_status":
+                "legacy_lower_bound_requalification_required",
             "budget_rule": (
-                "use empirical_with_production_diagnostics_hours; then add checkpoint, "
-                "field-output, restart-read, startup, system-variance, and "
-                "stationarity-extension reserve"
+                "the recorded force timing is a lower bound for delta-T-v1; perform a "
+                "paired production-grid static-tree timing before using the nominal "
+                "hours, then add checkpoint, field-output, restart-read, startup, "
+                "system-variance, and stationarity-extension reserve"
             ),
         },
         "segmentation": {
@@ -582,10 +620,36 @@ def build_production_campaign(
             "checkpoint_wall_hours_proxy":
                 checkpoint_root_steps * budget_root_cycle_seconds / 3600.0,
             "resume_rule": (
-                "read the newest audited restart, set nlim=current_cycle+"
+                "read the newest audited restart with refinement=static, set "
+                "nlim=current_cycle+"
                 f"{segment_root_steps}, retain the global tlim, and never infer the "
                 "next restart filename from a failed segment"
             ),
+        },
+        "topology_freeze": {
+            "status": "runtime_tree_audit_required",
+            "adaptive_warmup_root_steps": topology_warmup_root_steps,
+            "adaptive_warmup_duration_proxy_in_secondary_masses":
+                topology_warmup_duration_proxy,
+            "required_warmup_meshblocks": final_meshblocks,
+            "required_physical_refinement_levels": levels,
+            "production_refinement_mode": "static",
+            "handoff_rule": (
+                "accept only a complete finite warmup restart whose leaf tree has the "
+                "calibrated MeshBlock count and maximum physical level; all science, "
+                "background controls, and resolution contrasts begin from an audited "
+                "copy of that exact tree"
+            ),
+            "background_control": {
+                "state": "analytic upstream wind reinitialized on the warmup restart",
+                "probe_root_steps": 1,
+                "probe_root_dt_max_in_secondary_masses": baseline_probe_dt,
+                "interpretation": (
+                    "Frel is the cellwise delta-T zero test; the remaining Fmom value "
+                    "measures fixed-tree surface interpolation/quadrature bias and is "
+                    "subtracted from the matching production force offline"
+                ),
+            },
         },
         "storage_lifecycle": {
             "status": (
@@ -730,16 +794,44 @@ def build_production_campaign(
             ),
         },
         "athena_input": pilot["athena_input"],
+        "adaptive_warmup_argv_template": [
+            "{athena}", "-i", pilot["athena_input"], "-d", "{run_directory}",
+            *warmup_overrides,
+        ],
+        # Backward-compatible spelling now deliberately points to the short topology
+        # warmup rather than an adaptive science evolution.
         "fresh_argv_template": [
             "{athena}", "-i", pilot["athena_input"], "-d", "{run_directory}",
-            *fresh_overrides,
+            *warmup_overrides,
         ],
         "restart_argv_template": [
             "{athena}", "-r", "{audited_restart}", "-d", "{run_directory}",
+            "mesh_refinement/refinement=static",
+            "problem/reinitialize_wind_on_restart=false",
             f"time/nlim={{current_cycle_plus_{segment_root_steps}}}",
             f"time/tlim={duration:.17g}",
+            f"output1/dt={field_dt:.17g}",
+            f"output2/dt={field_dt:.17g}",
+            f"output3/dt={checkpoint_dt:.17g}",
+            f"output4/dt={history_dt:.17g}",
+        ],
+        "fixed_topology_background_argv_template": [
+            "{athena}", "-r", "{audited_warmup_restart}", "-d",
+            "{background_run_directory}",
+            "mesh_refinement/refinement=static",
+            "time/subcycling=none",
+            "problem/reinitialize_wind_on_restart=true",
+            "time/nlim={warmup_cycle_plus_1}",
+            f"time/root_dt_max={baseline_probe_dt:.17g}",
+            "time/tlim={warmup_time_plus_probe_dt}",
+            "output1/dt=0",
+            "output2/dt=0",
+            "output3/dt=0",
+            f"output4/dt={baseline_probe_dt:.17g}",
+            "output5/dt=0",
         ],
         "fresh_overrides": fresh_overrides,
+        "adaptive_warmup_overrides": warmup_overrides,
     }
     if qualification is not None:
         qualified_result = qualification["result"]

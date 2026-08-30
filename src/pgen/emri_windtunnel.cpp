@@ -70,6 +70,7 @@ struct WindTunnelParameters {
   Real adiabatic_index;
   int force_surface_nlevel;
   bool force_subtract_background;
+  bool reinitialize_wind_on_restart;
   bool wind_is_source_tetrad;
   bool force_is_source_tetrad;
 };
@@ -2123,6 +2124,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pin->GetOrAddInteger("problem", "force_surface_nlevel", 5);
   wind_tunnel.force_subtract_background = pin->GetOrAddBoolean(
       "problem", "force_subtract_background", true);
+  wind_tunnel.reinitialize_wind_on_restart = pin->GetOrAddBoolean(
+      "problem", "reinitialize_wind_on_restart", false);
+  if (wind_tunnel.reinitialize_wind_on_restart && !restart) {
+    Fatal("<problem> reinitialize_wind_on_restart=true is only valid with -r");
+  }
   wind_tunnel.adiabatic_index = pin->GetOrAddReal("mhd", "gamma", 5.0/3.0);
   const std::string dynamic_eos =
       pin->GetOrAddString("mhd", "dyn_eos", "ideal");
@@ -2366,6 +2372,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << wind_tunnel.force_outer_radius[2]/metric.secondary_mass << "}"
               << ", ADM cache="
               << (pmbp->padm->is_dynamic ? "stage-refresh" : "stationary")
+              << ", restart wind reset="
+              << wind_tunnel.reinitialize_wind_on_restart
               << std::endl;
     if (wind_profile_enabled) {
       std::cout << "EMRI profile table: rows=" << wind_profile_table.size()
@@ -2375,7 +2383,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                 << ", FNV1a64=" << FormatFNV1a64(wind_profile_hash) << std::endl;
     }
   }
-  if (restart) return;
+  if (restart && !wind_tunnel.reinitialize_wind_on_restart) return;
 
   auto &indcs = pmy_mesh_->mb_indcs;
   const int is = indcs.is;
@@ -2901,13 +2909,39 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
     }
     pdata->hdata[3] -= density*radial_velocity*area_weight;
 
+    // Form the perturbative momentum flux on the same surface quadrature used for
+    // the evolved state.  The analytic wind is evaluated at the quadrature point
+    // and contracted with the same metric, so this removes the leading upstream
+    // stress on the finite sphere.  A fixed-tree control measures the remaining
+    // interpolation/quadrature residual.  mdot intentionally remains the total mass
+    // flux rather than a perturbative diagnostic.
+    Real background_stress[4][4] = {{0.0}};
+    if (parameters.force_subtract_background) {
+      Real background_density;
+      Real background_pressure;
+      ComputeWindThermodynamics(
+          x, y, z, parameters, background_density, background_pressure);
+      Real background_velocity[3];
+      ComputeWindPrimitive(x, y, z, parameters, background_velocity);
+      Real background_field[3];
+      ComputeDensitizedMagneticField(x, y, z, parameters, background_field);
+      Real background_four_velocity[4];
+      Real background_sqrt_gamma;
+      Real background_sqrt_minus_g;
+      ComputeStressEnergyFromMetric(
+          metric, parameters, background_density, background_pressure,
+          background_velocity, background_field, background_four_velocity,
+          background_stress, background_sqrt_gamma, background_sqrt_minus_g);
+    }
     Real momentum_covector[4] = {0.0, 0.0, 0.0, 0.0};
     for (int covector_component=0; covector_component<4; ++covector_component) {
       for (int surface_direction=0; surface_direction<3; ++surface_direction) {
         Real mixed_stress = 0.0;
         for (int a=0; a<4; ++a) {
-          mixed_stress += stress[surface_direction+1][a]
-                         *metric[a][covector_component];
+          mixed_stress +=
+              (stress[surface_direction+1][a]
+               -background_stress[surface_direction+1][a])
+              *metric[a][covector_component];
         }
         momentum_covector[covector_component] +=
             surface_covector[surface_direction]*mixed_stress;
@@ -3019,6 +3053,24 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
                             densitized_field, local_metric, four_velocity, stress,
                             sqrt_gamma, sqrt_minus_g);
       }
+      Real background_density = 0.0;
+      Real background_stress[4][4] = {{0.0}};
+      if (parameters.force_subtract_background) {
+        Real background_pressure;
+        ComputeWindThermodynamics(
+            x, y, z, parameters, background_density, background_pressure);
+        Real background_velocity[3];
+        ComputeWindPrimitive(x, y, z, parameters, background_velocity);
+        Real background_field[3];
+        ComputeDensitizedMagneticField(x, y, z, parameters, background_field);
+        Real background_four_velocity[4];
+        Real background_sqrt_gamma;
+        Real background_sqrt_minus_g;
+        ComputeStressEnergyFromMetric(
+            local_metric, parameters, background_density, background_pressure,
+            background_velocity, background_field, background_four_velocity,
+            background_stress, background_sqrt_gamma, background_sqrt_minus_g);
+      }
       Real metric_derivative[3][4][4];
       if (numerical_adm_force) {
         Real derivative_left[3][4][4];
@@ -3049,7 +3101,7 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
                                    *size.d_view(m).dx3;
       const Real radius = sqrt(radius2);
       const Real source_density = parameters.force_subtract_background
-          ? density-parameters.rho : density;
+          ? density-background_density : density;
       const Real newtonian_volume = parameters.force_is_source_tetrad
           ? parameters.source_spatial_determinant*coordinate_volume
           : sqrt_gamma*coordinate_volume;
@@ -3064,7 +3116,7 @@ void EMRIHistory(HistoryData *pdata, Mesh *pm) {
         Real contraction = 0.0;
         for (int a=0; a<4; ++a) {
           for (int b=0; b<4; ++b) {
-            contraction += stress[a][b]
+            contraction += (stress[a][b]-background_stress[a][b])
                          *metric_derivative[force_direction][a][b];
           }
         }

@@ -576,6 +576,27 @@ the forced endpoint sample of one segment and the initial sample after restart d
 bias an average.  History uses physical-time cadence: analyze the timestamps actually
 written rather than assuming a row for every integer root cycle.
 
+The generated policy now separates mesh construction from science evolution.  Run the
+`adaptive_warmup_argv_template` for `physical_refinement_levels+1` root cycles, require
+the calibrated leaf count and finest level, and audit its final restart.  Every ordinary
+production restart then overrides `mesh_refinement/refinement=static`; changing leaf
+quadrature can no longer masquerade as time evolution in a force integral.  The
+`fixed_topology_background_argv_template` loads a copy of the same warmup restart,
+switches off level subcycling, replaces its GRMHD state by the analytic upstream wind,
+and advances one `1e-6`-root-step probe to force a new history sample.  Its residual
+surface momentum flux is the topology-matched interpolation/quadrature baseline.  Never
+use `reinitialize_wind_on_restart=true` in the science directory or in a continuation
+checkpoint.
+
+The local implementation evidence is recorded in
+`validation/force_background_fixed_topology_cpu_20260830.json`.  A Taylor-gradient
+initial state reduced the raw relativistic volume-force norm from `21.7290` to
+`4.32e-15` under cellwise background subtraction.  A topology-preserving static restart
+passed the strict cache audit at `2.22e-16`, and the analytic-reset probe wrote the
+expected separate surface-quadrature baseline.  This closes the CPU mechanism test, not
+the production GPU qualification: the changed force kernel and adaptive-to-static
+handoff must be exercised once on the 2779-block A100 grid before a long run.
+
 For this direct box, the production force shells are `0.5 r_a`, `1 r_a`, and `2 r_a`
 instead of the smoke-test radii `4m`, `6m`, and `7.5m`.  The latter see only the near-hole
 flow and cannot establish closure of the BHL wake force.  With 2779 blocks a double-
@@ -1932,30 +1953,42 @@ The `mu=0` energy-flux term in the second expression is essential: omitting it c
 large spurious tangential force in a rotating chart.  Set `force_frame=coordinate` only
 for legacy coordinate-sphere diagnostics.
 
-The paper-compatible far-field estimator is
+The paper-compatible density-only far-field estimator is
 
 ```text
-Fnewt_hat_a = m integral (rho-rho0) xhat_a/rhat^3 d^3xhat,
+Fnewt_hat_a = m integral (rho-rho_up(x,t)) xhat_a/rhat^3 d^3xhat,
 ```
 
-over `r_s < r < force_outer_radius_3`.  Subtracting the uniform background removes a
-finite-box cancellation error and is the default.  Set
-`force_subtract_background=false` to use `rho` literally as in the cited work.  The
-factor of secondary mass `m`, implicit when `G=m=c=1`, is retained here.
+over `r_s < r < force_outer_radius_3`.  The upstream density is the same analytic
+Taylor/profile state used by the boundary at that position and RK-stage time, reducing
+to `rho0` for a uniform wind.  This removes a finite-box cancellation error and is the
+default.  Set `force_subtract_background=false` to use `rho` literally as in the cited
+work.  The factor of secondary mass `m`, implicit when `G=m=c=1`, is retained here.
 
 The relativistic estimator treats the secondary position as a source parameter:
 
 ```text
-Frel_i(R) = -1/2 integral T^{mu nu} d_i hsec_{mu nu} sqrt(-g) d^3x,
+Frel_i(R) = -1/2 integral deltaT^{mu nu} d_i hsec_{mu nu} sqrt(-g) d^3x,
+deltaT^{mu nu} = T^{mu nu} - T_up^{mu nu}(x,t),
 ```
 
 where `d_i` differentiates the secondary Kerr-Schild perturbation with respect to
-field-point displacement while holding the rotating-coordinate Jacobian fixed.  Thus
+field-point displacement while holding the rotating-coordinate Jacobian fixed.  Both
+stress tensors use the same local metric, magnetic densitization convention, cell
+volume, cutoff, and quadrature.  Thus
 `-d_i hsec` is the derivative with respect to the secondary position.  This construction
 isolates the force associated with the small hole: derivatives of the primary metric and
 of the rotating basis are not included.  It also includes gas pressure and magnetic
 stress, whereas `Fnewt_i` uses density alone.  Its weak-field limit is
-`m integral rho x_i/r^3 dV`.
+`m integral (rho-rho_up) x_i/r^3 dV`.
+
+With background subtraction enabled, the reported momentum-force flux likewise uses
+`T-T_up` on the same extraction-sphere points; `mdot_hat` remains the total mass flux.
+The continuous analytic background does not exactly reproduce interpolation from a
+finite Cartesian/AMR stencil, so subtract the fixed-topology control's `FmomH` before
+forming a precision production contrast.  At initial cell centers the volume estimator
+is a strict zero test: a nonzero `Frel` then indicates an implementation or topology
+bookkeeping error, rather than a large relativistic drag from unperturbed gas.
 
 For source-frame output, the generalized-force covector is converted to force per source
 proper time and projected on the source tetrad.  `Frel1H_i`, `Frel2H_i`, and `Frel3H_i`

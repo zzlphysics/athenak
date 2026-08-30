@@ -54,6 +54,33 @@ def _maximum_divb(dump: dict) -> float:
     return max(float(np.max(np.abs(values))) for values in dump["mb_data"]["divb"])
 
 
+def _initial_force_row(
+    run_dir: Path, basename: str, subtract_background: bool
+) -> np.ndarray:
+    flags = [
+        "-d",
+        str(run_dir),
+        f"job/basename={basename}",
+        "time/nlim=0",
+        "problem/dlnrho_dxh1=0.02",
+        "problem/dlnpgas_dxh3=-0.01",
+        "problem/du2_dxh1=-0.015",
+        "problem/db1_dxh1=0.001",
+        "problem/db2_dxh2=-0.0004",
+        "problem/db3_dxh3=-0.0006",
+        f"problem/force_subtract_background={'true' if subtract_background else 'false'}",
+        "output1/dt=0",
+        "output2/dt=0",
+        "output3/dt=0",
+        "output4/dt=1",
+        "output5/dt=0",
+    ]
+    assert testutils.run(INPUT_FILE, flags)
+    history = run_dir / f"{basename}.user.hst"
+    rows = np.loadtxt(history)
+    return np.atleast_2d(rows)[-1]
+
+
 def test_emri_analytic_gradients_preserve_uniform_limit_and_divb(tmp_path: Path) -> None:
     zero_state, zero_divb = _run(tmp_path / "zero", "emri_zero", gradients=False)
     gradient_state, gradient_divb = _run(
@@ -107,3 +134,18 @@ def test_emri_user_boundary_is_active_level_safe(tmp_path: Path) -> None:
         "output5/dt=0",
     ]
     assert testutils.run(INPUT_FILE, flags)
+
+
+def test_emri_relativistic_force_subtracts_local_taylor_stress(
+    tmp_path: Path,
+) -> None:
+    subtracted = _initial_force_row(
+        tmp_path / "subtracted", "emri_force_subtracted", True
+    )
+    raw = _initial_force_row(tmp_path / "raw", "emri_force_raw", False)
+
+    # Columns 13--21 in the one-based history header are the three Frel vectors.
+    # Cell-centered initial data and the analytic Taylor background are identical,
+    # so the delta-T volume integral must vanish independent of finite-box symmetry.
+    assert float(np.max(np.abs(subtracted[12:21]))) < 1.0e-12
+    assert float(np.linalg.norm(raw[12:21])) > 1.0

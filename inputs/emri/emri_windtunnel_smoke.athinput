@@ -185,12 +185,18 @@ metric_fd_step        = 5.0e-5
 
 # Force diagnostics.  Fmom is measured on the inner sphere; Frel1..3 are the
 # relativistic secondary-source forces accumulated from that sphere to each outer radius.
+# Background subtraction uses the full local analytic Taylor/profile stress tensor for
+# Fmom/Frel and the local analytic density for Fnewt; mdot remains a total flux.
 force_surface_radius    = 3.0
 force_outer_radius_1    = 4.0
 force_outer_radius_2    = 6.0
 force_outer_radius_3    = 7.5
 force_surface_nlevel    = 5
 force_subtract_background = true
+# Diagnostic-only control: with -r, replace the loaded GRMHD state by the analytic
+# upstream wind while preserving the restart's exact leaf topology.  Do not enable in
+# an ordinary fresh or production evolution.
+reinitialize_wind_on_restart = false
 
 <emri_worldtube>
 # Optional fixed, grid-aligned outer extractor.  It is disabled in the ordinary smoke
